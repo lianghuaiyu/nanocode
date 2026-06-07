@@ -28,6 +28,7 @@ from .trace_cmd import run as _run_trace_cmd
 from ..tools import sandbox_defaults
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
+from ..trust import is_trusted
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trace": _run_trace_cmd}
@@ -253,13 +254,40 @@ async def _run_user_shell(command: str) -> str:
     return "\n".join(parts)
 
 
+# Security: NO .env (repo-local OR user-level) may set nanocode's own security-sensitive
+# env vars, the dynamic-linker injection vars, or interpreter-injection vars. Mirrors Codex's
+# ILLEGAL_ENV_VAR_PREFIX ("CODEX_"). These belong to the operator's shell / CLI flags, not to
+# .env content — otherwise a .env could disable the sandbox (NANOCODE_SHELL_SANDBOX=off),
+# hijack the microVM launcher (NANOCODE_MSB_BIN / MSB_BIN), preload a shared object
+# (LD_PRELOAD / DYLD_INSERT_LIBRARIES), hijack PATH, or inject code into the interpreter
+# (PYTHONPATH / NODE_OPTIONS / BASH_ENV …). This is defense-in-depth that applies to ANY .env
+# source, on top of the trust-gating that keeps an untrusted repo's .env from being read at all.
+_DOTENV_BLOCKED_PREFIXES = (
+    "NANOCODE_",   # 自有安全变量（sandbox 档 / msb 启动器…）—— 抄 Codex CODEX_ 前缀禁用
+    "LD_",         # Linux 动态链接器：LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT …
+    "DYLD_",       # macOS 动态链接器：DYLD_INSERT_LIBRARIES / DYLD_LIBRARY_PATH …
+)
+_DOTENV_BLOCKED_NAMES = frozenset({
+    "MSB_BIN", "PATH",
+    "IFS", "ENV", "BASH_ENV", "SHELLOPTS",
+    "PYTHONPATH", "NODE_OPTIONS", "PERL5LIB", "RUBYOPT",
+})
+
+
+def _is_blocked_dotenv_key(key: str) -> bool:
+    up = key.upper()
+    return up in _DOTENV_BLOCKED_NAMES or any(up.startswith(p) for p in _DOTENV_BLOCKED_PREFIXES)
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """Load KEY=VALUE pairs from a .env file into os.environ.
 
     Minimal and zero-dependency. Supports `#` comments, blank lines, an optional
     leading `export `, and surrounding single/double quotes. Existing environment
     variables are NOT overwritten (an explicit `export` always wins). Silently does
-    nothing if the file is absent.
+    nothing if the file is absent. Security-sensitive / injection keys
+    (`NANOCODE_*` / `LD_*` / `DYLD_*` / `MSB_BIN` / `PATH` / `PYTHONPATH` …) are never
+    loaded from ANY `.env` (see `_is_blocked_dotenv_key`).
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -280,7 +308,32 @@ def _load_dotenv(path: str = ".env") -> None:
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
             val = val[1:-1]
         if key and key not in os.environ:
+            if _is_blocked_dotenv_key(key):
+                continue  # 任何 .env 都不得设 nanocode 安全敏感 / 注入类变量（见上）
             os.environ[key] = val
+
+
+def _user_env_path() -> str:
+    """用户级、可信的 .env 路径（抄 Codex `$CODEX_HOME/.env`）。
+
+    落在 nanocode 的本地存储根（`paths.data_dir()`，默认 `~/.nanocode`，可被
+    `NANOCODE_HOME` 覆盖）下的 `.env`。这是 operator 自己拥有的、与任何 repo 无关的
+    可信来源，故总是加载。"""
+    from ..paths import data_dir
+    return str(data_dir() / ".env")
+
+
+def _load_env_files() -> None:
+    """加载 .env：用户级（总是，可信）+ repo 级（仅当 workspace 已被信任）。
+
+    Codex 形状：不信任 / 首见的 repo 的 `./.env` 完全不读，根本不让其控制环境
+    （PATH / LD_* / DYLD_* / NANOCODE_* / *_BASE_URL 等全部进不来）。新 / 未信任项目里
+    API key 等仍可来自 shell env 或用户级 `~/.nanocode/.env`；repo `./.env` 在用户信任
+    该目录后（下次运行）才生效。黑名单（`_is_blocked_dotenv_key`）对两个来源都生效。"""
+    _load_dotenv(_user_env_path())          # 用户级：operator 自己的，总是读
+    if is_trusted(Path.cwd()):              # 非交互、只读已记录的 trust（不弹对话）
+        _load_dotenv()                      # repo ./.env：仅当该目录此前已被信任
+    # 不信任 / 首见的 repo：其 ./.env 不读（一次性关掉 PATH/LD_*/NANOCODE_*/base_url 等整类）
 
 
 def _fmt_eval_row(c) -> str:
@@ -634,7 +687,7 @@ def main() -> None:
     _argv = sys.argv[1:]
     if _argv and _argv[0] in _SUBCOMMANDS:
         raise SystemExit(_SUBCOMMANDS[_argv[0]](_argv[1:]))
-    _load_dotenv()
+    _load_env_files()
     args = parse_args()
 
     if args.help:
