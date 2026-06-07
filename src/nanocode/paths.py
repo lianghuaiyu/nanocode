@@ -5,9 +5,22 @@ import os
 from pathlib import Path
 
 
+CONFIG_DIR_NAME = ".nanocode"
+
+
 def data_dir() -> Path:
     base = os.environ.get("NANOCODE_HOME")
     return Path(base) if base else Path.home() / ".nanocode"
+
+
+def user_config_dir() -> Path:
+    """用户级配置根 = data_dir()（默认 ~/.nanocode）。"""
+    return data_dir()
+
+
+def project_config_dir(cwd: Path | None = None) -> Path:
+    """项目级配置根 = <cwd>/.nanocode。"""
+    return (cwd or Path.cwd()) / CONFIG_DIR_NAME
 
 
 def sessions_dir() -> Path:
@@ -30,7 +43,7 @@ def project_memory_dir() -> Path:
 
 
 def trust_file() -> Path:
-    """工作区信任存储文件：data_dir()/trust.json（绝不放进项目 .claude/）。"""
+    """工作区信任存储文件：data_dir()/trust.json（绝不放进项目 .nanocode/）。"""
     d = data_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d / "trust.json"

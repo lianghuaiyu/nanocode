@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 # 内置保留类型：记忆巩固 curator（系统提示词复用 maintenance.CURATOR_CONSOLIDATION_PROMPT，
-# .claude/agents 不可覆盖；不向模型暴露为可 spawn 的 agent type）。
+# .nanocode/agents 不可覆盖；不向模型暴露为可 spawn 的 agent type）。
 MEMORY_CURATOR_TYPE = "memory-curator"
 
 # 内置保留类型：记忆 EVAL-mode curator（判断型，无工具，只出 QA 候选 JSON）。
-# .claude/agents 不可覆盖；不向模型暴露为可 spawn 的 agent type。
+# .nanocode/agents 不可覆盖；不向模型暴露为可 spawn 的 agent type。
 MEMORY_EVAL_CURATOR_TYPE = "memory-eval-curator"
 
 CURATOR_EVAL_PROMPT = """You are a memory curator in EVAL mode. Your job is to read the user's stored memory files and propose high-quality question/answer (QA) evaluation candidates that probe whether a retrieval system can recall the facts in those memories.

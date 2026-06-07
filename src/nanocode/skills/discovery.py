@@ -1,4 +1,4 @@
-"""技能发现：扫描 .claude/skills/*/SKILL.md，解析 frontmatter 元数据。"""
+"""技能发现：扫描 .nanocode/skills/*/SKILL.md，解析 frontmatter 元数据。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..frontmatter import parse_frontmatter, as_list
+from ..paths import data_dir, project_config_dir, CONFIG_DIR_NAME
 from .hooks import normalize_hooks
 
 # ─── Types ──────────────────────────────────────────────────
@@ -30,7 +31,7 @@ class SkillDefinition:
 # ─── Discovery ──────────────────────────────────────────────
 
 _cached_skills: list[SkillDefinition] | None = None
-_extra_skill_dirs: set[str] = set()  # 嵌套发现注册的额外 .claude/skills 目录
+_extra_skill_dirs: set[str] = set()  # 嵌套发现注册的额外 .nanocode/skills 目录
 
 
 def discover_skills() -> list[SkillDefinition]:
@@ -41,14 +42,14 @@ def discover_skills() -> list[SkillDefinition]:
     skills: dict[str, SkillDefinition] = {}
 
     # User-level skills (lower priority)
-    user_dir = Path.home() / ".claude" / "skills"
+    user_dir = data_dir() / "skills"
     _load_skills_from_dir(user_dir, "user", skills)
 
     # Project-level skills (higher priority, overwrites)
-    project_dir = Path.cwd() / ".claude" / "skills"
+    project_dir = project_config_dir() / "skills"
     _load_skills_from_dir(project_dir, "project", skills)
 
-    # 嵌套发现注册的额外目录（祖先链上的 .claude/skills）
+    # 嵌套发现注册的额外目录（祖先链上的 .nanocode/skills）
     for extra in sorted(_extra_skill_dirs):
         _load_skills_from_dir(Path(extra), "project", skills)
 
@@ -115,7 +116,7 @@ def reset_skill_cache() -> None:
 
 
 def register_nested_skill_dirs(touched: Path, cwd: Path) -> None:
-    """沿 touched 祖先链（cwd 子树内，不含 cwd 本身）注册 .claude/skills，有新增则清缓存。"""
+    """沿 touched 祖先链（cwd 子树内，不含 cwd 本身）注册 .nanocode/skills，有新增则清缓存。"""
     global _cached_skills
     try:
         touched = touched.resolve()
@@ -127,7 +128,7 @@ def register_nested_skill_dirs(touched: Path, cwd: Path) -> None:
     added = False
     d = touched.parent
     while True:
-        sk = d / ".claude" / "skills"
+        sk = d / CONFIG_DIR_NAME / "skills"
         if d != cwd and sk.is_dir() and str(sk) not in _extra_skill_dirs:
             _extra_skill_dirs.add(str(sk))
             added = True

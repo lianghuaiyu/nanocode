@@ -69,7 +69,7 @@ def test_append_to_last_user_empty():
 
 def test_skill_listing_delta_diff(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "z1"
+    d = tmp_path / ".nanocode" / "skills" / "z1"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: z1\ndescription: zee\n---\nbody")
     monkeypatch.chdir(tmp_path)

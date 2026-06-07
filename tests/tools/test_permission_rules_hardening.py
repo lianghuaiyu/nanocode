@@ -3,7 +3,7 @@
 1. deny 规则不可被 bypassPermissions 绕过（deny 提到 bypass 之上）。
 2. 前缀 allow 规则遇 shell 组合符 fail-closed，让危险后段重新落回 is_dangerous。
 
-规则确定性注入（monkeypatch 直接设缓存），不依赖宿主 ~/.claude/settings.json。
+规则确定性注入（monkeypatch 直接设缓存），不依赖宿主 ~/.nanocode/settings.json。
 边界：本修复唯一保证是「allow 规则不能把危险后段偷渡过 is_dangerous」；
 它不改 deny 语义，也不承诺拦截 is_dangerous 黑名单未覆盖的命令（如裸 curl）。
 """

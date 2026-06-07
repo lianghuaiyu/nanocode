@@ -609,7 +609,7 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/skills":
             skills = discover_skills()
             if not skills:
-                print_info("No skills found. Add skills to .claude/skills/<name>/SKILL.md")
+                print_info("No skills found. Add skills to .nanocode/skills/<name>/SKILL.md")
             else:
                 print_info(f"{len(skills)} skills:")
                 for s in skills:

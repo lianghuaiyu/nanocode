@@ -24,7 +24,7 @@ def _load_template() -> str:
 import re as _re
 
 # ─── @include resolution ─────────────────────────────────────
-# Resolves @./path, @~/path, @/path references in CLAUDE.md files.
+# Resolves @./path, @~/path, @/path references in NANOCODE.md / AGENTS.md files.
 
 _INCLUDE_RE = _re.compile(r"^@(\./[^\s]+|~/[^\s]+|/[^\s]+)$", _re.MULTILINE)
 _MAX_INCLUDE_DEPTH = 5
@@ -66,8 +66,8 @@ def _resolve_includes(
 
 
 def _load_rules_dir(directory: Path) -> str:
-    """Load all .md files from .claude/rules/ directory."""
-    rules_dir = directory / ".claude" / "rules"
+    """Load all .md files from .nanocode/rules/ directory."""
+    rules_dir = directory / ".nanocode" / "rules"
     if not rules_dir.is_dir():
         return ""
     try:
@@ -87,28 +87,38 @@ def _load_rules_dir(directory: Path) -> str:
         return ""
 
 
-def load_claude_md() -> str:
-    """Walk up from cwd collecting all CLAUDE.md files, resolving @includes."""
+# Project instruction files read per directory, in collection order (NANOCODE.md first).
+_PROJECT_INSTRUCTION_FILES = ("NANOCODE.md", "AGENTS.md")
+
+
+def load_project_instructions() -> str:
+    """Walk up from cwd collecting NANOCODE.md and AGENTS.md per dir, resolving @includes."""
     parts: list[str] = []
     d = Path.cwd().resolve()
     while True:
-        f = d / "CLAUDE.md"
-        if f.is_file():
-            try:
-                content = f.read_text()
-                content = _resolve_includes(content, d)
-                parts.insert(0, content)
-            except Exception:
-                pass
+        # 同一目录内按 NANOCODE.md → AGENTS.md 顺序收集，整块插到最前，
+        # 保持「向上 walk、root-most first」且「NANOCODE.md 在 AGENTS.md 之前」。
+        here: list[str] = []
+        for fname in _PROJECT_INSTRUCTION_FILES:
+            f = d / fname
+            if f.is_file():
+                try:
+                    content = f.read_text()
+                    content = _resolve_includes(content, d)
+                    here.append(content)
+                except Exception:
+                    pass
+        if here:
+            parts[0:0] = here
         parent = d.parent
         if parent == d:
             break
         d = parent
-    # Load .claude/rules/*.md from cwd
+    # Load .nanocode/rules/*.md from cwd
     rules = _load_rules_dir(Path.cwd())
     claude_md = ""
     if parts:
-        claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
+        claude_md = "\n\n# Project Instructions (NANOCODE.md / AGENTS.md)\n" + "\n\n---\n\n".join(parts)
     return claude_md + rules
 
 
@@ -136,7 +146,7 @@ def build_system_prompt() -> str:
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
     git_context = get_git_context()
-    claude_md = load_claude_md()
+    claude_md = load_project_instructions()
     memory_section = build_memory_prompt_section()
     skills_section = SKILL_PROMPT_GUIDANCE
     agent_section = build_agent_descriptions()

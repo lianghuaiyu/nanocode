@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..paths import data_dir
 from ..ui import print_info
 
 
@@ -33,7 +34,7 @@ class PlanModeMixin:
     # ─── Plan mode helpers ──────────────────────────────────────
 
     def _generate_plan_file_path(self) -> str:
-        d = Path.home() / ".claude" / "plans"
+        d = data_dir() / "plans"
         d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 

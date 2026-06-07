@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..frontmatter import parse_frontmatter, as_list
+from ..paths import data_dir, project_config_dir
 from ..tools import tool_definitions, ToolDef
 from ..memory.maintenance import CURATOR_CONSOLIDATION_PROMPT
 from .prompts import (
@@ -16,7 +17,7 @@ from .prompts import (
 
 READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
 
-# ─── Reserved built-in agent types (custom .claude/agents 不可覆盖) ──
+# ─── Reserved built-in agent types (custom .nanocode/agents 不可覆盖) ──
 # 这些类型由宿主特殊调度（如记忆巩固 curator），不能被项目/用户级 .md 覆盖，
 # 也不向模型暴露为可 spawn 的 agent type（get_available_agent_types 过滤）。
 RESERVED_AGENT_TYPES = {MEMORY_CURATOR_TYPE, MEMORY_EVAL_CURATOR_TYPE}
@@ -33,9 +34,9 @@ def _discover_custom_agents() -> dict[str, dict]:
 
     agents: dict[str, dict] = {}
     # User-level (lower priority)
-    _load_agents_from_dir(Path.home() / ".claude" / "agents", agents)
+    _load_agents_from_dir(data_dir() / "agents", agents)
     # Project-level (higher priority, overwrites)
-    _load_agents_from_dir(Path.cwd() / ".claude" / "agents", agents)
+    _load_agents_from_dir(project_config_dir() / "agents", agents)
 
     _cached_custom_agents = agents
     return agents
@@ -68,7 +69,7 @@ def _load_agents_from_dir(directory: Path, agents: dict[str, dict]) -> None:
 
 def get_sub_agent_config(agent_type: str) -> dict:
     """Return {system_prompt, tools} for the given agent type."""
-    # 保留类型先于 custom 发现匹配：.claude/agents 同名 .md 不能覆盖。
+    # 保留类型先于 custom 发现匹配：.nanocode/agents 同名 .md 不能覆盖。
     if agent_type == MEMORY_CURATOR_TYPE:
         return {"system_prompt": CURATOR_CONSOLIDATION_PROMPT, "tools": []}
     if agent_type == MEMORY_EVAL_CURATOR_TYPE:

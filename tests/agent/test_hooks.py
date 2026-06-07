@@ -8,7 +8,7 @@ def _agent():
 
 def test_skill_invocation_registers_hooks(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "guard"
+    d = tmp_path / ".nanocode" / "skills" / "guard"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text(
         "---\nname: guard\ncontext: inline\nhooks:\n  pre-tool-use:\n"

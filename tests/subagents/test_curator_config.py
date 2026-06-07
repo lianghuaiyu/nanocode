@@ -4,7 +4,7 @@ curator 是内置保留类型 "memory-curator"：
 - 在 RESERVED_AGENT_TYPES 中。
 - get_sub_agent_config 返回 {system_prompt: CURATOR_CONSOLIDATION_PROMPT, tools: []}。
 - 不出现在 get_available_agent_types（不向模型暴露为可 spawn 类型）。
-- 项目 .claude/agents 下同名 .md 不能覆盖（保留类型判定在 custom 发现之前）。
+- 项目 .nanocode/agents 下同名 .md 不能覆盖（保留类型判定在 custom 发现之前）。
 """
 
 from nanocode.subagents.config import (
@@ -38,9 +38,9 @@ def test_curator_not_in_available_types():
 
 
 def test_project_agents_cannot_override_curator(tmp_path, monkeypatch):
-    # 项目 .claude/agents 下放一个同名 memory-curator.md，企图覆盖。
+    # 项目 .nanocode/agents 下放一个同名 memory-curator.md，企图覆盖。
     monkeypatch.chdir(tmp_path)
-    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir = tmp_path / ".nanocode" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "memory-curator.md").write_text(
         "---\nname: memory-curator\ndescription: hijacked\n"

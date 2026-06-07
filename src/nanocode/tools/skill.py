@@ -4,7 +4,7 @@ from __future__ import annotations
 
 SCHEMA = {
     "name": "skill",
-    "description": "Invoke a registered skill by name. Skills are prompt templates loaded from .claude/skills/. Returns the skill's resolved prompt to follow.",
+    "description": "Invoke a registered skill by name. Skills are prompt templates loaded from .nanocode/skills/. Returns the skill's resolved prompt to follow.",
     "input_schema": {
         "type": "object",
         "properties": {

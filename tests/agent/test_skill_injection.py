@@ -8,7 +8,7 @@ def _agent():
 
 def test_inject_listing_then_silent(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "k1"
+    d = tmp_path / ".nanocode" / "skills" / "k1"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: k1\ndescription: kk\n---\nbody")
     monkeypatch.chdir(tmp_path)
@@ -33,7 +33,7 @@ def test_inject_listing_skipped_for_subagent(tmp_path, monkeypatch):
 
 def test_skill_tool_returns_stub_and_queues_body(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "commitx"
+    d = tmp_path / ".nanocode" / "skills" / "commitx"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: commitx\ndescription: c\ncontext: inline\n---\nDo the thing $ARGUMENTS")
     monkeypatch.chdir(tmp_path)
@@ -61,7 +61,7 @@ def test_clear_history_resets_skill_state(tmp_path, monkeypatch):
 
 def test_paths_skill_activated_by_touch(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "pyhelp"
+    d = tmp_path / ".nanocode" / "skills" / "pyhelp"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: pyhelp\ndescription: py\npaths:\n  - '*.py'\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
@@ -78,7 +78,7 @@ def test_paths_skill_activated_by_touch(tmp_path, monkeypatch):
 
 def test_disable_model_invocation_rejected(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "noai"
+    d = tmp_path / ".nanocode" / "skills" / "noai"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: noai\ndescription: x\ndisable-model-invocation: true\ncontext: inline\n---\nbody")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()

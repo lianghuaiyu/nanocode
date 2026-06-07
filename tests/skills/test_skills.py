@@ -6,7 +6,7 @@ from nanocode.skills import discovery, resolve
 
 @pytest.fixture
 def skill_repo(tmp_path, monkeypatch):
-    d = tmp_path / ".claude" / "skills" / "foo"
+    d = tmp_path / ".nanocode" / "skills" / "foo"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text(
         "---\nname: foo\ndescription: a foo skill\ncontext: inline\n---\n"
@@ -36,7 +36,7 @@ def test_execute_skill_inline(skill_repo):
 
 def test_user_invocable_false_disables(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "s1"
+    d = tmp_path / ".nanocode" / "skills" / "s1"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: s1\nuser_invocable: false\n---\nbody")
     monkeypatch.chdir(tmp_path)
@@ -47,7 +47,7 @@ def test_user_invocable_false_disables(tmp_path, monkeypatch):
 
 def test_user_invocable_underscore_true_read(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "s2"
+    d = tmp_path / ".nanocode" / "skills" / "s2"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: s2\nuser_invocable: true\n---\nbody")
     monkeypatch.chdir(tmp_path)
@@ -58,7 +58,7 @@ def test_user_invocable_underscore_true_read(tmp_path, monkeypatch):
 
 def test_allowed_tools_yaml_list(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "s3"
+    d = tmp_path / ".nanocode" / "skills" / "s3"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: s3\nallowed-tools:\n  - read_file\n  - run_shell\n---\nb")
     monkeypatch.chdir(tmp_path)
@@ -69,7 +69,7 @@ def test_allowed_tools_yaml_list(tmp_path, monkeypatch):
 
 def test_paths_field_parsed(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "p1"
+    d = tmp_path / ".nanocode" / "skills" / "p1"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: p1\npaths:\n  - 'src/**/*.py'\n  - '*.md'\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
@@ -79,7 +79,7 @@ def test_paths_field_parsed(tmp_path, monkeypatch):
 
 def test_disable_model_invocation_parsed(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "p2"
+    d = tmp_path / ".nanocode" / "skills" / "p2"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: p2\ndisable-model-invocation: true\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
@@ -89,7 +89,7 @@ def test_disable_model_invocation_parsed(tmp_path, monkeypatch):
 
 def test_defaults_no_paths_not_disabled(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "p3"
+    d = tmp_path / ".nanocode" / "skills" / "p3"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: p3\ndescription: d\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
@@ -110,7 +110,7 @@ def test_path_activates_skill(tmp_path):
 def test_nested_skill_discovery(tmp_path, monkeypatch):
     from nanocode.skills import discovery
     # cwd 下没有顶层 skill；嵌套子目录里有一个
-    nested = tmp_path / "pkg" / "sub" / ".claude" / "skills" / "nestedskill"
+    nested = tmp_path / "pkg" / "sub" / ".nanocode" / "skills" / "nestedskill"
     nested.mkdir(parents=True)
     (nested / "SKILL.md").write_text("---\nname: nestedskill\ndescription: n\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
@@ -132,7 +132,7 @@ def test_nested_discovery_stays_in_cwd_subtree(tmp_path, monkeypatch):
 
 def test_skill_hooks_parsed(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "guard"
+    d = tmp_path / ".nanocode" / "skills" / "guard"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text(
         "---\nname: guard\nhooks:\n  post-tool-use:\n"
@@ -146,7 +146,7 @@ def test_skill_hooks_parsed(tmp_path, monkeypatch):
 
 def test_skill_no_hooks_is_none(tmp_path, monkeypatch):
     from nanocode.skills import discovery
-    d = tmp_path / ".claude" / "skills" / "plain"
+    d = tmp_path / ".nanocode" / "skills" / "plain"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: plain\ndescription: d\n---\nbody")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()

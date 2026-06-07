@@ -492,7 +492,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._sent_skill_names.update(new_names)
 
     def _on_file_touched(self, inp: dict) -> None:
-        """成功 read/write/edit 后触发：先嵌套发现 .claude/skills，再 paths 条件激活。"""
+        """成功 read/write/edit 后触发：先嵌套发现 .nanocode/skills，再 paths 条件激活。"""
         fp = inp.get("file_path")
         if not fp:
             return

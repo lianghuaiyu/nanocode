@@ -40,7 +40,7 @@ memory files with write_file, and do NOT update MEMORY.md manually.
 ## What NOT to Save
 - Code patterns or architecture (read the code instead)
 - Git history (use git log)
-- Anything already in CLAUDE.md
+- Anything already in NANOCODE.md/AGENTS.md
 - Ephemeral task details
 
 ## When to Recall

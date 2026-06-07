@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from ..paths import data_dir, project_config_dir
 from .connection import McpConnection
 
 
@@ -93,16 +94,16 @@ class McpManager:
     def _load_configs(self) -> dict[str, dict]:
         merged: dict[str, dict] = {}
 
-        # 1. Global: ~/.claude/settings.json
-        global_path = Path.home() / ".claude" / "settings.json"
+        # 1. Global: data_dir()/settings.json (= ~/.nanocode/settings.json)
+        global_path = data_dir() / "settings.json"
         self._merge_config_file(global_path, merged)
 
-        # 2. Project: .claude/settings.json (cwd)
-        project_path = Path.cwd() / ".claude" / "settings.json"
+        # 2. Project: .nanocode/settings.json (cwd)
+        project_path = project_config_dir() / "settings.json"
         self._merge_config_file(project_path, merged)
 
-        # 3. Also check .mcp.json (Claude Code convention)
-        mcp_json_path = Path.cwd() / ".mcp.json"
+        # 3. Also check .nanocode/mcp.json
+        mcp_json_path = project_config_dir() / "mcp.json"
         self._merge_config_file(mcp_json_path, merged)
 
         return merged

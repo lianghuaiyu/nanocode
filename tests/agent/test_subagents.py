@@ -5,7 +5,7 @@ from __future__ import annotations
 
 def test_agent_allowed_tools_yaml_list(tmp_path, monkeypatch):
     from nanocode.subagents import config
-    d = tmp_path / ".claude" / "agents"
+    d = tmp_path / ".nanocode" / "agents"
     d.mkdir(parents=True)
     (d / "rev.md").write_text("---\nname: rev\nallowed-tools:\n  - read_file\n  - grep_search\n---\nprompt")
     monkeypatch.chdir(tmp_path)
@@ -16,7 +16,7 @@ def test_agent_allowed_tools_yaml_list(tmp_path, monkeypatch):
 
 def test_agent_allowed_tools_comma_string(tmp_path, monkeypatch):
     from nanocode.subagents import config
-    d = tmp_path / ".claude" / "agents"
+    d = tmp_path / ".nanocode" / "agents"
     d.mkdir(parents=True)
     (d / "rev2.md").write_text("---\nname: rev2\nallowed-tools: read_file,grep_search\n---\nprompt")
     monkeypatch.chdir(tmp_path)

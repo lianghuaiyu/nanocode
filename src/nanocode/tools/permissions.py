@@ -1,4 +1,4 @@
-"""权限判定：5 种权限模式 + .claude/settings.json 声明式 allow/deny 规则。"""
+"""权限判定：5 种权限模式 + .nanocode/settings.json 声明式 allow/deny 规则。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import shlex
 from pathlib import Path
 
 from .sandbox_backends.base import DEFAULT_PROTECTED_ROOTS
+from ..paths import data_dir, project_config_dir
 
 # ─── Permission modes ──────────────────────────────────────
 
@@ -21,7 +22,7 @@ EDIT_TOOLS = {"write_file", "edit_file"}
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 
 
-# ─── Permission rules (.claude/settings.json) ───────────────
+# ─── Permission rules (.nanocode/settings.json) ───────────────
 
 
 def _parse_rule(rule: str) -> dict:
@@ -51,8 +52,8 @@ def load_permission_rules() -> dict:
     allow: list[dict] = []
     deny: list[dict] = []
 
-    user_settings = _load_settings(Path.home() / ".claude" / "settings.json")
-    project_settings = _load_settings(Path.cwd() / ".claude" / "settings.json")
+    user_settings = _load_settings(data_dir() / "settings.json")
+    project_settings = _load_settings(project_config_dir() / "settings.json")
 
     for settings in [user_settings, project_settings]:
         if not settings or "permissions" not in settings:

@@ -35,8 +35,8 @@ htmlcov/
 .idea/
 .vscode/
 
-# trace 产物（项目本地）
-.nanocode/
+# trace 产物（项目本地）；项目级 .nanocode/{skills,agents,rules,settings.json} 可正常提交
+.nanocode/traces/
 
 # 内部开发记录默认不发布（devlog / 设计计划 / 规格 / 对比报告）；架构文档 docs/0N-*.md 正常跟踪
 docs/devlog/
@@ -44,6 +44,3 @@ docs/superpowers/
 docs/*-plan.md
 docs/*-report.md
 docs/agent-cli-*.md
-
-# 本地 agent 配置默认不发布；需要公开示例时用 git add -f .claude/<file>
-.claude/

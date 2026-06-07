@@ -1,8 +1,8 @@
-"""工作区信任层：在加载任何项目侧 .claude/ 配置之前确认用户信任当前工作区。
+"""工作区信任层：在加载任何项目侧 .nanocode/ 配置之前确认用户信任当前工作区。
 
 要点：
 - 单一前置闸：放在 `Agent()` 构造之前，一道闸覆盖全部项目侧加载点。
-- 存储落在 `data_dir()/trust.json`（默认 ~/.nanocode），绝不放进项目 `.claude/`。
+- 存储落在 `data_dir()/trust.json`（默认 ~/.nanocode），绝不放进项目 `.nanocode/`。
 - 存真实路径（非 sha256），因为祖先 walk 要靠路径比较；`_key_path` 贴 CC：
   优先 git toplevel，否则 `resolve(cwd)`。
 - HOME 特例：cwd==Path.home() 仅记内存、不落盘（贴 CC，下次重问）。
@@ -97,7 +97,7 @@ def ensure_workspace_trust(cwd: Path, *, interactive: bool, input_fn=input) -> b
     print(
         "⚠ 工作区信任确认\n"
         f"  当前目录：{cwd}\n"
-        "  这是你创建或信任的项目吗？nanocode 将加载此目录下的 .claude/ 配置\n"
+        "  这是你创建或信任的项目吗？nanocode 将加载此目录下的 .nanocode/ 配置\n"
         "  （权限规则、MCP server、技能、子 agent）并可读改/执行其中文件。\n"
         "  若非你的项目，请先退出审查内容。\n"
     )
