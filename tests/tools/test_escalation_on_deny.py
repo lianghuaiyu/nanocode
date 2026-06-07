@@ -81,3 +81,39 @@ def test_escalate_in_schema():
     assert "escalate" in props
     assert props["escalate"]["type"] == "boolean"
     assert "escalate" not in run_shell.SCHEMA["input_schema"]["required"]
+
+
+# ─── C 残留：escalate 确认提到 bypass 早返回之前（bypass 越不过）──────────────
+
+
+def test_escalate_confirms_under_bypass(monkeypatch):
+    """C：escalate=true 是沙盒逃逸到宿主的边界跨越 → bypass 下仍 confirm（原来直接 allow）。"""
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    r = check_permission("run_shell", {"command": "x", "escalate": True}, "bypassPermissions")
+    assert r["action"] == "confirm"
+    assert "escalate" in r["message"]
+
+
+def test_escalate_confirms_under_bypass_seatbelt(monkeypatch):
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "seatbelt")
+    r = check_permission("run_shell", {"command": "rm -rf x", "escalate": True}, "bypassPermissions")
+    assert r["action"] == "confirm"
+
+
+def test_escalate_default_still_confirms(monkeypatch):
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    r = check_permission("run_shell", {"command": "x", "escalate": True}, "default")
+    assert r["action"] == "confirm"
+
+
+def test_escalate_dontask_denies(monkeypatch):
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    r = check_permission("run_shell", {"command": "x", "escalate": True}, "dontAsk")
+    assert r["action"] == "deny"
+
+
+def test_non_escalate_command_still_allowed_under_bypass(monkeypatch):
+    """C：非 escalate 的普通命令在 bypass 下仍 allow（只有 escalate 提到 bypass 之前）。"""
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    r = check_permission("run_shell", {"command": "rm -rf /"}, "bypassPermissions")
+    assert r["action"] == "allow"

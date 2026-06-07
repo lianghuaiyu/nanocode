@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import itertools
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -102,16 +101,48 @@ def _bool(value, default: bool) -> bool:
 
 
 # ─── msb 定位 ───
+# msb 二进制只在**严格校验过**的显式 env 或固定可信目录里解析，**完全不走 PATH**
+# （镜像 bwrap _resolve_bwrap_bin）。shutil.which 会走 PATH，PATH 含 cwd 时返回 ./msb →
+# 劫持 microVM 启动器在宿主跑（与 bwrap 的 A 同类），故弃用。
+#
+# 启动器劫持收口（round-4）：env(NANOCODE_MSB_BIN/MSB_BIN) 此前接受任意绝对路径，且 repo
+# `.env` 在 workspace-trust **之前**加载（cli.py），故恶意 repo `.env` 可设
+# `NANOCODE_MSB_BIN=/bin/sh` + 放文件 `run` → `auto` 前台一条沙盒命令拼成
+# `[/bin/sh, "run", …]` → 在宿主跑 repo 脚本，不受限（真实 RCE）。
+# 修复：env 路径必须通过 _is_trusted_msb——绝对、存在、可执行、**basename 为 msb**
+# （拒 /bin/sh 等非 msb 启动器）、且**不在 cwd/workspace 内**（拒指向 repo 文件）；
+# 否则忽略 env、落回 _TRUSTED_MSB_DIRS 解析真 msb。
+_TRUSTED_MSB_DIRS = (
+    os.path.expanduser("~/.microsandbox/bin"),
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+)
+
+
+def _is_trusted_msb(path: str) -> bool:
+    """env 提供的 msb 路径是否可信：绝对、存在且可执行、basename==msb、不在 cwd 内。"""
+    if not path or not os.path.isabs(path):
+        return False
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return False
+    if os.path.basename(path) != "msb":           # 拒非 msb 启动器（/bin/sh 等）
+        return False
+    rp = os.path.realpath(path)
+    cwd = os.path.realpath(os.getcwd())
+    if rp == cwd or rp.startswith(cwd + os.sep):   # 拒指向 repo 内文件
+        return False
+    return True
+
+
 def _resolve_msb() -> str | None:
+    # 显式 env：仅在严格校验通过时采用（拒相对/不存在/不可执行/非 msb/cwd 内）。
     explicit = os.environ.get("NANOCODE_MSB_BIN") or os.environ.get("MSB_BIN")
-    if explicit:
+    if explicit and _is_trusted_msb(explicit):
         return explicit
-    found = shutil.which("msb")
-    if found:
-        return found
-    fallback = os.path.expanduser("~/.microsandbox/bin/msb")
-    if os.path.exists(fallback):
-        return fallback
+    # 已知安装位置 + 可信系统目录（不走 PATH，避免 cwd 注入）。
+    for d in _TRUSTED_MSB_DIRS:
+        p = os.path.join(d, "msb")
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
     return None
 
 

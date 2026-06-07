@@ -648,11 +648,20 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         event = build_hook_event(h["event"], h["skill"], tool_name, inp,
                                  (result or "")[:2000] if result else None,
                                  str(Path.cwd()), self.session_id)
+        # 权限通过后，用统一 planner 决定执行方式：任何沙盒档（auto/seatbelt）下 hook 都在
+        # 原生 OS 沙盒内受限跑（写 workspace 受限、无网，宿主工具链在），无原生后端则 blocked；
+        # off 档 hook 仍宿主跑（off=不沙盒）。hook 绝不进 microVM、绝不裸跑沙盒归类的命令。
+        hook_inp = {"command": cmd, "timeout": h["timeout_ms"], "stdin": json.dumps(event)}
+        kind, info = run_shell.plan_shell(hook_inp, context="hook")
         self._suppress_hooks = True
         try:
-            r = run_shell.run_structured({"command": cmd,
-                                          "timeout": h["timeout_ms"],
-                                          "stdin": json.dumps(event)})
+            if kind == "blocked":
+                return False, f"hook blocked: {info}"
+            if kind == "sandbox":
+                # info 是后端模块：run_structured 接受 stdin（hook event JSON）。
+                r = info.run_structured(hook_inp, posture="workspace-write", cwd=str(Path.cwd()))
+            else:  # host（off 档 / escalate）
+                r = run_shell.run_structured(hook_inp)
         finally:
             self._suppress_hooks = False
         if r["timed_out"]:

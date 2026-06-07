@@ -9,7 +9,7 @@ import asyncio
 import pytest
 
 from nanocode.agent.engine import Agent, _auto_deny_confirm
-from nanocode.tools import run_shell, permissions
+from nanocode.tools import run_shell, permissions, sandbox_shell
 
 
 def _agent(**kw):
@@ -108,3 +108,100 @@ def test_background_auto_deny(stub_run_structured):
     assert ok is False
     assert "not approved" in msg.lower()
     assert stub_run_structured == []
+
+
+# ─── round-2 spec-2：hook 经统一 planner 受限（seatbelt 沙盒内跑；auto/off 宿主跑）─────
+
+
+def test_hook_seatbelt_runs_confined(monkeypatch, stub_run_structured):
+    """seatbelt 档 + 非危险写文件 hook → 经 backend.run_structured（沙盒内，confined），
+    **不**走 run_shell.run_structured 宿主裸跑。"""
+    import nanocode.tools.sandbox_backends as sb
+
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "seatbelt")
+    backend_calls = []
+
+    class _FakeBackend:
+        @staticmethod
+        def run_structured(inp, *, posture="workspace-write", cwd=None):
+            backend_calls.append({"inp": inp, "posture": posture, "cwd": cwd})
+            return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False, "error": None}
+
+    monkeypatch.setattr(sb, "resolve_native_backend", lambda: _FakeBackend)
+    a = _agent()
+    a.confirm_fn = None
+    # 'touch out.txt' 归类 sandbox（非只读、非危险）→ seatbelt 后端受限跑。
+    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
+    assert ok is True
+    assert msg == ""
+    assert len(backend_calls) == 1
+    assert backend_calls[0]["inp"]["command"] == "touch out.txt"
+    assert backend_calls[0]["posture"] == "workspace-write"
+    # hook event JSON 经 stdin 传入沙盒 subprocess
+    assert backend_calls[0]["inp"]["stdin"]
+    assert stub_run_structured == []  # 未走宿主 run_structured
+
+
+def test_hook_seatbelt_no_backend_blocks(monkeypatch, stub_run_structured):
+    """seatbelt 档 + 无原生后端 → hook blocked（fail-closed），宿主 run_structured 未调用。"""
+    import nanocode.tools.sandbox_backends as sb
+
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "seatbelt")
+    monkeypatch.setattr(sb, "resolve_native_backend", lambda: None)
+    a = _agent()
+    a.confirm_fn = None
+    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
+    assert ok is False
+    assert "hook blocked" in msg.lower()
+    assert stub_run_structured == []
+
+
+def test_hook_auto_runs_confined(monkeypatch, stub_run_structured):
+    """修复 2：auto 档 hook 改走原生后端受限（seatbelt/bwrap），不再裸跑宿主、不进 microVM。
+    planner 把 hook 提到 mode 分支之前，任何沙盒档（auto/seatbelt）都用原生后端。"""
+    import nanocode.tools.sandbox_backends as sb
+
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    monkeypatch.setattr(sandbox_shell, "_resolve_msb", lambda: "/fake/msb")
+    backend_calls = []
+
+    class _FakeBackend:
+        @staticmethod
+        def run_structured(inp, *, posture="workspace-write", cwd=None):
+            backend_calls.append({"inp": inp, "posture": posture, "cwd": cwd})
+            return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False, "error": None}
+
+    monkeypatch.setattr(sb, "resolve_native_backend", lambda: _FakeBackend)
+    a = _agent()
+    a.confirm_fn = None
+    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
+    assert ok is True
+    assert msg == ""
+    assert len(backend_calls) == 1  # 走原生后端受限，未裸跑宿主
+    assert backend_calls[0]["inp"]["command"] == "touch out.txt"
+    assert stub_run_structured == []  # 未走宿主 run_structured
+
+
+def test_hook_auto_no_backend_blocks(monkeypatch, stub_run_structured):
+    """修复 2：auto 档 hook 但无原生后端 → blocked（fail-closed），不退化为 microVM/裸跑。"""
+    import nanocode.tools.sandbox_backends as sb
+
+    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
+    monkeypatch.setattr(sandbox_shell, "_resolve_msb", lambda: "/fake/msb")
+    monkeypatch.setattr(sb, "resolve_native_backend", lambda: None)
+    a = _agent()
+    a.confirm_fn = None
+    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
+    assert ok is False
+    assert "hook blocked" in msg.lower()
+    assert stub_run_structured == []
+
+
+def test_hook_off_runs_host(stub_run_structured):
+    """off 档（默认）hook → 宿主跑（零回归）。"""
+    a = _agent()
+    a.confirm_fn = None
+    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
+    assert ok is True
+    assert len(stub_run_structured) == 1
+    assert stub_run_structured[0]["command"] == "touch out.txt"

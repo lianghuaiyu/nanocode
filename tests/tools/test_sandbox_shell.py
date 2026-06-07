@@ -46,6 +46,7 @@ def test_enum_validators():
 
 # ---- msb 定位 ----
 def test_resolve_msb_prefers_env(monkeypatch, tmp_path):
+    # tmp_path（cwd 外）造可执行 msb、basename==msb → _is_trusted_msb True，env 被采用。
     fake = tmp_path / "msb"
     fake.write_text("#!/bin/sh\n")
     fake.chmod(0o755)
@@ -54,19 +55,138 @@ def test_resolve_msb_prefers_env(monkeypatch, tmp_path):
 
 
 def test_resolve_msb_missing_returns_none(monkeypatch):
+    # 不走 PATH（shutil.which 已移除）：清空 env + 钉死候选目录全不命中 → None。
     monkeypatch.delenv("NANOCODE_MSB_BIN", raising=False)
     monkeypatch.delenv("MSB_BIN", raising=False)
-    monkeypatch.setattr(ss.shutil, "which", lambda _: None)
-    monkeypatch.setattr(ss.os.path, "exists", lambda _: False)
+    monkeypatch.setattr(ss.os.path, "isfile", lambda _: False)
     assert ss._resolve_msb() is None
 
 
+def test_resolve_msb_rejects_relative_env(monkeypatch, tmp_path):
+    # 与 bwrap 的 A 同类：相对 env 值（cwd 可注入 ./msb）必须被拒，不得返回。
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    monkeypatch.setenv("NANOCODE_MSB_BIN", "msb")  # 相对 → 拒绝
+    monkeypatch.setattr(ss.os.path, "isfile", lambda _: False)  # 候选也不命中
+    assert ss._resolve_msb() is None
+
+
+def test_resolve_msb_ignores_cwd_msb(monkeypatch, tmp_path):
+    # PATH 含 cwd + 造可执行 ./msb：_resolve_msb 不走 PATH → 不返回它。
+    monkeypatch.delenv("NANOCODE_MSB_BIN", raising=False)
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    monkeypatch.chdir(tmp_path)
+    fake = tmp_path / "msb"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+    # 钉死可信候选全不命中，证明绝不回退到 cwd/PATH 里的 ./msb。
+    monkeypatch.setattr(ss.os.path, "isfile", lambda _: False)
+    assert ss._resolve_msb() != str(fake)
+    assert ss._resolve_msb() is None
+
+
+def test_resolve_msb_from_trusted_candidate(monkeypatch, tmp_path):
+    # 可信候选目录命中（~/.microsandbox/bin/msb 等）：绝对路径返回。
+    monkeypatch.delenv("NANOCODE_MSB_BIN", raising=False)
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    fake = tmp_path / "msb"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(ss.os.path, "isfile", lambda p: p == str(fake))
+    monkeypatch.setattr(ss.os, "access", lambda p, m: p == str(fake))
+    # 钉死可信目录元组，使候选目录的 msb 落到 fake 路径上。
+    monkeypatch.setattr(ss, "_TRUSTED_MSB_DIRS", (str(tmp_path),))
+    assert ss._resolve_msb() == str(fake)
+
+
+# ---- 启动器劫持收口（round-4）：env msb 严格校验 ----
+def test_is_trusted_msb_rejects_non_msb_basename(monkeypatch, tmp_path):
+    # /bin/sh 等非 msb 启动器：basename != msb → 拒（核心 RCE 收口）。
+    sh = tmp_path / "sh"
+    sh.write_text("#!/bin/sh\n")
+    sh.chmod(0o755)
+    assert ss._is_trusted_msb(str(sh)) is False
+
+
+def test_is_trusted_msb_rejects_relative(monkeypatch):
+    assert ss._is_trusted_msb("msb") is False
+    assert ss._is_trusted_msb("./msb") is False
+    assert ss._is_trusted_msb("") is False
+
+
+def test_is_trusted_msb_rejects_nonexistent(monkeypatch, tmp_path):
+    assert ss._is_trusted_msb(str(tmp_path / "msb")) is False  # 不存在
+
+
+def test_is_trusted_msb_rejects_non_executable(monkeypatch, tmp_path):
+    f = tmp_path / "msb"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0o644)  # 不可执行
+    assert ss._is_trusted_msb(str(f)) is False
+
+
+def test_is_trusted_msb_rejects_inside_cwd(monkeypatch, tmp_path):
+    # cwd 内造可执行 msb：指向 repo 文件 → 拒（拒 .env 把 msb 指回 repo 脚本）。
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "msb"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0o755)
+    assert ss._is_trusted_msb(str(f)) is False
+
+
+def test_is_trusted_msb_accepts_valid_outside_cwd(monkeypatch, tmp_path):
+    # 绝对、存在、可执行、basename==msb、cwd 外 → True。
+    outside = tmp_path / "bin"
+    outside.mkdir()
+    f = outside / "msb"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0o755)
+    # cwd 设到另一个不含 f 的目录，确保 f 在 cwd 外。
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    assert ss._is_trusted_msb(str(f)) is True
+
+
+def test_resolve_msb_rejects_bin_sh_launcher_hijack(monkeypatch):
+    # 核心载荷：NANOCODE_MSB_BIN=/bin/sh → 绝不返回 /bin/sh（落回候选或 None）。
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    monkeypatch.setenv("NANOCODE_MSB_BIN", "/bin/sh")
+    assert ss._resolve_msb() != "/bin/sh"
+
+
+def test_resolve_msb_rejects_cwd_msb_env(monkeypatch, tmp_path):
+    # cwd 内造可执行 msb + env 指过去 → 被拒（不返回 cwd 内的 msb）。
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "msb"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0o755)
+    monkeypatch.setenv("NANOCODE_MSB_BIN", str(f))
+    # 钉死可信目录全不命中，证明 cwd 内的 msb 绝不被采用。
+    monkeypatch.setattr(ss, "_TRUSTED_MSB_DIRS", ())
+    assert ss._resolve_msb() != str(f)
+    assert ss._resolve_msb() is None
+
+
+def test_resolve_msb_accepts_valid_env_outside_cwd(monkeypatch, tmp_path):
+    # tmp_path（cwd 外）造合法 msb + env 指过去 → 命中返回。
+    monkeypatch.delenv("MSB_BIN", raising=False)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    f = tmp_path / "msb"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0o755)
+    monkeypatch.setenv("NANOCODE_MSB_BIN", str(f))
+    assert ss._resolve_msb() == str(f)
+
+
 def _run_cmd(inp):
-    return ss.build_msb_command({**inp, "persist": False})
+    return ss.build_msb_command({**inp, "persist": False}, msb="msb")
 
 
 def test_run_basic_offline_default(monkeypatch):
-    monkeypatch.setenv("NANOCODE_MSB_BIN", "msb")
     cmd = _run_cmd({"command": "echo hi", "deps": "none"})
     assert cmd[:2] == ["msb", "run"]
     assert "-q" in cmd
@@ -172,8 +292,7 @@ def test_exec_workdir_when_mount(monkeypatch, tmp_path):
 
 
 def test_build_msb_command_persist_returns_exec(monkeypatch):
-    monkeypatch.setenv("NANOCODE_MSB_BIN", "msb")
-    cmd = ss.build_msb_command({"command": "x", "persist": True, "deps": "none"})
+    cmd = ss.build_msb_command({"command": "x", "persist": True, "deps": "none"}, msb="msb")
     assert cmd[:2] == ["msb", "exec"]
 
 

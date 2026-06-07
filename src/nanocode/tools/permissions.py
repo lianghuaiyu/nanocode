@@ -8,6 +8,8 @@ import re
 import shlex
 from pathlib import Path
 
+from .sandbox_backends.base import DEFAULT_PROTECTED_ROOTS
+
 # ─── Permission modes ──────────────────────────────────────
 
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
@@ -111,10 +113,10 @@ def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
 # 故 "git status && curl evil" 不会命中——含 && 的命令不进快速通道）。
 READONLY_SHELL_PREFIXES = (
     "ls", "pwd", "cat", "head", "tail", "wc", "echo", "which", "whoami",
-    "grep", "rg", "find", "tree", "stat", "file", "date", "env", "printenv",
+    "grep", "rg", "tree", "stat", "file", "date", "printenv",
     "du", "df", "uname", "hostname", "id", "ps", "true",
-    "git status", "git log", "git diff", "git show", "git branch",
-    "git remote", "git rev-parse", "git describe",
+    "git status", "git log", "git diff", "git show",
+    "git rev-parse", "git describe",
     "python --version", "python3 --version", "pip --version",
     "node --version", "npm --version",
 )
@@ -124,9 +126,10 @@ _SHELL_COMPOSITION_CHARS = set("|&;<>$`(){}\n")
 
 
 def shell_sandbox_mode() -> str:
-    """'off'（默认）| 'auto'。控制 run_shell 是否经沙盒路由。"""
+    """'off'（默认）| 'auto'（microVM 路由）| 'seatbelt'（原生 OS 沙盒）。
+    控制 run_shell 是否经沙盒路由及走哪种后端。"""
     val = (os.environ.get("NANOCODE_SHELL_SANDBOX") or "off").strip().lower()
-    return val if val in ("off", "auto") else "off"
+    return val if val in ("off", "auto", "seatbelt") else "off"
 
 
 def is_readonly_command(command: str) -> bool:
@@ -150,20 +153,62 @@ def is_readonly_command(command: str) -> bool:
 def classify_shell_runtime(command: str) -> str:
     """run_shell 命令的运行时归类：'host' 或 'sandbox'。
     - 路由关闭（off）→ host（保持旧行为）。
-    - 危险命令 → host（确认后须作用于真实宿主，如 rm foo）。
     - 只读白名单 → host（快速直跑）。
-    - 其余 → sandbox（默认进 microVM）。"""
-    from .run_shell import is_dangerous
+    - 其余（含危险命令）→ sandbox（auto→microVM；seatbelt→原生 OS 沙盒）。
 
-    if shell_sandbox_mode() != "auto":
+    危险命令归类为 sandbox：default 下经 check_permission confirm（确认→进沙盒，受限），
+    bypass 下无确认仍进沙盒（受限），真要上宿主须走 escalate=true。闭合 seatbelt+bypass
+    下 `rm -rf .git` 在宿主裸跑的洞。"""
+    if shell_sandbox_mode() == "off":
         return "host"
     if not (command or "").strip():
-        return "host"
-    if is_dangerous(command):
         return "host"
     if is_readonly_command(command):
         return "host"
     return "sandbox"
+
+
+def _project_root(start: str | None = None) -> str:
+    """向上walk找 .git 定位 git 项目根；没找到 .git → 回退 cwd。
+
+    从 repo/src 启动时，cwd 锚不住 repo/.git/...；锚到项目根才挡得住 `../.git/hooks/x`。
+    `.git` 既可能是目录，也可能是 gitfile（worktree/submodule 的 `.git` 是文件，内含
+    `gitdir: ...`）→ 用 os.path.exists 而非 isdir，否则这类 repo 锚点回退、`../.git` 不受保护。
+
+    已知限制（round-4，不修）：本锚点模型只把 `.git`（含 gitfile）所在目录当项目根，
+    **不解析 gitfile 里 `gitdir:` 指向的真实元数据目录**。worktree/submodule 的真实
+    `.git` 元数据落在 worktree 之外（如父仓 `.git/worktrees/<name>/...`、
+    `.git/modules/<sub>/...`），那些外部目录不在 _is_protected_path 的保护范围内——
+    bypass 下写它们不受阻。属边角、低实战风险，记录于 round-4 devlog，暂不展开跟随。
+    """
+    d = os.path.realpath(start or os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.realpath(os.getcwd())  # 没找到 .git → 回退 cwd
+        d = parent
+
+
+def _is_protected_path(file_path: str) -> bool:
+    """file_path 是否落在受保护元数据目录（.git/.nanocode/.claude/.codex/.agents）内。
+
+    锚点为 git 项目根（向上找 .git）**和** cwd 两处，故从 repo/src 启动也能保护 repo/.git/…。
+    """
+    if not file_path:
+        return False
+    try:
+        abs_p = os.path.realpath(file_path)
+    except Exception:
+        return False
+    anchors = {_project_root(), os.path.realpath(os.getcwd())}
+    for root in anchors:
+        for pr in DEFAULT_PROTECTED_ROOTS:
+            p = os.path.join(root, pr)
+            if abs_p == p or abs_p.startswith(p + os.sep):
+                return True
+    return False
 
 
 def check_permission(
@@ -178,6 +223,20 @@ def check_permission(
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+
+    # 受保护项目元数据目录写入：边界规则，先于 bypass/acceptEdits 裁决（与 deny 同属
+    # 「bypass 越不过」的硬边界），否则 bypass 下可写穿 .git/hooks/... 等持久化路径。
+    if tool_name in ("write_file", "edit_file") and _is_protected_path(inp.get("file_path", "")):
+        if mode == "dontAsk":
+            return {"action": "deny", "message": f"Auto-denied (dontAsk): protected path {inp.get('file_path', '')}"}
+        return {"action": "confirm", "message": f"write into protected project dir: {inp.get('file_path', '')}"}
+
+    # escalate=true 是沙盒逃逸到宿主的边界跨越：先于 bypass 裁决（与 deny/protected 同属
+    # 「bypass 越不过」的硬边界），否则 bypass 下 escalate=true 会无确认直接上宿主。
+    if tool_name == "run_shell" and shell_sandbox_mode() != "off" and inp.get("escalate"):
+        if mode == "dontAsk":
+            return {"action": "deny", "message": f"Auto-denied (dontAsk): escalate {inp.get('command', '')}"}
+        return {"action": "confirm", "message": f"escalate to host (bypass sandbox): {inp.get('command', '')}"}
 
     if mode == "bypassPermissions":
         return {"action": "allow"}
@@ -206,10 +265,7 @@ def check_permission(
     needs_confirm = False
     confirm_message = ""
 
-    if tool_name == "run_shell" and shell_sandbox_mode() == "auto" and inp.get("escalate"):
-        needs_confirm = True
-        confirm_message = f"escalate to host (bypass sandbox): {inp.get('command', '')}"
-    elif tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
+    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
         confirm_message = inp.get("command", "")
     elif tool_name == "sandbox_shell" and inp.get("mount_workspace", False):
@@ -233,8 +289,6 @@ def check_permission(
             return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
         return {"action": "confirm", "message": confirm_message}
 
-    if tool_name == "run_shell" and shell_sandbox_mode() == "auto":
-        return {"action": "allow", "runtime": classify_shell_runtime(inp.get("command", ""))}
     return {"action": "allow"}
 
 

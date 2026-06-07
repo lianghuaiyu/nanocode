@@ -50,6 +50,10 @@ async def run_shell_background_task(manager, task_id, command, stdout_path, stde
     except asyncio.CancelledError:
         manager.update_task(task_id, status="cancelled", result_summary="(cancelled by task_stop)")
         raise
+    if r.get("blocked"):
+        # fail-closed：后台命令无法关进沙盒（无原生后端 / auto microVM）→ 拒绝裸跑，落库为 blocked。
+        manager.update_task(task_id, status="blocked", result_summary=r["blocked"])
+        return
     status = classify_exit(r["exit_code"], r["timed_out"], r["cancelled"], r["error"])
     manager.update_task(task_id, status=status, exit_code=r["exit_code"],
                         result_summary=_summarize(stdout_path), error=r["error"])
