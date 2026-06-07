@@ -1,0 +1,336 @@
+"""OpenAI 兼容后端：流式对话循环、并行/串行工具批处理、流式响应组装、
+摘要压缩与分层裁剪（budget / snip / microcompact）。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+
+from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result
+from ..tools import check_permission, get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
+from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
+from .models import _to_openai_tools, _with_retry
+from .compaction import (
+    SNIP_PLACEHOLDER, SNIP_THRESHOLD, MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS,
+)
+
+
+class OpenAIBackendMixin:
+    async def _compact_openai(self) -> None:
+        # Invariant: caller must ensure the last message is a plain user-text
+        # message (not a `tool` role result). Same reasoning as
+        # _compact_anthropic — slicing off a tool result would orphan the
+        # preceding assistant's tool_calls.
+        if len(self._openai_messages) < 5:
+            return
+        system_msg = self._openai_messages[0]
+        last_user_msg = self._openai_messages[-1]
+        summary_resp = await self._openai_client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
+                *self._openai_messages[1:-1],
+                {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
+            ],
+        )
+        summary_text = summary_resp.choices[0].message.content or "No summary available."
+        self._openai_messages = [
+            system_msg,
+            {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
+            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
+        ]
+        if last_user_msg.get("role") == "user":
+            self._openai_messages.append(last_user_msg)
+        self.last_input_token_count = 0
+
+    # Tier 1: Budget tool results
+    def _budget_tool_results_openai(self) -> None:
+        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        if utilization < 0.5:
+            return
+        budget = 15000 if utilization > 0.7 else 30000
+        for msg in self._openai_messages:
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
+                keep = (budget - 80) // 2
+                msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
+
+    # Tier 2: Snip stale results
+    def _snip_stale_results_openai(self) -> None:
+        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        if utilization < SNIP_THRESHOLD:
+            return
+        tool_msgs = []
+        for i, msg in enumerate(self._openai_messages):
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
+                tool_msgs.append(i)
+        if len(tool_msgs) <= KEEP_RECENT_RESULTS:
+            return
+        snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
+        for i in range(snip_count):
+            self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
+
+    # Tier 3: Microcompact
+    def _microcompact_openai(self) -> None:
+        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
+            return
+        tool_msgs = []
+        for i, msg in enumerate(self._openai_messages):
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
+                tool_msgs.append(i)
+        clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
+        for i in range(max(0, clear_count)):
+            self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+
+    # ─── OpenAI-compatible backend ───────────────────────────────
+
+    async def _chat_openai(self, user_message: str) -> None:
+        self._openai_messages.append({"role": "user", "content": user_message})
+        # Auto-compact at turn boundary only — see _chat_anthropic for rationale.
+        # The last message is now plain user text, so the slice in
+        # _compact_openai won't orphan a tool_calls / tool message pair.
+        await self._check_and_compact()
+
+        # Start async memory prefetch (non-blocking, fires once per user turn)
+        memory_prefetch: MemoryPrefetch | None = None
+        if not self.is_sub_agent:
+            sq = self._build_side_query()
+            if sq:
+                memory_prefetch = start_memory_prefetch(
+                    user_message, sq,
+                    self._already_surfaced_memories, self._session_memory_bytes,
+                    backend=self._memory_backend,
+                )
+
+        while True:
+            if self._aborted:
+                break
+
+            self._run_compression_pipeline()
+
+            # Consume memory prefetch if settled (non-blocking poll, zero-wait)
+            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                memory_prefetch.consumed = True
+                try:
+                    memories = memory_prefetch.task.result()
+                    if memories:
+                        injection_text = format_memories_for_injection(memories)
+                        last = self._openai_messages[-1] if self._openai_messages else None
+                        if last and last.get("role") == "user":
+                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
+                        else:
+                            self._openai_messages.append({"role": "user", "content": injection_text})
+                        for m in memories:
+                            self._already_surfaced_memories.add(m.path)
+                            self._session_memory_bytes += len(m.content.encode())
+                except Exception:
+                    pass  # prefetch errors already logged
+
+            self._inject_finished_tasks(self._openai_messages)
+            self._inject_skill_listing(self._openai_messages)
+
+            if not self.is_sub_agent:
+                start_spinner()
+
+            self.tracer.emit(
+                "llm_request", model=self.model,
+                message_count=len(self._openai_messages),
+                messages=self._openai_messages,
+            )
+            response = await self._call_openai_stream()
+
+            if not self.is_sub_agent:
+                stop_spinner()
+
+            self.last_api_call_time = time.time()
+
+            if response.get("usage"):
+                self.total_input_tokens += response["usage"]["prompt_tokens"]
+                self.total_output_tokens += response["usage"]["completion_tokens"]
+                self.last_input_token_count = response["usage"]["prompt_tokens"]
+
+            choice = response.get("choices", [{}])[0] if response.get("choices") else {}
+            message = choice.get("message", {})
+
+            self._openai_messages.append(message)
+
+            _tcs = message.get("tool_calls") or []
+            self.tracer.emit(
+                "assistant_message",
+                text=message.get("content") or "",
+                thinking="",
+                tool_uses=[
+                    {"id": tc.get("id"),
+                     "name": (tc.get("function") or {}).get("name"),
+                     "input": (tc.get("function") or {}).get("arguments")}
+                    for tc in _tcs
+                ],
+            )
+            _usage = response.get("usage") or {}
+            self.tracer.emit(
+                "llm_response",
+                input_tokens=_usage.get("prompt_tokens", 0),
+                output_tokens=_usage.get("completion_tokens", 0),
+            )
+
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                if not self.is_sub_agent:
+                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                break
+
+            self.current_turns += 1
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
+                self.tracer.emit("budget_exceeded", reason=budget["reason"])
+                break
+
+            # Phase 1: Parse & permission-check (serial)
+            oai_checked: list[dict] = []
+            for tc in tool_calls:
+                if self._aborted:
+                    break
+                if tc.get("type") != "function":
+                    continue
+                fn_name = tc["function"]["name"]
+                try:
+                    inp = json.loads(tc["function"]["arguments"])
+                except Exception:
+                    inp = {}
+
+                print_tool_call(fn_name, inp)
+                self.tracer.emit("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
+
+                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
+                self.tracer.emit("permission_decision", tool=fn_name,
+                                 action=perm["action"], message=perm.get("message", ""))
+                if perm["action"] == "deny":
+                    print_info(f"Denied: {perm.get('message', '')}")
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+                    continue
+                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                    confirmed = await self._confirm_dangerous(perm["message"])
+                    if not confirmed:
+                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
+                        continue
+                    self._confirmed_paths.add(perm["message"])
+                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
+
+            # Phase 2: Group & execute (parallel for consecutive safe tools)
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
+
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
+
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        self.tracer.emit("tool_result", tool=ct_item["fn"],
+                                         tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
+                        return ct_item, res
+
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
+                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
+                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
+                        self.tracer.emit("tool_result", tool=ct["fn"],
+                                         tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
+
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
+                        self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+
+            self._context_cleared = False
+            if not oai_context_break:
+                self._inject_pending_skill_bodies(self._openai_messages)
+
+    async def _call_openai_stream(self) -> dict:
+        async def _do():
+            stream = await self._openai_client.chat.completions.create(
+                model=self.model,
+                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
+                messages=self._openai_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            content = ""
+            tool_calls: dict[int, dict] = {}
+            finish_reason = ""
+            usage = None
+
+            async for chunk in stream:
+                if chunk.usage:
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                    }
+
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                if delta and delta.content:
+                    content += delta.content
+
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        existing = tool_calls.get(tc.index)
+                        if existing:
+                            if tc.function and tc.function.arguments:
+                                existing["arguments"] += tc.function.arguments
+                        else:
+                            tool_calls[tc.index] = {
+                                "id": tc.id or "",
+                                "name": (tc.function.name if tc.function else "") or "",
+                                "arguments": (tc.function.arguments if tc.function else "") or "",
+                            }
+
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+
+            if content:
+                stop_spinner()
+                self._emit_block(content)
+
+            assembled = None
+            if tool_calls:
+                assembled = [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for _, tc in sorted(tool_calls.items())
+                ]
+
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": assembled,
+                    },
+                    "finish_reason": finish_reason or "stop",
+                }],
+                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+            }
+
+        return await _with_retry(_do)

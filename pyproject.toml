@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanocode"
+version = "1.0.0"
+description = "A minimal but real command-line coding agent, built from scratch in Python"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "prompt_toolkit>=3.0.29",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+simplemem = ["lancedb>=0.4.0", "pyarrow>=12.0.0", "numpy>=1.24.0", "dateparser>=1.1.0", "rank-bm25>=0.2.2"]
+
+[project.scripts]
+nanocode = "nanocode.entrypoints.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nanocode*"]
+
+[tool.setuptools.package-data]
+nanocode = ["system_prompt.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
