@@ -272,10 +272,18 @@ _DOTENV_BLOCKED_NAMES = frozenset({
     "IFS", "ENV", "BASH_ENV", "SHELLOPTS",
     "PYTHONPATH", "NODE_OPTIONS", "PERL5LIB", "RUBYOPT",
 })
+# 前缀黑名单的显式例外：这些 NANOCODE_* 只是普通配置，不碰沙箱档位 / msb 启动器 /
+# 数据目录 / 动态链接器 / 解释器注入，故允许 .env 设置。模型选择不引入新攻击面——
+# base_url（OPENAI_/ANTHROPIC_BASE_URL）本就允许从 .env 来，模型名只是搭配它而已。
+_DOTENV_ALLOWED_NAMES = frozenset({
+    "NANOCODE_MODEL",   # 仅选择模型；无安全敏感性
+})
 
 
 def _is_blocked_dotenv_key(key: str) -> bool:
     up = key.upper()
+    if up in _DOTENV_ALLOWED_NAMES:
+        return False  # 显式放行的普通配置，优先于下面的前缀黑名单
     return up in _DOTENV_BLOCKED_NAMES or any(up.startswith(p) for p in _DOTENV_BLOCKED_PREFIXES)
 
 
@@ -287,7 +295,8 @@ def _load_dotenv(path: str = ".env") -> None:
     variables are NOT overwritten (an explicit `export` always wins). Silently does
     nothing if the file is absent. Security-sensitive / injection keys
     (`NANOCODE_*` / `LD_*` / `DYLD_*` / `MSB_BIN` / `PATH` / `PYTHONPATH` …) are never
-    loaded from ANY `.env` (see `_is_blocked_dotenv_key`).
+    loaded from ANY `.env` (see `_is_blocked_dotenv_key`), with an explicit allowlist
+    of benign exceptions (`NANOCODE_MODEL`, see `_DOTENV_ALLOWED_NAMES`).
     """
     try:
         with open(path, encoding="utf-8") as f:

@@ -62,6 +62,30 @@ def test_nonsecurity_keys_still_loaded(tmp_path, monkeypatch):
     assert os.environ.get("MY_VAR") == "z"
 
 
+def test_allowlisted_nanocode_model_not_blocked():
+    # NANOCODE_MODEL is an explicit allowlist exception to the NANOCODE_ prefix block.
+    assert not cli._is_blocked_dotenv_key("NANOCODE_MODEL")
+    assert not cli._is_blocked_dotenv_key("nanocode_model")  # case-insensitive
+    # Other NANOCODE_* (incl. security-sensitive) stay blocked.
+    assert cli._is_blocked_dotenv_key("NANOCODE_SHELL_SANDBOX")
+    assert cli._is_blocked_dotenv_key("NANOCODE_MODELX")  # not an exact allowlist match
+    assert cli._is_blocked_dotenv_key("NANOCODE_HOME")
+
+
+def test_nanocode_model_loaded_from_dotenv(tmp_path, monkeypatch):
+    # The whole point: a repo .env can now actually select the model.
+    env = tmp_path / ".env"
+    env.write_text(
+        "NANOCODE_MODEL=step-3.7-flash\n"
+        "NANOCODE_SHELL_SANDBOX=off\n"  # sibling NANOCODE_* still blocked
+    )
+    _clear_env(monkeypatch, "NANOCODE_MODEL", "NANOCODE_SHELL_SANDBOX")
+    monkeypatch.chdir(tmp_path)
+    cli._load_dotenv()
+    assert os.environ.get("NANOCODE_MODEL") == "step-3.7-flash"
+    assert "NANOCODE_SHELL_SANDBOX" not in os.environ
+
+
 def test_existing_env_not_overwritten(tmp_path, monkeypatch):
     # The `key not in os.environ` guard runs before the block filter, so a
     # pre-existing (operator-set) value always wins.
