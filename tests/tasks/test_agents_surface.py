@@ -40,7 +40,7 @@ def test_agent_definition_detail_for_name(tmp_path, monkeypatch):
     assert "run_shell" in detail  # appears in disallowed
     assert "Disallowed tools: run_shell" in detail
     assert "Review carefully" in detail  # system-prompt preview
-    assert "ADVISORY" in detail  # honest P4 note
+    assert "ENFORCED" in detail  # P4: call-time enforcement is now active
     assert "/rev.md" in detail  # source
 
 

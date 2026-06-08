@@ -95,6 +95,18 @@ from .openai_backend import OpenAIBackendMixin
 # 确保前台子 agent 永远有界（不至无限循环拖死父 loop）。
 SUBAGENT_MAX_TURNS_FALLBACK = 50
 
+# 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
+# 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
+# 注意：'memory'（save/update/delete 会落到真实 memory_tool）、'agent'（子不能 spawn 孙）、
+# 'skill'（fork/hook 可触达 shell）都【不在】此集——它们必须受 allowlist 约束。
+_ALWAYS_ALLOWED_META = frozenset({
+    "task_list", "task_output", "task_stop",
+    "enter_plan_mode", "exit_plan_mode",
+})
+
+# 'agent' 元工具：子 agent 一律不可调用（独立 call-time 后备，见 _tool_blocked_by_allowlist）。
+_AGENT_META_TOOL = "agent"
+
 
 async def _auto_deny_confirm(_command: str) -> bool:
     """后台子 agent 的 confirm_fn：无 TTY 等价拒绝（auto-deny-but-continue）。"""
@@ -130,12 +142,26 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         confirmed_paths: set[str] | None = None,
         memory_backend: "MemoryBackend | None" = None,
         artifact_id: str | None = None,
+        allowed_tool_names: set[str] | None = None,
+        depth: int = 0,
+        agent_type: str | None = None,
+        agent_source: str | None = None,
     ):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
+        # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
+        # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
+        # 工具名集（{t['name'] for t in cfg['tools']}，已剔除 agent + disallowed）。
+        # _execute_tool_call 在 meta 工具拦截之后、真实工具派发之前据此 fail-closed。
+        self._allowed_tool_names = allowed_tool_names
+        # 代际深度：主 agent = 0，每下一层子 agent = 父 + 1。max_depth 纵深防御据此判定。
+        self.depth = depth
+        # 子 agent 身份（审批 UI / 诊断用）：类型 + 来源（自定义项目 agent 的 .md 路径）。
+        self.agent_type = agent_type
+        self.agent_source = agent_source
         # None = 主 agent 默认全量工具表；[] = 子 agent 显式空工具集（绝不回退全量，
         # 否则 deny-all / allowed-tools:agent / extends 空交集 / curator(tools:[]) 会被
         # 提权为全部工具，含 agent）。
@@ -631,7 +657,37 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         for t in pending:
             self.task_manager.update_task(t.id, injected=True)
 
+    def _tool_blocked_by_allowlist(self, name: str) -> bool:
+        """P4：本次工具调用是否被 call-time allowlist 拦截。
+
+        - allowlist 为 None（主 agent / 未约束）→ 永不拦截。
+        - 'agent' → 子 agent 一律拦截（独立 fail-closed 后备，不依赖工具表是否剥了它）。
+        - 纯宿主 meta（task_*/plan_mode，无持久副作用、不经 execute_tool）→ 放行。
+        - 其余一切（含 memory / skill / run_shell / 真实工具）→ 不在有效集内即拦截。
+          memory 的 save/update/delete 会落到真实 memory_tool，skill 的 fork/hook 可触达
+          shell，故它们必须受 allowlist 约束、不能当作无条件放行的 meta。
+
+        run_shell 后台分支也经此判定（_execute_tool_call 在分流前先调本方法），所以
+        read-only agent 即便走 run_in_background 也无法绕过对 run_shell 的拦截。
+        """
+        if self._allowed_tool_names is None:
+            return False
+        if name == _AGENT_META_TOOL:
+            return True  # 子 agent 永不可 spawn 孙——独立后备
+        if name in _ALWAYS_ALLOWED_META:
+            return False
+        return name not in self._allowed_tool_names
+
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        # P4 call-time allowlist enforcement（安全基石）：在任何真实工具派发（含
+        # run_shell 后台分支）之前 fail-closed。仅约束 REAL 工具——子 agent 合法持有的
+        # meta 工具（task_*/memory/plan_mode/skill；agent 永远被剥）不在约束内。
+        # 这是覆盖前台 + 后台 run_shell 的单一咽喉点：run_shell 后台分支在下方先于 meta
+        # 拦截返回，若不在此处先判，read-only agent 仍能借 run_in_background 跑 run_shell。
+        if self._tool_blocked_by_allowlist(name):
+            self.tracer.emit("tool_blocked", tool=name, reason="not_in_allowlist",
+                             agent_type=self.agent_type, artifact_id=self.artifact_id)
+            return f"Error: tool '{name}' is not permitted for this sub-agent."
         if name == "run_shell" and inp.get("run_in_background"):
             tid = await self._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
             return (f"Started background shell task {tid}. It will report completion later. "
@@ -642,10 +698,19 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return tasks_tool.task_output_text(self.task_manager, inp.get("task_id", ""),
                                                int(inp.get("tail_bytes") or 8000))
         if name == "task_stop":
-            return await tasks_tool.task_stop(self.task_manager, self._background_tasks, inp.get("task_id", ""))
+            # 子 agent 共享父 TaskManager：限制其只能 stop 自己持有协程的 task，
+            # 不得把父/兄弟的 task 标 cancelled（orphan-cancel 仅主 agent 可用）。
+            return await tasks_tool.task_stop(
+                self.task_manager, self._background_tasks, inp.get("task_id", ""),
+                allow_orphan_cancel=not self.is_sub_agent)
         if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
             return await self._recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
         if name == "memory" and inp.get("action") == "consolidate":
+            # 记忆巩固会 spawn 一个 curator（孙 agent）并批量改写宿主记忆文件——属
+            # 宿主/会话级操作，子 agent 不得触发（否则绕过 agent 后备 + depth/threads）。
+            if self.is_sub_agent:
+                return ("Error: memory consolidation is a host/session operation and "
+                        "is not available to sub-agents.")
             return await self._spawn_memory_consolidate()
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
@@ -705,6 +770,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         from ..skills.hooks import build_hook_event
 
         cmd = h["command"]
+        # P4 安全基石：skill hook 会以 run_shell 身份跑命令。若本（子）agent 的有效集
+        # 不含 run_shell，则它不得借 skill hook 旁路获得 shell——按 allowlist fail-closed。
+        if self._tool_blocked_by_allowlist("run_shell"):
+            self.tracer.emit("tool_blocked", tool="run_shell", reason="hook_not_in_allowlist",
+                             agent_type=self.agent_type, artifact_id=self.artifact_id)
+            return False, (f"hook command blocked: run_shell is not permitted for this sub-agent "
+                           f"({h['skill']} {h['event']})")
         perm = check_permission("run_shell", {"command": cmd}, self.permission_mode)
         if perm["action"] == "deny":
             return False, f"hook command denied ({h['skill']} {h['event']}): {perm.get('message', cmd)}"
@@ -753,6 +825,51 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return None
         return max(0, self.max_turns - self.current_turns)
 
+    # ─── P4 concurrency / depth caps ─────────────────────────────
+
+    def _running_background_subagent_count(self) -> int:
+        """当前并发运行的后台子 agent 数：本 agent 持有的 detached task 中，回指一个
+        SubAgentRecord（owner_agent_id 非空）且 status=='running' 的 TaskRecord 计数。
+
+        以 owner_agent_id 而非 kind=='subagent' 判定，使 memory curator/eval/optimize
+        这些同样跑后台子 agent 的任务也计入上限——否则它们会绕过 max_threads。
+        shell 后台任务 owner_agent_id 为 None，不计。
+        以 TaskManager 的权威状态为准（detached 协程结束落终态），不靠 task.done()。"""
+        n = 0
+        for t in self._background_tasks:
+            tid = getattr(t, "_nanocode_task_id", None)
+            if not tid:
+                continue
+            rec = self.task_manager.get_task(tid)
+            if rec and rec.owner_agent_id and rec.status == "running":
+                n += 1
+        return n
+
+    def _depth_cap_exceeded(self) -> bool:
+        """新 spawn 的子 agent 深度（self.depth + 1）是否超过 max_depth。
+
+        主 agent depth=0，其子 depth=1。今天子不能 spawn 孙（agent 工具被剥），故 live
+        depth 结构上恒为 1；max_depth 是前瞻性纵深防御 backstop。"""
+        from ..tools import load_agents_config
+        max_depth = load_agents_config().get("max_depth")
+        if not max_depth or max_depth <= 0:
+            return False
+        return (self.depth + 1) > max_depth
+
+    def _max_threads(self) -> int:
+        from ..tools import load_agents_config
+        return load_agents_config().get("max_threads") or 0
+
+    @staticmethod
+    def _foreground_timeout(tool_timeout_ms, config: dict, fleet_cfg: dict):
+        """前台子 agent 的有效超时：工具入参 > manifest 'timeout-ms' > settings
+        [agents] default_timeout_ms（item 2/4）。全缺省 -> None（无 wall-clock 超时）。"""
+        if tool_timeout_ms is not None:
+            return tool_timeout_ms
+        if config.get("timeout_ms") is not None:
+            return config.get("timeout_ms")
+        return fleet_cfg.get("default_timeout_ms")
+
     def _bounded_sub_agent_max_turns(self, manifest_max_turns: int | None) -> int:
         """计算前台子 agent 的 turn 上限：
 
@@ -767,7 +884,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None,
                          background=False, max_turns=None, model=None,
-                         artifact_id=None) -> "Agent":
+                         artifact_id=None, agent_source=None) -> "Agent":
         """构造子 agent：集中权限继承。
 
         与 Claude Code / Kimi Code 对齐：
@@ -778,6 +895,11 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         - max_turns：前台子 agent 传入有界 turn 上限（_check_budget 强制），保证有界。
         - model：可选 per-agent 模型覆盖（manifest 'model'）；None 则继承父 model。
 
+        P4 call-time allowlist：从**实际**子工具集（已剔除 agent + disallowed）派生
+        allowed_tool_names = {t['name'] for t in safe_tools}，传给子 agent。子 agent 据此
+        在 _execute_tool_call fail-closed——即便模型臆造一个未播报的真实工具名也跑不了。
+        depth = 父 depth + 1（纵深防御计数）。agent_type/agent_source 供审批 UI 标识身份。
+
         background=True（detached 后台子 agent）：无 TTY，需确认的危险调用一律
         auto-deny（confirm_fn=_auto_deny_confirm 恒拒），并使用**新空集** confirmed_paths
         （不与父共享，后台确认不回流父），其余继承不变。
@@ -785,6 +907,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         safe_tools = [t for t in tools if t.get("name") != "agent"]
         confirm_fn = _auto_deny_confirm if background else self.confirm_fn
         confirmed_paths = set() if background else self._confirmed_paths
+        allowed_tool_names = {t["name"] for t in safe_tools}
         return Agent(
             model=model or self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
@@ -799,6 +922,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             trace_parent=self.tracer,
             max_turns=max_turns,
             artifact_id=artifact_id,
+            allowed_tool_names=allowed_tool_names,
+            depth=self.depth + 1,
+            agent_type=agent_type,
+            agent_source=agent_source,
         )
 
     # ─── Skill fork mode ─────────────────────────────────────
@@ -815,6 +942,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return f"Unknown skill: {inp.get('skill_name', '')}"
 
         if result["context"] == "fork":
+            # P4 max_depth backstop：skill-fork 也 spawn 一个子 agent（depth+1），
+            # 与 agent 工具同样受深度上限约束，防纵深递归 fan-out。
+            if self._depth_cap_exceeded():
+                return ("Error: max sub-agent depth reached; skill fork not spawned.")
             tools = (
                 [t for t in self.tools if t["name"] in result["allowed_tools"]]
                 if result.get("allowed_tools")
@@ -1092,6 +1223,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 max_turns=self._bounded_sub_agent_max_turns(config.get("max_turns")),
                 model=config.get("model"),
                 artifact_id=agent_id,
+                agent_source=config.get("source"),
             )
             # 复用与前台一致的可靠超时原语（_await_subagent_run 内部不依赖 wait_for，
             # 因此不受 chat() 吞 CancelledError 影响——超时不会被误判为完成）。
@@ -1595,15 +1727,34 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
         resume_id = inp.get("resume")
-        # 工具入参 timeout_ms 优先；缺省时回退 manifest 'timeout-ms'（item 4）。
+        # 工具入参 timeout_ms 优先；缺省时回退 manifest 'timeout-ms'，再回退 settings
+        # [agents] default/background_timeout_ms（item 2/4）。
         tool_timeout_ms = inp.get("timeout_ms")
+        from ..tools import load_agents_config
+        fleet_cfg = load_agents_config()
+
+        # ─── P4 max_depth backstop（纵深防御，适用于所有 spawn 路径）───
+        # 子不能 spawn 孙（agent 工具被剥），故今天 live depth 恒为 1；此为前瞻性 backstop。
+        if self._depth_cap_exceeded():
+            return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
+                    f"cannot spawn a sub-agent at depth {self.depth + 1}.")
 
         # ─── run_in_background: detached subagent (auto-deny-but-continue) ───
         if inp.get("run_in_background"):
             if resume_id:
                 return "Error: run_in_background cannot be combined with resume."
+            # P4 max_threads：cap 并发运行的后台子 agent。前台子 agent 阻塞父、天然串行，
+            # 故 cap 只施于后台 spawn——超限直接拒绝、绝不 spawn（fail-closed）。
+            max_threads = self._max_threads()
+            if max_threads > 0 and self._running_background_subagent_count() >= max_threads:
+                return (f"Error: max concurrent sub-agents ({max_threads}) reached; "
+                        f"try again later.")
             bg_cfg = get_sub_agent_config(agent_type)
-            bg_timeout = tool_timeout_ms if tool_timeout_ms is not None else bg_cfg.get("timeout_ms")
+            bg_timeout = tool_timeout_ms
+            if bg_timeout is None:
+                bg_timeout = bg_cfg.get("timeout_ms")
+            if bg_timeout is None:
+                bg_timeout = fleet_cfg.get("background_timeout_ms")
             task_id = await self._spawn_background_subagent(
                 agent_type=agent_type, description=description, prompt=prompt,
                 timeout_ms=bg_timeout)
@@ -1634,7 +1785,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
                         f"model '{rec.model}' but its current effective model is '{current_eff_model}'. "
                         f"Cannot resume with a different model.")
-            eff_timeout = tool_timeout_ms if tool_timeout_ms is not None else config.get("timeout_ms")
+            eff_timeout = self._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
             max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
             print_sub_agent_start(rec.type, description)
             # Update record status
@@ -1652,6 +1803,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     max_turns=max_turns,
                     model=rec.model or current_eff_model,
                     artifact_id=resume_id,
+                    agent_source=config.get("source"),
                 )
                 # Reload persisted messages
                 history = _session_v2.read_agent_messages(self.session_id, resume_id)
@@ -1700,7 +1852,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         # ─── fresh path ──────────────────────────────────────────
         config = get_sub_agent_config(agent_type)
-        eff_timeout = tool_timeout_ms if tool_timeout_ms is not None else config.get("timeout_ms")
+        eff_timeout = self._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
         max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
         eff_model = config.get("model") or self.model
         print_sub_agent_start(agent_type, description)
@@ -1724,6 +1876,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 max_turns=max_turns,
                 model=eff_model,
                 artifact_id=rec.id,
+                agent_source=config.get("source"),
             )
             kind, payload = await self._run_foreground_subagent(
                 sub_agent, prompt, eff_timeout, rec.id)
@@ -1766,12 +1919,33 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Shared ──────────────────────────────────────────────────
 
     async def _confirm_dangerous(self, command: str) -> bool:
-        print_confirmation(command)
+        # P4 审批 UI 身份：子 agent 触发的确认必须带上子 agent 身份（id + type + source），
+        # 否则审批人无从判断是哪个（可能由不受信项目定义的）子 agent 在请求危险操作。
+        # 仅 enrich 传给 confirm_fn 的消息字符串，签名不变；主 agent 行为不变。
+        message = self._decorate_confirm_message(command)
+        print_confirmation(message)
         if self.confirm_fn:
-            return await self.confirm_fn(command)
+            return await self.confirm_fn(message)
         # Fallback: blocking input
         try:
             answer = input("  Allow? (y/n): ")
             return answer.lower().startswith("y")
         except EOFError:
             return False
+
+    def _confirm_dedupe_key(self, message: str) -> str:
+        """共享 _confirmed_paths 的去重键：子 agent 按身份隔离，避免「A 批过的危险命令
+        被 B 静默复用、跳过带身份的确认」。主 agent 用原始消息（不变）。"""
+        return self._decorate_confirm_message(message)
+
+    def _decorate_confirm_message(self, command: str) -> str:
+        """子 agent 确认消息前缀加身份标识（[sub-agent <id> type=<t> source=<s>]）。
+        主 agent（非子）原样返回。"""
+        if not self.is_sub_agent:
+            return command
+        parts = [f"sub-agent {self.artifact_id}"]
+        if self.agent_type:
+            parts.append(f"type={self.agent_type}")
+        if self.agent_source:
+            parts.append(f"source={self.agent_source}")
+        return f"[{' '.join(parts)}] {command}"

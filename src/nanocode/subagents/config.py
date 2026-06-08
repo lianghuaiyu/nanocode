@@ -35,11 +35,17 @@ RESERVED_AGENT_TYPES = {MEMORY_CURATOR_TYPE, MEMORY_EVAL_CURATOR_TYPE}
 # ─── Custom agent discovery ─────────────────────────────────
 
 _cached_custom_agents: dict[str, dict] | None = None
+# 缓存键：(cwd, project_trusted)。任一变化即作废缓存——防止长驻进程切 cwd / 信任态后
+# 仍复用旧的「已信任项目 agent」（fail-closed，不依赖显式 reset_agent_cache）。
+_cached_agents_key: tuple | None = None
 
 
 def _discover_custom_agents() -> dict[str, dict]:
-    global _cached_custom_agents
-    if _cached_custom_agents is not None:
+    global _cached_custom_agents, _cached_agents_key
+
+    trusted = _project_agents_trusted()
+    key = (str(Path.cwd()), bool(trusted))
+    if _cached_custom_agents is not None and _cached_agents_key == key:
         return _cached_custom_agents
 
     agents: dict[str, dict] = {}
@@ -50,13 +56,38 @@ def _discover_custom_agents() -> dict[str, dict]:
     #   3. 项目级 <cwd>/.agents/agents       （通用约定）
     #   4. 项目级 project_config_dir()/agents（<cwd>/.nanocode/agents，最高）
     # 每个条目都带 'source'（.md 绝对路径），便于排查同名碰撞被谁覆盖。
+    #
+    # TRUST GATE（P4）：USER 级（~/.nanocode/agents、~/.agents/agents）是用户自己的，
+    # 永远加载。PROJECT 级（<cwd>/.nanocode/agents、<cwd>/.agents/agents）只在工作区
+    # 受信任时加载——非交互/未信任运行绝不静默加载项目本地 agent 定义（它们可声明
+    # system prompt + 宽工具集，等同于让不受信项目注入可执行身份）。信任判定在发现时
+    # 现读 trust.is_trusted(cwd)，且缓存按 (cwd, trusted) 键控，态变即重判。
     _load_agents_from_dir(Path.home() / ".agents" / "agents", agents)
     _load_agents_from_dir(data_dir() / "agents", agents)
-    _load_agents_from_dir(Path.cwd() / ".agents" / "agents", agents)
-    _load_agents_from_dir(project_config_dir() / "agents", agents)
+    if trusted:
+        _load_agents_from_dir(Path.cwd() / ".agents" / "agents", agents)
+        _load_agents_from_dir(project_config_dir() / "agents", agents)
 
     _cached_custom_agents = agents
+    _cached_agents_key = key
     return agents
+
+
+def _project_agents_trusted() -> bool:
+    """项目级 agent 定义是否可加载：当前工作区受信任则 True。
+
+    失败保护：trust 判定抛错时 fail-closed（不加载项目 agent），绝不因信任层故障
+    而静默加载不受信目录。委托给独立 impl 便于测试既能整体 stub 本闸、又能验证它
+    真正委托 trust.is_trusted。"""
+    return _project_agents_trusted_impl()
+
+
+def _project_agents_trusted_impl() -> bool:
+    from ..trust import is_trusted
+    try:
+        return is_trusted(Path.cwd())
+    except Exception:
+        return False
 
 
 def _load_agents_from_dir(directory: Path, agents: dict[str, dict]) -> None:
@@ -255,12 +286,14 @@ def get_sub_agent_config(agent_type: str) -> dict:
     'disallowed_names', 'max_turns', 'timeout_ms', 'extends'.
 
     'allowed_names' is the EFFECTIVE allowed tool-NAME set (or None = unrestricted
-    except 'agent'); P4 will enforce it at call-time. P1 only advertises it.
+    except 'agent'). P4 enforces it at call-time via the ACTUAL effective toolset.
 
-    P4 ENFORCEMENT CONTRACT: enforce against the ACTUAL effective toolset names
-    ({t['name'] for t in cfg['tools']}), NOT 'allowed_names' alone — 'allowed_names'
-    may be None (unrestricted-except-deny) while 'disallowed_names' still removes
-    tools, so allow-only enforcement would re-permit denied tools.
+    P4 ENFORCEMENT CONTRACT (now ACTIVE): the engine enforces against the ACTUAL
+    effective toolset names ({t['name'] for t in cfg['tools']}), NOT 'allowed_names'
+    alone — 'allowed_names' may be None (unrestricted-except-deny) while
+    'disallowed_names' still removes tools, so allow-only enforcement would re-permit
+    denied tools. _build_sub_agent derives allowed_tool_names from cfg['tools'] (agent
+    stripped, disallowed removed) and the sub-agent fail-closes any out-of-set real tool.
     """
     # 保留类型先于 custom 发现匹配：.nanocode/agents 同名 .md 不能覆盖。
     if agent_type == MEMORY_CURATOR_TYPE:
@@ -328,5 +361,6 @@ def build_agent_descriptions() -> str:
 
 
 def reset_agent_cache() -> None:
-    global _cached_custom_agents
+    global _cached_custom_agents, _cached_agents_key
     _cached_custom_agents = None
+    _cached_agents_key = None

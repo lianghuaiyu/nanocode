@@ -163,8 +163,9 @@ def agent_definition_detail_text(name: str) -> str | None:
         preview = preview[:200] + "…"
     parts.append(f"System-prompt preview: {preview or '(empty)'}")
     parts.append(
-        "Note: tool restriction is currently ADVISORY (advertised-only); "
-        "call-time enforcement lands in P4.")
+        "Note: tool restriction is ENFORCED at call time — a sub-agent of this "
+        "type can only invoke the effective tools listed above; any other real "
+        "tool call is blocked.")
     return "\n".join(parts)
 
 
@@ -175,7 +176,8 @@ def agents_overview_text(manager) -> str:
             + list_subagents_text(manager))
 
 
-async def task_stop(manager, background_tasks: set, task_id: str, grace_s: float = 3.0) -> str:
+async def task_stop(manager, background_tasks: set, task_id: str, grace_s: float = 3.0,
+                    allow_orphan_cancel: bool = True) -> str:
     t = manager.get_task(task_id)
     if t is None:
         return f"Unknown task: {task_id}"
@@ -187,6 +189,12 @@ async def task_stop(manager, background_tasks: set, task_id: str, grace_s: float
             target = bg
             break
     if target is None:
+        # 协程不在调用方持有的 background_tasks 内：
+        # - 主 agent（allow_orphan_cancel=True，历史行为）：仍标 cancelled。
+        # - 子 agent（False）：拒绝——不得 cancel 自己不持有的（父/兄弟）共享 task。
+        if not allow_orphan_cancel:
+            return (f"Task {task_id}: not owned by this sub-agent; refusing to stop "
+                    f"a task it does not hold.")
         manager.update_task(task_id, status="cancelled",
                             result_summary="(stop requested; no live coroutine found)")
         return f"Task {task_id}: no live coroutine found; marked cancelled."

@@ -209,12 +209,12 @@ class OpenAIBackendMixin:
                     print_info(f"Denied: {perm.get('message', '')}")
                     oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
                     continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                if perm["action"] == "confirm" and perm.get("message") and self._confirm_dedupe_key(perm["message"]) not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
                         oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
                         continue
-                    self._confirmed_paths.add(perm["message"])
+                    self._confirmed_paths.add(self._confirm_dedupe_key(perm["message"]))
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
             # Phase 2: Group & execute (parallel for consecutive safe tools)

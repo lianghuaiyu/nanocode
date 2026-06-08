@@ -44,6 +44,70 @@ def _load_settings(file_path: Path) -> dict | None:
 _cached_rules: dict | None = None
 
 
+# ─── Sub-agent fleet config (.nanocode/settings.json "agents" section) ──
+#
+# 控制子 agent 舰队的并发与超时上限（call-time enforcement 由 engine 消费）。
+# 用户级 + 项目级 settings.json 合并（项目覆盖用户的逐键），与权限规则同源同缓存语义。
+#   max_threads          : 同时运行的后台子 agent 上限（前台子 agent 阻塞父、天然串行，
+#                          故 cap 只施于后台 spawn）。
+#   max_depth            : 子 agent 代际深度上限（主=0，每下一层 +1）。今天子不能 spawn 孙
+#                          （agent 工具被剥），故 live depth 结构上恒为 1；此为前瞻性纵深防御。
+#   default_timeout_ms   : 前台子 agent 的回退 wall-clock 超时（工具入参 / manifest 都缺省时）。
+#   background_timeout_ms: 后台子 agent 的回退 wall-clock 超时（同上）。
+AGENTS_CONFIG_DEFAULTS: dict = {
+    "max_threads": 4,
+    "max_depth": 2,
+    "default_timeout_ms": None,
+    "background_timeout_ms": None,
+}
+
+_cached_agents_config: dict | None = None
+
+
+def _coerce_int(value, default):
+    """settings 整数字段归一：非法/缺省 -> default（绝不抛）。None 透传（=无超时）。"""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def load_agents_config() -> dict:
+    """读取 .nanocode/settings.json 的 "agents" 段（用户 + 项目合并，缓存）。
+
+    缺省时回退 AGENTS_CONFIG_DEFAULTS。项目级逐键覆盖用户级。仅识别已知键
+    （max_threads / max_depth / default_timeout_ms / background_timeout_ms），
+    其余忽略。整数字段非法 -> 回退默认；timeout 字段缺省 -> None（无超时）。
+    """
+    global _cached_agents_config
+    if _cached_agents_config is not None:
+        return _cached_agents_config
+
+    merged = dict(AGENTS_CONFIG_DEFAULTS)
+    user_settings = _load_settings(data_dir() / "settings.json")
+    project_settings = _load_settings(project_config_dir() / "settings.json")
+    for settings in [user_settings, project_settings]:
+        if not settings or not isinstance(settings.get("agents"), dict):
+            continue
+        section = settings["agents"]
+        for key in AGENTS_CONFIG_DEFAULTS:
+            if key in section:
+                merged[key] = section[key]
+
+    cfg = {
+        "max_threads": _coerce_int(merged.get("max_threads"),
+                                   AGENTS_CONFIG_DEFAULTS["max_threads"]),
+        "max_depth": _coerce_int(merged.get("max_depth"),
+                                 AGENTS_CONFIG_DEFAULTS["max_depth"]),
+        "default_timeout_ms": _coerce_int(merged.get("default_timeout_ms"), None),
+        "background_timeout_ms": _coerce_int(merged.get("background_timeout_ms"), None),
+    }
+    _cached_agents_config = cfg
+    return cfg
+
+
 def load_permission_rules() -> dict:
     global _cached_rules
     if _cached_rules is not None:
@@ -294,5 +358,6 @@ def check_permission(
 
 
 def reset_permission_cache() -> None:
-    global _cached_rules
+    global _cached_rules, _cached_agents_config
     _cached_rules = None
+    _cached_agents_config = None
