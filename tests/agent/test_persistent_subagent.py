@@ -51,7 +51,10 @@ def test_agent_tool_registers_subagent_record(monkeypatch):
     res = asyncio.run(parent._execute_agent_tool(
         {"type": "coder", "description": "do x", "prompt": "build it"}))
 
-    assert res == "sub done"
+    # P3: parent gets a bounded envelope (small text passes through as summary) that
+    # also points at the persisted result.md — not the raw transcript verbatim.
+    assert "sub done" in res
+    assert "result.md" in res
     recs = parent.task_manager.list_subagents()
     assert len(recs) == 1
     rec = recs[0]
@@ -149,7 +152,9 @@ def test_resume_reloads_history_and_appends(monkeypatch):
     monkeypatch.setattr(parent, "_build_sub_agent", _spy_build2)
     res = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "prompt": "second prompt", "resume": "agent-001"}))
-    assert res == "second"
+    # P3: resume also returns the bounded envelope (summary passthrough + result_path).
+    assert "second" in res
+    assert "result.md" in res
     # resume 不新增记录
     assert len(parent.task_manager.list_subagents()) == 1
     # run_once 之前历史已 reload（>=2 条）

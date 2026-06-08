@@ -94,13 +94,17 @@ def test_fresh_subagent_writes_all_artifacts():
     _spy_run(parent, text="hello result")
     res = asyncio.run(parent._execute_agent_tool(
         {"type": "coder", "description": "build x", "prompt": "the task prompt"}))
-    assert res == "hello result"
+    # P3: parent receives a bounded envelope (not the raw transcript). Small text
+    # passes through as the summary; the envelope also points at result.md.
+    assert "hello result" in res
+    assert "result.md" in res
 
     d = _session_v2.agent_dir("fgart", "agent-001")
     for fname in ("meta.json", "prompt.txt", "result.md", "wire.jsonl", "messages.json"):
         assert (d / fname).exists(), f"missing {fname}"
 
     assert (d / "prompt.txt").read_text(encoding="utf-8") == "the task prompt"
+    # full transcript still on disk verbatim (envelope is bounded; result.md is not)
     assert (d / "result.md").read_text(encoding="utf-8") == "hello result"
 
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))

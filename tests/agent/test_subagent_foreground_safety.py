@@ -93,7 +93,9 @@ def test_foreground_success_no_timeout_returns_text():
     _spy_build(parent, text="hello from sub")
     res = asyncio.run(parent._execute_agent_tool(
         {"type": "coder", "description": "d", "prompt": "p"}))
-    assert res == "hello from sub"
+    # P3: bounded envelope — small text passes through as summary + points at result.md.
+    assert "hello from sub" in res
+    assert "result.md" in res
     assert parent.task_manager.get_subagent("agent-001").status == "completed"
 
 

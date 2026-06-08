@@ -49,6 +49,9 @@ def task_output_text(manager, task_id: str, tail_bytes: int = 8000) -> str:
              f"Description: {t.description}", f"Summary: {t.result_summary or '(none)'}"]
     if t.error:
         parts.append(f"Error: {t.error}")
+    # 子 agent 类 task：surface result.md 路径（含完整 transcript + findings + files touched）。
+    if t.result_path:
+        parts.append(f"Result: {t.result_path}")
     parts.append("\nstdout tail:\n" + (tail_file(t.stdout_path, tail_bytes) if t.stdout_path else "" or "(empty)"))
     parts.append("\nstderr tail:\n" + (tail_file(t.stderr_path, tail_bytes) if t.stderr_path else "" or "(empty)"))
     parts.append("\nFull logs:")

@@ -191,6 +191,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
 
+        # 宿主派生事实：本 agent 实例观测到的 read / modified 文件集合。
+        # 子 agent 各自跟踪自己的——run_once 后父读取 sub_agent._files_read/_files_modified
+        # 装配 AgentResult。绝不信任模型自述的文件清单。
+        self._files_read: set[str] = set()
+        self._files_modified: set[str] = set()
+
         # MCP integration
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
@@ -544,11 +550,24 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             append_to_last_user(messages, text)
             self._sent_skill_names.update(new_names)
 
-    def _on_file_touched(self, inp: dict) -> None:
-        """成功 read/write/edit 后触发：先嵌套发现 .nanocode/skills，再 paths 条件激活。"""
+    def _on_file_touched(self, name: str, inp: dict) -> None:
+        """成功 read/write/edit 后触发：宿主派生文件事实 + 嵌套发现 .nanocode/skills + paths 条件激活。
+
+        name 是工具名（read_file/write_file/edit_file）：read_file → _files_read，
+        write_file/edit_file → _files_modified（绝对化路径，宿主**观测**派生，不信任模型）。
+        """
         fp = inp.get("file_path")
         if not fp:
             return
+        # 宿主派生事实：记录被触碰的文件（按工具语义分到 read / modified）。
+        try:
+            abspath = str(Path(fp).resolve())
+        except Exception:
+            abspath = str(fp)
+        if name == "read_file":
+            self._files_read.add(abspath)
+        elif name in ("write_file", "edit_file"):
+            self._files_modified.add(abspath)
         touched = Path(fp)
         cwd = Path.cwd()
         register_nested_skill_dirs(touched, cwd)        # 先嵌套发现
@@ -659,7 +678,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return await self._mcp_manager.call_tool(name, inp)
         result = await execute_tool(name, inp, self._read_file_state)
         if name in ("read_file", "write_file", "edit_file") and not result.startswith(("Error", "Warning")):
-            self._on_file_touched(inp)
+            self._on_file_touched(name, inp)
         return result
 
     # ─── 工具级 hooks：注册 / 匹配 / 执行 ──────────────────────
@@ -861,10 +880,11 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self.total_output_tokens += sub_result["tokens"]["output"]
             self.task_manager.update_subagent(rec.id, status="completed")
             self._persist_agent_messages(rec.id, sub_agent)
-            self._write_agent_result(rec.id, sub_result["text"] or "")
+            result_path = self._write_agent_result(rec.id, sub_result["text"] or "")
             self._finalize_agent_meta(rec.id, "completed")
             print_sub_agent_end("skill-fork", skill_name)
-            return sub_result["text"] or "(Skill produced no output)"
+            # 与 fresh/resume 一致：回传有界信封而非整段 transcript（完整在 result.md）。
+            return self._finalize_foreground_result(sub_agent, sub_result, result_path, rec.id)
 
         self._pending_skill_bodies.append((inp.get("skill_name", ""), result["prompt"]))
         return f'[skill "{inp.get("skill_name", "")}" loaded — its instructions follow in the next message]'
@@ -919,6 +939,100 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return _session_v2.write_agent_result(self.session_id, agent_id, text or "")
         except Exception:
             return None
+
+    # ─── Structured AgentResult + bounded envelope ────────────────
+
+    # 小结果直通阈值：raw text <= 此字节数时整段作为 summary 直通父上下文
+    # （concise explore/plan deliverable 不应被截断丢失）；超出则截断 + 指针。
+    _ENVELOPE_PASSTHROUGH_BYTES = 4096
+    _ENVELOPE_MAX_FINDINGS = 10
+    _ENVELOPE_MAX_FILES = 10
+
+    def _build_agent_result(self, sub_agent: "Agent", text: str,
+                            tokens: dict, result_path: str | None) -> dict:
+        """装配 AgentResult：宿主派生文件事实 + 模型自述 summary/findings（可选结构块解析，回退兜底）。
+
+        files_read / files_modified 取自 SUB-AGENT 实例的观测集合（宿主派生，不信任模型）。
+        summary / findings 由 parse_structured_result 解析子 agent 最终文本；无结构块则
+        summary=首 ~500 字符、findings=[]。tokens 已折叠进父，仅展示。
+        """
+        from ..subagents.result import parse_structured_result
+        parsed = parse_structured_result(text or "")
+        files_read = sorted(getattr(sub_agent, "_files_read", None) or set())
+        files_modified = sorted(getattr(sub_agent, "_files_modified", None) or set())
+        return {
+            "summary": parsed["summary"],
+            "findings": parsed["findings"],
+            "files_read": files_read,
+            "files_modified": files_modified,
+            "tokens": {"input": tokens.get("input", 0), "output": tokens.get("output", 0)},
+            "result_path": result_path,
+        }
+
+    def _render_agent_result_envelope(self, result: dict, raw_text: str) -> str:
+        """渲染**有界、定形**的信封——父上下文看到的就是这个（不再是整段 transcript）。
+
+        规则：
+        - raw_text 小（<= ~4KB）→ 整段直通作为 summary（concise deliverable 不丢失）；
+          否则用模型 summary，并附 "... [truncated — full result at <path>, use read_file]" 指针。
+        - 始终追加：top findings（cap ~10）、files_modified（cap ~10 名 + 溢出计数）、
+          files_read 计数、tokens、result_path。
+        - 无论 findings/files 多少都有界。
+        """
+        raw_text = raw_text or ""
+        result_path = result.get("result_path")
+        small = len(raw_text.encode("utf-8")) <= self._ENVELOPE_PASSTHROUGH_BYTES
+        if not raw_text.strip():
+            # 空输出：别用 "truncated"（什么都没截）；仍给出 result_path 指针。
+            body = (f"(sub-agent produced no output; see {result_path})"
+                    if result_path else "(sub-agent produced no output)")
+        elif small:
+            body = raw_text.strip()
+        else:
+            summary = (result.get("summary") or "").strip() or "(no summary)"
+            pointer = (f"\n... [truncated — full result at {result_path}, use read_file]"
+                       if result_path else
+                       "\n... [truncated — full result not persisted]")
+            body = summary + pointer
+
+        lines = [body]
+
+        findings = result.get("findings") or []
+        if findings:
+            shown = findings[:self._ENVELOPE_MAX_FINDINGS]
+            lines.append("\nFindings:")
+            lines.extend(f"  - {f}" for f in shown)
+            if len(findings) > len(shown):
+                lines.append(f"  - (+{len(findings) - len(shown)} more)")
+
+        modified = result.get("files_modified") or []
+        if modified:
+            shown = modified[:self._ENVELOPE_MAX_FILES]
+            lines.append("\nFiles modified:")
+            lines.extend(f"  - {p}" for p in shown)
+            if len(modified) > len(shown):
+                lines.append(f"  - (+{len(modified) - len(shown)} more)")
+
+        read_count = len(result.get("files_read") or [])
+        tok = result.get("tokens") or {}
+        lines.append(f"\nFiles read: {read_count}")
+        lines.append(f"Tokens: {tok.get('input', 0)} in / {tok.get('output', 0)} out")
+        lines.append(f"Result: {result_path or '(not persisted)'}")
+        return "\n".join(lines)
+
+    def _finalize_foreground_result(self, sub_agent: "Agent", result: dict,
+                                    result_path: str | None, record_id: str | None) -> str:
+        """前台/skill-fork 成功路径共用：装配 AgentResult → 渲染有界信封 → 回填
+        SubAgentRecord.last_result_path。返回给父的就是这个有界信封（非整段 transcript）。"""
+        text = result.get("text") or ""
+        agent_result = self._build_agent_result(
+            sub_agent, text, result.get("tokens") or {}, result_path)
+        if record_id is not None and result_path:
+            try:
+                self.task_manager.update_subagent(record_id, last_result_path=result_path)
+            except Exception:
+                pass
+        return self._render_agent_result_envelope(agent_result, text)
 
     # ─── Background sub-agent (detached, auto-deny-but-continue) ──
 
@@ -1032,11 +1146,16 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         text = result["text"] or ""
         # result.md 双写：task_dir（既有，供 task_output）+ agent_dir（本 agent 自包含）。
         result_path = self._write_subagent_result(task_id, text)
-        self._write_agent_result(agent_id, text)
+        agent_result_path = self._write_agent_result(agent_id, text)
+        # P3：result_summary 用结构化 AgentResult 的 summary（模型自述或宿主回退），
+        # result_path 指向 task_dir/result.md，last_result_path 指向 agent_dir/result.md。
+        agent_result = self._build_agent_result(
+            sub_agent, text, result["tokens"], result_path)
         self.task_manager.update_task(
             task_id, status="completed", result_path=result_path,
-            result_summary=self._summarize_subagent_text(text))
-        self.task_manager.update_subagent(agent_id, status="completed")
+            result_summary=agent_result["summary"])
+        self.task_manager.update_subagent(
+            agent_id, status="completed", last_result_path=agent_result_path)
         self._persist_agent_messages(agent_id, sub_agent)
         self._finalize_agent_meta(agent_id, "completed")
         print_sub_agent_end(agent_type, description)
@@ -1571,10 +1690,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self.total_output_tokens += result["tokens"]["output"]
             self.task_manager.update_subagent(resume_id, status="completed")
             self._persist_agent_messages(resume_id, sub_agent)
-            self._write_agent_result(resume_id, result["text"] or "")
+            result_path = self._write_agent_result(resume_id, result["text"] or "")
             self._finalize_agent_meta(resume_id, "completed")
             print_sub_agent_end(rec.type, description)
-            return result["text"] or "(Sub-agent produced no output)"
+            # P3：父收到的是有界信封（summary + findings + 宿主派生文件事实 + result_path），
+            # 而非整段 transcript（transcript 已落 result.md，可经 read_file 取回）。
+            return self._finalize_foreground_result(
+                sub_agent, result, result_path, resume_id)
 
         # ─── fresh path ──────────────────────────────────────────
         config = get_sub_agent_config(agent_type)
@@ -1633,10 +1755,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.total_output_tokens += result["tokens"]["output"]
         self.task_manager.update_subagent(rec.id, status="completed")
         self._persist_agent_messages(rec.id, sub_agent)
-        self._write_agent_result(rec.id, result["text"] or "")
+        result_path = self._write_agent_result(rec.id, result["text"] or "")
         self._finalize_agent_meta(rec.id, "completed")
         print_sub_agent_end(agent_type, description)
-        return result["text"] or "(Sub-agent produced no output)"
+        # P3：父收到的是有界信封（summary + findings + 宿主派生文件事实 + result_path），
+        # 而非整段 transcript（transcript 已落 result.md，可经 read_file 取回）。
+        return self._finalize_foreground_result(
+            sub_agent, result, result_path, rec.id)
 
     # ─── Shared ──────────────────────────────────────────────────
 

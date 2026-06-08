@@ -42,6 +42,18 @@ def test_task_output_unknown():
     assert "unknown" in tt.task_output_text(TaskManager(), "task-999", 10).lower()
 
 
+def test_task_output_text_prints_result_path_for_subagent(tmp_path):
+    """P3: sub-agent task surfaces result.md path (full transcript + findings)."""
+    m = TaskManager(); t = m.create_task("subagent", "scan repo")
+    rp = tmp_path / "result.md"; rp.write_text("the full result body")
+    m.update_task(t.id, status="completed", result_path=str(rp),
+                  result_summary="scanned 12 files")
+    txt = tt.task_output_text(m, t.id, tail_bytes=8000)
+    assert "completed" in txt
+    assert "scanned 12 files" in txt
+    assert str(rp) in txt
+
+
 def test_task_stop_unknown():
     assert "unknown" in asyncio.run(tt.task_stop(TaskManager(), set(), "task-999")).lower()
 

@@ -8,6 +8,18 @@ _TAIL_BYTES = 2000
 
 
 def render_task_reminder(task) -> str:
+    # 子 agent 类 task（subagent / memory_*）：无 stdout 日志，但有 result.md（result_path）。
+    # 渲染 result_path + summary，并丢掉对它毫无意义的空 stdout Output-tail。
+    if task.result_path:
+        return ("<system-reminder>\n"
+                f"Background task {task.id} {task.status}.\n\n"
+                f"Kind: {task.kind}\n"
+                f"Description: {task.description}\n"
+                f"Exit code: {task.exit_code}\n"
+                f"Summary:\n{task.result_summary or '(none)'}\n\n"
+                f"Full result:\n{task.result_path}\n"
+                "(read_file the full result for findings + files touched.)\n"
+                "</system-reminder>")
     tail = tail_file(task.stdout_path, _TAIL_BYTES) if task.stdout_path else ""
     return ("<system-reminder>\n"
             f"Background task {task.id} {task.status}.\n\n"

@@ -69,7 +69,7 @@ def test_paths_skill_activated_by_touch(tmp_path, monkeypatch):
     msgs = [{"role": "user", "content": "hi"}]
     a._inject_skill_listing(msgs)
     assert "pyhelp" not in str(msgs[-1]["content"])          # 未触碰 → 不在清单
-    a._on_file_touched({"file_path": "foo.py"})
+    a._on_file_touched("read_file", {"file_path": "foo.py"})
     assert "pyhelp" in a._activated_path_skills
     msgs2 = [{"role": "user", "content": "next"}]
     a._inject_skill_listing(msgs2)

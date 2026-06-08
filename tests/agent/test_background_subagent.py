@@ -149,6 +149,23 @@ def test_background_completes_and_fills_result_summary():
     assert sub.status == "completed"
 
 
+def test_background_sets_result_path_and_last_result_path():
+    """P3: background completion sets task.result_path + subagent.last_result_path."""
+    parent = _agent()
+    _spy_build_with_stub(parent, text="bg result body")
+
+    async def scenario():
+        await parent._execute_agent_tool(
+            {"type": "coder", "description": "d",
+             "prompt": "p", "run_in_background": True})
+        return await _wait_task_terminal(parent, "task-001")
+
+    rec = asyncio.run(scenario())
+    assert rec.result_path and rec.result_path.endswith("result.md")
+    sub = parent.task_manager.get_subagent("agent-001")
+    assert sub.last_result_path and sub.last_result_path.endswith("result.md")
+
+
 def test_background_persists_messages_to_v2():
     parent = _agent()
     _spy_build_with_stub(parent, text="persisted bg body")
