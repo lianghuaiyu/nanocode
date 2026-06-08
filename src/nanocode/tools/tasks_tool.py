@@ -85,6 +85,81 @@ def subagent_detail_text(manager, agent_id: str) -> str:
     return "\n".join(parts)
 
 
+def list_agent_definitions_text(manager=None) -> str:
+    """渲染"可用 agent 定义"目录：内置(explore/plan/general) + 每个自定义 agent。
+
+    每行：name — one-line description；自定义额外附 source 路径与 model（若设）。
+    与运行实例(list_subagents_text)互补——这是"定义"而非"实例"。
+    """
+    from ..subagents.config import (
+        get_available_agent_types, _discover_custom_agents, get_sub_agent_config,
+    )
+    types = get_available_agent_types()
+    custom = _discover_custom_agents()
+    lines = ["Available agent definitions:"]
+    for t in types:
+        name = t["name"]
+        desc = (t.get("description") or "").strip() or "(no description)"
+        line = f"  {name}  —  {desc}"
+        extra = []
+        if name in custom:
+            cfg = get_sub_agent_config(name)
+            if cfg.get("model"):
+                extra.append(f"model={cfg['model']}")
+            if cfg.get("source"):
+                extra.append(f"source={cfg['source']}")
+        if extra:
+            line += "  [" + ", ".join(extra) + "]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def agent_definition_detail_text(name: str) -> str | None:
+    """渲染单个 agent 定义的详情（source / extends / 有效工具 / disallowed / model /
+    系统提示词预览）。若 name 不是已知定义则返回 None（调用方再尝试当 instance id）。"""
+    from ..subagents.config import (
+        get_available_agent_types, _discover_custom_agents, get_sub_agent_config,
+        RESERVED_AGENT_TYPES,
+    )
+    known = {t["name"] for t in get_available_agent_types()}
+    if name not in known or name in RESERVED_AGENT_TYPES:
+        return None
+    cfg = get_sub_agent_config(name)
+    custom = _discover_custom_agents().get(name)
+    tool_names = sorted(t["name"] for t in cfg["tools"])
+    disallowed = sorted(cfg.get("disallowed_names") or [])
+    allowed = cfg.get("allowed_names")
+    parts = [
+        f"Agent definition: {name}",
+        f"Description: {(custom.get('description') if custom else '') or '(built-in)'}",
+        f"Source: {cfg.get('source') or '(built-in)'}",
+        f"Extends: {cfg.get('extends') or '(none)'}",
+        f"Model: {cfg.get('model') or '(inherits parent)'}",
+        f"Effective tools ({len(tool_names)}): {', '.join(tool_names) or '(none)'}",
+        f"Allow-list: {'(unrestricted except agent)' if allowed is None else ', '.join(sorted(allowed)) or '(none)'}",
+        f"Disallowed tools: {', '.join(disallowed) or '(none)'}",
+    ]
+    if cfg.get("max_turns"):
+        parts.append(f"Max turns: {cfg['max_turns']}")
+    if cfg.get("timeout_ms"):
+        parts.append(f"Timeout (ms): {cfg['timeout_ms']}")
+    preview = (cfg.get("system_prompt") or "").strip().replace("\n", " ")
+    if len(preview) > 200:
+        preview = preview[:200] + "…"
+    parts.append(f"System-prompt preview: {preview or '(empty)'}")
+    parts.append(
+        "Note: tool restriction is currently ADVISORY (advertised-only); "
+        "call-time enforcement lands in P4.")
+    return "\n".join(parts)
+
+
+def agents_overview_text(manager) -> str:
+    """`/agents`（无参）总览：可用定义 + 运行实例两段。"""
+    return (list_agent_definitions_text(manager)
+            + "\n\nRunning instances:\n"
+            + list_subagents_text(manager))
+
+
 async def task_stop(manager, background_tasks: set, task_id: str, grace_s: float = 3.0) -> str:
     t = manager.get_task(task_id)
     if t is None:

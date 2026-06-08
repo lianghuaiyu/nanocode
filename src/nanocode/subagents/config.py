@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from ..frontmatter import parse_frontmatter, as_list
@@ -16,6 +17,15 @@ from .prompts import (
 # ─── Read-only tools (for explore and plan agents) ──────────
 
 READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
+
+# 'agent' 元工具永远从任何子 agent 工具集中剔除（子不能 spawn 孙）。
+_AGENT_TOOL = "agent"
+
+# extends 解析的最大深度（防御环/恶意深链）。
+_MAX_EXTENDS_DEPTH = 5
+
+# 内置基类型（extends 可指向它们）。
+_BUILTIN_BASE_TYPES = {"explore", "plan", "general", "coder"}
 
 # ─── Reserved built-in agent types (custom .nanocode/agents 不可覆盖) ──
 # 这些类型由宿主特殊调度（如记忆巩固 curator），不能被项目/用户级 .md 覆盖，
@@ -33,9 +43,16 @@ def _discover_custom_agents() -> dict[str, dict]:
         return _cached_custom_agents
 
     agents: dict[str, dict] = {}
-    # User-level (lower priority)
+    # Merge-by-name precedence: 后加载的目录覆盖同名条目（low -> high，later wins）。
+    # 顺序（低 -> 高）：
+    #   1. 用户级 ~/.agents/agents          （legacy/通用约定，最低）
+    #   2. 用户级 data_dir()/agents         （~/.nanocode/agents）
+    #   3. 项目级 <cwd>/.agents/agents       （通用约定）
+    #   4. 项目级 project_config_dir()/agents（<cwd>/.nanocode/agents，最高）
+    # 每个条目都带 'source'（.md 绝对路径），便于排查同名碰撞被谁覆盖。
+    _load_agents_from_dir(Path.home() / ".agents" / "agents", agents)
     _load_agents_from_dir(data_dir() / "agents", agents)
-    # Project-level (higher priority, overwrites)
+    _load_agents_from_dir(Path.cwd() / ".agents" / "agents", agents)
     _load_agents_from_dir(project_config_dir() / "agents", agents)
 
     _cached_custom_agents = agents
@@ -45,7 +62,7 @@ def _discover_custom_agents() -> dict[str, dict]:
 def _load_agents_from_dir(directory: Path, agents: dict[str, dict]) -> None:
     if not directory.is_dir():
         return
-    for entry in directory.iterdir():
+    for entry in sorted(directory.iterdir()):
         if not entry.suffix == ".md":
             continue
         try:
@@ -53,47 +70,233 @@ def _load_agents_from_dir(directory: Path, agents: dict[str, dict]) -> None:
             result = parse_frontmatter(raw)
             meta = result.meta
             name = meta.get("name") or entry.stem
-            allowed_tools = as_list(meta.get("allowed-tools"))
+            # 保留类型不可被 .md 覆盖（curator 等宿主调度类型）。
+            if name in RESERVED_AGENT_TYPES:
+                continue
+            # 'tools' 是 'allowed-tools' 的别名；两者同时存在则并集。
+            allowed = as_list(meta.get("allowed-tools")) or []
+            tools_alias = as_list(meta.get("tools")) or []
+            # 并集（保序去重）。
+            seen: set[str] = set()
+            allowed_tools: list[str] = []
+            for t in (*allowed, *tools_alias):
+                if t not in seen:
+                    seen.add(t)
+                    allowed_tools.append(t)
+            disallowed_tools = as_list(meta.get("disallowed-tools")) or []
+            max_turns = _as_int(meta.get("max-turns"))
+            timeout_ms = _as_int(meta.get("timeout-ms"))
             agents[name] = {
                 "name": name,
                 "description": meta.get("description", ""),
                 "allowed_tools": allowed_tools,
+                "disallowed_tools": disallowed_tools,
                 "system_prompt": result.body,
+                "model": meta.get("model") or None,
+                "extends": (str(meta["extends"]).strip() or None) if meta.get("extends") else None,
+                "source": str(entry),
+                "max_turns": max_turns,
+                "timeout_ms": timeout_ms,
             }
         except Exception:
             pass
+
+
+def _as_int(value) -> int | None:
+    """frontmatter 整数字段归一：非法/空 -> None（绝不抛）。"""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+# ─── Effective toolset resolution (with extends) ────────────
+
+
+def _resolve_effective(agent_type: str, _depth: int = 0,
+                       _seen: tuple[str, ...] = ()) -> dict:
+    """递归解析一个类型的有效配置（含 extends 收窄）。
+
+    返回 {system_prompt, model, description, allowed_names (set|None), disallowed_names (set)}。
+    - allowed_names=None 表示"无 allow-list"（除 agent 外全部工具）。
+    - 子只能收窄基：allowed = base ∩ child；disallowed = base ∪ child。
+
+    环/缺失基/超深度 -> 忽略 extends（不抛），相当于该层无基。
+    """
+    # 内置基类型（无 extends）。
+    if agent_type in ("explore", "plan"):
+        prompt = EXPLORE_PROMPT if agent_type == "explore" else PLAN_PROMPT
+        return {
+            "system_prompt": prompt,
+            "model": None,
+            "description": "",
+            "allowed_names": set(READ_ONLY_TOOLS),
+            "disallowed_names": set(),
+        }
+    if agent_type in ("general", "coder"):
+        return {
+            "system_prompt": GENERAL_PROMPT,
+            "model": None,
+            "description": "",
+            "allowed_names": None,  # 全部（除 agent）
+            "disallowed_names": set(),
+        }
+
+    custom = _discover_custom_agents().get(agent_type)
+    if not custom:
+        # 未知类型回退 general 语义。
+        return {
+            "system_prompt": GENERAL_PROMPT,
+            "model": None,
+            "description": "",
+            "allowed_names": None,
+            "disallowed_names": set(),
+        }
+
+    # 自定义类型自身的 allow/deny（None = 无 allow-list）。
+    self_allowed: set[str] | None = set(custom["allowed_tools"]) if custom["allowed_tools"] else None
+    self_disallowed: set[str] = set(custom["disallowed_tools"])
+
+    base = None
+    extends = custom.get("extends")
+    extends_failed = False
+    if extends:
+        # 防环 + 防超深度 + 防自指 + 不可 extends 保留类型。
+        if (extends in _seen or extends == agent_type
+                or _depth >= _MAX_EXTENDS_DEPTH
+                or extends in RESERVED_AGENT_TYPES):
+            # warning（comment-style，不抛）：忽略此 extends，并 fail-closed。
+            print(f"# [subagents] ignoring extends='{extends}' for '{agent_type}' "
+                  f"(cycle / missing base / max-depth / reserved)", file=sys.stderr, flush=True)
+            base = None
+            extends_failed = True
+        elif extends not in _BUILTIN_BASE_TYPES and extends not in _discover_custom_agents():
+            print(f"# [subagents] ignoring extends='{extends}' for '{agent_type}' "
+                  f"(unknown base)", file=sys.stderr, flush=True)
+            base = None
+            extends_failed = True
+        else:
+            base = _resolve_effective(extends, _depth + 1, (*_seen, agent_type))
+
+    if base is None:
+        # extends 显式声明但解析失败（环/缺失/超深/保留）：FAIL-CLOSED。
+        # 不能回退到 child 自己的 allow-list（否则 `extends: explroe` 拼错 + 宽
+        # allowed-tools 会静默提权）。降级为只读最小集，宁紧勿松。
+        if extends_failed:
+            eff_allowed = _intersect_allowed(set(READ_ONLY_TOOLS), self_allowed)
+            eff_disallowed = self_disallowed
+        else:
+            eff_allowed = self_allowed
+            eff_disallowed = self_disallowed
+        model = custom.get("model")
+        description = custom.get("description", "")
+        body = custom["system_prompt"]
+    else:
+        # Tools: 子只能收窄。allowed = base ∩ child；disallowed = base ∪ child。
+        eff_allowed = _intersect_allowed(base["allowed_names"], self_allowed)
+        eff_disallowed = set(base["disallowed_names"]) | self_disallowed
+        # Scalars：child 覆盖 base（child 设了才覆盖）。
+        model = custom.get("model") or base.get("model")
+        description = custom.get("description") or base.get("description", "")
+        # system_prompt：child body 非空则替换，否则继承 base。
+        body = custom["system_prompt"] if (custom["system_prompt"] or "").strip() else base["system_prompt"]
+
+    return {
+        "system_prompt": body,
+        "model": model,
+        "description": description,
+        "allowed_names": eff_allowed,
+        "disallowed_names": eff_disallowed,
+    }
+
+
+def _intersect_allowed(base: set[str] | None, child: set[str] | None) -> set[str] | None:
+    """allow-list 交集语义：None = 无约束（全部）。
+
+    - base=None, child=None -> None（都不约束）
+    - base=None, child=X     -> X（child 收窄）
+    - base=Y, child=None     -> Y（base 已约束，child 不放宽）
+    - base=Y, child=X        -> Y ∩ X（双重收窄；子绝不会获得 base 没有的工具）
+    """
+    if base is None and child is None:
+        return None
+    if base is None:
+        return set(child)
+    if child is None:
+        return set(base)
+    return set(base) & set(child)
+
+
+def _filter_tools(allowed_names: set[str] | None, disallowed_names: set[str]) -> list[ToolDef]:
+    """按 allow/deny 计算有效 ToolDef 列表，并永远剔除 'agent'。
+
+    规则：start = allow-list 过滤（无 allow-list 则全部）；再减 disallowed（deny 胜出）；
+    最后剔除 'agent'。
+    """
+    if allowed_names is None:
+        names = {t["name"] for t in tool_definitions}
+    else:
+        names = set(allowed_names)
+    names -= set(disallowed_names)   # disallowed 胜出
+    names.discard(_AGENT_TOOL)       # 子不能 spawn 孙
+    return [t for t in tool_definitions if t["name"] in names]
 
 
 # ─── Main config function ───────────────────────────────────
 
 
 def get_sub_agent_config(agent_type: str) -> dict:
-    """Return {system_prompt, tools} for the given agent type."""
+    """Return config for the given agent type.
+
+    Backward-compatible shape: always returns at least {system_prompt, tools}.
+    Additional keys (non-breaking): 'model', 'source', 'allowed_names',
+    'disallowed_names', 'max_turns', 'timeout_ms', 'extends'.
+
+    'allowed_names' is the EFFECTIVE allowed tool-NAME set (or None = unrestricted
+    except 'agent'); P4 will enforce it at call-time. P1 only advertises it.
+
+    P4 ENFORCEMENT CONTRACT: enforce against the ACTUAL effective toolset names
+    ({t['name'] for t in cfg['tools']}), NOT 'allowed_names' alone — 'allowed_names'
+    may be None (unrestricted-except-deny) while 'disallowed_names' still removes
+    tools, so allow-only enforcement would re-permit denied tools.
+    """
     # 保留类型先于 custom 发现匹配：.nanocode/agents 同名 .md 不能覆盖。
     if agent_type == MEMORY_CURATOR_TYPE:
-        return {"system_prompt": CURATOR_CONSOLIDATION_PROMPT, "tools": []}
+        return {"system_prompt": CURATOR_CONSOLIDATION_PROMPT, "tools": [],
+                "model": None, "source": None, "allowed_names": set(),
+                "disallowed_names": set(), "max_turns": None, "timeout_ms": None,
+                "extends": None}
     if agent_type == MEMORY_EVAL_CURATOR_TYPE:
-        return {"system_prompt": CURATOR_EVAL_PROMPT, "tools": []}
+        return {"system_prompt": CURATOR_EVAL_PROMPT, "tools": [],
+                "model": None, "source": None, "allowed_names": set(),
+                "disallowed_names": set(), "max_turns": None, "timeout_ms": None,
+                "extends": None}
+
+    eff = _resolve_effective(agent_type)
+    tools = _filter_tools(eff["allowed_names"], eff["disallowed_names"])
 
     custom = _discover_custom_agents().get(agent_type)
-    if custom:
-        if custom["allowed_tools"]:
-            tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
-        else:
-            tools = [t for t in tool_definitions if t["name"] != "agent"]
-        return {"system_prompt": custom["system_prompt"], "tools": tools}
+    source = custom.get("source") if custom else None
+    max_turns = custom.get("max_turns") if custom else None
+    timeout_ms = custom.get("timeout_ms") if custom else None
+    extends = custom.get("extends") if custom else None
 
-    read_only = [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
-    full_tools = [t for t in tool_definitions if t["name"] != "agent"]
+    # 有效 allowed-name 集（供 /agents show 与 P4 用）：把 deny 与 agent 剔除后的真实名集。
+    effective_allowed_names = {t["name"] for t in tools}
 
-    if agent_type == "explore":
-        return {"system_prompt": EXPLORE_PROMPT, "tools": read_only}
-    elif agent_type == "plan":
-        return {"system_prompt": PLAN_PROMPT, "tools": read_only}
-    elif agent_type in ("general", "coder"):  # coder 与 general 显式同义
-        return {"system_prompt": GENERAL_PROMPT, "tools": full_tools}
-    else:  # 未知类型回退到 general 语义
-        return {"system_prompt": GENERAL_PROMPT, "tools": full_tools}
+    return {
+        "system_prompt": eff["system_prompt"],
+        "tools": tools,
+        "model": eff["model"],
+        "source": source,
+        "allowed_names": effective_allowed_names if eff["allowed_names"] is not None else None,
+        "disallowed_names": set(eff["disallowed_names"]),
+        "max_turns": max_turns,
+        "timeout_ms": timeout_ms,
+        "extends": extends,
+    }
 
 
 # ─── Available agent types (for system prompt) ──────────────

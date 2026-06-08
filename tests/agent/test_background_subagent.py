@@ -287,3 +287,57 @@ def test_background_timeout_maps_task_timed_out_sub_failed():
     assert rec.status == "timed_out"
     sub = parent.task_manager.get_subagent("agent-001")
     assert sub.status == "failed"
+
+
+def test_background_construction_error_marks_records_failed_not_running():
+    """Codex P1 round-3 regression: if building the background sub-agent raises
+    BEFORE the run helper returns (e.g. config/build error), the detached task
+    must still land terminal (failed), never leave task/sub stuck in 'running'."""
+    parent = _agent()
+
+    def _boom(**kw):
+        raise RuntimeError("build blew up")
+
+    parent._build_sub_agent = _boom
+
+    async def scenario():
+        await parent._spawn_background_subagent(
+            agent_type="coder", description="d", prompt="p")
+        return await _wait_task_terminal(parent, "task-001")
+
+    rec = asyncio.run(scenario())
+    assert rec.status == "failed"
+    assert "build blew up" in (rec.error or "")
+    sub = parent.task_manager.get_subagent("agent-001")
+    assert sub.status == "failed"  # not left at 'running'
+
+
+def test_background_timeout_reliable_even_if_run_once_swallows_cancel():
+    """Codex P1 regression: Agent.chat() swallows CancelledError, so a naive
+    asyncio.wait_for would let a timed-out background run be marked completed.
+    A run_once that catches the cancel and returns a normal result must STILL be
+    detected as a timeout (task=timed_out, sub=failed), not completed."""
+    parent = _agent()
+
+    def _swallows_cancel(sub):
+        async def _ro(prompt):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                # mimic Agent.chat(): swallow the cancel and return normally
+                sub._aborted = True
+                return {"text": "partial-after-cancel", "tokens": {"input": 1, "output": 1}}
+            return {"text": "never", "tokens": {"input": 0, "output": 0}}
+        return _ro
+
+    _spy_build_with_stub(parent, run_once=_swallows_cancel)
+
+    async def scenario():
+        await parent._spawn_background_subagent(
+            agent_type="coder", description="d", prompt="p", timeout_ms=50)
+        return await _wait_task_terminal(parent, "task-001")
+
+    rec = asyncio.run(scenario())
+    assert rec.status == "timed_out"   # NOT "completed"
+    sub = parent.task_manager.get_subagent("agent-001")
+    assert sub.status == "failed"

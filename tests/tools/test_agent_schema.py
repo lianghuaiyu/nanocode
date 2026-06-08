@@ -7,9 +7,17 @@ def test_schema_name():
     assert SCHEMA["name"] == "agent"
 
 
-def test_type_enum_includes_coder():
-    enum = SCHEMA["input_schema"]["properties"]["type"]["enum"]
-    assert set(enum) == {"explore", "plan", "general", "coder"}
+def test_type_is_free_string_not_enum():
+    # P1 fix (Codex review): the restrictive enum was removed so discovered custom
+    # agent types are selectable by schema-honoring backends. 'type' is now a free
+    # string whose description documents the built-ins + custom types.
+    t = SCHEMA["input_schema"]["properties"]["type"]
+    assert t["type"] == "string"
+    assert "enum" not in t
+    desc = t["description"].lower()
+    for builtin in ("explore", "plan", "general", "coder"):
+        assert builtin in desc
+    assert "custom" in desc
 
 
 def test_resume_is_optional_string():

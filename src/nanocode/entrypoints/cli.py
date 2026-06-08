@@ -52,8 +52,8 @@ _BUILTIN_COMMANDS = [
     ("/tasks", "List background tasks"),
     ("/task", "Show a background task's status & log"),
     ("/task-stop", "Stop a running background task"),
-    ("/agents", "List sub-agents in this session"),
-    ("/agent", "Show a sub-agent's details"),
+    ("/agents", "Agent definitions + running instances (available|running|show <name|id>)"),
+    ("/agent", "Show a sub-agent instance's details"),
 ]
 
 
@@ -651,9 +651,30 @@ async def run_repl(agent: Agent) -> None:
             tid = inp.split(maxsplit=1)[1].strip()
             print(task_output_text(agent.task_manager, tid))
             continue
-        if inp == "/agents":
-            from ..tools.tasks_tool import list_subagents_text
-            print(list_subagents_text(agent.task_manager))
+        if inp == "/agents" or inp.startswith("/agents "):
+            from ..tools.tasks_tool import (
+                agents_overview_text, list_agent_definitions_text,
+                list_subagents_text, agent_definition_detail_text,
+                subagent_detail_text,
+            )
+            parts = inp.split(maxsplit=2)
+            sub = parts[1] if len(parts) > 1 else ""
+            if sub == "":
+                print(agents_overview_text(agent.task_manager))
+            elif sub == "available":
+                print(list_agent_definitions_text(agent.task_manager))
+            elif sub == "running":
+                print(list_subagents_text(agent.task_manager))
+            elif sub == "show":
+                arg = parts[2].strip() if len(parts) > 2 else ""
+                if not arg:
+                    print_error("Usage: /agents show <name|id>")
+                else:
+                    detail = agent_definition_detail_text(arg)
+                    print(detail if detail is not None
+                          else subagent_detail_text(agent.task_manager, arg))
+            else:
+                print_error("Usage: /agents [available|running|show <name|id>]")
             continue
         if inp.startswith("/agent "):
             from ..tools.tasks_tool import subagent_detail_text
@@ -739,8 +760,11 @@ REPL commands:
   /tasks [status]     List background tasks (optionally filter by status)
   /task <id>          Show a background task's status, summary, and log tail
   /task-stop <id>     Stop a running background task
-  /agents             List sub-agents in this session
-  /agent <id>         Show a sub-agent's details
+  /agents             Agent definitions + running instances
+  /agents available   List agent definitions (built-in + custom)
+  /agents running     List sub-agent instances in this session
+  /agents show <name|id>  Show a definition (name) or an instance (agent-NNN)
+  /agent <id>         Show a sub-agent instance's details
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
   !<command>          Run a shell command directly (your own command; bypasses agent + permissions)
 

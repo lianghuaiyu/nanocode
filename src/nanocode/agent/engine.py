@@ -91,6 +91,10 @@ from .openai_backend import OpenAIBackendMixin
 
 # ─── Agent ───────────────────────────────────────────────────
 
+# 前台子 agent 的回退 turn 上限：当 manifest 未声明 max-turns 时使用，
+# 确保前台子 agent 永远有界（不至无限循环拖死父 loop）。
+SUBAGENT_MAX_TURNS_FALLBACK = 50
+
 
 async def _auto_deny_confirm(_command: str) -> bool:
     """后台子 agent 的 confirm_fn：无 TTY 等价拒绝（auto-deny-but-continue）。"""
@@ -131,7 +135,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        # None = 主 agent 默认全量工具表；[] = 子 agent 显式空工具集（绝不回退全量，
+        # 否则 deny-all / allowed-tools:agent / extends 空交集 / curator(tools:[]) 会被
+        # 提权为全部工具，含 agent）。
+        self.tools = tool_definitions if custom_tools is None else custom_tools
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -675,7 +682,26 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     # ─── Sub-agent factory (centralized permission inheritance) ──
 
-    def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None, background=False) -> "Agent":
+    def _parent_remaining_turns(self) -> int | None:
+        """父若有 max_turns 预算，返回剩余可用 turn 数（>=0），否则 None（无界）。"""
+        if self.max_turns is None:
+            return None
+        return max(0, self.max_turns - self.current_turns)
+
+    def _bounded_sub_agent_max_turns(self, manifest_max_turns: int | None) -> int:
+        """计算前台子 agent 的 turn 上限：
+
+        manifest max-turns 优先，否则回退 SUBAGENT_MAX_TURNS_FALLBACK；
+        若父有剩余 turn 预算，clamp 到 min(value, parent_remaining)——子绝不超过父。
+        """
+        value = manifest_max_turns if (manifest_max_turns and manifest_max_turns > 0) else SUBAGENT_MAX_TURNS_FALLBACK
+        remaining = self._parent_remaining_turns()
+        if remaining is not None:
+            value = min(value, remaining)
+        return value
+
+    def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None,
+                         background=False, max_turns=None, model=None) -> "Agent":
         """构造子 agent：集中权限继承。
 
         与 Claude Code / Kimi Code 对齐：
@@ -683,6 +709,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         - 共享父 confirm_fn + _confirmed_paths（确认回流到父，同一引用）。
         - 共享 session_id + task_manager；trace 父子靠 trace_parent 对象。
         - is_sub_agent 工具表强制剔除 agent（子不能 spawn 孙）。
+        - max_turns：前台子 agent 传入有界 turn 上限（_check_budget 强制），保证有界。
+        - model：可选 per-agent 模型覆盖（manifest 'model'）；None 则继承父 model。
 
         background=True（detached 后台子 agent）：无 TTY，需确认的危险调用一律
         auto-deny（confirm_fn=_auto_deny_confirm 恒拒），并使用**新空集** confirmed_paths
@@ -692,7 +720,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         confirm_fn = _auto_deny_confirm if background else self.confirm_fn
         confirmed_paths = set() if background else self._confirmed_paths
         return Agent(
-            model=self.model,
+            model=model or self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
             custom_system_prompt=system_prompt,
             custom_tools=safe_tools,
@@ -703,6 +731,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             session_id=session_id or self.session_id,
             task_manager=self.task_manager,
             trace_parent=self.tracer,
+            max_turns=max_turns,
         )
 
     # ─── Skill fork mode ─────────────────────────────────────
@@ -729,6 +758,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 system_prompt=result["prompt"],
                 tools=tools,
                 agent_type="coder",
+                max_turns=self._bounded_sub_agent_max_turns(None),
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -773,9 +803,11 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
                                          prompt: str, timeout_ms: int | None = None) -> str:
         """注册 subagent + task（双向链）+ detached 协程，立即返回 task_id。"""
+        # 记录 EFFECTIVE 模型（manifest 覆盖优先），与前台/resume 一致。
+        eff_model = get_sub_agent_config(agent_type).get("model") or self.model
         sub_rec = self.task_manager.create_subagent(
             type=agent_type, description=description,
-            model=self.model, provider=self._current_provider(),
+            model=eff_model, provider=self._current_provider(),
         )
         self.task_manager.update_subagent(sub_rec.id, status="running")
         task_rec = self.task_manager.create_task(
@@ -804,11 +836,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 tools=config["tools"],
                 agent_type=agent_type,
                 background=True,
+                max_turns=self._bounded_sub_agent_max_turns(config.get("max_turns")),
+                model=config.get("model"),
             )
-            if timeout_ms is not None:
-                result = await asyncio.wait_for(sub_agent.run_once(prompt), timeout=timeout_ms / 1000.0)
-            else:
-                result = await sub_agent.run_once(prompt)
+            # 复用与前台一致的可靠超时原语（_await_subagent_run 内部不依赖 wait_for，
+            # 因此不受 chat() 吞 CancelledError 影响——超时不会被误判为完成）。
+            kind, payload = await self._await_subagent_run(sub_agent, prompt, timeout_ms)
         except asyncio.CancelledError:
             self.task_manager.update_task(
                 task_id, status="cancelled",
@@ -818,17 +851,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self._persist_agent_messages(agent_id, sub_agent)
             print_sub_agent_end(agent_type, description)
             raise
-        except asyncio.TimeoutError:
-            # SUBAGENT_STATUSES 无 timed_out → 子映射 failed，task 标 timed_out
-            self.task_manager.update_task(
-                task_id, status="timed_out",
-                result_summary=f"(timed out after {timeout_ms}ms)")
-            self.task_manager.update_subagent(agent_id, status="failed")
-            if sub_agent is not None:
-                self._persist_agent_messages(agent_id, sub_agent)
-            print_sub_agent_end(agent_type, description)
-            return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态，detached 任务不能悬挂 running
             self.task_manager.update_task(
                 task_id, status="failed", error=str(e),
                 result_summary=f"(sub-agent error: {e})")
@@ -838,6 +861,27 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             print_sub_agent_end(agent_type, description)
             return
 
+        if kind == "timeout":
+            # SUBAGENT_STATUSES 现含 timed_out；保留既有约定：task=timed_out, sub=failed。
+            self.task_manager.update_task(
+                task_id, status="timed_out",
+                result_summary=f"(timed out after {timeout_ms}ms)")
+            self.task_manager.update_subagent(agent_id, status="failed")
+            if sub_agent is not None:
+                self._persist_agent_messages(agent_id, sub_agent)
+            print_sub_agent_end(agent_type, description)
+            return
+        if kind == "error":
+            self.task_manager.update_task(
+                task_id, status="failed", error=str(payload),
+                result_summary=f"(sub-agent error: {payload})")
+            self.task_manager.update_subagent(agent_id, status="failed")
+            if sub_agent is not None:
+                self._persist_agent_messages(agent_id, sub_agent)
+            print_sub_agent_end(agent_type, description)
+            return
+
+        result = payload  # kind == "ok"
         # 成功：token 累加进父 + result.md + result_summary + 持久化 messages
         self.total_input_tokens += result["tokens"]["input"]
         self.total_output_tokens += result["tokens"]["output"]
@@ -901,6 +945,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 tools=config["tools"],
                 agent_type=self._MEMORY_CURATOR_TYPE,
                 background=True,
+                max_turns=self._bounded_sub_agent_max_turns(config.get("max_turns")),
             )
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
@@ -1005,6 +1050,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 tools=config["tools"],
                 agent_type=self._MEMORY_EVAL_CURATOR_TYPE,
                 background=True,
+                max_turns=self._bounded_sub_agent_max_turns(config.get("max_turns")),
             )
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
@@ -1182,24 +1228,99 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 result_summary=f"(optimize error: {e})")
             return
 
+    async def _await_subagent_run(self, sub_agent: "Agent", prompt: str,
+                                  timeout_ms: int | None) -> tuple[str, object]:
+        """可靠地 await 一次子 agent run_once，并施加可选 wall-clock 超时。
+
+        返回 (kind, payload)：'ok'->result dict；'timeout'->None；'error'->Exception。
+
+        关键：Agent.chat() 会吞掉 CancelledError（优雅 abort），因此 asyncio.wait_for
+        在超时 cancel 后内层吞掉取消、"正常返回"——wait_for 会回值而非抛 TimeoutError。
+        这里改用 asyncio.wait 的 pending 集合可靠判定超时，并用 _aborted 兜底。
+        外层取消（如 task_stop）先取消内层任务再向上传播，避免任务泄漏。
+        """
+        inner = asyncio.ensure_future(sub_agent.run_once(prompt))
+        try:
+            if timeout_ms is not None and timeout_ms > 0:
+                done, pending = await asyncio.wait({inner}, timeout=timeout_ms / 1000.0)
+                timed_out = inner in pending
+            else:
+                await asyncio.wait({inner})
+                timed_out = False
+        except asyncio.CancelledError:
+            inner.cancel()
+            try:
+                await inner
+            except BaseException:
+                pass
+            raise
+
+        if timed_out or getattr(sub_agent, "_aborted", False):
+            if not inner.done():
+                inner.cancel()
+            try:
+                await inner
+            except BaseException:
+                pass
+            return "timeout", None
+        try:
+            return "ok", inner.result()
+        except asyncio.CancelledError:
+            return "timeout", None
+        except Exception as e:  # noqa: BLE001 - 归一为 error，不外泄崩溃父循环
+            return "error", e
+
+    async def _run_foreground_subagent(self, sub_agent: "Agent", prompt: str,
+                                       timeout_ms: int | None,
+                                       record_id: str | None) -> tuple[str, str | dict]:
+        """前台子 agent 执行：施加 wall-clock 超时，永不让异常逃逸。
+
+        返回 (kind, payload)：
+        - kind='ok'      -> payload 是 run_once 的 result dict（含 text + tokens）。
+        - kind='timeout' -> payload 是给模型的超时字符串；record 已标 'timed_out'。
+        - kind='error'   -> payload 是给模型的错误字符串。
+        """
+        kind, payload = await self._await_subagent_run(sub_agent, prompt, timeout_ms)
+        if kind == "timeout":
+            if record_id is not None:
+                try:
+                    self.task_manager.update_subagent(record_id, status="timed_out")
+                except Exception:
+                    pass
+            return "timeout", f"[sub-agent timed out after {timeout_ms} ms]"
+        if kind == "error":
+            return "error", f"Sub-agent error: {payload}"
+        return "ok", payload  # type: ignore[return-value]
+
     async def _execute_agent_tool(self, inp: dict) -> str:
         # ─── Variable extraction (hoisted; shared by background/resume/fresh) ───
         agent_type = inp.get("type", "general")
-        # Type normalization: general/coder synonym; unknown → coder
+        # Type normalization: general/coder synonym; known custom types pass through;
+        # truly-unknown → coder. RESERVED types are never spawnable via the tool.
+        from ..subagents.config import _discover_custom_agents, RESERVED_AGENT_TYPES
         if agent_type in ("general", "coder"):
             agent_type = "coder"
-        elif agent_type not in ("explore", "plan"):
-            agent_type = "coder"
+        elif agent_type in ("explore", "plan"):
+            pass
+        elif agent_type in _discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
+            pass  # 已发现的自定义类型：保留，按其 manifest 解析配置
+        else:
+            agent_type = "coder"  # 真正未知（含保留名）→ general 语义
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
         resume_id = inp.get("resume")
+        # 工具入参 timeout_ms 优先；缺省时回退 manifest 'timeout-ms'（item 4）。
+        tool_timeout_ms = inp.get("timeout_ms")
 
         # ─── run_in_background: detached subagent (auto-deny-but-continue) ───
         if inp.get("run_in_background"):
             if resume_id:
                 return "Error: run_in_background cannot be combined with resume."
+            bg_cfg = get_sub_agent_config(agent_type)
+            bg_timeout = tool_timeout_ms if tool_timeout_ms is not None else bg_cfg.get("timeout_ms")
             task_id = await self._spawn_background_subagent(
-                agent_type=agent_type, description=description, prompt=prompt)
+                agent_type=agent_type, description=description, prompt=prompt,
+                timeout_ms=bg_timeout)
             return (f"Started background sub-agent task {task_id}. It will report completion later. "
                     f"Use task_output with task_id={task_id} to inspect progress.")
 
@@ -1208,24 +1329,34 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             rec = self.task_manager.get_subagent(resume_id)
             if not rec:
                 return f"Error: sub-agent '{resume_id}' not found (unknown id)."
+            # 保留类型（curator 等宿主内部 agent）不可经公开 agent 工具 resume —
+            # 否则已知 agent-NNN curator 记录会被任意 prompt 重跑（结合空工具集回退提权）。
+            if rec.type in RESERVED_AGENT_TYPES:
+                return (f"Error: sub-agent '{resume_id}' is a reserved internal agent "
+                        f"and cannot be resumed via the agent tool.")
             # Provider mismatch check
             if rec.provider and rec.provider != self._current_provider():
                 return (f"Error: provider mismatch — sub-agent '{resume_id}' was created with "
                         f"provider '{rec.provider}' but current provider is '{self._current_provider()}'. "
                         f"Cannot resume across providers.")
-            # Model mismatch check
-            if rec.model and rec.model != self.model:
-                return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
-                        f"model '{rec.model}' but current model is '{self.model}'. "
-                        f"Cannot resume with a different model.")
-
             # Reload history and build sub-agent
             config = get_sub_agent_config(rec.type)
+            # 当前有效模型（manifest 覆盖优先）；与 record 里存的 EFFECTIVE 模型比对。
+            current_eff_model = config.get("model") or self.model
+            # Model mismatch check（基于有效模型，而非父模型）
+            if rec.model and rec.model != current_eff_model:
+                return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
+                        f"model '{rec.model}' but its current effective model is '{current_eff_model}'. "
+                        f"Cannot resume with a different model.")
+            eff_timeout = tool_timeout_ms if tool_timeout_ms is not None else config.get("timeout_ms")
+            max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
             print_sub_agent_start(rec.type, description)
             sub_agent = self._build_sub_agent(
                 system_prompt=config["system_prompt"],
                 tools=config["tools"],
                 agent_type=rec.type,
+                max_turns=max_turns,
+                model=rec.model or current_eff_model,
             )
             # Reload persisted messages
             history = _session_v2.read_agent_messages(self.session_id, resume_id)
@@ -1237,27 +1368,34 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             # Update record status
             self.task_manager.update_subagent(resume_id, status="running")
 
-            try:
-                result = await sub_agent.run_once(prompt)
-                self.total_input_tokens += result["tokens"]["input"]
-                self.total_output_tokens += result["tokens"]["output"]
-                self.task_manager.update_subagent(resume_id, status="completed")
+            kind, payload = await self._run_foreground_subagent(
+                sub_agent, prompt, eff_timeout, resume_id)
+            if kind != "ok":
+                # timeout：record 已在 helper 内标 'timed_out'；error：这里补标 failed。
+                if kind == "error":
+                    self.task_manager.update_subagent(resume_id, status="failed")
                 self._persist_agent_messages(resume_id, sub_agent)
                 print_sub_agent_end(rec.type, description)
-                return result["text"] or "(Sub-agent produced no output)"
-            except Exception as e:
-                self.task_manager.update_subagent(resume_id, status="failed")
-                self._persist_agent_messages(resume_id, sub_agent)
-                print_sub_agent_end(rec.type, description)
-                return f"Sub-agent error: {e}"
+                return payload  # type: ignore[return-value]
+            result = payload  # type: ignore[assignment]
+            self.total_input_tokens += result["tokens"]["input"]
+            self.total_output_tokens += result["tokens"]["output"]
+            self.task_manager.update_subagent(resume_id, status="completed")
+            self._persist_agent_messages(resume_id, sub_agent)
+            print_sub_agent_end(rec.type, description)
+            return result["text"] or "(Sub-agent produced no output)"
 
         # ─── fresh path ──────────────────────────────────────────
         config = get_sub_agent_config(agent_type)
+        eff_timeout = tool_timeout_ms if tool_timeout_ms is not None else config.get("timeout_ms")
+        max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
+        eff_model = config.get("model") or self.model
         print_sub_agent_start(agent_type, description)
-        # Register SubAgentRecord
+        # Register SubAgentRecord — 记录 EFFECTIVE 模型（manifest 覆盖优先），
+        # 否则 resume 的 model-mismatch 校验会拿父模型自比、形同虚设。
         rec = self.task_manager.create_subagent(
             type=agent_type, description=description,
-            model=self.model, provider=self._current_provider(),
+            model=eff_model, provider=self._current_provider(),
         )
         self.task_manager.update_subagent(rec.id, status="running")
 
@@ -1265,21 +1403,25 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             system_prompt=config["system_prompt"],
             tools=config["tools"],
             agent_type=agent_type,
+            max_turns=max_turns,
+            model=eff_model,
         )
 
-        try:
-            result = await sub_agent.run_once(prompt)
-            self.total_input_tokens += result["tokens"]["input"]
-            self.total_output_tokens += result["tokens"]["output"]
-            self.task_manager.update_subagent(rec.id, status="completed")
+        kind, payload = await self._run_foreground_subagent(
+            sub_agent, prompt, eff_timeout, rec.id)
+        if kind != "ok":
+            if kind == "error":
+                self.task_manager.update_subagent(rec.id, status="failed")
             self._persist_agent_messages(rec.id, sub_agent)
             print_sub_agent_end(agent_type, description)
-            return result["text"] or "(Sub-agent produced no output)"
-        except Exception as e:
-            self.task_manager.update_subagent(rec.id, status="failed")
-            self._persist_agent_messages(rec.id, sub_agent)
-            print_sub_agent_end(agent_type, description)
-            return f"Sub-agent error: {e}"
+            return payload  # type: ignore[return-value]
+        result = payload  # type: ignore[assignment]
+        self.total_input_tokens += result["tokens"]["input"]
+        self.total_output_tokens += result["tokens"]["output"]
+        self.task_manager.update_subagent(rec.id, status="completed")
+        self._persist_agent_messages(rec.id, sub_agent)
+        print_sub_agent_end(agent_type, description)
+        return result["text"] or "(Sub-agent produced no output)"
 
     # ─── Shared ──────────────────────────────────────────────────
 

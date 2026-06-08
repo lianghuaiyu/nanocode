@@ -10,9 +10,10 @@ SCHEMA = {
         "properties": {
             "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
             "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
-            "type": {"type": "string", "enum": ["explore", "plan", "general", "coder"], "description": "Agent type. Default: general"},
+            "type": {"type": "string", "description": "Agent type. Built-ins: 'explore' (read-only), 'plan' (read-only planning), 'general'/'coder' (full tools). Custom agent types advertised in the system prompt (from .nanocode/agents or .agents/agents) may also be named. Default: general."},
             "resume": {"type": "string", "description": "Resume a previously persisted sub-agent by its id; reloads its history and appends this prompt"},
             "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false)"},
+            "timeout_ms": {"type": "integer", "description": "Wall-clock timeout in ms for this sub-agent run. If omitted, the agent definition's timeout-ms (if any) is used; otherwise no wall-clock limit (a turn ceiling still bounds it)."},
         },
         "required": ["description", "prompt"],
     },

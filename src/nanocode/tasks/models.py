@@ -6,7 +6,7 @@ from dataclasses import dataclass, asdict, fields
 TASK_KINDS = ("subagent", "shell", "memory_consolidate", "memory_eval", "memory_optimize")
 TASK_STATUSES = ("running", "completed", "failed", "blocked", "cancelled", "lost", "timed_out")
 TERMINAL_TASK_STATUSES = ("completed", "failed", "blocked", "cancelled", "lost", "timed_out")
-SUBAGENT_STATUSES = ("idle", "running", "completed", "failed", "blocked", "cancelled", "lost")
+SUBAGENT_STATUSES = ("idle", "running", "completed", "failed", "blocked", "cancelled", "lost", "timed_out")
 
 
 @dataclass
