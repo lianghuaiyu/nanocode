@@ -23,6 +23,8 @@ from .reader import (
     next_seq_from_wire,
     read_agent_wire,
     merge_session_events,
+    list_wire_sessions,
+    resolve_wire_session,
 )
 
 __all__ = [
@@ -34,4 +36,6 @@ __all__ = [
     "next_seq_from_wire",
     "read_agent_wire",
     "merge_session_events",
+    "list_wire_sessions",
+    "resolve_wire_session",
 ]

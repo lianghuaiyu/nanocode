@@ -266,3 +266,82 @@ def render_summary(events: list[dict]) -> str:
     if not tool_calls:
         lines.append("  (none)")
     return "\n".join(lines)
+
+
+# ─── wire lane（always-on per-agent event tree）视图 ──────────────
+# 复用上面的 _SUMMARIZERS 渲染体；但 wire lane 以 agent_id 分组（非 session_id），
+# 故时间线用 AGENT 列、汇总按 agent_id 数子 agent，而不走 _depths/parent_session_id。
+
+def render_wire_session_list(sessions: list[dict]) -> str:
+    if not sessions:
+        return "No wire sessions found under ~/.nanocode/sessions/."
+    lines = [f"{'SESSION':18}  {'WHEN':19}  {'AGENTS':>6}  {'EVENTS':>6}  FIRST MESSAGE"]
+    for s in sessions:
+        when = (s.get("start_ts") or "")[:19].replace("T", " ")
+        msg = _truncate((s.get("first_user_msg") or "").replace("\n", " "), 50)
+        lines.append(f"{s['session_id']:18}  {when:19}  {s.get('n_agents', 1):>6}  {s.get('n_events', 0):>6}  {msg}")
+    return "\n".join(lines)
+
+
+def _wire_body(e, full: bool) -> str:
+    """用 SessionEvent 的 payload（.data）调用既有 _SUMMARIZERS 渲染体。"""
+    fn = _SUMMARIZERS.get(e.type)
+    if not fn:
+        return ""
+    d = dict(e.data)
+    d.setdefault("parent_session_id", e.parent_session_id)  # session_start 体会用
+    return fn(d, full)
+
+
+def render_wire_timeline(events, full: bool = False) -> str:
+    if not events:
+        return "(no events)"
+    lines = [f"{'AGENT':12} {'#':>3} {'TYPE':<18} DETAIL"]
+    for e in events:
+        body = _wire_body(e, full)
+        lines.append(f"{e.agent_id:<12} {e.seq:>3} {e.type:<18} {body}".rstrip())
+    return "\n".join(lines)
+
+
+def render_wire_summary(events, full: bool = False) -> str:
+    if not events:
+        return "(no events)"
+    disp = [{"type": e.type, "ts": e.ts, **e.data} for e in events]
+    tool_calls = Counter(d.get("tool") for d in disp if d.get("type") == "tool_call")
+    ends = [d for d in disp if d.get("type") in ("session_end", "turn_end")]
+    if ends:
+        last = ends[-1]
+        in_tok, out_tok, turns = last.get("input_tokens", 0), last.get("output_tokens", 0), last.get("turns", 0)
+    else:
+        resp = [d for d in disp if d.get("type") == "llm_response"]
+        in_tok = sum(d.get("input_tokens", 0) for d in resp)
+        out_tok = sum(d.get("output_tokens", 0) for d in resp)
+        turns = 0
+    ts = [e.ts for e in events if e.ts]
+    dur = ""
+    if len(ts) >= 2:
+        try:
+            dur = f"{(datetime.fromisoformat(ts[-1]) - datetime.fromisoformat(ts[0])).total_seconds():.1f}s"
+        except Exception:
+            dur = ""
+    agents = sorted({e.agent_id for e in events})
+    sub_agents = len([a for a in agents if a != "main"])
+    n_budget = sum(1 for d in disp if d.get("type") == "budget_exceeded")
+    n_deny = sum(1 for d in disp if d.get("type") == "permission_decision" and d.get("action") == "deny")
+    n_legacy = sum(1 for e in events if e.legacy)
+    lines = [
+        f"events:      {len(events)}" + (f" ({n_legacy} legacy)" if n_legacy else ""),
+        f"turns:       {turns}",
+        f"tokens:      {in_tok} in / {out_tok} out",
+        f"est. cost:   ${_cost(in_tok, out_tok):.4f}",
+        f"duration:    {dur}",
+        f"agents:      {len(agents)} ({sub_agents} sub)",
+        f"budget hits: {n_budget}",
+        f"denied:      {n_deny}",
+        "tool calls:",
+    ]
+    for tool, n in tool_calls.most_common():
+        lines.append(f"  {tool}: {n}")
+    if not tool_calls:
+        lines.append("  (none)")
+    return "\n".join(lines)

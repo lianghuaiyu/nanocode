@@ -97,3 +97,63 @@ def merge_session_events(session_id: str) -> list[SessionEvent]:
         events.extend(read_agent_wire(wire, _agent_id_from_wire_path(wire)))
     events.sort(key=lambda e: (e.ts, e.agent_id, e.seq, e.line_no))
     return events
+
+
+def _wire_first_meta(main_wire: Path) -> dict:
+    """从主 agent wire 早停扫出列表展示用的元信息（model/start_ts/首条 user 文本）。"""
+    model = start_ts = first_user_msg = ""
+    for _, obj in _iter_json_lines(main_wire):
+        if not start_ts:
+            start_ts = obj.get("ts", "")
+        if not model and obj.get("model"):
+            model = obj.get("model", "")
+        if obj.get("type") == "user_message" and not first_user_msg:
+            first_user_msg = obj.get("text") or ""
+            break
+    return {"model": model, "start_ts": start_ts, "first_user_msg": first_user_msg}
+
+
+def list_wire_sessions() -> list[dict]:
+    """列出 ``~/.nanocode/sessions/*`` 下含 per-agent wire 的会话（按 mtime 倒序）。"""
+    root = sessions_dir()
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    for sdir in root.iterdir():
+        if not sdir.is_dir():
+            continue
+        wires = session_agent_wires(sdir.name)
+        if not wires:
+            continue
+        n_events = 0
+        for w in wires:
+            try:
+                n_events += sum(1 for ln in w.read_text(encoding="utf-8").splitlines() if ln.strip())
+            except Exception:
+                pass
+        main_wire = sdir / "agents" / "main" / "wire.jsonl"
+        meta = _wire_first_meta(main_wire) if main_wire.exists() else {
+            "model": "", "start_ts": "", "first_user_msg": ""}
+        try:
+            mtime = max(w.stat().st_mtime for w in wires)
+        except Exception:
+            mtime = 0.0
+        out.append({"session_id": sdir.name, "n_events": n_events,
+                    "n_agents": len(wires), "mtime": mtime, **meta})
+    out.sort(key=lambda s: s["mtime"], reverse=True)
+    return out
+
+
+def resolve_wire_session(arg: str) -> str:
+    """``arg='latest'`` → 最新；否则按 session_id 前缀匹配（0→FileNotFoundError，多→ValueError）。"""
+    sessions = list_wire_sessions()
+    if not sessions:
+        raise FileNotFoundError("no wire sessions found under ~/.nanocode/sessions/")
+    if arg == "latest":
+        return sessions[0]["session_id"]  # 已按 mtime 倒序
+    matches = [s["session_id"] for s in sessions if s["session_id"].startswith(arg)]
+    if not matches:
+        raise FileNotFoundError(f"no wire session matching '{arg}'")
+    if len(matches) > 1:
+        raise ValueError("ambiguous session id '" + arg + "': " + ", ".join(sorted(matches)))
+    return matches[0]
