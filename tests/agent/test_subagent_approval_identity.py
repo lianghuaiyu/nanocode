@@ -107,3 +107,60 @@ def test_confirm_dedupe_key_is_identity_scoped_for_subagents():
     assert "agent-001" in ka and "agent-002" in kb
     # main agent uses the raw message (unchanged dedupe behavior)
     assert parent._confirm_dedupe_key(msg) == msg
+
+
+# ─── Holistic review HIGH: identity-scoped dedupe is enforced end-to-end ──
+
+
+def test_confirm_if_needed_dedupes_within_agent_but_not_across_siblings():
+    """End-to-end on the shared decision both backends call: a sibling sub-agent's
+    prior approval of the SAME raw message must NOT let another sub-agent skip its
+    own identity-bearing confirmation. (Reverting to raw-message dedupe fails this.)"""
+    shared = set()
+    parent = Agent(api_key="test", trace_enabled=False, permission_mode="default",
+                   session_id="apdedupe", confirmed_paths=shared)
+    prompts = []
+
+    def make(artifact_id):
+        sub = parent._build_sub_agent(system_prompt="s", tools=tool_definitions,
+                                      agent_type="coder", artifact_id=artifact_id)
+
+        async def _cf(message):
+            prompts.append((artifact_id, message))
+            return True   # approve
+
+        sub.confirm_fn = _cf
+        return sub
+
+    a = make("agent-001")
+    b = make("agent-002")
+    msg = "rm -rf build/"
+
+    # A confirms once, then is deduped on the repeat (same agent)
+    assert asyncio.run(a._confirm_if_needed(msg)) is True
+    assert asyncio.run(a._confirm_if_needed(msg)) is True
+    # B must STILL be prompted (sibling approval not reused)
+    assert asyncio.run(b._confirm_if_needed(msg)) is True
+
+    a_prompts = [m for (aid, m) in prompts if aid == "agent-001"]
+    b_prompts = [m for (aid, m) in prompts if aid == "agent-002"]
+    assert len(a_prompts) == 1   # A prompted once (second call deduped)
+    assert len(b_prompts) == 1   # B prompted despite A's prior approval
+    # the messages carried each agent's identity
+    assert "agent-001" in a_prompts[0]
+    assert "agent-002" in b_prompts[0]
+
+
+def test_confirm_if_needed_denial_not_cached():
+    """A denied action must not be cached as approved (re-prompts next time)."""
+    parent = _agent()
+    sub = parent._build_sub_agent(system_prompt="s", tools=tool_definitions,
+                                  agent_type="coder", artifact_id="agent-001")
+    answers = iter([False, True])
+
+    async def _cf(message):
+        return next(answers)
+
+    sub.confirm_fn = _cf
+    assert asyncio.run(sub._confirm_if_needed("danger")) is False  # denied
+    assert asyncio.run(sub._confirm_if_needed("danger")) is True   # re-prompted, approved

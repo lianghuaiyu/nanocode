@@ -269,12 +269,10 @@ class AnthropicBackendMixin:
                     print_info(f"Denied: {perm.get('message', '')}")
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
                     continue
-                if perm["action"] == "confirm" and perm.get("message") and self._confirm_dedupe_key(perm["message"]) not in self._confirmed_paths:
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
+                if perm["action"] == "confirm" and perm.get("message"):
+                    if not await self._confirm_if_needed(perm["message"]):
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
                         continue
-                    self._confirmed_paths.add(self._confirm_dedupe_key(perm["message"]))
 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)

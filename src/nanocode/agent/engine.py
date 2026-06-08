@@ -2009,6 +2009,21 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         被 B 静默复用、跳过带身份的确认」。主 agent 用原始消息（不变）。"""
         return self._decorate_confirm_message(message)
 
+    async def _confirm_if_needed(self, message: str) -> bool:
+        """统一的「危险动作确认 + 共享去重」决策——两后端共用（端到端可测、防变异）。
+
+        返回 True=放行（此前已按本 agent 身份确认过，或刚确认通过）；False=拒绝。
+        去重键经 _confirm_dedupe_key 按子 agent 身份隔离：兄弟子 agent 的批准互不复用。"""
+        if not message:
+            return True
+        key = self._confirm_dedupe_key(message)
+        if key in self._confirmed_paths:
+            return True
+        if not await self._confirm_dangerous(message):
+            return False
+        self._confirmed_paths.add(key)
+        return True
+
     def _decorate_confirm_message(self, command: str) -> str:
         """子 agent 确认消息前缀加身份标识（[sub-agent <id> type=<t> source=<s>]）。
         主 agent（非子）原样返回。"""
