@@ -282,8 +282,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         """
         # 1) per-agent wire sink（always-on，独立文件）
         sinks: list = []
+        start_seq = 0
         try:
             wire_path = _session_v2.agent_wire_path(self.session_id, self.artifact_id)
+            # resume-safe：从既有 wire tail 续 seq，避免 evt_{agent_id}_{seq} 跨运行碰撞。
+            from ..events.reader import next_seq_from_wire
+            start_seq = next_seq_from_wire(wire_path)
             sinks.append(JsonlSink(wire_path))
         except Exception:
             pass  # 仪表化绝不影响 agent 启动
@@ -304,7 +308,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             parent_session_id = os.environ.get("NANOCODE_TRACE_PARENT", "").strip() or None
 
         tracer = Tracer(self.session_id, [*sinks, *debug_sinks],
-                        parent_session_id=parent_session_id)
+                        parent_session_id=parent_session_id,
+                        agent_id=self.artifact_id, start_seq=start_seq)
         # 标记 debug sink，供子 agent 继承（区别于 per-agent wire sink）。
         tracer._debug_sinks = debug_sinks
         return tracer
@@ -398,6 +403,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 print(f"[mcp] Init failed: {e}", flush=True)
 
         self._aborted = False
+        self.tracer.begin_turn()  # 一次用户输入 = 一个 turn；后续事件携带该 turn_id
         self.tracer.emit("user_message", text=user_message)
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.current_task()

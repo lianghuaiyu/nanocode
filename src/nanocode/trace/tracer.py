@@ -1,21 +1,55 @@
-"""Tracer：在明确节点 emit 事件给各 sink；关闭态为零开销 no-op。"""
+"""Tracer：在明确节点 emit 事件给各 sink；关闭态为零开销 no-op。
+
+事件 spine（docs/09「现有事件源对账」）：Tracer 在原有事件 dict 上 **flat-additive**
+地补 envelope 树链接字段——`id`/`agent_id`/`branch_id`/`parent_id`/`turn_id`——使
+per-agent `wire.jsonl` 成为 Pi 风格的盘上 entry tree。所有 enrich 逻辑都在 emit 的
+try 内，保住「instrumentation 绝不影响 agent」。
+"""
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
 from typing import Any
 
+from ..events.models import event_id
 from .sinks import Sink
 
 SCHEMA_VERSION = 1
 
 
 class Tracer:
-    def __init__(self, session_id: str, sinks: "list[Sink]", parent_session_id: "str | None" = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        sinks: "list[Sink]",
+        parent_session_id: "str | None" = None,
+        *,
+        agent_id: str = "main",
+        branch_id: str = "main",
+        start_seq: int = 0,
+    ) -> None:
         self.session_id = session_id
         self.parent_session_id = parent_session_id
         self.sinks = sinks
-        self._seq = 0
+        self.agent_id = agent_id
+        self.branch_id = branch_id
+        self._seq = start_seq
+        # resume-safe 链接：若从 wire tail 续号（start_seq>0），首个新事件的 parent
+        # 即上一轮 tail 的（可确定性反推的）id evt_{agent_id}_{start_seq-1}。
+        self._last_event_id: "str | None" = (
+            event_id(agent_id, start_seq - 1) if start_seq > 0 else None
+        )
+        self._turn_id: "str | None" = None
+
+    def begin_turn(self, turn_id: "str | None" = None) -> str:
+        """标记一个 turn（一次用户输入）的开始；后续事件携带该 turn_id。
+
+        缺省 turn_id 由 **resume-safe 的 seq** 派生（``turn_{agent_id}_{seq}``，seq 为本
+        turn 首个事件的序号）——而非可重置计数器，否则 resume 后新 turn 会与上一轮的
+        ``turn_1`` 碰撞（与 event id 同一类 resume 安全问题）。调用方亦可显式传 turn_id。
+        """
+        self._turn_id = turn_id or f"turn_{self.agent_id}_{self._seq}"
+        return self._turn_id
 
     def emit(self, type: str, **fields: Any) -> None:
         try:
@@ -28,6 +62,14 @@ class Tracer:
                 "type": type,
                 **fields,
             }
+            # envelope 树链接字段（authoritative，置于 **fields 之后以覆盖意外同名 payload）。
+            ev_id = event_id(self.agent_id, self._seq)
+            event["id"] = ev_id
+            event["agent_id"] = self.agent_id
+            event["branch_id"] = self.branch_id
+            event["parent_id"] = self._last_event_id
+            event["turn_id"] = self._turn_id
+            self._last_event_id = ev_id
             self._seq += 1
         except Exception:
             return
@@ -37,8 +79,14 @@ class Tracer:
             except Exception:
                 pass  # instrumentation 绝不影响 agent
 
-    def child(self, session_id: str) -> "Tracer":
-        return Tracer(session_id, self.sinks, parent_session_id=self.session_id)
+    def child(self, session_id: str, agent_id: "str | None" = None) -> "Tracer":
+        return Tracer(
+            session_id,
+            self.sinks,
+            parent_session_id=self.session_id,
+            agent_id=agent_id or session_id,
+            branch_id=self.branch_id,
+        )
 
     def close(self) -> None:
         for sink in self.sinks:
@@ -53,6 +101,11 @@ class NullTracer:
 
     session_id = ""
     parent_session_id = None
+    agent_id = "main"
+    branch_id = "main"
+
+    def begin_turn(self, *args: Any, **kwargs: Any) -> str:
+        return ""
 
     def emit(self, *args: Any, **kwargs: Any) -> None:
         pass
