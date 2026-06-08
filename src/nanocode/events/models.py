@@ -48,6 +48,10 @@ def event_id(agent_id: str, seq: int) -> str:
     因 seq 在 resume 时从既有 wire tail 续号（见 reader.next_seq_from_wire 与
     Tracer.start_seq），跨运行不重号；且 legacy 行虽未存 id，也可由 (agent_id, seq)
     反推（agent_id 由读侧从文件路径注入），故 resume 的 legacy→new 边界链接无缝。
+
+    约束：``agent_id`` 必须不含分隔符 ``_``（现状 artifact_id 为 ``main`` / ``agent-NNN``，
+    用连字符）。id 当作**不透明键**使用（相等比较 / parent 指针），含 ``_`` 不会立即出错，
+    但会破坏未来任何按 ``_`` 反解析 id 的逻辑——勿引入带下划线的 agent_id。
     """
     return f"evt_{agent_id}_{seq}"
 

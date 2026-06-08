@@ -86,6 +86,11 @@ def merge_session_events(session_id: str) -> list[SessionEvent]:
 
     展示序 = (ts, agent_id, seq, line_no)，稳定、可复现。这是**展示序、非因果序**——
     跨兄弟 agent 不承诺全序；因果链只在单 agent 内由 `parent_id` 保证。
+
+    注意：`ts` 按**字符串**排序，等价于时间序仅因唯一写者 `Tracer.emit` 恒用
+    `datetime.now(timezone.utc).isoformat()`（定宽 `+00:00`）。若将来引入第二个/外部写者，
+    或 legacy 行带非 UTC 偏移（如 `+08:00`）或 `Z` 后缀的 `timestamp`，字符串序会与时间序
+    背离（仅影响展示，不影响 parent_id 因果）——届时应在此改为解析为 UTC datetime 再排序。
     """
     events: list[SessionEvent] = []
     for wire in session_agent_wires(session_id):

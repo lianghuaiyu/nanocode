@@ -127,3 +127,22 @@ def test_null_tracer_begin_turn_and_emit_are_noops():
     assert n.begin_turn() == ""
     n.emit("anything", x=1)  # 不抛
     assert n.child("k") is n
+
+
+def test_envelope_keys_are_authoritative_over_payload_kwargs():
+    """EVT-1 回归：payload kwarg 不得篡改 envelope（尤其 seq——id 由它派生）。"""
+    sink = MemSink()
+    t = Tracer("real-sess", [sink], agent_id="main")
+    # 恶意/意外的同名 payload：试图覆盖 envelope 字段
+    # （type 是位置参数，无法作 kwarg 传入——本就安全；故只测其余 envelope 键）
+    t.emit("tool_call", seq=777, ts="FAKE", session_id="OTHER", v=999,
+           agent_id="evil", id="evil", parent_id="evil", turn_id="evil")
+    e = sink.events[0]
+    assert e["seq"] == 0 and e["id"] == "evt_main_0"   # seq/id 由 envelope 主宰
+    assert e["session_id"] == "real-sess" and e["v"] == 1
+    assert e["agent_id"] == "main" and e["ts"] != "FAKE"
+    assert e["type"] == "tool_call"
+    # 下一条续号正常（未被 seq=777 污染）
+    t.emit("tool_result")
+    assert sink.events[1]["seq"] == 1 and sink.events[1]["id"] == "evt_main_1"
+    assert sink.events[1]["parent_id"] == "evt_main_0"

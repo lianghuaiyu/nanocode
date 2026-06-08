@@ -53,16 +53,16 @@ class Tracer:
 
     def emit(self, type: str, **fields: Any) -> None:
         try:
-            event = {
-                "v": SCHEMA_VERSION,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "session_id": self.session_id,
-                "parent_session_id": self.parent_session_id,
-                "seq": self._seq,
-                "type": type,
-                **fields,
-            }
-            # envelope 树链接字段（authoritative，置于 **fields 之后以覆盖意外同名 payload）。
+            # payload 先铺底，envelope 字段随后**全部**覆盖写入——确保 envelope 对所有键
+            # authoritative（含 v/ts/session_id/parent_session_id/seq/type）。否则同名 payload
+            # kwarg（如误传 seq=）会篡改 envelope，造成 id↔seq 错位、resume 续号被污染。
+            event = dict(fields)
+            event["v"] = SCHEMA_VERSION
+            event["ts"] = datetime.now(timezone.utc).isoformat()
+            event["session_id"] = self.session_id
+            event["parent_session_id"] = self.parent_session_id
+            event["seq"] = self._seq
+            event["type"] = type
             ev_id = event_id(self.agent_id, self._seq)
             event["id"] = ev_id
             event["agent_id"] = self.agent_id
@@ -80,6 +80,13 @@ class Tracer:
                 pass  # instrumentation 绝不影响 agent
 
     def child(self, session_id: str, agent_id: "str | None" = None) -> "Tracer":
+        """[test/legacy 用途] 派生一个共享 sinks 的子 Tracer。
+
+        注意：生产中的子 agent **不**走这里——它们经 ``Agent(...) -> _build_tracer`` 构造，
+        那里用 ``next_seq_from_wire`` 算出 ``start_seq``（resume-safe）并取 ``agent_id=artifact_id``。
+        本方法不接 ``start_seq``（恒从 seq 0 起，非 resume-safe），仅供测试/历史调用；新代码
+        请走 ``_build_tracer`` 路径，勿用 ``child()`` 挂生产 wire，否则会重开 id 碰撞。
+        """
         return Tracer(
             session_id,
             self.sinks,
