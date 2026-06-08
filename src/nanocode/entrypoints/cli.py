@@ -672,14 +672,14 @@ async def run_repl(agent: Agent) -> None:
                 else:
                     detail = agent_definition_detail_text(arg)
                     print(detail if detail is not None
-                          else subagent_detail_text(agent.task_manager, arg))
+                          else subagent_detail_text(agent.task_manager, arg, agent.session_id))
             else:
                 print_error("Usage: /agents [available|running|show <name|id>]")
             continue
         if inp.startswith("/agent "):
             from ..tools.tasks_tool import subagent_detail_text
             aid = inp.split(maxsplit=1)[1].strip()
-            print(subagent_detail_text(agent.task_manager, aid))
+            print(subagent_detail_text(agent.task_manager, aid, agent.session_id))
             continue
 
         # Skill invocation: /<skill-name> [args]

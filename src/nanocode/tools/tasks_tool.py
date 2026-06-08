@@ -68,7 +68,7 @@ def list_subagents_text(manager) -> str:
         for a in sorted(subs, key=lambda x: x.id))
 
 
-def subagent_detail_text(manager, agent_id: str) -> str:
+def subagent_detail_text(manager, agent_id: str, session_id: str | None = None) -> str:
     a = manager.get_subagent(agent_id)
     if a is None:
         return f"Unknown sub-agent: {agent_id}"
@@ -82,6 +82,18 @@ def subagent_detail_text(manager, agent_id: str) -> str:
         parts.append(f"Messages: {a.message_path}")
     if a.task_id:
         parts.append(f"Task: {a.task_id}")
+    # P2 artifacts: surface wire.jsonl / result.md paths if they exist on disk.
+    if session_id:
+        try:
+            from ..session import v2 as _v2
+            d = _v2.session_root(session_id) / "agents" / a.id
+            for label, fname in (("Wire", "wire.jsonl"), ("Result", "result.md"),
+                                 ("Meta", "meta.json"), ("Prompt", "prompt.txt")):
+                p = d / fname
+                if p.exists():
+                    parts.append(f"{label}: {p}")
+        except Exception:
+            pass
     return "\n".join(parts)
 
 

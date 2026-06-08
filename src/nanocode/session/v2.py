@@ -47,12 +47,51 @@ def read_main_messages(session_id: str) -> list:
     return _read_json(session_root(session_id) / "main" / "messages.json", [])
 
 
+def agent_dir(session_id: str, agent_id: str) -> Path:
+    """每个 agent 的 artifact 主目录 = <session>/agents/<agent_id>/。
+
+    主 agent 用 agent_id="main"；子 agent 用其 SubAgentRecord id（如 "agent-001"）。
+    messages.json / meta.json / prompt.txt / result.md / wire.jsonl 全部落在此目录下，
+    保证「同一 agent 的全部产物自包含于一处」。
+    """
+    d = session_root(session_id) / "agents" / agent_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def write_agent_messages(session_id: str, agent_id: str, messages: list) -> None:
-    _write_json(session_root(session_id) / "agents" / agent_id / "messages.json", messages)
+    _write_json(agent_dir(session_id, agent_id) / "messages.json", messages)
 
 
 def read_agent_messages(session_id: str, agent_id: str) -> list:
-    return _read_json(session_root(session_id) / "agents" / agent_id / "messages.json", [])
+    return _read_json(agent_dir(session_id, agent_id) / "messages.json", [])
+
+
+def write_agent_meta(session_id: str, agent_id: str, meta: dict) -> None:
+    """写 <agent_dir>/meta.json（spawn 时 status=running，完成时补 status/ended_at）。"""
+    _write_json(agent_dir(session_id, agent_id) / "meta.json", meta)
+
+
+def read_agent_meta(session_id: str, agent_id: str) -> dict | None:
+    p = agent_dir(session_id, agent_id) / "meta.json"
+    return _read_json(p, None) if p.exists() else None
+
+
+def write_agent_prompt(session_id: str, agent_id: str, prompt: str) -> None:
+    """写 <agent_dir>/prompt.txt（spawn 时落子 agent 的任务 prompt）。"""
+    (agent_dir(session_id, agent_id) / "prompt.txt").write_text(prompt or "", encoding="utf-8")
+
+
+def write_agent_result(session_id: str, agent_id: str, text: str) -> str:
+    """写 <agent_dir>/result.md（完成时落最终 assistant 文本），返回路径字符串。"""
+    p = agent_dir(session_id, agent_id) / "result.md"
+    p.write_text(text or "", encoding="utf-8")
+    return str(p)
+
+
+def agent_wire_path(session_id: str, agent_id: str) -> Path:
+    """每个 agent 的 always-on 事件账本 <agent_dir>/wire.jsonl 的路径。"""
+    return agent_dir(session_id, agent_id) / "wire.jsonl"
 
 
 def task_dir(session_id: str, task_id: str) -> Path:
