@@ -290,3 +290,59 @@ def test_empty_output_envelope_does_not_say_truncated():
         {"type": "coder", "description": "d", "prompt": "p"}))
     assert "truncated" not in res
     assert "no output" in res.lower()
+
+
+# ─── Holistic review HIGH: terminal (timeout/error) cost + breadcrumb ──
+
+
+def test_timed_out_subagent_folds_tokens_into_parent():
+    """Cost safety: a sub-agent that spends tokens then times out must still fold
+    that spend into the parent (else max_cost_usd is blind to runaway sub-agents)."""
+    parent = _agent()
+    real_build = parent._build_sub_agent
+
+    def _spy(**kw):
+        sub = real_build(**kw)
+
+        async def _ro(prompt):
+            sub.total_input_tokens = 1234   # simulate spend before the timeout
+            sub.total_output_tokens = 567
+            await asyncio.sleep(30)
+            return {"text": "never", "tokens": {"input": 0, "output": 0}}
+
+        sub.run_once = _ro
+        return sub
+
+    parent._build_sub_agent = _spy
+    before_in, before_out = parent.total_input_tokens, parent.total_output_tokens
+    res = asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "p", "timeout_ms": 30}))
+    assert "timed out" in res.lower()
+    assert parent.total_input_tokens == before_in + 1234   # folded despite timeout
+    assert parent.total_output_tokens == before_out + 567
+
+
+def test_timed_out_subagent_envelope_surfaces_files_modified():
+    """A sub-agent that modified files then timed out must give the parent a
+    breadcrumb (files_modified + a pointer), not a bare '[timed out]' string."""
+    parent = _agent()
+    real_build = parent._build_sub_agent
+
+    def _spy(**kw):
+        sub = real_build(**kw)
+
+        async def _ro(prompt):
+            sub._files_modified.add("/repo/touched.py")   # host-observed before timeout
+            await asyncio.sleep(30)
+
+        sub.run_once = _ro
+        return sub
+
+    parent._build_sub_agent = _spy
+    res = asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "p", "timeout_ms": 30}))
+    assert "timed out" in res.lower()
+    assert "touched.py" in res          # files_modified surfaced
+    # subagent record points at a persisted result.md
+    sub = parent.task_manager.get_subagent("agent-001")
+    assert sub.last_result_path and sub.last_result_path.endswith("result.md")

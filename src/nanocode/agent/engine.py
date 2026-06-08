@@ -1116,15 +1116,21 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         """
         raw_text = raw_text or ""
         result_path = result.get("result_path")
+        explicit_summary = (result.get("summary") or "").strip()
         small = len(raw_text.encode("utf-8")) <= self._ENVELOPE_PASSTHROUGH_BYTES
         if not raw_text.strip():
-            # 空输出：别用 "truncated"（什么都没截）；仍给出 result_path 指针。
-            body = (f"(sub-agent produced no output; see {result_path})"
-                    if result_path else "(sub-agent produced no output)")
+            # 空 transcript：若调用方已显式给了 summary（如超时/错误终态的原因），用它；
+            # 否则给"无输出"提示。两种都仍带 result_path 指针。
+            if explicit_summary:
+                body = explicit_summary + (f"\nFull result at {result_path}, use read_file"
+                                           if result_path else "")
+            else:
+                body = (f"(sub-agent produced no output; see {result_path})"
+                        if result_path else "(sub-agent produced no output)")
         elif small:
             body = raw_text.strip()
         else:
-            summary = (result.get("summary") or "").strip() or "(no summary)"
+            summary = explicit_summary or "(no summary)"
             pointer = (f"\n... [truncated — full result at {result_path}, use read_file]"
                        if result_path else
                        "\n... [truncated — full result not persisted]")
@@ -1154,6 +1160,44 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         lines.append(f"Tokens: {tok.get('input', 0)} in / {tok.get('output', 0)} out")
         lines.append(f"Result: {result_path or '(not persisted)'}")
         return "\n".join(lines)
+
+    def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
+        """把子 agent 已花费的 token 折叠进父——成功/超时/错误都要折，否则一个跑了很久
+        才超时/出错的子 agent 对 max_cost_usd 完全不可见（runaway 成本黑洞）。子 agent
+        是全新实例（从 0 起算），故其 total_*_tokens 即为本次增量。"""
+        try:
+            self.total_input_tokens += getattr(sub_agent, "total_input_tokens", 0) or 0
+            self.total_output_tokens += getattr(sub_agent, "total_output_tokens", 0) or 0
+        except Exception:
+            pass
+
+    def _write_terminal_result(self, agent_id: str, sub_agent, reason: str) -> str | None:
+        """终态（超时/错误）写 result.md：有 partial 输出就写它，否则写 reason。
+        返回路径，供 task.result_path/last_result_path——让 reminder 指向 agent_dir
+        而非渲染误导性的空 shell 日志。"""
+        partial = "".join(getattr(sub_agent, "_output_buffer", None) or []) if sub_agent else ""
+        return self._write_agent_result(agent_id, partial or reason)
+
+    def _finalize_foreground_terminal(self, sub_agent: "Agent", record_id: str,
+                                      kind: str, payload, timeout_ms: int | None) -> str:
+        """前台 timeout/error 终态共用：折叠 token（成本可见）+ 落 partial result.md +
+        回传带宿主派生 files_modified 的最小信封（而非裸 '[timed out]' 字符串），
+        使「改了文件后超时」的子 agent 也给父留下面包屑。"""
+        self._fold_subagent_tokens(sub_agent)
+        partial = "".join(getattr(sub_agent, "_output_buffer", None) or [])
+        reason = (f"[sub-agent timed out after {timeout_ms} ms]" if kind == "timeout"
+                  else str(payload))
+        result_path = self._write_agent_result(record_id, partial or reason)
+        if result_path:
+            try:
+                self.task_manager.update_subagent(record_id, last_result_path=result_path)
+            except Exception:
+                pass
+        agent_result = self._build_agent_result(
+            sub_agent, partial or reason, {"input": 0, "output": 0}, result_path)
+        agent_result["summary"] = reason + (
+            " — partial transcript persisted" if partial else "")
+        return self._render_agent_result_envelope(agent_result, "")
 
     def _finalize_foreground_result(self, sub_agent: "Agent", result: dict,
                                     result_path: str | None, record_id: str | None) -> str:
@@ -1255,20 +1299,28 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         if kind == "timeout":
             # SUBAGENT_STATUSES 现含 timed_out；保留既有约定：task=timed_out, sub=failed。
+            self._fold_subagent_tokens(sub_agent)  # 成本可见：超时也折算 token
+            rp = self._write_terminal_result(agent_id, sub_agent,
+                                             f"(timed out after {timeout_ms}ms)")
             self.task_manager.update_task(
-                task_id, status="timed_out",
+                task_id, status="timed_out", result_path=rp,
                 result_summary=f"(timed out after {timeout_ms}ms)")
-            self.task_manager.update_subagent(agent_id, status="failed")
+            self.task_manager.update_subagent(agent_id, status="failed",
+                                              last_result_path=rp)
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "timed_out")
             print_sub_agent_end(agent_type, description)
             return
         if kind == "error":
+            self._fold_subagent_tokens(sub_agent)  # 成本可见：出错也折算 token
+            rp = self._write_terminal_result(agent_id, sub_agent,
+                                             f"(sub-agent error: {payload})")
             self.task_manager.update_task(
-                task_id, status="failed", error=str(payload),
+                task_id, status="failed", error=str(payload), result_path=rp,
                 result_summary=f"(sub-agent error: {payload})")
-            self.task_manager.update_subagent(agent_id, status="failed")
+            self.task_manager.update_subagent(agent_id, status="failed",
+                                              last_result_path=rp)
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "failed")
@@ -1840,7 +1892,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self._finalize_agent_meta(
                     resume_id, "timed_out" if kind == "timeout" else "failed")
                 print_sub_agent_end(rec.type, description)
-                return payload  # type: ignore[return-value]
+                return self._finalize_foreground_terminal(
+                    sub_agent, resume_id, kind, payload, eff_timeout)
             result = payload  # type: ignore[assignment]
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
@@ -1906,7 +1959,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._finalize_agent_meta(
                 rec.id, "timed_out" if kind == "timeout" else "failed")
             print_sub_agent_end(agent_type, description)
-            return payload  # type: ignore[return-value]
+            return self._finalize_foreground_terminal(
+                sub_agent, rec.id, kind, payload, eff_timeout)
         result = payload  # type: ignore[assignment]
         self.total_input_tokens += result["tokens"]["input"]
         self.total_output_tokens += result["tokens"]["output"]
