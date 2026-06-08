@@ -32,18 +32,18 @@ def _read_only_sub(parent):
 # ─── keystone: out-of-set real tool is blocked at call time ──────
 
 
-def test_readonly_subagent_write_file_blocked():
+def test_readonly_subagent_write_file_blocked(tmp_path):
     parent = _agent()
     sub = _read_only_sub(parent)
+    target = tmp_path / "should_not_write.txt"
     # write_file is NOT in the explore allowlist -> blocked before dispatch.
     res = asyncio.run(sub._execute_tool_call(
-        "write_file", {"file_path": "/tmp/should_not_write.txt", "content": "x"}))
+        "write_file", {"file_path": str(target), "content": "x"}))
     assert isinstance(res, str)
     assert "not permitted" in res.lower()
     assert "write_file" in res
     # And the file was never created (dispatch was short-circuited).
-    import os
-    assert not os.path.exists("/tmp/should_not_write.txt")
+    assert not target.exists()
 
 
 def test_readonly_subagent_allowed_tool_still_runs(tmp_path):

@@ -391,3 +391,28 @@ def test_skill_fork_swallowed_cancel_is_not_marked_completed(monkeypatch):
     assert subs[0].status == "cancelled"   # NOT "completed"
     meta = _read_meta("forkcancel", subs[0].id)
     assert meta and meta["status"] == "cancelled"
+
+
+def test_foreground_timeout_finalizes_meta_timed_out():
+    """Holistic review MED (P1 timeout × P2 meta): a timed-out foreground sub-agent
+    must finalize agents/<id>/meta.json to status='timed_out' (mutation: mislabeling
+    it 'failed' would otherwise pass)."""
+    parent = _agent(session_id="tometa")
+    real_build = parent._build_sub_agent
+
+    def _spy(**kw):
+        sub = real_build(**kw)
+
+        async def _ro(prompt):
+            await asyncio.sleep(30)
+
+        sub.run_once = _ro
+        return sub
+
+    parent._build_sub_agent = _spy
+    asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "p", "timeout_ms": 25}))
+    meta = _session_v2.read_agent_meta("tometa", "agent-001")
+    assert meta is not None
+    assert meta["status"] == "timed_out"   # NOT "failed"/"completed"
+    assert meta.get("ended_at")

@@ -274,8 +274,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         - wire sink 永远独立：写 agent_dir(session, artifact_id)/wire.jsonl，绝不与父
           复用（否则所有子 agent 事件会并进父文件）。
-        - debug sink 沿用旧 trace_parent.child() 语义：父若开了 debug trace，子继承同一组
-          debug sink（共写 ./.nanocode/traces/<parent_sid>.jsonl）。父用 _debug_sinks 标记。
+        - debug sink：子继承父的 _debug_sinks（父若开了 debug trace，子共写
+          ./.nanocode/traces/<parent_sid>.jsonl）；但 wire sink 是各自独立的。
         - parent_session_id：子 agent = 父 session_id；主 agent = NANOCODE_TRACE_PARENT env。
         - 失败保护：JsonlSink 已对 I/O 故障自禁用；wire 路径解析若抛错也吞掉、退化为无 wire
           sink，绝不让 __init__ 失败。
