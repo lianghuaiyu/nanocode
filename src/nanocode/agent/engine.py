@@ -713,6 +713,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                         "is not available to sub-agents.")
             return await self._spawn_memory_consolidate()
         if name in ("enter_plan_mode", "exit_plan_mode"):
+            # Plan mode 是主 agent / REPL 流程，会改写 self.permission_mode。子 agent
+            # 若能 exit_plan_mode 就能把自己从 plan 放宽到 default——自我提权。禁用之。
+            if self.is_sub_agent:
+                return "Error: plan-mode tools are not available to sub-agents."
             return await self._execute_plan_mode_tool(name)
         if name == "agent":
             return await self._execute_agent_tool(inp)

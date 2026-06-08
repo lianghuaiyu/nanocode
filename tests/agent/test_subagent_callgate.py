@@ -274,3 +274,23 @@ def test_main_agent_task_stop_orphan_still_cancels():
     res = asyncio.run(parent._execute_tool_call("task_stop", {"task_id": t.id}))
     assert "marked cancelled" in res.lower()
     assert parent.task_manager.get_task(t.id).status == "cancelled"
+
+
+# ─── Holistic review HIGH: sub-agents cannot use plan-mode to self-escalate ──
+
+
+def test_subagent_cannot_use_plan_mode_to_escalate():
+    """A sub-agent inheriting permission_mode='plan' must NOT be able to call
+    exit_plan_mode to widen its own permission_mode."""
+    parent = _agent(permission_mode="plan")
+    sub = parent._build_sub_agent(
+        system_prompt="s", tools=tool_definitions, agent_type="coder")
+    assert sub.permission_mode == "plan"   # inherited
+    res = asyncio.run(sub._execute_tool_call("exit_plan_mode", {}))
+    assert "not available to sub-agents" in res.lower()
+    assert sub.permission_mode == "plan"   # unchanged — no self-escalation
+    res2 = asyncio.run(sub._execute_tool_call("enter_plan_mode", {}))
+    assert "not available to sub-agents" in res2.lower()
+    # main agent can still use plan mode
+    res3 = asyncio.run(parent._execute_tool_call("enter_plan_mode", {}))
+    assert "not available to sub-agents" not in res3.lower()
