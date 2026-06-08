@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 
 from .sandbox_backends.base import DEFAULT_PROTECTED_ROOTS
@@ -361,3 +362,76 @@ def reset_permission_cache() -> None:
     global _cached_rules, _cached_agents_config
     _cached_rules = None
     _cached_agents_config = None
+
+
+# ─── Sub-agent call-time allowlist (P4) ──────────────────────────
+# 纯宿主 meta 工具（无持久副作用、不经 execute_tool）→ allowlist 永不约束。
+# 注意：'memory'（save/update/delete 落真实 memory_tool）、'agent'（子不能 spawn 孙）、
+# 'skill'（fork/hook 可触达 shell）都【不在】此集——必须受 allowlist 约束。
+ALWAYS_ALLOWED_META = frozenset({
+    "task_list", "task_output", "task_stop",
+    "enter_plan_mode", "exit_plan_mode",
+})
+AGENT_META_TOOL = "agent"  # 'agent' 元工具：子 agent 一律不可调用（独立 fail-closed 后备）
+
+
+def allowlist_blocks(name: str, allowed_tool_names: "set[str] | None") -> bool:
+    """子 agent call-time allowlist 判定（纯函数；从 engine._tool_blocked_by_allowlist 上移）。
+
+    - allowed_tool_names 为 None（主 agent / 未约束）→ 永不拦截。
+    - 'agent' → 子 agent 一律拦截（独立后备，不依赖工具表是否剥了它）。
+    - 纯宿主 meta（task_*/plan_mode）→ 放行。
+    - 其余（含 memory/skill/run_shell/真实工具）→ 不在有效集内即拦截。
+    """
+    if allowed_tool_names is None:
+        return False
+    if name == AGENT_META_TOOL:
+        return True
+    if name in ALWAYS_ALLOWED_META:
+        return False
+    return name not in allowed_tool_names
+
+
+# ─── PermissionEngine：工具派发的单一可测决策点 ───────────────────
+
+@dataclass
+class Decision:
+    """一次工具派发授权的统一决策。
+
+    action: ``"allow" | "deny" | "confirm"``（``confirm`` == request-approval；沿用现有线值
+    以不改用户语义）。allowlist_blocked: 子 agent call-time allowlist 是否拦截——供 callgate
+    (_execute_tool_call) 据此 fail-closed。
+    """
+    action: str
+    message: str = ""
+    allowlist_blocked: bool = False
+
+
+class PermissionEngine:
+    """工具派发的单一决策点：合并权限策略(check_permission) + 子 agent allowlist。
+
+    纯决策——不弹审批 UI、不 emit 事件、不执行工具。审批交互由调用方据 ``action=="confirm"``
+    处理（保持 dedupe / 子 agent 身份装饰语义不变）；allowlist 的 fail-closed 兜底由 callgate
+    据 ``allowlist_blocked`` 施加。两后端 + callgate + 未来 App Server/SDK 都经此入口，policy
+    不再各处散落。
+
+    读取 agent 的 live 权限上下文（``permission_mode`` / ``_plan_file_path`` /
+    ``_allowed_tool_names``），故 mode/plan-file 随会话变化自动生效；单测可传任意带这三个
+    属性的对象。
+    """
+
+    def __init__(self, agent) -> None:
+        self._agent = agent
+
+    def allowlist_blocks(self, name: str) -> bool:
+        return allowlist_blocks(name, self._agent._allowed_tool_names)
+
+    def check(self, name: str, inp: dict) -> Decision:
+        """单一入口：返回 policy action + allowlist 标记（纯决策，无副作用）。"""
+        a = self._agent
+        policy = check_permission(name, inp, a.permission_mode, a._plan_file_path)
+        return Decision(
+            action=policy["action"],
+            message=policy.get("message", ""),
+            allowlist_blocked=self.allowlist_blocks(name),
+        )

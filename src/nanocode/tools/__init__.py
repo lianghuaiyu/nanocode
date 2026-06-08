@@ -8,6 +8,7 @@ from .permissions import (
     PermissionMode, READ_TOOLS, EDIT_TOOLS, CONCURRENCY_SAFE_TOOLS,
     check_permission, load_permission_rules, reset_permission_cache,
     load_agents_config,
+    PermissionEngine, Decision, allowlist_blocks,
 )
 from .execute import execute_tool
 from .run_shell import is_dangerous
@@ -18,5 +19,6 @@ __all__ = [
     "PermissionMode", "READ_TOOLS", "EDIT_TOOLS", "CONCURRENCY_SAFE_TOOLS",
     "check_permission", "load_permission_rules", "reset_permission_cache",
     "load_agents_config",
+    "PermissionEngine", "Decision", "allowlist_blocks",
     "execute_tool", "is_dangerous",
 ]

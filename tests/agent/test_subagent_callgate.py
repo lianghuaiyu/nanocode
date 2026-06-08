@@ -12,7 +12,8 @@ import asyncio
 
 import pytest
 
-from nanocode.agent.engine import Agent, _ALWAYS_ALLOWED_META
+from nanocode.agent.engine import Agent
+from nanocode.tools.permissions import ALWAYS_ALLOWED_META as _ALWAYS_ALLOWED_META
 from nanocode.tools import tool_definitions
 from nanocode.subagents import config
 
