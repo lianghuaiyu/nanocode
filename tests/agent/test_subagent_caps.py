@@ -289,3 +289,28 @@ def test_skill_fork_blocked_when_depth_exceeded(monkeypatch, tmp_path):
     assert "depth" in res.lower()
     # no skill-fork sub-agent record was created
     assert [s for s in sub.task_manager.list_subagents() if s.type == "skill-fork"] == []
+
+
+# ─── Holistic review MED: curators HONOR max_threads (not just count) ──
+
+
+def test_memory_consolidate_respects_max_threads(monkeypatch, tmp_path):
+    """Curators counted toward max_threads but never checked it (counted-but-not-capped).
+    A consolidate spawn must be refused when the cap is already reached."""
+    _set_agents_settings(monkeypatch, tmp_path, {"max_threads": 1})
+    monkeypatch.setattr("nanocode.agent.engine.build_curator_user_message",
+                        lambda: "memory: some content to consolidate", raising=False)
+
+    async def scenario():
+        parent = _agent()
+        t1 = _stub_running_bg_subagent(parent)   # fills the single slot
+        res = await parent._spawn_memory_consolidate()
+        # no new curator subagent record was created
+        curators = [s for s in parent.task_manager.list_subagents()
+                    if s.type == "memory-curator"]
+        t1.cancel()
+        return res, curators
+
+    res, curators = asyncio.run(scenario())
+    assert "max concurrent sub-agents" in res.lower()
+    assert curators == []

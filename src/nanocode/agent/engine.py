@@ -864,6 +864,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         from ..tools import load_agents_config
         return load_agents_config().get("max_threads") or 0
 
+    def _background_subagent_cap_reached(self) -> bool:
+        """后台子 agent 是否已达 max_threads 上限。curator/eval 与 agent 工具共用此判定，
+        使「计入」与「受限」一致——否则 curator 计入计数却不受限，自相矛盾。"""
+        mt = self._max_threads()
+        return mt > 0 and self._running_background_subagent_count() >= mt
+
     @staticmethod
     def _foreground_timeout(tool_timeout_ms, config: dict, fleet_cfg: dict):
         """前台子 agent 的有效超时：工具入参 > manifest 'timeout-ms' > settings
@@ -1215,10 +1221,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     # ─── Background sub-agent (detached, auto-deny-but-continue) ──
 
-    def _summarize_subagent_text(self, text: str) -> str:
-        """result_summary：截断子 agent 输出首 500 字符。"""
-        return (text or "")[:500]
-
     def _write_subagent_result(self, task_id: str, text: str) -> str | None:
         """把子 agent 完整输出写到 task_dir/result.md，返回路径（失败返回 None）。"""
         try:
@@ -1361,6 +1363,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         user_message = build_curator_user_message()
         if user_message.startswith("No memory files"):
             return "No memories to consolidate."
+        if self._background_subagent_cap_reached():
+            return (f"Error: max concurrent sub-agents ({self._max_threads()}) reached; "
+                    f"memory consolidation not started — try again later.")
 
         description = "memory consolidation"
         sub_rec = self.task_manager.create_subagent(
@@ -1476,6 +1481,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         user_message = build_eval_curator_message()
         if user_message.startswith("No memory files"):
             return "No memories to generate eval candidates from."
+        if self._background_subagent_cap_reached():
+            return (f"Error: max concurrent sub-agents ({self._max_threads()}) reached; "
+                    f"memory eval not started — try again later.")
         # eval 候选 provenance 的 source.session_id 必须指向真实存在的 session，
         # 否则 add_pending 校验会拒掉全部候选。REPL 命令不走 chat()，在此显式落盘。
         self._persist_state()

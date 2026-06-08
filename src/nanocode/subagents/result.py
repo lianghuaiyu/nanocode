@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import re
 
-# 摘要回退长度（与既有 _summarize_subagent_text 对齐）。
+# 摘要回退长度（首 ~500 字符）。
 SUMMARY_FALLBACK_CHARS = 500
 # 模型自述 summary 的硬上限：信封 body 必须有界，与模型是否配合无关
 # （否则一个 12KB 的模型 summary 会原样撑进父上下文，挫败"有界"目标）。
