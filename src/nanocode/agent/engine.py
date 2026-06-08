@@ -17,7 +17,7 @@ import openai
 from ..tools import (
     tool_definitions,
     execute_tool,
-    check_permission,
+    PermissionEngine,
     CONCURRENCY_SAFE_TOOLS,
     get_active_tool_definitions,
     ToolDef,
@@ -97,15 +97,8 @@ SUBAGENT_MAX_TURNS_FALLBACK = 50
 
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
 # 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
-# 注意：'memory'（save/update/delete 会落到真实 memory_tool）、'agent'（子不能 spawn 孙）、
-# 'skill'（fork/hook 可触达 shell）都【不在】此集——它们必须受 allowlist 约束。
-_ALWAYS_ALLOWED_META = frozenset({
-    "task_list", "task_output", "task_stop",
-    "enter_plan_mode", "exit_plan_mode",
-})
-
-# 'agent' 元工具：子 agent 一律不可调用（独立 call-time 后备，见 _tool_blocked_by_allowlist）。
-_AGENT_META_TOOL = "agent"
+# Sub-agent call-time allowlist 的 meta 工具集与判定已上移至 tools.permissions
+# （ALWAYS_ALLOWED_META / AGENT_META_TOOL / allowlist_blocks），由 PermissionEngine 统一持有。
 
 
 async def _auto_deny_confirm(_command: str) -> bool:
@@ -157,6 +150,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # 工具名集（{t['name'] for t in cfg['tools']}，已剔除 agent + disallowed）。
         # _execute_tool_call 在 meta 工具拦截之后、真实工具派发之前据此 fail-closed。
         self._allowed_tool_names = allowed_tool_names
+        # 工具派发的单一决策点（policy + sub-agent allowlist）；读 agent live 上下文。
+        self.permission = PermissionEngine(self)
         # 代际深度：主 agent = 0，每下一层子 agent = 父 + 1。max_depth 纵深防御据此判定。
         self.depth = depth
         # 子 agent 身份（审批 UI / 诊断用）：类型 + 来源（自定义项目 agent 的 .md 路径）。
@@ -664,25 +659,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self.task_manager.update_task(t.id, injected=True)
 
     def _tool_blocked_by_allowlist(self, name: str) -> bool:
-        """P4：本次工具调用是否被 call-time allowlist 拦截。
+        """P4 call-time allowlist 判定——委托给 PermissionEngine（单一决策来源）。
 
-        - allowlist 为 None（主 agent / 未约束）→ 永不拦截。
-        - 'agent' → 子 agent 一律拦截（独立 fail-closed 后备，不依赖工具表是否剥了它）。
-        - 纯宿主 meta（task_*/plan_mode，无持久副作用、不经 execute_tool）→ 放行。
-        - 其余一切（含 memory / skill / run_shell / 真实工具）→ 不在有效集内即拦截。
-          memory 的 save/update/delete 会落到真实 memory_tool，skill 的 fork/hook 可触达
-          shell，故它们必须受 allowlist 约束、不能当作无条件放行的 meta。
-
-        run_shell 后台分支也经此判定（_execute_tool_call 在分流前先调本方法），所以
-        read-only agent 即便走 run_in_background 也无法绕过对 run_shell 的拦截。
+        语义见 tools.permissions.allowlist_blocks。保留本薄包装供 callgate
+        (_execute_tool_call) 与 hook-shell 路径 (_run_hook) 调用，二者即 fail-closed 兜底点。
         """
-        if self._allowed_tool_names is None:
-            return False
-        if name == _AGENT_META_TOOL:
-            return True  # 子 agent 永不可 spawn 孙——独立后备
-        if name in _ALWAYS_ALLOWED_META:
-            return False
-        return name not in self._allowed_tool_names
+        return self.permission.allowlist_blocks(name)
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         # P4 call-time allowlist enforcement（安全基石）：在任何真实工具派发（含
@@ -1994,6 +1976,26 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             sub_agent, result, result_path, rec.id)
 
     # ─── Shared ──────────────────────────────────────────────────
+
+    async def _authorize_dispatch(self, name: str, inp: dict) -> "tuple[bool, str | None]":
+        """两后端派发前共用的授权 + 审批交互（单一入口，de-dup）。返回 ``(allowed, denial)``。
+
+        - 经 ``self.permission.check`` 取 policy 决策并 emit ``permission_decision``；
+        - ``deny`` → 打印并返回 ``"Action denied: …"``；
+        - ``confirm`` → 走 ``_confirm_if_needed``（dedupe + 身份装饰）；拒则返回固定文案。
+
+        **allowlist 不在此判**——它是 ``_execute_tool_call`` 的 fail-closed 兜底（保持子 agent
+        拒绝消息 "Error: tool '…' is not permitted" 与 prompt-then-block 行为不变）。
+        """
+        d = self.permission.check(name, inp)
+        self.tracer.emit("permission_decision", tool=name, action=d.action, message=d.message)
+        if d.action == "deny":
+            print_info(f"Denied: {d.message}")
+            return False, f"Action denied: {d.message}"
+        if d.action == "confirm" and d.message:
+            if not await self._confirm_if_needed(d.message):
+                return False, "User denied this action."
+        return True, None
 
     async def _confirm_dangerous(self, command: str) -> bool:
         # P4 审批 UI 身份：子 agent 触发的确认必须带上子 agent 身份（id + type + source），

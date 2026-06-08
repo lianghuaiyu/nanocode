@@ -8,7 +8,7 @@ import json
 import time
 
 from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result
-from ..tools import check_permission, get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
+from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _to_openai_tools, _with_retry
 from .compaction import (
@@ -202,17 +202,11 @@ class OpenAIBackendMixin:
                 print_tool_call(fn_name, inp)
                 self.tracer.emit("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
 
-                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
-                self.tracer.emit("permission_decision", tool=fn_name,
-                                 action=perm["action"], message=perm.get("message", ""))
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+                # 单一决策入口（policy + 审批）；allowlist 兜底在 _execute_tool_call。
+                allowed, denial = await self._authorize_dispatch(fn_name, inp)
+                if not allowed:
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": denial})
                     continue
-                if perm["action"] == "confirm" and perm.get("message"):
-                    if not await self._confirm_if_needed(perm["message"]):
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
-                        continue
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
             # Phase 2: Group & execute (parallel for consecutive safe tools)

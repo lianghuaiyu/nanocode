@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result, render_thinking
-from ..tools import check_permission, get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
+from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _get_max_output_tokens, _with_retry
 from .compaction import (
@@ -185,8 +185,8 @@ class AnthropicBackendMixin:
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
-                    if perm["action"] == "allow":
+                    # 早执行判定经同一 PermissionEngine；allowlist 兜底仍在 _execute_tool_call。
+                    if self.permission.check(block["name"], block["input"]).action == "allow":
                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
@@ -261,18 +261,11 @@ class AnthropicBackendMixin:
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
-                # Permission check for tools not started early
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-                self.tracer.emit("permission_decision", tool=tu.name,
-                                 action=perm["action"], message=perm.get("message", ""))
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
+                # Permission check for tools not started early（单一决策入口 + 审批）
+                allowed, denial = await self._authorize_dispatch(tu.name, inp)
+                if not allowed:
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial})
                     continue
-                if perm["action"] == "confirm" and perm.get("message"):
-                    if not await self._confirm_if_needed(perm["message"]):
-                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
-                        continue
 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
