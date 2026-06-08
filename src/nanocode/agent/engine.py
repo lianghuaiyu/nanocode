@@ -17,7 +17,6 @@ import openai
 from ..tools import (
     tool_definitions,
     execute_tool,
-    check_permission,
     PermissionEngine,
     CONCURRENCY_SAFE_TOOLS,
     get_active_tool_definitions,

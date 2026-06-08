@@ -82,14 +82,61 @@ def test_callgate_blocks_even_when_backend_precheck_bypassed(tmp_path):
 
 
 def test_callgate_is_single_chokepoint_no_path_escapes(tmp_path, monkeypatch):
-    """把 allowlist 闸强制全拦截后，任何真实派发路径都不得执行到真实工具。
+    """把 allowlist 闸强制全拦截后，任何真实派发路径都不得执行到真实工具/后台 shell。
 
-    覆盖：前台 _execute_tool_call、后台 run_shell 分支。若将来新增一条绕过 callgate 的
-    派发路径，本测试会因真实工具被执行而失败。
+    覆盖：前台真实工具、CONCURRENCY_SAFE 工具（anthropic 早执行的工具类型，早执行也是
+    包 _execute_tool_call）、后台 run_shell 分支。若将来新增一条绕过 callgate 的派发路径，
+    本测试会因真实工具被执行 / 后台 shell 被 spawn 而失败。
     """
     parent = _agent()
     executed = []
-    # 记录真实工具是否被触达（_run_real_tool 是 callgate 之后的派发末端）
+    spawned = []
+    orig_real = parent._run_real_tool
+    orig_bg = parent._spawn_background_shell
+
+    async def _spy_real(name, inp):
+        executed.append(name)
+        return await orig_real(name, inp)
+
+    async def _spy_bg(*a, **k):
+        spawned.append(a)
+        return await orig_bg(*a, **k)
+
+    monkeypatch.setattr(parent, "_run_real_tool", _spy_real)
+    monkeypatch.setattr(parent, "_spawn_background_shell", _spy_bg)
+    # 强制 allowlist 闸全拦截（模拟「一切真实工具都不被允许」）
+    monkeypatch.setattr(parent.permission, "allowlist_blocks", lambda name: True)
+
+    # 前台真实工具
+    r1 = asyncio.run(parent._execute_tool_call("write_file", {"file_path": str(tmp_path / "a"), "content": "x"}))
+    assert "not permitted" in r1.lower()
+    # CONCURRENCY_SAFE 工具（anthropic 早执行就是包 _execute_tool_call 跑此类工具）
+    r2 = asyncio.run(parent._execute_tool_call("read_file", {"file_path": str(tmp_path / "missing")}))
+    assert "not permitted" in r2.lower()
+    # 后台 run_shell 分支（run_in_background 早于 meta 分流，必经 callgate）
+    r3 = asyncio.run(parent._execute_tool_call("run_shell", {"command": "echo x", "run_in_background": True}))
+    assert "not permitted" in r3.lower()
+
+    assert executed == [], f"real tool dispatched past the callgate: {executed}"
+    assert spawned == [], f"background shell spawned past the callgate: {spawned}"
+
+
+def test_early_streaming_safe_tool_starts_then_blocked_at_callgate(tmp_path, monkeypatch):
+    """anthropic 早执行不变量：policy=allow 的 CONCURRENCY_SAFE 工具会被早启动（predicate
+    用 permission.check().action），但其早执行体即 _execute_tool_call，callgate 仍 fail-closed。
+
+    证明「policy 允许 → 早启动；callgate 仍拦截」，覆盖最易被未来改动绕过的早执行路径。
+    """
+    from nanocode.tools import CONCURRENCY_SAFE_TOOLS
+    parent = _agent()
+    # 强制 allowlist 全拦截；但 policy 对只读工具仍 allow → 早执行 predicate 会放行启动
+    monkeypatch.setattr(parent.permission, "allowlist_blocks", lambda name: True)
+    safe = "read_file"
+    assert safe in CONCURRENCY_SAFE_TOOLS
+    # _on_tool_block 的早执行 predicate：permission.check(...).action == "allow"
+    assert parent.permission.check(safe, {"file_path": str(tmp_path / "x")}).action == "allow"
+    # 早执行体（= asyncio.create_task(_execute_tool_call(...))）仍过 callgate
+    executed = []
     orig = parent._run_real_tool
 
     async def _spy(name, inp):
@@ -97,17 +144,9 @@ def test_callgate_is_single_chokepoint_no_path_escapes(tmp_path, monkeypatch):
         return await orig(name, inp)
 
     monkeypatch.setattr(parent, "_run_real_tool", _spy)
-    # 强制 allowlist 闸全拦截（模拟「一切真实工具都不被允许」）
-    monkeypatch.setattr(parent.permission, "allowlist_blocks", lambda name: True)
-
-    # 前台真实工具
-    r1 = asyncio.run(parent._execute_tool_call("write_file", {"file_path": str(tmp_path / "a"), "content": "x"}))
-    assert "not permitted" in r1.lower()
-    # 后台 run_shell 分支（run_in_background 早于 meta 分流，必经 callgate）
-    r2 = asyncio.run(parent._execute_tool_call("run_shell", {"command": "echo x", "run_in_background": True}))
-    assert "not permitted" in r2.lower()
-
-    assert executed == [], f"real tool dispatched past the callgate: {executed}"
+    res = asyncio.run(parent._execute_tool_call(safe, {"file_path": str(tmp_path / "x")}))
+    assert "not permitted" in res.lower()
+    assert executed == []
 
 
 # ─── _authorize_dispatch（后端共用入口）── deny/confirm/allow ────
