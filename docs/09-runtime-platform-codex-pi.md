@@ -1324,12 +1324,14 @@ per-agent wire.jsonl 原地升级为 Pi-style entry tree（事实源 spine），
 
 具体包括：
 
-- 给现有 emit 事件**加 envelope 字段**（`id=evt_{agent_id}_{seq}`/`parent_id`/`turn_id`/`branch_id`/`agent_id`），flat-additive、保留现有 type 名。
-- `seq` 从 wire tail 续号（resume-safe）；`turn_id` 在 `chat()` 起手铸。
-- **不新增** session 根文件；统一时间线由读时 merge（`(ts,agent_id,seq,line_no)` 展示序）生成。
-- 现有 `nanocode trace` replay/summary 可指向同一 wire 流——可审计性目标基本达成。
-- **resume 仍以 snapshot 为权威**。
-- 不做 AgentRuntime facade，不做 app-server，不做 fork，不做 SDK，不碰 PermissionEngine/P-1。
+- 给现有 emit 事件**加 envelope 字段**（`id=evt_{agent_id}_{seq}`/`parent_id`/`turn_id`/`branch_id`/`agent_id`），flat-additive、保留现有 type 名。✅ 已落地（`trace/tracer.py`）
+- `seq` 从 wire tail 续号（resume-safe）；`turn_id` 在 `chat()` 起手铸。✅ 已落地（`engine._build_tracer` + `chat`）
+- **不新增** session 根文件；统一时间线由读时 merge（`(ts,agent_id,seq,line_no)` 展示序）生成。✅ 已落地（`events/reader.merge_session_events`）
+- 现有 `nanocode trace` replay/summary 可指向同一 wire 流——可审计性目标基本达成。✅ 已落地（`nanocode trace --wire`）
+- **resume 仍以 snapshot 为权威**。✅ 未改 resume 路径
+- 不做 AgentRuntime facade，不做 app-server，不做 fork，不做 SDK，不碰 PermissionEngine/P-1。✅
+
+> **进度（2026-06-08，branch `feat/event-store`）**：MVP 三连已落地并通过交叉验证（workflow 4-lens + Codex CLI reviewer）。Codex 发现并已修复一个真实 bug（torn wire tail 续写会粘坏首个 resume 事件 → `JsonlSink` append 前补换行）；workflow 发现并已修复 emit envelope 权威性（payload kwarg 不能篡改 seq/id）。945 tests passing。下一步候选：P0.5 PermissionEngine 合并 / P-1 解耦 refactor（均需另起，spine 已自洽收口）。
 
 > 注意：初版 MVP（events.jsonl + AgentRuntime in-process + TurnResult）其实捆绑了 P0+P1+P4，把一个 facade 重构塞进了"最小"里。真正的最小价值是可观测/可审计——只需事件统一一条 lane。AgentRuntime/TurnResult 等到真有第二个 caller 再做。
 
