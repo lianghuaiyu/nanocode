@@ -267,10 +267,10 @@ def test_running_count_includes_curator_subagents(monkeypatch, tmp_path):
 # ─── Codex P4 regression: skill-fork honors max_depth ────────────
 
 
-def test_skill_fork_blocked_when_depth_exceeded(monkeypatch, tmp_path):
-    """Codex P4 MED: skill-fork spawns a sub-agent and must honor max_depth."""
-    _set_agents_settings(monkeypatch, tmp_path, {"max_depth": 1})
-
+def test_skill_fork_blocked_for_subagents(monkeypatch, tmp_path):
+    """Holistic review (Codex): a sub-agent must not spawn descendants by ANY meta
+    route. fork-mode skills are refused for sub-agents outright (stronger than the
+    depth cap, which still bounds the main agent)."""
     def _fake_get_skill(name):
         return None
 
@@ -281,14 +281,16 @@ def test_skill_fork_blocked_when_depth_exceeded(monkeypatch, tmp_path):
     monkeypatch.setattr("nanocode.skills.execute_skill", _fake_execute, raising=False)
 
     parent = _agent()
-    # a depth-1 sub-agent trying to skill-fork (would be depth 2) must be blocked
     sub = parent._build_sub_agent(
         system_prompt="s", tools=parent.tools, agent_type="coder")
     assert sub.depth == 1
     res = asyncio.run(sub._execute_skill_tool({"skill_name": "s", "args": "a"}))
-    assert "depth" in res.lower()
+    assert "not available to sub-agents" in res.lower()
     # no skill-fork sub-agent record was created
     assert [s for s in sub.task_manager.list_subagents() if s.type == "skill-fork"] == []
+    # the MAIN agent can still fork (subject to depth cap)
+    main_res = asyncio.run(parent._execute_skill_tool({"skill_name": "s", "args": "a"}))
+    assert "not available to sub-agents" not in main_res.lower()
 
 
 # ─── Holistic review MED: curators HONOR max_threads (not just count) ──

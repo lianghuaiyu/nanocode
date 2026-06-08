@@ -952,8 +952,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return f"Unknown skill: {inp.get('skill_name', '')}"
 
         if result["context"] == "fork":
-            # P4 max_depth backstop：skill-fork 也 spawn 一个子 agent（depth+1），
-            # 与 agent 工具同样受深度上限约束，防纵深递归 fan-out。
+            # 安全不变量：子 agent 不得经任何 meta 路径 spawn 后代。'agent' 工具已硬拦，
+            # skill fork 同样是「spawn 一个子 agent」——对子 agent 一律禁止（避免借
+            # fork-mode skill 绕过「子不 spawn 孙」做纵深 fan-out）。主 agent 不受限。
+            if self.is_sub_agent:
+                return ("Error: fork-mode skills are not available to sub-agents "
+                        "(sub-agents cannot spawn descendants).")
+            # max_depth backstop（主 agent 仍受全局深度上限约束）。
             if self._depth_cap_exceeded():
                 return ("Error: max sub-agent depth reached; skill fork not spawned.")
             tools = (
