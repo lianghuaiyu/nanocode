@@ -35,6 +35,7 @@ from ..memory.maintenance import (
     build_eval_curator_message,
 )
 from .sink import EventSink, TerminalSink, BufferSink
+from .message_store import MessageStore
 from ..session import save_session
 from ..prompt import build_system_prompt
 from ..skills.listing import (
@@ -233,9 +234,11 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._active_hooks: list[dict] = []
         self._suppress_hooks: bool = False
 
-        # Separate message histories
-        self._anthropic_messages: list[dict] = []
-        self._openai_messages: list[dict] = []
+        # Separate message histories —— 各由一个 MessageStore owner 持有。
+        # 经 _anthropic_messages / _openai_messages 属性访问（getter 返回 live list，
+        # 读/索引/切片/append/in-place 裁剪零改动；整列赋值经 setter 路由到 owner）。
+        self._anthropic_store = MessageStore()
+        self._openai_store = MessageStore()
 
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -487,6 +490,45 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     async def compact(self) -> None:
         await self._compact_conversation()
+
+    # ─── Message-list ownership（P-1 子目标2：单一 owner 入口）──────
+    # provider 消息列表由 MessageStore 持有。getter 暴露 live list（读/索引/切片/append/
+    # in-place 裁剪零改动）；整列赋值经 setter 路由到 owner（resume/compaction/clear）。
+    # 跨 agent 场景：父**不得**直接赋值子的列表——经 _load_messages / 读经 _dump_messages。
+
+    @property
+    def _openai_messages(self) -> list:
+        return self._openai_store.items
+
+    @_openai_messages.setter
+    def _openai_messages(self, messages: list) -> None:
+        self._openai_store.load(messages)
+
+    @property
+    def _anthropic_messages(self) -> list:
+        return self._anthropic_store.items
+
+    @_anthropic_messages.setter
+    def _anthropic_messages(self, messages: list) -> None:
+        self._anthropic_store.load(messages)
+
+    def _active_store(self) -> MessageStore:
+        return self._openai_store if self.use_openai else self._anthropic_store
+
+    def _load_messages(self, messages: list) -> None:
+        """load：用 history/快照接管本 agent 活动列表（resume 单一入口；含被父恢复的子 agent）。"""
+        self._active_store().load(messages)
+
+    def _replace_messages(self, messages: list) -> None:
+        """replace：整列重置（compaction 摘要替换 / clear）。"""
+        self._active_store().replace(messages)
+
+    def _append_message(self, message) -> None:
+        self._active_store().append(message)
+
+    def _dump_messages(self) -> list:
+        """dump：导出活动列表（持久化只读；含父读子 agent 列表）。"""
+        return self._active_store().dump()
 
     # ─── Session ──────────────────────────────────────────────
 
@@ -1034,7 +1076,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     def _persist_agent_messages(self, agent_id: str, sub_agent: "Agent") -> None:
         """Persist sub-agent messages to v2 session storage."""
         try:
-            msgs = sub_agent._anthropic_messages if not sub_agent.use_openai else sub_agent._openai_messages
+            # 经子 agent owner 的 dump 入口读，不再直接 reach 进 sub_agent._{provider}_messages。
+            msgs = sub_agent._dump_messages()
             _session_v2.write_agent_messages(self.session_id, agent_id, msgs)
         except Exception:
             pass
@@ -1867,12 +1910,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     artifact_id=resume_id,
                     agent_source=config.get("source"),
                 )
-                # Reload persisted messages
+                # Reload persisted messages —— 经子 agent 自己的 owner 入口加载，
+                # 父不再直接赋值 sub_agent._{provider}_messages（P-1 子目标2/criterion4）。
                 history = _session_v2.read_agent_messages(self.session_id, resume_id)
-                if not sub_agent.use_openai:
-                    sub_agent._anthropic_messages = history
-                else:
-                    sub_agent._openai_messages = history
+                sub_agent._load_messages(history)
 
                 kind, payload = await self._run_foreground_subagent(
                     sub_agent, prompt, eff_timeout, resume_id)
