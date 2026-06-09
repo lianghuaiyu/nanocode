@@ -595,11 +595,15 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
+        before = self._get_message_count()
         if self.use_openai:
             await self._compact_openai()
         else:
             await self._compact_anthropic()
-        self.tracer.emit("compaction", kind="auto")
+        # 保留事件名 compaction（report.py 硬读它），additive 补压缩前后消息数——供 /tree 与审计。
+        # 注：rebuild 经 llm_request 快照 oracle 已忠实反映 post-compaction 状态，无需 supersession 重放。
+        self.tracer.emit("compaction", kind="auto",
+                         message_count_before=before, message_count_after=self._get_message_count())
         self._sink.info("Conversation compacted.")
         self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
