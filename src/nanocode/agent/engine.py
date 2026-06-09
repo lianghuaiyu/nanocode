@@ -34,21 +34,7 @@ from ..memory.maintenance import (
     apply_plan,
     build_eval_curator_message,
 )
-from ..ui import (
-    print_assistant_text,
-    render_assistant_markdown,
-    print_tool_call,
-    print_tool_result,
-    print_error,
-    print_confirmation,
-    print_cost,
-    print_retry,
-    print_info,
-    print_sub_agent_start,
-    print_sub_agent_end,
-    start_spinner,
-    stop_spinner,
-)
+from .sink import EventSink, TerminalSink, BufferSink
 from ..session import save_session
 from ..prompt import build_system_prompt
 from ..skills.listing import (
@@ -139,12 +125,22 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         depth: int = 0,
         agent_type: str | None = None,
         agent_source: str | None = None,
+        sink: "EventSink | None" = None,
     ):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
+        # 表现层注入边界（P-1 解耦目标3）：core 经 self._sink 发 UI 事件，不直接 import ..ui。
+        # 显式注入优先；否则子 agent 用 BufferSink（捕获助手文本、抑制其余），主 agent 用
+        # TerminalSink（包装 ui.py，行为不变）。_output_buffer 的旧职责并入 BufferSink。
+        if sink is not None:
+            self._sink = sink
+        elif is_sub_agent:
+            self._sink = BufferSink()
+        else:
+            self._sink = TerminalSink()
         # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
         # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
         # 工具名集（{t['name'] for t in cfg['tools']}，已剔除 agent + disallowed）。
@@ -206,8 +202,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # Thinking mode
         self._thinking_mode = self._resolve_thinking_mode()
 
-        # Output buffer (sub-agents capture output)
-        self._output_buffer: list[str] | None = None
+        # 子 agent 输出捕获已并入注入的 BufferSink（见 self._sink / _captured_text）。
 
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
@@ -395,7 +390,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
             except Exception as e:
-                print(f"[mcp] Init failed: {e}", flush=True)
+                self._sink.info(f"[mcp] Init failed: {e}")
 
         self._aborted = False
         self.tracer.begin_turn()  # 一次用户输入 = 一个 turn；后续事件携带该 turn_id
@@ -418,7 +413,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Sub-agent entry point ────────────────────────────────
 
     async def run_once(self, prompt: str) -> dict:
-        self._output_buffer = []
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
         try:
@@ -431,10 +425,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 output_tokens=self.total_output_tokens, turns=self.current_turns,
             )
             self.tracer.close()
-        text = "".join(self._output_buffer)
-        self._output_buffer = None
         return {
-            "text": text,
+            "text": self._captured_text(),
             "tokens": {
                 "input": self.total_input_tokens - prev_in,
                 "output": self.total_output_tokens - prev_out,
@@ -443,17 +435,21 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     # ─── Output helper ────────────────────────────────────────
 
-    def _emit_text(self, text: str) -> None:
-        if self._output_buffer is not None:
-            self._output_buffer.append(text)
-        else:
-            print_assistant_text(text)
+    def _captured_text(self) -> str:
+        """子 agent 累积的助手文本：从注入的 BufferSink 取回（无 buffer 能力则空串）。"""
+        getter = getattr(self._sink, "text", None)
+        return getter() if callable(getter) else ""
+
+    @staticmethod
+    def _subagent_captured_text(sub_agent) -> str:
+        """父读取子 agent 已捕获的 partial 文本（超时/错误终态用）——经子的 sink，
+        不再 reach 进已删除的 _output_buffer 字段。"""
+        if sub_agent is None:
+            return ""
+        return sub_agent._captured_text()
 
     def _emit_block(self, text: str) -> None:
-        if self._output_buffer is not None:
-            self._output_buffer.append(text)
-        else:
-            render_assistant_markdown(text)
+        self._sink.assistant_markdown(text)
 
     # ─── REPL commands ────────────────────────────────────────
 
@@ -470,13 +466,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._activated_path_skills = set()
         self._active_hooks = []
         reset_skill_cache()
-        print_info("Conversation cleared.")
+        self._sink.info("Conversation cleared.")
 
     def show_cost(self) -> None:
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
-        print_info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+        self._sink.info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
 
     def _get_current_cost_usd(self) -> float:
         return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
@@ -508,7 +504,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             for a in self.task_manager.list_subagents():
                 if a.status in ("running", "idle"):
                     self.task_manager.update_subagent(a.id, status="lost")
-        print_info(f"Session restored ({self._get_message_count()} messages).")
+        self._sink.info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
@@ -550,7 +546,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     async def _check_and_compact(self) -> None:
         if self.last_input_token_count > self.effective_window * 0.85:
-            print_info("Context window filling up, compacting conversation...")
+            self._sink.info("Context window filling up, compacting conversation...")
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
@@ -559,7 +555,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         else:
             await self._compact_anthropic()
         self.tracer.emit("compaction", kind="auto")
-        print_info("Conversation compacted.")
+        self._sink.info("Conversation compacted.")
         self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
     # ─── Skill progressive disclosure ─────────────────────────
@@ -966,7 +962,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._write_agent_spawn_artifacts(
                 agent_id=rec.id, agent_type="skill-fork", description=skill_name,
                 prompt=fork_prompt, model=self.model, background=False)
-            print_sub_agent_start("skill-fork", skill_name)
+            self._sink.sub_agent_start("skill-fork", skill_name)
             sub_agent = None
             try:
                 sub_agent = self._build_sub_agent(
@@ -985,14 +981,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 if sub_agent is not None:
                     self._persist_agent_messages(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
-                print_sub_agent_end("skill-fork", skill_name)
+                self._sink.sub_agent_end("skill-fork", skill_name)
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 self.task_manager.update_subagent(rec.id, status="failed")
                 if sub_agent is not None:
                     self._persist_agent_messages(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
-                print_sub_agent_end("skill-fork", skill_name)
+                self._sink.sub_agent_end("skill-fork", skill_name)
                 return f"Skill fork error: {e}"
 
             if kind == "timeout":
@@ -1000,13 +996,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self.task_manager.update_subagent(rec.id, status="cancelled")
                 self._persist_agent_messages(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
-                print_sub_agent_end("skill-fork", skill_name)
+                self._sink.sub_agent_end("skill-fork", skill_name)
                 raise asyncio.CancelledError()
             if kind == "error":
                 self.task_manager.update_subagent(rec.id, status="failed")
                 self._persist_agent_messages(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
-                print_sub_agent_end("skill-fork", skill_name)
+                self._sink.sub_agent_end("skill-fork", skill_name)
                 return f"Skill fork error: {payload}"
 
             sub_result = payload
@@ -1016,7 +1012,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._persist_agent_messages(rec.id, sub_agent)
             result_path = self._write_agent_result(rec.id, sub_result["text"] or "")
             self._finalize_agent_meta(rec.id, "completed")
-            print_sub_agent_end("skill-fork", skill_name)
+            self._sink.sub_agent_end("skill-fork", skill_name)
             # 与 fresh/resume 一致：回传有界信封而非整段 transcript（完整在 result.md）。
             return self._finalize_foreground_result(sub_agent, sub_result, result_path, rec.id)
 
@@ -1174,7 +1170,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         """终态（超时/错误）写 result.md：有 partial 输出就写它，否则写 reason。
         返回路径，供 task.result_path/last_result_path——让 reminder 指向 agent_dir
         而非渲染误导性的空 shell 日志。"""
-        partial = "".join(getattr(sub_agent, "_output_buffer", None) or []) if sub_agent else ""
+        partial = self._subagent_captured_text(sub_agent)
         return self._write_agent_result(agent_id, partial or reason)
 
     def _finalize_foreground_terminal(self, sub_agent: "Agent", record_id: str,
@@ -1183,7 +1179,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         回传带宿主派生 files_modified 的最小信封（而非裸 '[timed out]' 字符串），
         使「改了文件后超时」的子 agent 也给父留下面包屑。"""
         self._fold_subagent_tokens(sub_agent)
-        partial = "".join(getattr(sub_agent, "_output_buffer", None) or [])
+        partial = self._subagent_captured_text(sub_agent)
         reason = (f"[sub-agent timed out after {timeout_ms} ms]" if kind == "timeout"
                   else str(payload))
         result_path = self._write_agent_result(record_id, partial or reason)
@@ -1240,7 +1236,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._write_agent_spawn_artifacts(
             agent_id=sub_rec.id, agent_type=agent_type, description=description,
             prompt=prompt, model=eff_model, background=True)
-        print_sub_agent_start(agent_type, description)
+        self._sink.sub_agent_start(agent_type, description)
         task = asyncio.create_task(self._run_background_subagent(
             agent_id=sub_rec.id, task_id=task_rec.id, agent_type=agent_type,
             description=description, prompt=prompt, timeout_ms=timeout_ms))
@@ -1279,7 +1275,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "cancelled")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             raise
         except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态，detached 任务不能悬挂 running
             self.task_manager.update_task(
@@ -1289,7 +1285,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "failed")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             return
 
         if kind == "timeout":
@@ -1305,7 +1301,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "timed_out")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             return
         if kind == "error":
             self._fold_subagent_tokens(sub_agent)  # 成本可见：出错也折算 token
@@ -1319,7 +1315,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "failed")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             return
 
         result = payload  # kind == "ok"
@@ -1341,7 +1337,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             agent_id, status="completed", last_result_path=agent_result_path)
         self._persist_agent_messages(agent_id, sub_agent)
         self._finalize_agent_meta(agent_id, "completed")
-        print_sub_agent_end(agent_type, description)
+        self._sink.sub_agent_end(agent_type, description)
 
     # ─── Memory consolidation (Auto-Dream) ────────────────────
 
@@ -1373,7 +1369,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             agent_id=sub_rec.id, agent_type=self._MEMORY_CURATOR_TYPE,
             description=description, prompt=user_message, model=self.model,
             background=True)
-        print_sub_agent_start(self._MEMORY_CURATOR_TYPE, description)
+        self._sink.sub_agent_start(self._MEMORY_CURATOR_TYPE, description)
         task = asyncio.create_task(self._run_memory_consolidate(
             agent_id=sub_rec.id, task_id=task_rec.id, user_message=user_message))
         task._nanocode_task_id = task_rec.id
@@ -1417,7 +1413,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "cancelled")
-            print_sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
             raise
         except asyncio.TimeoutError:
             self.task_manager.update_task(
@@ -1427,7 +1423,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "timed_out")
-            print_sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
             return
         except Exception as e:
             self.task_manager.update_task(
@@ -1437,7 +1433,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "failed")
-            print_sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
             return
 
         # curator 成功产出 JSON 提案：token 累加 + 持久化 + 写 result.md
@@ -1457,14 +1453,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self.task_manager.update_task(
                 task_id, status="completed", result_path=result_path,
                 result_summary="Consolidation: no changes (unparseable plan)")
-            print_sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
             return
 
         apply_result = apply_plan(plan)
         self.task_manager.update_task(
             task_id, status="completed", result_path=result_path,
             result_summary=apply_result.summary_line())
-        print_sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
+        self._sink.sub_agent_end(self._MEMORY_CURATOR_TYPE, description)
 
     # ─── Memory eval candidate generation (EVAL-mode curator) ──
 
@@ -1494,7 +1490,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             agent_id=sub_rec.id, agent_type=self._MEMORY_EVAL_CURATOR_TYPE,
             description=description, prompt=user_message, model=self.model,
             background=True)
-        print_sub_agent_start(self._MEMORY_EVAL_CURATOR_TYPE, description)
+        self._sink.sub_agent_start(self._MEMORY_EVAL_CURATOR_TYPE, description)
         task = asyncio.create_task(self._run_memory_eval(
             agent_id=sub_rec.id, task_id=task_rec.id, user_message=user_message))
         task._nanocode_task_id = task_rec.id
@@ -1535,7 +1531,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "cancelled")
-            print_sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
             raise
         except asyncio.TimeoutError:
             self.task_manager.update_task(
@@ -1545,7 +1541,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "timed_out")
-            print_sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
             return
         except Exception as e:
             self.task_manager.update_task(
@@ -1555,7 +1551,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(agent_id, sub_agent)
             self._finalize_agent_meta(agent_id, "failed")
-            print_sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
             return
 
         self.total_input_tokens += result["tokens"]["input"]
@@ -1578,7 +1574,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self.task_manager.update_task(
                 task_id, status="completed", result_path=result_path,
                 result_summary="Generated 0 pending eval candidates (unparseable output)")
-            print_sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
+            self._sink.sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
             return
 
         for item in candidates:
@@ -1607,7 +1603,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.task_manager.update_task(
             task_id, status="completed", result_path=result_path,
             result_summary=summary)
-        print_sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
+        self._sink.sub_agent_end(self._MEMORY_EVAL_CURATOR_TYPE, description)
 
     # ─── Memory optimization (EvolveMem, host-only) ───────────
 
@@ -1844,7 +1840,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                         f"Cannot resume with a different model.")
             eff_timeout = self._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
             max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
-            print_sub_agent_start(rec.type, description)
+            self._sink.sub_agent_start(rec.type, description)
             # Update record status
             self.task_manager.update_subagent(resume_id, status="running")
             self._write_agent_spawn_artifacts(
@@ -1876,14 +1872,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 if sub_agent is not None:
                     self._persist_agent_messages(resume_id, sub_agent)
                 self._finalize_agent_meta(resume_id, "cancelled")
-                print_sub_agent_end(rec.type, description)
+                self._sink.sub_agent_end(rec.type, description)
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 self.task_manager.update_subagent(resume_id, status="failed")
                 if sub_agent is not None:
                     self._persist_agent_messages(resume_id, sub_agent)
                 self._finalize_agent_meta(resume_id, "failed")
-                print_sub_agent_end(rec.type, description)
+                self._sink.sub_agent_end(rec.type, description)
                 return f"Sub-agent error: {e}"
             if kind != "ok":
                 # timeout：record 已在 helper 内标 'timed_out'；error：这里补标 failed。
@@ -1892,7 +1888,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self._persist_agent_messages(resume_id, sub_agent)
                 self._finalize_agent_meta(
                     resume_id, "timed_out" if kind == "timeout" else "failed")
-                print_sub_agent_end(rec.type, description)
+                self._sink.sub_agent_end(rec.type, description)
                 return self._finalize_foreground_terminal(
                     sub_agent, resume_id, kind, payload, eff_timeout)
             result = payload  # type: ignore[assignment]
@@ -1902,7 +1898,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._persist_agent_messages(resume_id, sub_agent)
             result_path = self._write_agent_result(resume_id, result["text"] or "")
             self._finalize_agent_meta(resume_id, "completed")
-            print_sub_agent_end(rec.type, description)
+            self._sink.sub_agent_end(rec.type, description)
             # P3：父收到的是有界信封（summary + findings + 宿主派生文件事实 + result_path），
             # 而非整段 transcript（transcript 已落 result.md，可经 read_file 取回）。
             return self._finalize_foreground_result(
@@ -1913,7 +1909,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         eff_timeout = self._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
         max_turns = self._bounded_sub_agent_max_turns(config.get("max_turns"))
         eff_model = config.get("model") or self.model
-        print_sub_agent_start(agent_type, description)
+        self._sink.sub_agent_start(agent_type, description)
         # Register SubAgentRecord — 记录 EFFECTIVE 模型（manifest 覆盖优先），
         # 否则 resume 的 model-mismatch 校验会拿父模型自比、形同虚设。
         rec = self.task_manager.create_subagent(
@@ -1944,14 +1940,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             if sub_agent is not None:
                 self._persist_agent_messages(rec.id, sub_agent)
             self._finalize_agent_meta(rec.id, "cancelled")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             raise
         except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
             self.task_manager.update_subagent(rec.id, status="failed")
             if sub_agent is not None:
                 self._persist_agent_messages(rec.id, sub_agent)
             self._finalize_agent_meta(rec.id, "failed")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
         if kind != "ok":
             if kind == "error":
@@ -1959,7 +1955,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._persist_agent_messages(rec.id, sub_agent)
             self._finalize_agent_meta(
                 rec.id, "timed_out" if kind == "timeout" else "failed")
-            print_sub_agent_end(agent_type, description)
+            self._sink.sub_agent_end(agent_type, description)
             return self._finalize_foreground_terminal(
                 sub_agent, rec.id, kind, payload, eff_timeout)
         result = payload  # type: ignore[assignment]
@@ -1969,7 +1965,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._persist_agent_messages(rec.id, sub_agent)
         result_path = self._write_agent_result(rec.id, result["text"] or "")
         self._finalize_agent_meta(rec.id, "completed")
-        print_sub_agent_end(agent_type, description)
+        self._sink.sub_agent_end(agent_type, description)
         # P3：父收到的是有界信封（summary + findings + 宿主派生文件事实 + result_path），
         # 而非整段 transcript（transcript 已落 result.md，可经 read_file 取回）。
         return self._finalize_foreground_result(
@@ -1990,7 +1986,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         d = self.permission.check(name, inp)
         self.tracer.emit("permission_decision", tool=name, action=d.action, message=d.message)
         if d.action == "deny":
-            print_info(f"Denied: {d.message}")
+            self._sink.info(f"Denied: {d.message}")
             return False, f"Action denied: {d.message}"
         if d.action == "confirm" and d.message:
             if not await self._confirm_if_needed(d.message):
@@ -2002,7 +1998,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # 否则审批人无从判断是哪个（可能由不受信项目定义的）子 agent 在请求危险操作。
         # 仅 enrich 传给 confirm_fn 的消息字符串，签名不变；主 agent 行为不变。
         message = self._decorate_confirm_message(command)
-        print_confirmation(message)
+        self._sink.confirmation(message)
         if self.confirm_fn:
             return await self.confirm_fn(message)
         # Fallback: blocking input

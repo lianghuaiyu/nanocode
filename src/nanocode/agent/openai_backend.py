@@ -7,7 +7,6 @@ import asyncio
 import json
 import time
 
-from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _to_openai_tools, _with_retry
@@ -130,7 +129,7 @@ class OpenAIBackendMixin:
             self._inject_skill_listing(self._openai_messages)
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._sink.spinner_start()
 
             self.tracer.emit(
                 "llm_request", model=self.model,
@@ -140,7 +139,7 @@ class OpenAIBackendMixin:
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._sink.spinner_stop()
 
             self.last_api_call_time = time.time()
 
@@ -176,13 +175,13 @@ class OpenAIBackendMixin:
             tool_calls = message.get("tool_calls")
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._sink.cost(self.total_input_tokens, self.total_output_tokens)
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 break
 
@@ -199,7 +198,7 @@ class OpenAIBackendMixin:
                 except Exception:
                     inp = {}
 
-                print_tool_call(fn_name, inp)
+                self._sink.tool_call(fn_name, inp)
                 self.tracer.emit("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
 
                 # 单一决策入口（policy + 审批）；allowlist 兜底在 _execute_tool_call。
@@ -227,7 +226,7 @@ class OpenAIBackendMixin:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
-                        print_tool_result(ct_item["fn"], res)
+                        self._sink.tool_result(ct_item["fn"], res)
                         self.tracer.emit("tool_result", tool=ct_item["fn"],
                                          tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
                         return ct_item, res
@@ -242,7 +241,7 @@ class OpenAIBackendMixin:
                             continue
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
-                        print_tool_result(ct["fn"], res)
+                        self._sink.tool_result(ct["fn"], res)
                         self.tracer.emit("tool_result", tool=ct["fn"],
                                          tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
 
@@ -303,7 +302,7 @@ class OpenAIBackendMixin:
                     finish_reason = chunk.choices[0].finish_reason
 
             if content:
-                stop_spinner()
+                self._sink.spinner_stop()
                 self._emit_block(content)
 
             assembled = None
@@ -325,4 +324,4 @@ class OpenAIBackendMixin:
                 "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
             }
 
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._sink.retry)

@@ -7,7 +7,6 @@ import asyncio
 import time
 from typing import Any
 
-from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result, render_thinking
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _get_max_output_tokens, _with_retry
@@ -175,7 +174,7 @@ class AnthropicBackendMixin:
             self._inject_skill_listing(self._anthropic_messages)
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._sink.spinner_start()
 
             # ── Streaming tool execution ──────────────────────────────
             # As each tool_use content block completes during streaming, check
@@ -198,7 +197,7 @@ class AnthropicBackendMixin:
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._sink.spinner_stop()
 
             self.last_api_call_time = time.time()
             self.total_input_tokens += response.usage.input_tokens
@@ -229,13 +228,13 @@ class AnthropicBackendMixin:
 
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._sink.cost(self.total_input_tokens, self.total_output_tokens)
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 break
 
@@ -247,7 +246,7 @@ class AnthropicBackendMixin:
                 if context_break or self._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
-                print_tool_call(tu.name, inp)
+                self._sink.tool_call(tu.name, inp)
                 self.tracer.emit("tool_call", tool=tu.name, input=inp, tool_use_id=tu.id)
 
                 # Was this tool already started during streaming?
@@ -255,7 +254,7 @@ class AnthropicBackendMixin:
                 if early_task:
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
+                    self._sink.tool_result(tu.name, res)
                     self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
                                      chars=len(res), result=res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
@@ -269,7 +268,7 @@ class AnthropicBackendMixin:
 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
-                print_tool_result(tu.name, res)
+                self._sink.tool_result(tu.name, res)
                 self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
                                  chars=len(res), result=res)
 
@@ -346,13 +345,14 @@ class AnthropicBackendMixin:
 
                     elif event.type == "content_block_stop":
                         if event.index in text_blocks:
-                            stop_spinner()
+                            self._sink.spinner_stop()
                             self._emit_block("".join(text_blocks.pop(event.index)))
                         elif event.index in thinking_blocks:
                             buf = thinking_blocks.pop(event.index)
-                            if self._output_buffer is None:
-                                stop_spinner()
-                                render_thinking("".join(buf))
+                            # sink 自行决定渲染/抑制（BufferSink 下 thinking/spinner 均 no-op，
+                            # 等价于旧 is_sub_agent 抑制）；core 不再判 _output_buffer。
+                            self._sink.spinner_stop()
+                            self._sink.thinking("".join(buf))
                         else:
                             tb = tool_blocks_by_index.pop(event.index, None)
                             if tb and on_tool_block_complete:
@@ -373,4 +373,4 @@ class AnthropicBackendMixin:
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._sink.retry)
