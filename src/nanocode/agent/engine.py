@@ -36,6 +36,7 @@ from ..memory.maintenance import (
 )
 from .sink import EventSink, TerminalSink, BufferSink
 from .message_store import MessageStore
+from .context_builder import SessionContextBuilder
 from ..session import save_session
 from ..prompt import build_system_prompt
 from ..skills.listing import (
@@ -534,10 +535,23 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Session ──────────────────────────────────────────────
 
     def restore_session(self, data: dict) -> None:
-        if data.get("anthropicMessages"):
-            self._anthropic_messages = data["anthropicMessages"]
-        if data.get("openaiMessages"):
-            self._openai_messages = data["openaiMessages"]
+        # P5：events 为 resume 权威——优先从 wire 事件树重建主 agent 消息（llm_request 快照
+        # oracle），**仅当重建忠实**（无未闭合 tool 轮）才采用；否则回退 snapshot data
+        # （_auto_save 始终写了完整列表）——保证 resume 翻转无数据丢失（Codex/workflow blocking）。
+        builder = SessionContextBuilder(self.session_id)
+        rebuilt, faithful = builder._rebuild(agent_id="main")
+        if rebuilt and faithful:
+            self._load_messages(rebuilt)
+            # 续在正确分支上：若最后一轮在 fork 分支，tracer 须继续记到该 branch_id，
+            # 否则续写被误记为 main，破坏 /tree 与后续事件重建（Codex review P2）。
+            branch = builder.current_branch(agent_id="main")
+            if branch and branch != "main":
+                self.tracer.branch_id = branch
+        else:
+            if data.get("anthropicMessages"):
+                self._anthropic_messages = data["anthropicMessages"]
+            if data.get("openaiMessages"):
+                self._openai_messages = data["openaiMessages"]
         # v2 state: load TaskManager + mark non-terminal entries as lost
         state = data.get("state")
         if state and isinstance(state, dict):
@@ -594,11 +608,15 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
+        before = self._get_message_count()
         if self.use_openai:
             await self._compact_openai()
         else:
             await self._compact_anthropic()
-        self.tracer.emit("compaction", kind="auto")
+        # 保留事件名 compaction（report.py 硬读它），additive 补压缩前后消息数——供 /tree 与审计。
+        # 注：rebuild 经 llm_request 快照 oracle 已忠实反映 post-compaction 状态，无需 supersession 重放。
+        self.tracer.emit("compaction", kind="auto",
+                         message_count_before=before, message_count_after=self._get_message_count())
         self._sink.info("Conversation compacted.")
         self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
@@ -1911,9 +1929,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     artifact_id=resume_id,
                     agent_source=config.get("source"),
                 )
-                # Reload persisted messages —— 经子 agent 自己的 owner 入口加载，
-                # 父不再直接赋值 sub_agent._{provider}_messages（P-1 子目标2/criterion4）。
-                history = _session_v2.read_agent_messages(self.session_id, resume_id)
+                # Reload persisted messages —— P5：events 为权威（从 wire leaf→root 重建，
+                # llm_request 快照 oracle），snapshot 兜底（重建空时回退，不丢数据）。
+                history = SessionContextBuilder(self.session_id).resume_messages(
+                    agent_id=resume_id, prefer_events=True)
                 sub_agent._load_messages(history)
 
                 kind, payload = await self._run_foreground_subagent(

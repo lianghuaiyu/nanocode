@@ -22,6 +22,9 @@ def run(argv: list[str]) -> int:
                         help="read the always-on per-agent event tree "
                              "(~/.nanocode/sessions/<id>/agents/*/wire.jsonl) instead of "
                              "the opt-in ./.nanocode/traces/ debug lane")
+    parser.add_argument("--tree", action="store_true",
+                        help="with --wire: show the session branch tree (fork points) instead "
+                             "of the flat timeline")
     args = parser.parse_args(argv)
 
     if args.wire:
@@ -58,7 +61,9 @@ def _run_wire(args) -> int:
         print_error(str(e))
         return 1
     events = reader.merge_session_events(sid)
-    if args.summary:
+    if args.tree:
+        console.print(report.render_wire_tree(events, full=args.full))
+    elif args.summary:
         console.print(report.render_wire_summary(events, full=args.full))
     else:
         console.print(report.render_wire_timeline(events, full=args.full))
