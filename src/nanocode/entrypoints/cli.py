@@ -508,7 +508,12 @@ async def run_repl(agent: Agent) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        # 注意：历史行为——主 REPL agent 的旧 `_output_buffer` 恒为 None（仅子 agent 的
+        # run_once 才置空列表），故此分支对主 agent 实为 dead，SIGINT 一律落到 else 的
+        # 「按两次退出」。P-1 移除 _output_buffer 后，用恒 False 占位以**逐字节保留**该行为，
+        # 不借机改成「Ctrl-C 中断处理中的 agent」（那是行为变更，超出 P-1 无语义变更约束）。
+        agent_capturing_output = False  # was: agent._output_buffer is not None (always None for main)
+        if agent._aborted is False and agent_capturing_output:
             # Agent is processing
             agent.abort()
             print("\n  (interrupted)")

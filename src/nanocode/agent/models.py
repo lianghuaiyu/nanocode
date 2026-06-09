@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import time
 
-from ..ui import print_retry
 from ..tools import ToolDef
 
 # ─── Retry with exponential backoff ──────────────────────────
@@ -22,7 +21,12 @@ def _is_retryable(error: Exception) -> bool:
     return False
 
 
-async def _with_retry(fn, max_retries: int = 3):
+async def _with_retry(fn, max_retries: int = 3, on_retry=None):
+    """带指数退避的重试封装。
+
+    on_retry(attempt, max_retries, reason)：每次重试前的通知回调（由调用方注入，
+    通常是 agent 的 sink.retry），缺省 None = 不通知。core 不直接 import ..ui。
+    """
     for attempt in range(max_retries + 1):
         try:
             return await fn()
@@ -32,7 +36,8 @@ async def _with_retry(fn, max_retries: int = 3):
             delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
-            print_retry(attempt + 1, max_retries, reason)
+            if on_retry is not None:
+                on_retry(attempt + 1, max_retries, reason)
             await asyncio.sleep(delay)
 
 

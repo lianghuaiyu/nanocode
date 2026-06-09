@@ -7,13 +7,9 @@ import asyncio
 import json
 import time
 
-from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _to_openai_tools, _with_retry
-from .compaction import (
-    SNIP_PLACEHOLDER, SNIP_THRESHOLD, MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS,
-)
 
 
 class OpenAIBackendMixin:
@@ -44,43 +40,8 @@ class OpenAIBackendMixin:
             self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
 
-    # Tier 1: Budget tool results
-    def _budget_tool_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < 0.5:
-            return
-        budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._openai_messages:
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
-                keep = (budget - 80) // 2
-                msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
-
-    # Tier 2: Snip stale results
-    def _snip_stale_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < SNIP_THRESHOLD:
-            return
-        tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
-                tool_msgs.append(i)
-        if len(tool_msgs) <= KEEP_RECENT_RESULTS:
-            return
-        snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
-        for i in range(snip_count):
-            self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
-
-    # Tier 3: Microcompact
-    def _microcompact_openai(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
-        tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
-                tool_msgs.append(i)
-        clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
-        for i in range(max(0, clear_count)):
-            self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+    # Budget/snip/microcompact tier 实现已上移至 compaction.CompressionPipeline；
+    # 本 backend 不再实现细节，engine._run_compression_pipeline 每轮调用 facade（行为不变）。
 
     # ─── OpenAI-compatible backend ───────────────────────────────
 
@@ -130,7 +91,7 @@ class OpenAIBackendMixin:
             self._inject_skill_listing(self._openai_messages)
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._sink.spinner_start()
 
             self.tracer.emit(
                 "llm_request", model=self.model,
@@ -140,7 +101,7 @@ class OpenAIBackendMixin:
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._sink.spinner_stop()
 
             self.last_api_call_time = time.time()
 
@@ -176,13 +137,13 @@ class OpenAIBackendMixin:
             tool_calls = message.get("tool_calls")
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._sink.cost(self.total_input_tokens, self.total_output_tokens)
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 break
 
@@ -199,7 +160,7 @@ class OpenAIBackendMixin:
                 except Exception:
                     inp = {}
 
-                print_tool_call(fn_name, inp)
+                self._sink.tool_call(fn_name, inp)
                 self.tracer.emit("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
 
                 # 单一决策入口（policy + 审批）；allowlist 兜底在 _execute_tool_call。
@@ -227,7 +188,7 @@ class OpenAIBackendMixin:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
-                        print_tool_result(ct_item["fn"], res)
+                        self._sink.tool_result(ct_item["fn"], res)
                         self.tracer.emit("tool_result", tool=ct_item["fn"],
                                          tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
                         return ct_item, res
@@ -242,7 +203,7 @@ class OpenAIBackendMixin:
                             continue
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
-                        print_tool_result(ct["fn"], res)
+                        self._sink.tool_result(ct["fn"], res)
                         self.tracer.emit("tool_result", tool=ct["fn"],
                                          tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
 
@@ -303,7 +264,7 @@ class OpenAIBackendMixin:
                     finish_reason = chunk.choices[0].finish_reason
 
             if content:
-                stop_spinner()
+                self._sink.spinner_stop()
                 self._emit_block(content)
 
             assembled = None
@@ -325,4 +286,4 @@ class OpenAIBackendMixin:
                 "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
             }
 
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._sink.retry)

@@ -7,14 +7,9 @@ import asyncio
 import time
 from typing import Any
 
-from ..ui import stop_spinner, start_spinner, print_cost, print_info, print_tool_call, print_tool_result, render_thinking
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _get_max_output_tokens, _with_retry
-from .compaction import (
-    SNIPPABLE_TOOLS, SNIP_PLACEHOLDER, SNIP_THRESHOLD,
-    MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS,
-)
 
 
 class AnthropicBackendMixin:
@@ -44,83 +39,9 @@ class AnthropicBackendMixin:
             self._anthropic_messages.append(last_user_msg)
         self.last_input_token_count = 0
 
-    # Tier 1: Budget tool results
-    def _budget_tool_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < 0.5:
-            return
-        budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._anthropic_messages:
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and len(block["content"]) > budget:
-                    keep = (budget - 80) // 2
-                    block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
-
-    # Tier 2: Snip stale results
-    def _snip_stale_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < SNIP_THRESHOLD:
-            return
-
-        results = []
-        for mi, msg in enumerate(self._anthropic_messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for bi, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] != SNIP_PLACEHOLDER:
-                    tool_use_id = block.get("tool_use_id")
-                    tool_info = self._find_tool_use_by_id(tool_use_id)
-                    if tool_info and tool_info["name"] in SNIPPABLE_TOOLS:
-                        results.append({"mi": mi, "bi": bi, "name": tool_info["name"], "file_path": tool_info.get("input", {}).get("file_path")})
-
-        if len(results) <= KEEP_RECENT_RESULTS:
-            return
-
-        to_snip = set()
-        seen_files: dict[str, list[int]] = {}
-        for i, r in enumerate(results):
-            if r["name"] == "read_file" and r.get("file_path"):
-                seen_files.setdefault(r["file_path"], []).append(i)
-
-        for indices in seen_files.values():
-            if len(indices) > 1:
-                for j in indices[:-1]:
-                    to_snip.add(j)
-
-        snip_before = len(results) - KEEP_RECENT_RESULTS
-        for i in range(snip_before):
-            to_snip.add(i)
-
-        for idx in to_snip:
-            r = results[idx]
-            self._anthropic_messages[r["mi"]]["content"][r["bi"]]["content"] = SNIP_PLACEHOLDER
-
-    # Tier 3: Microcompact
-    def _microcompact_anthropic(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
-        all_results = []
-        for mi, msg in enumerate(self._anthropic_messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for bi, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
-                    all_results.append((mi, bi))
-        clear_count = len(all_results) - KEEP_RECENT_RESULTS
-        for i in range(max(0, clear_count)):
-            mi, bi = all_results[i]
-            self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
-
-    def _find_tool_use_by_id(self, tool_use_id: str) -> dict | None:
-        for msg in self._anthropic_messages:
-            if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
-                continue
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
-                    return {"name": block["name"], "input": block.get("input", {})}
-        return None
+    # Budget/snip/microcompact tier 实现（含 _find_tool_use_by_id）已上移至
+    # compaction.CompressionPipeline；本 backend 不再实现细节，
+    # engine._run_compression_pipeline 每轮调用 facade（行为不变）。
 
     # ─── Anthropic backend ───────────────────────────────────────
 
@@ -175,7 +96,7 @@ class AnthropicBackendMixin:
             self._inject_skill_listing(self._anthropic_messages)
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._sink.spinner_start()
 
             # ── Streaming tool execution ──────────────────────────────
             # As each tool_use content block completes during streaming, check
@@ -198,7 +119,7 @@ class AnthropicBackendMixin:
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._sink.spinner_stop()
 
             self.last_api_call_time = time.time()
             self.total_input_tokens += response.usage.input_tokens
@@ -229,13 +150,13 @@ class AnthropicBackendMixin:
 
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._sink.cost(self.total_input_tokens, self.total_output_tokens)
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 break
 
@@ -247,7 +168,7 @@ class AnthropicBackendMixin:
                 if context_break or self._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
-                print_tool_call(tu.name, inp)
+                self._sink.tool_call(tu.name, inp)
                 self.tracer.emit("tool_call", tool=tu.name, input=inp, tool_use_id=tu.id)
 
                 # Was this tool already started during streaming?
@@ -255,7 +176,7 @@ class AnthropicBackendMixin:
                 if early_task:
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
+                    self._sink.tool_result(tu.name, res)
                     self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
                                      chars=len(res), result=res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
@@ -269,7 +190,7 @@ class AnthropicBackendMixin:
 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
-                print_tool_result(tu.name, res)
+                self._sink.tool_result(tu.name, res)
                 self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
                                  chars=len(res), result=res)
 
@@ -346,13 +267,14 @@ class AnthropicBackendMixin:
 
                     elif event.type == "content_block_stop":
                         if event.index in text_blocks:
-                            stop_spinner()
+                            self._sink.spinner_stop()
                             self._emit_block("".join(text_blocks.pop(event.index)))
                         elif event.index in thinking_blocks:
                             buf = thinking_blocks.pop(event.index)
-                            if self._output_buffer is None:
-                                stop_spinner()
-                                render_thinking("".join(buf))
+                            # sink 自行决定渲染/抑制（BufferSink 下 thinking/spinner 均 no-op，
+                            # 等价于旧 is_sub_agent 抑制）；core 不再判 _output_buffer。
+                            self._sink.spinner_stop()
+                            self._sink.thinking("".join(buf))
                         else:
                             tb = tool_blocks_by_index.pop(event.index, None)
                             if tb and on_tool_block_complete:
@@ -373,4 +295,4 @@ class AnthropicBackendMixin:
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._sink.retry)

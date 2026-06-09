@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..paths import data_dir
-from ..ui import print_info
 
 
 class PlanModeMixin:
@@ -19,7 +18,7 @@ class PlanModeMixin:
             self._system_prompt = self._base_system_prompt
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Exited plan mode → {self.permission_mode} mode")
+            self._sink.info(f"Exited plan mode → {self.permission_mode} mode")
             return self.permission_mode
         else:
             self._pre_plan_mode = self.permission_mode
@@ -28,7 +27,7 @@ class PlanModeMixin:
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
+            self._sink.info(f"Entered plan mode. Plan file: {self._plan_file_path}")
             return "plan"
 
     # ─── Plan mode helpers ──────────────────────────────────────
@@ -69,7 +68,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
+            self._sink.info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
 
         if name == "exit_plan_mode":
@@ -112,7 +111,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if choice == "clear-and-execute":
                     self._clear_history_keep_system()
                     self._context_cleared = True
-                    print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
+                    self._sink.info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
                     return (
                         f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
                         f"Plan file: {saved_plan_path}\n\n"
@@ -120,7 +119,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         f"Proceed with implementation."
                     )
 
-                print_info(f"Plan approved. Executing in {target_mode} mode.")
+                self._sink.info(f"Plan approved. Executing in {target_mode} mode.")
                 return (
                     f"User approved the plan. Permission mode: {target_mode}\n\n"
                     f"## Approved Plan:\n{plan_content}\n\n"
@@ -134,7 +133,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._system_prompt = self._base_system_prompt
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
+            self._sink.info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"
