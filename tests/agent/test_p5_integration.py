@@ -83,3 +83,64 @@ def test_tree_render_shows_branches_and_fork_points():
     assert "branch experiment" in out
     assert "forked from evt_main_1" in out
     assert "root q" in out and "branch q" in out
+
+
+def test_fork_to_invalid_event_raises_and_leaves_session_unchanged():
+    """Codex P2: fork_to 无效 from_event_id 不得静默清空 live 历史。"""
+    sid = "p5fkbad"
+    _seed_wire(sid, [
+        ("user_message", {"text": "base"}),
+        ("llm_request", {"model": "m", "messages": [{"role": "user", "content": "base"}]}),
+    ])
+    a = _agent(sid)
+    a._append_message({"role": "user", "content": "live"})
+    th = AgentRuntime().adopt(a)
+    before = list(a._anthropic_messages)
+    before_branch = a.tracer.branch_id
+    try:
+        th.fork_to("evt_main_999", "bad")   # 不存在的 event id
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    assert a._anthropic_messages == before           # live 历史未被清
+    assert a.tracer.branch_id == before_branch        # 未切到无效分支
+
+
+def test_restore_falls_back_to_snapshot_when_rebuild_unfaithful():
+    """blocking 数据丢失回归：turn 在 tool 执行后被打断（无第二个 llm_request）时，
+    events 重建会丢 tool 轮——restore 必须回退到完整 snapshot，不丢数据。"""
+    sid = "p5unfaithful"
+    _seed_wire(sid, [
+        ("llm_request", {"model": "m", "messages": [{"role": "user", "content": "q"}]}),
+        ("assistant_message", {"text": "working", "tool_uses": [{"id": "tu", "name": "read_file", "input": {}}]}),
+        ("tool_result", {"tool": "read_file", "tool_use_id": "tu", "result": "FILE CONTENTS"}),
+    ])
+    a = _agent(sid)
+    # snapshot 保存了完整 3 条（含 tool 输出）——_auto_save 的实际行为
+    full = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "tu", "name": "read_file"}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu", "content": "FILE CONTENTS"}]},
+    ]
+    a.restore_session({"anthropicMessages": full})
+    # 重建不忠实 → 回退 snapshot → tool 输出仍在
+    assert a._anthropic_messages == full
+    flat = str(a._anthropic_messages)
+    assert "FILE CONTENTS" in flat
+
+
+def test_restore_continues_on_forked_branch_identity():
+    """Codex P2: 最后一轮在 fork 分支时，restore 后 tracer 须续在该 branch（非 main）。"""
+    sid = "p5rbranch"
+    t = Tracer(sid, [JsonlSink(_v2.agent_wire_path(sid, "main"))], agent_id="main")
+    t.begin_turn()
+    t.emit("user_message", text="base")
+    t.emit("llm_request", model="m", messages=[{"role": "user", "content": "base"}])  # evt_main_1
+    t.begin_branch("experiment", from_event_id="evt_main_1")
+    t.emit("llm_request", model="m", messages=[{"role": "user", "content": "on-exp"}])  # branch leaf
+    t.emit("assistant_message", text="exp-ans", tool_uses=[])
+    t.close()
+    a = _agent(sid)
+    a.restore_session({})
+    assert a.tracer.branch_id == "experiment"   # 续写记到 experiment，非默认 main
+    assert a._anthropic_messages[0] == {"role": "user", "content": "on-exp"}

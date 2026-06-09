@@ -48,33 +48,72 @@ class SessionContextBuilder:
               + 其后追加的 assistant 文本消息（按 provider 形态重建）。
         无 llm_request → 返回 []（调用方兜底快照）。
         """
+        messages, _faithful = self._rebuild(agent_id=agent_id, leaf_id=leaf_id)
+        return messages
+
+    def _rebuild(self, *, agent_id: str = "main", leaf_id: "str | None" = None):
+        """重建 + 忠实度判定，返回 (messages, faithful)。
+
+        faithful=False 表示：最后一个 llm_request 之后存在**未闭合的 tool 轮**
+        （assistant 带 tool_uses，或其后跟 tool_result，却没有下一个 llm_request 把它纳入快照）
+        ——这类 turn（abort / budget / turn-limit / context-break 打断）下，重建会丢掉那条
+        assistant tool_use 及其 tool_result（Codex/workflow 标的 blocking 数据丢失）。调用方据此
+        回退到 snapshot（_auto_save 始终写了完整列表），保证 resume 翻转**不丢数据**。
+        """
         wire = _session_v2.agent_wire_path(self.session_id, agent_id)
         events = _event_reader.read_agent_wire(wire, agent_id)
         if not events:
-            return []
+            return [], False
         branch = _branch_chain(events, leaf_id)
-        # 最后一个 llm_request 的 messages = 该点模型所见的完整数组（post-compression）。
         last_req_idx = _last_index(branch, lambda e: e.type == "llm_request" and isinstance(e.data.get("messages"), list))
         if last_req_idx is None:
-            return []
+            return [], False
+        tail = branch[last_req_idx + 1:]
         messages = copy.deepcopy(branch[last_req_idx].data["messages"])
-        # 追加最后一个 llm_request 之后的尾条 assistant 文本（turn 收尾的响应，未进任何 llm_request 快照）。
-        trailing = _trailing_assistant(branch[last_req_idx + 1:])
+        trailing = _trailing_assistant(tail)
         if trailing is not None:
             messages.append(trailing)
-        return messages
+        # 忠实度：尾部出现「带 tool_uses 的 assistant」或「tool_result」即为未闭合 tool 轮，
+        # 这部分未进任何 llm_request 快照、也不会被 _trailing_assistant 重建 → 不忠实。
+        faithful = not any(
+            (e.type == "assistant_message" and e.data.get("tool_uses")) or e.type == "tool_result"
+            for e in tail
+        )
+        return messages, faithful
 
     def resume_messages(self, *, agent_id: str = "main", prefer_events: bool = False) -> list:
         """resume 上下文。默认 snapshot（保持 P3 行为，resume 权威仍是快照）。
 
-        `prefer_events=True` 改为事件树重建优先、快照兜底——resume 权威的「翻转」是 task 21
-        的刻意一步（带 byte-equal 校验 + 兜底），不在此默认开启，避免静默改变数据敏感的 resume。
+        `prefer_events=True`：事件树重建优先，但**仅当重建忠实**（无未闭合 tool 轮）才采用；
+        否则回退 snapshot（_auto_save 始终写了完整列表）——保证 resume 翻转无数据丢失。
         """
         if prefer_events:
-            rebuilt = self.rebuild_messages(agent_id=agent_id)
-            if rebuilt:
+            rebuilt, faithful = self._rebuild(agent_id=agent_id)
+            if rebuilt and faithful:
                 return rebuilt
         return self.snapshot_messages(agent_id=agent_id)
+
+    def current_branch(self, *, agent_id: str = "main", leaf_id: "str | None" = None) -> "str | None":
+        """返回 resume leaf 所在的 branch_id（供 restore 时让 tracer 续在正确分支上）。
+
+        leaf_id 指定时返回该 event 的 branch；否则返回最后一条**会话**事件的 branch——
+        跳过尾部的 session_start（resume 时新构造的 agent 会在 __init__ 往同一 wire 追加一条
+        session_start，它恒在默认 main 分支，不能用它判分支，否则 fork 续写被误记为 main）。
+        无事件→None。修复 Codex review P2。
+        """
+        wire = _session_v2.agent_wire_path(self.session_id, agent_id)
+        events = _event_reader.read_agent_wire(wire, agent_id)
+        if not events:
+            return None
+        if leaf_id is not None:
+            for e in events:
+                if e.id == leaf_id:
+                    return e.branch_id or "main"
+            return None
+        for e in reversed(events):
+            if e.type != "session_start":
+                return e.branch_id or "main"
+        return events[-1].branch_id or "main"
 
 
 def _branch_chain(events: list, leaf_id: "str | None") -> list:
@@ -104,10 +143,12 @@ def _last_index(events: list, pred) -> "int | None":
 
 
 def _trailing_assistant(events: list) -> "dict | None":
-    """从最后一个 llm_request 之后的事件里取尾条 assistant 文本消息，按 provider 形态重建。
+    """从最后一个 llm_request 之后的事件里取尾条 assistant 的**文本响应**，重建为文本消息。
 
-    仅处理 turn 收尾的纯文本助手响应（无 tool_uses——有 tool 的轮次其后必有新 llm_request，
-    其快照已含该 assistant，不会落到尾部）。OpenAI: {role,content:str}；Anthropic: content 文本块。
+    仅处理 turn 收尾的纯文本助手响应（带 tool_uses 的不在此——那种「未闭合 tool 轮」由
+    _rebuild 的 faithful 判定拦下、回退 snapshot）。**刻意规范化为 text-only**
+    `{role:assistant, content:<str>}`（两 provider 同形）：与 API 等价（Anthropic 接受 str
+    content，compaction ack 已如此用），且 thinking/签名等已在落盘时剥离，故不丢模型行为。
     无文本则 None（不追加）。
     """
     idx = _last_index(events, lambda e: e.type == "assistant_message")
@@ -115,11 +156,10 @@ def _trailing_assistant(events: list) -> "dict | None":
         return None
     ev = events[idx]
     if ev.data.get("tool_uses"):
-        return None  # 有工具的 assistant 不是 turn 收尾条，其后有 llm_request 兜住
+        return None  # 有工具的 assistant 不是 turn 收尾条；其未闭合性由 faithful 判定处理
     text = ev.data.get("text") or ""
     if not text:
         return None
-    # provider 形态：anthropic 助手 content 为块列表，openai 为字符串。
-    # 经 branch 上既有消息形态推断：若 llm_request.messages 的助手项 content 是 list → anthropic。
+    # text-only 规范化：str content 对 Anthropic / OpenAI 均合法（见 docstring）。
     return {"role": "assistant", "content": text}
 

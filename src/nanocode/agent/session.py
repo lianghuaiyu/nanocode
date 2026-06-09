@@ -56,8 +56,16 @@ class AgentSession:
         在新 branch_id 下继续（首事件带 parent_event_id=from_event_id）。返回重建的上下文。
 
         后续 run_turn 追加到新分支，不覆盖原分支（append-only + branch_id 隔离）。
+
+        校验（Codex review P2）：from_event_id 无效 / 重建为空时**不切分支、不动会话**，抛
+        ValueError——否则会静默清空 live 历史并把后续事件挂到无效 fork 点。
         """
         messages = self.context_builder.rebuild_messages(agent_id=agent_id, leaf_id=from_event_id)
+        if not messages:
+            raise ValueError(
+                f"cannot fork from event '{from_event_id}': no rebuildable context "
+                "(unknown event id, or that branch has no llm_request); session left unchanged"
+            )
         self.agent.tracer.begin_branch(branch_id, from_event_id=from_event_id)
         self.agent._load_messages(messages)
         return messages

@@ -37,15 +37,22 @@ def test_rebuild_empty_when_no_llm_request():
     assert SessionContextBuilder(sid).rebuild_messages() == []
 
 
-def test_rebuild_no_trailing_when_last_assistant_has_tools():
-    """最后一个 llm_request 后若 assistant 仍带 tool_uses，不当作 turn 收尾，不追加。"""
+def test_unfaithful_rebuild_when_tool_round_after_last_llm_request():
+    """blocking 数据丢失回归（Codex/workflow）：turn 在 tool 执行后、第二个 llm_request 前
+    被打断（abort/budget/turn-limit）——wire 有 llm_request→assistant(tool_uses)→tool_result，
+    无第二个 llm_request。重建会丢掉该 assistant tool_use + tool_result，故必须判为不忠实，
+    让调用方回退 snapshot。"""
     sid = "cb3"
     t = _wire(sid); t.begin_turn()
     t.emit("llm_request", model="m", messages=[{"role": "user", "content": "q"}])
-    t.emit("assistant_message", text="", tool_uses=[{"id": "tu", "name": "x", "input": {}}])
+    t.emit("assistant_message", text="working", tool_uses=[{"id": "tu", "name": "read_file", "input": {}}])
+    t.emit("tool_result", tool="read_file", tool_use_id="tu", result="FILE CONTENTS")
     t.close()
-    rebuilt = SessionContextBuilder(sid).rebuild_messages()
-    assert rebuilt == [{"role": "user", "content": "q"}]   # 无尾条追加
+    b = SessionContextBuilder(sid)
+    msgs, faithful = b._rebuild()
+    assert faithful is False                       # 不忠实——尾部有未闭合 tool 轮
+    # resume 据此回退 snapshot（此处无 snapshot → 空），绝不返回丢了 tool 输出的残缺重建
+    assert b.resume_messages(prefer_events=True) == b.snapshot_messages()
 
 
 def test_rebuild_branch_from_leaf_only_walks_ancestors():

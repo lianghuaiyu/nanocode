@@ -536,10 +536,17 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     def restore_session(self, data: dict) -> None:
         # P5：events 为 resume 权威——优先从 wire 事件树重建主 agent 消息（llm_request 快照
-        # oracle），重建为空时回退到传入的 snapshot data（flat JSON / v2 messages.json）。
-        rebuilt = SessionContextBuilder(self.session_id).rebuild_messages(agent_id="main")
-        if rebuilt:
+        # oracle），**仅当重建忠实**（无未闭合 tool 轮）才采用；否则回退 snapshot data
+        # （_auto_save 始终写了完整列表）——保证 resume 翻转无数据丢失（Codex/workflow blocking）。
+        builder = SessionContextBuilder(self.session_id)
+        rebuilt, faithful = builder._rebuild(agent_id="main")
+        if rebuilt and faithful:
             self._load_messages(rebuilt)
+            # 续在正确分支上：若最后一轮在 fork 分支，tracer 须继续记到该 branch_id，
+            # 否则续写被误记为 main，破坏 /tree 与后续事件重建（Codex review P2）。
+            branch = builder.current_branch(agent_id="main")
+            if branch and branch != "main":
+                self.tracer.branch_id = branch
         else:
             if data.get("anthropicMessages"):
                 self._anthropic_messages = data["anthropicMessages"]
