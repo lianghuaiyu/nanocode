@@ -133,3 +133,50 @@ class BufferSink(NullSink):
         """清空捕获——每次 run_once 入口调用，复刻旧 `_output_buffer = []` 的每轮重置，
         使复用的（持久/resume）子 agent 实例不把上一轮文本泄漏进本轮结果。"""
         self._chunks = []
+
+
+class TeeSink:
+    """把每个事件分发给多个 sink（如 TerminalSink 显示 + BufferSink 捕获）。
+
+    P4 用于主线程 TurnResult.final_response：不回归 TerminalSink 打印的前提下捕获助手文本。
+    显式列出全部 EventSink 方法（不用 __getattr__ 兜底），避免 hasattr/isinstance 误命中。
+    """
+
+    def __init__(self, *sinks) -> None:
+        self._sinks = sinks
+
+    def assistant_markdown(self, text: str) -> None:
+        for s in self._sinks: s.assistant_markdown(text)
+
+    def thinking(self, text: str) -> None:
+        for s in self._sinks: s.thinking(text)
+
+    def spinner_start(self, label: str = "Thinking") -> None:
+        for s in self._sinks: s.spinner_start(label)
+
+    def spinner_stop(self) -> None:
+        for s in self._sinks: s.spinner_stop()
+
+    def tool_call(self, name: str, inp: dict) -> None:
+        for s in self._sinks: s.tool_call(name, inp)
+
+    def tool_result(self, name: str, result: str) -> None:
+        for s in self._sinks: s.tool_result(name, result)
+
+    def cost(self, input_tokens: int, output_tokens: int) -> None:
+        for s in self._sinks: s.cost(input_tokens, output_tokens)
+
+    def info(self, message: str) -> None:
+        for s in self._sinks: s.info(message)
+
+    def confirmation(self, command: str) -> None:
+        for s in self._sinks: s.confirmation(command)
+
+    def sub_agent_start(self, agent_type: str, description: str) -> None:
+        for s in self._sinks: s.sub_agent_start(agent_type, description)
+
+    def sub_agent_end(self, agent_type: str, description: str) -> None:
+        for s in self._sinks: s.sub_agent_end(agent_type, description)
+
+    def retry(self, attempt: int, max_retries: int, reason: str) -> None:
+        for s in self._sinks: s.retry(attempt, max_retries, reason)
