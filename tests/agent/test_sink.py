@@ -127,3 +127,28 @@ def test_permission_deny_routes_info_through_sink():
     allowed, denial = asyncio.run(a._authorize_dispatch("run_shell", {"command": "ls"}))
     assert allowed is False
     assert any(e[0] == "info" and "Denied" in e[1] for e in rec.events)
+
+
+def test_buffer_sink_reset_clears_capture():
+    b = BufferSink()
+    b.assistant_markdown("one")
+    assert b.text() == "one"
+    b.reset()
+    assert b.text() == ""
+
+
+def test_run_once_resets_capture_per_invocation():
+    """Codex review P2：复用的子 agent 实例多次 run_once 不得累积上一轮文本。
+
+    旧 run_once 入口 `_output_buffer = []` 每轮重置；新实现经 BufferSink.reset() 复刻之。
+    """
+    sub = _read_only_sub(_agent())
+
+    async def fake_chat(prompt):
+        sub._emit_block(f"run:{prompt}")
+
+    sub.chat = fake_chat
+    r1 = asyncio.run(sub.run_once("a"))
+    r2 = asyncio.run(sub.run_once("b"))
+    assert r1["text"] == "run:a"
+    assert r2["text"] == "run:b"   # 不是 "run:arun:b"——上一轮已重置

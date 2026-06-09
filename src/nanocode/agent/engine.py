@@ -67,11 +67,7 @@ from .models import (
     _to_openai_tools,
     _with_retry,
 )
-from .compaction import (
-    SNIPPABLE_TOOLS, SNIP_PLACEHOLDER, SNIP_THRESHOLD,
-    MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS, persist_large_result,
-    CompressionPipeline,
-)
+from .compaction import persist_large_result, CompressionPipeline
 from .plan_mode import PlanModeMixin
 from .anthropic_backend import AnthropicBackendMixin
 from .openai_backend import OpenAIBackendMixin
@@ -417,6 +413,11 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Sub-agent entry point ────────────────────────────────
 
     async def run_once(self, prompt: str) -> dict:
+        # 每轮入口重置捕获——复刻旧 `_output_buffer = []`，使复用的（持久/resume/headless）
+        # 子 agent 实例不把上一轮文本泄漏进本轮结果（Codex review P2）。
+        resetter = getattr(self._sink, "reset", None)
+        if callable(resetter):
+            resetter()
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
         try:

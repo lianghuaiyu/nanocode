@@ -92,3 +92,15 @@ def test_parent_persist_reads_via_dump_entry():
     sub._append_message({"role": "user", "content": "to-persist"})
     # _persist_agent_messages 内部经 sub._dump_messages() 读，等价于活动列表
     assert sub._dump_messages() == sub._anthropic_messages
+
+
+def test_reassign_then_append_lands_on_new_list():
+    """守护不变量（workflow 建议）：setter 整列替换后，经 getter 的 append 落在新列表上，
+    而非 stale alias——这是 _compact_* 重置历史后继续 append last_user 依赖的语义。"""
+    a = _anth_agent()
+    a._anthropic_messages = [{"role": "user", "content": "m1"}, {"role": "user", "content": "m2"}]
+    first = a._anthropic_messages
+    a._anthropic_messages.append({"role": "assistant", "content": "m3"})
+    # append 命中 setter 装入的同一新列表
+    assert a._anthropic_store.items is first
+    assert [m["content"] for m in a._anthropic_messages] == ["m1", "m2", "m3"]
