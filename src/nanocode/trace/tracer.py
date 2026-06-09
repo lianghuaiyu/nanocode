@@ -40,6 +40,16 @@ class Tracer:
             event_id(agent_id, start_seq - 1) if start_seq > 0 else None
         )
         self._turn_id: "str | None" = None
+        # fork：下一条 emit 要带的一次性 parent_event_id（分支首事件指向 fork 点）。
+        self._pending_parent_event_id: "str | None" = None
+
+    def begin_branch(self, branch_id: str, *, from_event_id: "str | None" = None) -> None:
+        """切到一个新分支（fork）：后续事件携带新 branch_id，且分支的第一条事件带
+        parent_event_id=from_event_id（指向 fork 点），其 parent_id 也接到 fork 点而非上一条。"""
+        self.branch_id = branch_id
+        if from_event_id is not None:
+            self._pending_parent_event_id = from_event_id
+            self._last_event_id = from_event_id  # 分支首事件的 parent_id 接到 fork 点
 
     def begin_turn(self, turn_id: "str | None" = None) -> str:
         """标记一个 turn（一次用户输入）的开始；后续事件携带该 turn_id。
@@ -69,6 +79,10 @@ class Tracer:
             event["branch_id"] = self.branch_id
             event["parent_id"] = self._last_event_id
             event["turn_id"] = self._turn_id
+            # fork：分支首事件带一次性 parent_event_id（指向 fork 点），随后清掉。
+            if self._pending_parent_event_id is not None:
+                event["parent_event_id"] = self._pending_parent_event_id
+                self._pending_parent_event_id = None
             self._last_event_id = ev_id
             self._seq += 1
         except Exception:

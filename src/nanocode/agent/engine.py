@@ -535,10 +535,16 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Session ──────────────────────────────────────────────
 
     def restore_session(self, data: dict) -> None:
-        if data.get("anthropicMessages"):
-            self._anthropic_messages = data["anthropicMessages"]
-        if data.get("openaiMessages"):
-            self._openai_messages = data["openaiMessages"]
+        # P5：events 为 resume 权威——优先从 wire 事件树重建主 agent 消息（llm_request 快照
+        # oracle），重建为空时回退到传入的 snapshot data（flat JSON / v2 messages.json）。
+        rebuilt = SessionContextBuilder(self.session_id).rebuild_messages(agent_id="main")
+        if rebuilt:
+            self._load_messages(rebuilt)
+        else:
+            if data.get("anthropicMessages"):
+                self._anthropic_messages = data["anthropicMessages"]
+            if data.get("openaiMessages"):
+                self._openai_messages = data["openaiMessages"]
         # v2 state: load TaskManager + mark non-terminal entries as lost
         state = data.get("state")
         if state and isinstance(state, dict):
@@ -1916,9 +1922,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     artifact_id=resume_id,
                     agent_source=config.get("source"),
                 )
-                # Reload persisted messages —— 经 SessionContextBuilder 取上下文（P3 快照、
-                # P5 事件树重建的统一入口），再经子 agent owner 入口加载（不直接赋值子列表）。
-                history = SessionContextBuilder(self.session_id).resume_messages(agent_id=resume_id)
+                # Reload persisted messages —— P5：events 为权威（从 wire leaf→root 重建，
+                # llm_request 快照 oracle），snapshot 兜底（重建空时回退，不丢数据）。
+                history = SessionContextBuilder(self.session_id).resume_messages(
+                    agent_id=resume_id, prefer_events=True)
                 sub_agent._load_messages(history)
 
                 kind, payload = await self._run_foreground_subagent(

@@ -60,7 +60,7 @@ def test_builder_injectable_into_session():
     a = _agent()
 
     class FakeBuilder(SessionContextBuilder):
-        def resume_messages(self, *, agent_id="main"):
+        def resume_messages(self, *, agent_id="main", prefer_events=True):
             return [{"role": "user", "content": f"built:{agent_id}"}]
 
     s = AgentSession(a, context_builder=FakeBuilder(a.session_id))

@@ -303,6 +303,39 @@ def render_wire_timeline(events, full: bool = False) -> str:
     return "\n".join(lines)
 
 
+def render_wire_tree(events, full: bool = False) -> str:
+    """`/tree` 最小文本：按 branch_id 分组展示 session 的分支结构 + fork 点。
+
+    用 SessionEvent 的 branch_id / parent_event_id：每个非 main 分支显示它从哪个 event
+    fork 出来；分支内列 turn 边界（user_message / turn_end）作锚点，避免逐事件刷屏。
+    """
+    if not events:
+        return "(no events)"
+    # 分支出现顺序（main 在前）+ 每分支的 fork 点（首事件的 parent_event_id）。
+    order: list = []
+    fork_of: dict = {}
+    by_branch: dict = {}
+    for e in events:
+        b = e.branch_id or "main"
+        if b not in by_branch:
+            by_branch[b] = []
+            order.append(b)
+            if e.parent_event_id:
+                fork_of[b] = e.parent_event_id
+        by_branch[b].append(e)
+    lines = []
+    for b in order:
+        head = f"● branch {b}"
+        if b in fork_of:
+            head += f"  (forked from {fork_of[b]})"
+        lines.append(head)
+        for e in by_branch[b]:
+            if e.type in ("user_message", "turn_end", "compaction"):
+                body = _truncate(_wire_body(e, full).replace("\n", " "), 60)
+                lines.append(f"    {e.seq:>3} {e.type:<16} {body}".rstrip())
+    return "\n".join(lines)
+
+
 def render_wire_summary(events, full: bool = False) -> str:
     if not events:
         return "(no events)"

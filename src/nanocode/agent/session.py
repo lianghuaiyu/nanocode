@@ -39,12 +39,25 @@ class AgentSession:
         run_once 的 BufferSink 捕获（子 agent）；结构化结果由 P4 的 TurnResult 承载。"""
         await self.agent.chat(prompt)
 
-    def resume(self, *, agent_id: str = "main") -> list:
+    def resume(self, *, agent_id: str = "main", prefer_events: bool = True) -> list:
         """经 SessionContextBuilder 取 resume 上下文并装入 agent 的 MessageStore（不覆盖空）。
 
-        等价于旧 restore 的「有数据才装」语义；P5 换成事件树重建时此调用点不变。
+        P5：默认 prefer_events=True——events 成为 resume 权威（从 wire leaf→root 重建，用
+        llm_request 快照作 byte-exact oracle），snapshot 降为兜底 cache（重建为空时回退，
+        不丢数据）。等价于旧 restore 的「有数据才装」语义；调用方可传 prefer_events=False 强制快照。
         """
-        messages = self.context_builder.resume_messages(agent_id=agent_id)
+        messages = self.context_builder.resume_messages(agent_id=agent_id, prefer_events=prefer_events)
         if messages:
             self.agent._load_messages(messages)
+        return messages
+
+    def fork_to(self, from_event_id: str, branch_id: str, *, agent_id: str = "main") -> list:
+        """把本 session 切到一个新分支（fork）：从 from_event_id 重建上下文装入，并让 tracer
+        在新 branch_id 下继续（首事件带 parent_event_id=from_event_id）。返回重建的上下文。
+
+        后续 run_turn 追加到新分支，不覆盖原分支（append-only + branch_id 隔离）。
+        """
+        messages = self.context_builder.rebuild_messages(agent_id=agent_id, leaf_id=from_event_id)
+        self.agent.tracer.begin_branch(branch_id, from_event_id=from_event_id)
+        self.agent._load_messages(messages)
         return messages
