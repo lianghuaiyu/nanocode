@@ -89,10 +89,7 @@ def subagent_detail_text(manager, agent_id: str, session_id: str | None = None) 
     if session_id:
         try:
             from ..session import v2 as _v2
-            d = _v2.session_root(session_id) / "agents" / a.id
-            for label, fname in (("Wire", "wire.jsonl"), ("Result", "result.md"),
-                                 ("Meta", "meta.json"), ("Prompt", "prompt.txt")):
-                p = d / fname
+            for label, p in _v2.agent_artifact_paths(session_id, a.id):
                 if p.exists():
                     parts.append(f"{label}: {p}")
         except Exception:
