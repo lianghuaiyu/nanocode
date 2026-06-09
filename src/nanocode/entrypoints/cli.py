@@ -16,7 +16,7 @@ from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..agent import Agent
+from ..agent import Agent, AgentSession
 from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from ..session import load_session, get_latest_session_id
 from ..session import v2 as _session_v2
@@ -473,6 +473,9 @@ def _resolve_resume_session() -> tuple:
 async def run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
+    # P3 seam：主 turn 经 AgentSession.run_turn 驱动（当前委托 agent.chat，行为不变）。
+    session = AgentSession(agent)
+
     async def confirm_fn(message: str) -> bool:
         answer = await _async_read_line("  Allow? (y/n): ", persistent=False)
         if answer is EOF or answer is CANCEL:
@@ -701,10 +704,10 @@ async def run_repl(agent: Agent) -> None:
                     if skill.context == "fork":
                         result = execute_skill(skill.name, cmd_args)
                         if result:
-                            await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
+                            await session.run_turn(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
                     else:
                         resolved = resolve_skill_prompt(skill, cmd_args)
-                        await agent.chat(resolved)
+                        await session.run_turn(resolved)
                 except Exception as e:
                     if "abort" not in str(e).lower():
                         print_error(str(e))
@@ -712,7 +715,7 @@ async def run_repl(agent: Agent) -> None:
 
         # Normal chat
         try:
-            await agent.chat(inp)
+            await session.run_turn(inp)
         except Exception as e:
             if "abort" not in str(e).lower():
                 print_error(str(e))

@@ -36,6 +36,7 @@ from ..memory.maintenance import (
 )
 from .sink import EventSink, TerminalSink, BufferSink
 from .message_store import MessageStore
+from .context_builder import SessionContextBuilder
 from ..session import save_session
 from ..prompt import build_system_prompt
 from ..skills.listing import (
@@ -1911,9 +1912,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     artifact_id=resume_id,
                     agent_source=config.get("source"),
                 )
-                # Reload persisted messages —— 经子 agent 自己的 owner 入口加载，
-                # 父不再直接赋值 sub_agent._{provider}_messages（P-1 子目标2/criterion4）。
-                history = _session_v2.read_agent_messages(self.session_id, resume_id)
+                # Reload persisted messages —— 经 SessionContextBuilder 取上下文（P3 快照、
+                # P5 事件树重建的统一入口），再经子 agent owner 入口加载（不直接赋值子列表）。
+                history = SessionContextBuilder(self.session_id).resume_messages(agent_id=resume_id)
                 sub_agent._load_messages(history)
 
                 kind, payload = await self._run_foreground_subagent(
