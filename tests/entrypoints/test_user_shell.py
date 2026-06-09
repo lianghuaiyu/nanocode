@@ -24,5 +24,6 @@ def test_true_no_output():
 
 
 def test_help_lists_bang():
-    import inspect
-    assert "!<command>" in inspect.getsource(cli.main)
+    # !<command> shell escape 必须在 REPL 帮助里有文档；CMD-P1 后帮助由 _repl_commands_help() 生成
+    # （--help 与 /help 共用），故断言渲染输出而非 main() 源码。
+    assert "!<command>" in cli._repl_commands_help()

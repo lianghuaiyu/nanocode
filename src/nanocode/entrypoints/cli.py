@@ -16,19 +16,19 @@ from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..agent import Agent, AgentSession
+from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager
 from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from ..session import load_session, get_latest_session_id
 from ..session import v2 as _session_v2
-from ..memory import list_memories
-from ..memory import eval_store
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
 from ..trace import is_enabled as _trace_is_enabled, trace_file as _trace_file
 from .trace_cmd import run as _run_trace_cmd
-from ..tools import sandbox_defaults
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
+from .commands.types import CommandContext, Local, Prompt
+from .commands.runner import dispatch, NOT_A_COMMAND
+from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trace": _run_trace_cmd}
@@ -39,22 +39,23 @@ EOF = object()      # stdin EOF (Ctrl-D)
 CANCEL = object()   # line cancelled at prompt (Ctrl-C)
 
 
-# 内置斜杠命令 (name, 一行描述)。描述与 --help 保持一致；作为补全菜单的 meta。
-# exit/quit 是裸词（无 /），不进 /-gated 菜单，故不在此列。
-_BUILTIN_COMMANDS = [
-    ("/clear", "Clear conversation history"),
-    ("/plan", "Toggle plan mode (read-only)"),
-    ("/cost", "Show token usage and cost"),
-    ("/compact", "Manually compact the conversation"),
-    ("/memory", "List saved memories"),
-    ("/skills", "List available skills"),
-    ("/sandbox", "Show/set sandbox session defaults"),
-    ("/tasks", "List background tasks"),
-    ("/task", "Show a background task's status & log"),
-    ("/task-stop", "Stop a running background task"),
-    ("/agents", "Agent definitions + running instances (available|running|show <name|id>)"),
-    ("/agent", "Show a sub-agent instance's details"),
-]
+# 内置斜杠命令的单一来源：从命令 registry 派生（取代旧的手维护列表，消除与 dispatch 的漂移）。
+# exit/quit 是裸词（无 /），不进 /-gated 菜单，故不在 registry。
+_REGISTRY = build_registry()
+_BUILTIN_COMMANDS = [(s.name, s.description) for s in _REGISTRY.specs() if not s.is_hidden]
+
+
+def _repl_commands_help() -> str:
+    """REPL 命令帮助块（--help 与 /help 共用同一 registry 来源，CMD-P1）。"""
+    lines = ["", "REPL commands:"]
+    for s in _REGISTRY.specs():
+        if s.is_hidden:
+            continue
+        left = f"  {s.name}" + (f" {s.arg_hint}" if s.arg_hint else "")
+        lines.append(f"{left:<22} {s.description}")
+    lines.append(f'{"  /<skill-name>":<22} Invoke a skill (e.g. /commit "fix types")')
+    lines.append(f'{"  !<command>":<22} Run a shell command directly (your own command; bypasses agent + permissions)')
+    return "\n".join(lines) + "\n"
 
 
 class _CommandCompleter(Completer):
@@ -345,57 +346,8 @@ def _load_env_files() -> None:
     # 不信任 / 首见的 repo：其 ./.env 不读（一次性关掉 PATH/LD_*/NANOCODE_*/base_url 等整类）
 
 
-def _fmt_eval_row(c) -> str:
-    """One-line summary of an eval candidate for REPL listing."""
-    q = (c.question or "").strip().replace("\n", " ")
-    if len(q) > 70:
-        q = q[:67] + "..."
-    cat = c.category or "general"
-    return f"    {c.id}  [{cat}]  {q}"
-
-
-def handle_eval_command(rest: str) -> str:
-    """Render `/memory eval <rest>` as a string (pure; REPL prints the result).
-
-    Subcommands:
-      (empty)|pending|confirmed|rejected   list candidates in that state
-      confirm <id>                         confirm a pending candidate (human)
-      reject <id>                          reject a pending candidate (human)
-    Anything else returns a Usage line.
-    """
-    parts = (rest or "").split()
-    sub = parts[0] if parts else "pending"
-    arg = parts[1] if len(parts) > 1 else ""
-
-    usage = ("Usage: /memory eval [pending|confirmed|rejected] | "
-             "confirm <id> | reject <id>")
-
-    if sub in ("pending", "confirmed", "rejected"):
-        listers = {
-            "pending": eval_store.list_pending,
-            "confirmed": eval_store.list_confirmed,
-            "rejected": eval_store.list_rejected,
-        }
-        rows = listers[sub]()
-        if not rows:
-            return f"No {sub} eval candidates."
-        lines = [f"{len(rows)} {sub} eval candidate(s):"]
-        lines += [_fmt_eval_row(c) for c in rows]
-        return "\n".join(lines)
-
-    if sub == "confirm":
-        if not arg:
-            return usage
-        ok = eval_store.confirm(arg)
-        return f"Confirmed {arg}." if ok else f"Could not confirm {arg!r} (not a pending candidate)."
-
-    if sub == "reject":
-        if not arg:
-            return usage
-        ok = eval_store.reject(arg)
-        return f"Rejected {arg}." if ok else f"Could not reject {arg!r} (not a pending candidate)."
-
-    return usage
+# `handle_eval_command` / `_fmt_eval_row` 已迁入 commands/builtin（CMD-P0）；
+# 见文件顶部的 re-export（保持 cli.handle_eval_command / cli._fmt_eval_row 的 back-compat）。
 
 
 def parse_args() -> argparse.Namespace:
@@ -476,13 +428,25 @@ async def run_repl(agent: Agent) -> None:
     # P3 seam：主 turn 经 AgentSession.run_turn 驱动（当前委托 agent.chat，行为不变）。
     session = AgentSession(agent)
 
+    # CMD-P0/P1：slash 命令经 registry/runner 分发（_REGISTRY 为模块级单源，与补全/--help 共用）。
+    _ctx = CommandContext(agent=agent, session=session, out=agent._sink, registry=_REGISTRY)
+
+    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（复用现有 session，不新建）。
+    # NANOCODE_REPL_VIA_RUNTIME=0 可回退到直接 session.run_turn（cancel/approval 回归时的逃生阀）。
+    _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
+    _thread = RuntimeThread(AgentRuntime(), agent, session)
+
+    async def _drive_turn(prompt: str) -> None:
+        if _via_runtime:
+            await _thread.run(prompt)
+        else:
+            await session.run_turn(prompt)
+
     async def confirm_fn(message: str) -> bool:
         answer = await _async_read_line("  Allow? (y/n): ", persistent=False)
         if answer is EOF or answer is CANCEL:
             return False
         return answer.lower().startswith("y")
-
-    agent.set_confirm_fn(confirm_fn)
 
     async def plan_approval_fn(plan_content: str) -> dict:
         print_plan_for_approval(plan_content)
@@ -505,7 +469,8 @@ async def run_repl(agent: Agent) -> None:
             else:
                 print("  Invalid choice. Enter 1, 2, 3, or 4.")
 
-    agent.set_plan_approval_fn(plan_approval_fn)
+    # CMD-P2.5：审批经 ApprovalManager 注入（取代散点 agent.set_confirm_fn / set_plan_approval_fn）。
+    ApprovalManager(confirm_fn=confirm_fn, plan_approval_fn=plan_approval_fn).attach(agent)
 
     sigint_count = 0
 
@@ -573,122 +538,23 @@ async def run_repl(agent: Agent) -> None:
                 print_info(await _run_user_shell(cmd))
             continue
 
-        # REPL commands
-        if inp == "/clear":
-            agent.clear_history()
-            continue
-        if inp == "/plan":
-            agent.toggle_plan_mode()
-            continue
-        if inp == "/cost":
-            agent.show_cost()
-            continue
-        if inp == "/compact":
-            try:
-                await agent.compact()
-            except Exception as e:
-                print_error(str(e))
-            continue
-        if inp == "/memory consolidate":
-            res = await agent._spawn_memory_consolidate()
-            print_info(res)
-            continue
-        if inp == "/memory eval generate":
-            res = await agent._spawn_memory_eval()
-            print_info(res)
-            continue
-        if inp == "/memory optimize":
-            res = await agent._spawn_memory_optimize()
-            print_info(res)
-            continue
-        if inp == "/memory eval" or inp.startswith("/memory eval "):
-            rest = inp[len("/memory eval"):].strip()
-            print_info(handle_eval_command(rest))
-            continue
-        if inp == "/memory":
-            memories = list_memories()
-            if not memories:
-                print_info("No memories saved yet.")
-            else:
-                print_info(f"{len(memories)} memories:")
-                for m in memories:
-                    print(f"    [{m.type}] {m.name} — {m.description}")
-            continue
-        if inp == "/skills":
-            skills = discover_skills()
-            if not skills:
-                print_info("No skills found. Add skills to .nanocode/skills/<name>/SKILL.md")
-            else:
-                print_info(f"{len(skills)} skills:")
-                for s in skills:
-                    tag = f"/{s.name}" if s.user_invocable else s.name
-                    print(f"    {tag} ({s.source}) — {s.description}")
-            continue
-
-        if inp == "/sandbox" or inp.startswith("/sandbox "):
-            parts = inp.split()
-            if len(parts) == 1:
-                d = sandbox_defaults.get_defaults()
-                print_info("Sandbox session defaults:")
-                for k, v in d.items():
-                    print(f"    {k} = {v}")
-                print_info("Set with: /sandbox <persist|network|mount_workspace|deps> <value>")
-            elif len(parts) == 3:
-                try:
-                    newval = sandbox_defaults.set_default(parts[1], parts[2])
-                    print_info(f"sandbox {parts[1]} = {newval}")
-                except ValueError as e:
-                    print_error(str(e))
-            else:
-                print_error("Usage: /sandbox [<key> <value>]")
-            continue
-
-        # 后台任务 / 子 agent 可观测命令（必须在 skill 名匹配之前拦截）
-        if inp == "/tasks" or inp.startswith("/tasks "):
-            from ..tools.tasks_tool import list_tasks_text
-            status = inp.split()[1] if len(inp.split()) > 1 else None
-            print(list_tasks_text(agent.task_manager, status, None))
-            continue
-        if inp.startswith("/task-stop "):
-            from ..tools.tasks_tool import task_stop
-            tid = inp.split(maxsplit=1)[1].strip()
-            print(await task_stop(agent.task_manager, agent._background_tasks, tid))
-            continue
-        if inp.startswith("/task "):
-            from ..tools.tasks_tool import task_output_text
-            tid = inp.split(maxsplit=1)[1].strip()
-            print(task_output_text(agent.task_manager, tid))
-            continue
-        if inp == "/agents" or inp.startswith("/agents "):
-            from ..tools.tasks_tool import (
-                agents_overview_text, list_agent_definitions_text,
-                list_subagents_text, agent_definition_detail_text,
-                subagent_detail_text,
-            )
-            parts = inp.split(maxsplit=2)
-            sub = parts[1] if len(parts) > 1 else ""
-            if sub == "":
-                print(agents_overview_text(agent.task_manager))
-            elif sub == "available":
-                print(list_agent_definitions_text(agent.task_manager))
-            elif sub == "running":
-                print(list_subagents_text(agent.task_manager))
-            elif sub == "show":
-                arg = parts[2].strip() if len(parts) > 2 else ""
-                if not arg:
-                    print_error("Usage: /agents show <name|id>")
-                else:
-                    detail = agent_definition_detail_text(arg)
-                    print(detail if detail is not None
-                          else subagent_detail_text(agent.task_manager, arg, agent.session_id))
-            else:
-                print_error("Usage: /agents [available|running|show <name|id>]")
-            continue
-        if inp.startswith("/agent "):
-            from ..tools.tasks_tool import subagent_detail_text
-            aid = inp.split(maxsplit=1)[1].strip()
-            print(subagent_detail_text(agent.task_manager, aid, agent.session_id))
-            continue
+        # REPL slash commands —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
+        # !shell / exit / quit / 全角归一 / 未知斜杠 fallthrough 仍在本 loop 处理（见上下）。
+        _result = await dispatch(inp, _REGISTRY, _ctx)
+        if _result is not NOT_A_COMMAND:
+            # 按 CommandResult variant 路由（Codex cross-review MED）：Prompt 驱动一个 turn；
+            # Local 打印 output / 可退出；Control 留给 CMD-P3+ lifecycle。当前 builtin 全为 Local()。
+            if isinstance(_result, Prompt):
+                await _drive_turn(_result.prompt)
+                continue
+            if isinstance(_result, Local):
+                if _result.output:
+                    print_info(_result.output)
+                if _result.exit_repl:
+                    print("\nBye!\n")
+                    break
+                continue
+            continue  # Control（CMD-P3+）：落地时在此路由 replace_thread/switch_runtime…
 
         # Skill invocation: /<skill-name> [args]
         if inp.startswith("/"):
@@ -704,10 +570,10 @@ async def run_repl(agent: Agent) -> None:
                     if skill.context == "fork":
                         result = execute_skill(skill.name, cmd_args)
                         if result:
-                            await session.run_turn(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
+                            await _drive_turn(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
                     else:
                         resolved = resolve_skill_prompt(skill, cmd_args)
-                        await session.run_turn(resolved)
+                        await _drive_turn(resolved)
                 except Exception as e:
                     if "abort" not in str(e).lower():
                         print_error(str(e))
@@ -715,7 +581,7 @@ async def run_repl(agent: Agent) -> None:
 
         # Normal chat
         try:
-            await session.run_turn(inp)
+            await _drive_turn(inp)
         except Exception as e:
             if "abort" not in str(e).lower():
                 print_error(str(e))
@@ -752,30 +618,7 @@ Environment:
   API keys are read from env vars: ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL)
   or OPENAI_API_KEY (+ OPENAI_BASE_URL). A .env file in the current directory is
   loaded automatically (existing environment variables take precedence).
-
-REPL commands:
-  /clear              Clear conversation history
-  /plan               Toggle plan mode (read-only <-> normal)
-  /cost               Show token usage and cost
-  /compact            Manually compact conversation
-  /memory             List saved memories
-  /memory consolidate Run a curator pass to merge/rewrite/archive memories
-  /memory eval        List/confirm/reject memory eval candidates (pending|confirmed|rejected | confirm <id> | reject <id>)
-  /memory eval generate  Run an EVAL-mode curator pass to propose pending eval candidates
-  /memory optimize    Run EvolveMem on confirmed eval candidates to tune retrieval config
-  /skills             List available skills
-  /sandbox            Show/set sandbox session defaults (persist/network/mount_workspace/deps)
-  /tasks [status]     List background tasks (optionally filter by status)
-  /task <id>          Show a background task's status, summary, and log tail
-  /task-stop <id>     Stop a running background task
-  /agents             Agent definitions + running instances
-  /agents available   List agent definitions (built-in + custom)
-  /agents running     List sub-agent instances in this session
-  /agents show <name|id>  Show a definition (name) or an instance (agent-NNN)
-  /agent <id>         Show a sub-agent instance's details
-  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
-  !<command>          Run a shell command directly (your own command; bypasses agent + permissions)
-
+""" + _repl_commands_help() + """
 Examples:
   nanocode "fix the bug in src/app.py"
   nanocode --yolo "run all tests and fix failures"
@@ -886,9 +729,18 @@ Examples:
             pass
 
     if prompt:
-        # One-shot mode
+        # One-shot mode —— CMD-P2.5：headless 路径同样经 RuntimeThread.run，不绕过 runtime。
+        # NANOCODE_REPL_VIA_RUNTIME=0 回退到直接 agent.chat（与 REPL 同一逃生阀）。
+        _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
+
+        async def _one_shot() -> None:
+            if _via_runtime:
+                await AgentRuntime().adopt(agent).run(prompt)
+            else:
+                await agent.chat(prompt)
+
         try:
-            asyncio.run(agent.chat(prompt))
+            asyncio.run(_one_shot())
         except Exception as e:
             print_error(str(e))
             sys.exit(1)
