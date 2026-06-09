@@ -69,6 +69,7 @@ from .models import (
 from .compaction import (
     SNIPPABLE_TOOLS, SNIP_PLACEHOLDER, SNIP_THRESHOLD,
     MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS, persist_large_result,
+    CompressionPipeline,
 )
 from .plan_mode import PlanModeMixin
 from .anthropic_backend import AnthropicBackendMixin
@@ -606,14 +607,22 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     # ─── Multi-tier compression pipeline ──────────────────────
 
     def _run_compression_pipeline(self) -> None:
+        # 每次 API 调用前的 in-place 多层裁剪——委托给 CompressionPipeline facade
+        # （tier 实现已从 backend 收敛到 compaction.py；此处行为不变，仍每轮跑）。
         if self.use_openai:
-            self._budget_tool_results_openai()
-            self._snip_stale_results_openai()
-            self._microcompact_openai()
+            CompressionPipeline.prepare_openai(
+                self._openai_messages,
+                last_input_token_count=self.last_input_token_count,
+                effective_window=self.effective_window,
+                last_api_call_time=self.last_api_call_time,
+            )
         else:
-            self._budget_tool_results_anthropic()
-            self._snip_stale_results_anthropic()
-            self._microcompact_anthropic()
+            CompressionPipeline.prepare_anthropic(
+                self._anthropic_messages,
+                last_input_token_count=self.last_input_token_count,
+                effective_window=self.effective_window,
+                last_api_call_time=self.last_api_call_time,
+            )
 
     # ─── Large result persistence ─────────────────────────────────
 

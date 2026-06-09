@@ -10,9 +10,6 @@ import time
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _to_openai_tools, _with_retry
-from .compaction import (
-    SNIP_PLACEHOLDER, SNIP_THRESHOLD, MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS,
-)
 
 
 class OpenAIBackendMixin:
@@ -43,43 +40,8 @@ class OpenAIBackendMixin:
             self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
 
-    # Tier 1: Budget tool results
-    def _budget_tool_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < 0.5:
-            return
-        budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._openai_messages:
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
-                keep = (budget - 80) // 2
-                msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
-
-    # Tier 2: Snip stale results
-    def _snip_stale_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < SNIP_THRESHOLD:
-            return
-        tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
-                tool_msgs.append(i)
-        if len(tool_msgs) <= KEEP_RECENT_RESULTS:
-            return
-        snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
-        for i in range(snip_count):
-            self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
-
-    # Tier 3: Microcompact
-    def _microcompact_openai(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
-        tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
-                tool_msgs.append(i)
-        clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
-        for i in range(max(0, clear_count)):
-            self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+    # Budget/snip/microcompact tier 实现已上移至 compaction.CompressionPipeline；
+    # 本 backend 不再实现细节，engine._run_compression_pipeline 每轮调用 facade（行为不变）。
 
     # ─── OpenAI-compatible backend ───────────────────────────────
 

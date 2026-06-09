@@ -10,10 +10,6 @@ from typing import Any
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from .models import _get_max_output_tokens, _with_retry
-from .compaction import (
-    SNIPPABLE_TOOLS, SNIP_PLACEHOLDER, SNIP_THRESHOLD,
-    MICROCOMPACT_IDLE_S, KEEP_RECENT_RESULTS,
-)
 
 
 class AnthropicBackendMixin:
@@ -43,83 +39,9 @@ class AnthropicBackendMixin:
             self._anthropic_messages.append(last_user_msg)
         self.last_input_token_count = 0
 
-    # Tier 1: Budget tool results
-    def _budget_tool_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < 0.5:
-            return
-        budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._anthropic_messages:
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and len(block["content"]) > budget:
-                    keep = (budget - 80) // 2
-                    block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
-
-    # Tier 2: Snip stale results
-    def _snip_stale_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
-        if utilization < SNIP_THRESHOLD:
-            return
-
-        results = []
-        for mi, msg in enumerate(self._anthropic_messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for bi, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] != SNIP_PLACEHOLDER:
-                    tool_use_id = block.get("tool_use_id")
-                    tool_info = self._find_tool_use_by_id(tool_use_id)
-                    if tool_info and tool_info["name"] in SNIPPABLE_TOOLS:
-                        results.append({"mi": mi, "bi": bi, "name": tool_info["name"], "file_path": tool_info.get("input", {}).get("file_path")})
-
-        if len(results) <= KEEP_RECENT_RESULTS:
-            return
-
-        to_snip = set()
-        seen_files: dict[str, list[int]] = {}
-        for i, r in enumerate(results):
-            if r["name"] == "read_file" and r.get("file_path"):
-                seen_files.setdefault(r["file_path"], []).append(i)
-
-        for indices in seen_files.values():
-            if len(indices) > 1:
-                for j in indices[:-1]:
-                    to_snip.add(j)
-
-        snip_before = len(results) - KEEP_RECENT_RESULTS
-        for i in range(snip_before):
-            to_snip.add(i)
-
-        for idx in to_snip:
-            r = results[idx]
-            self._anthropic_messages[r["mi"]]["content"][r["bi"]]["content"] = SNIP_PLACEHOLDER
-
-    # Tier 3: Microcompact
-    def _microcompact_anthropic(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
-        all_results = []
-        for mi, msg in enumerate(self._anthropic_messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for bi, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
-                    all_results.append((mi, bi))
-        clear_count = len(all_results) - KEEP_RECENT_RESULTS
-        for i in range(max(0, clear_count)):
-            mi, bi = all_results[i]
-            self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
-
-    def _find_tool_use_by_id(self, tool_use_id: str) -> dict | None:
-        for msg in self._anthropic_messages:
-            if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
-                continue
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
-                    return {"name": block["name"], "input": block.get("input", {})}
-        return None
+    # Budget/snip/microcompact tier 实现（含 _find_tool_use_by_id）已上移至
+    # compaction.CompressionPipeline；本 backend 不再实现细节，
+    # engine._run_compression_pipeline 每轮调用 facade（行为不变）。
 
     # ─── Anthropic backend ───────────────────────────────────────
 
