@@ -132,7 +132,7 @@ class AnthropicBackendMixin:
                 "role": "assistant",
                 "content": [self._block_to_dict(b) for b in response.content],
             })
-            self.tracer.emit(
+            self._dispatch_event(
                 "assistant_message",
                 text="".join(b.text for b in response.content if b.type == "text"),
                 thinking=getattr(response, "_nanocode_thinking", ""),
@@ -168,17 +168,14 @@ class AnthropicBackendMixin:
                 if context_break or self._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
-                self._sink.tool_call(tu.name, inp)
-                self.tracer.emit("tool_call", tool=tu.name, input=inp, tool_use_id=tu.id)
+                self._dispatch_event("tool_call", tool=tu.name, input=inp, tool_use_id=tu.id)
 
                 # Was this tool already started during streaming?
                 early_task = early_executions.get(tu.id)
                 if early_task:
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
-                    self._sink.tool_result(tu.name, res)
-                    self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
-                                     chars=len(res), result=res)
+                    self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
@@ -190,9 +187,7 @@ class AnthropicBackendMixin:
 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
-                self._sink.tool_result(tu.name, res)
-                self.tracer.emit("tool_result", tool=tu.name, tool_use_id=tu.id,
-                                 chars=len(res), result=res)
+                self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
 
                 if self._context_cleared:
                     self._context_cleared = False
@@ -274,7 +269,7 @@ class AnthropicBackendMixin:
                             # sink 自行决定渲染/抑制（BufferSink 下 thinking/spinner 均 no-op，
                             # 等价于旧 is_sub_agent 抑制）；core 不再判 _output_buffer。
                             self._sink.spinner_stop()
-                            self._sink.thinking("".join(buf))
+                            self._dispatch_event("assistant_thinking", text="".join(buf))
                         else:
                             tb = tool_blocks_by_index.pop(event.index, None)
                             if tb and on_tool_block_complete:
