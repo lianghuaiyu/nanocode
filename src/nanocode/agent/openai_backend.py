@@ -116,7 +116,7 @@ class OpenAIBackendMixin:
             self._openai_messages.append(message)
 
             _tcs = message.get("tool_calls") or []
-            self.tracer.emit(
+            self._dispatch_event(
                 "assistant_message",
                 text=message.get("content") or "",
                 thinking="",
@@ -160,8 +160,7 @@ class OpenAIBackendMixin:
                 except Exception:
                     inp = {}
 
-                self._sink.tool_call(fn_name, inp)
-                self.tracer.emit("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
+                self._dispatch_event("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
 
                 # 单一决策入口（policy + 审批）；allowlist 兜底在 _execute_tool_call。
                 allowed, denial = await self._authorize_dispatch(fn_name, inp)
@@ -188,9 +187,7 @@ class OpenAIBackendMixin:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
-                        self._sink.tool_result(ct_item["fn"], res)
-                        self.tracer.emit("tool_result", tool=ct_item["fn"],
-                                         tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
+                        self._dispatch_event("tool_result", tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
                         return ct_item, res
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
@@ -203,9 +200,7 @@ class OpenAIBackendMixin:
                             continue
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
-                        self._sink.tool_result(ct["fn"], res)
-                        self.tracer.emit("tool_result", tool=ct["fn"],
-                                         tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
+                        self._dispatch_event("tool_result", tool=ct["fn"], tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
 
                         if self._context_cleared:
                             self._context_cleared = False

@@ -59,6 +59,20 @@ def agent_dir(session_id: str, agent_id: str) -> Path:
     return d
 
 
+# 一个 agent 的标准 artifact 文件名（label -> filename）。集中此处的路径 grammar，
+# 避免上层（tasks_tool 等）手拼 'agents'/<id>/<filename>（PERSIST-P1 的唯一真实去散点）。
+AGENT_ARTIFACT_FILES = (("Wire", "wire.jsonl"), ("Result", "result.md"),
+                        ("Meta", "meta.json"), ("Prompt", "prompt.txt"))
+
+
+def agent_artifact_paths(session_id: str, agent_id: str) -> list[tuple[str, Path]]:
+    """枚举一个 agent 的标准 artifact 路径 (label, path)，**不创建 agent 目录**（与
+    agent_dir() 的 mkdir `<session>/agents/<id>` 副作用相反；只读用途）。注：session_root()
+    仍可能确保顶层 sessions/ 目录存在——与旧 tasks_tool 手拼路径的行为一致。调用方按 .exists() 过滤。"""
+    base = session_root(session_id) / "agents" / agent_id
+    return [(label, base / fname) for label, fname in AGENT_ARTIFACT_FILES]
+
+
 def write_agent_messages(session_id: str, agent_id: str, messages: list) -> None:
     _write_json(agent_dir(session_id, agent_id) / "messages.json", messages)
 

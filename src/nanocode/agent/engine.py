@@ -76,9 +76,11 @@ from .openai_backend import OpenAIBackendMixin
 
 # ─── Agent ───────────────────────────────────────────────────
 
-# 前台子 agent 的回退 turn 上限：当 manifest 未声明 max-turns 时使用，
-# 确保前台子 agent 永远有界（不至无限循环拖死父 loop）。
-SUBAGENT_MAX_TURNS_FALLBACK = 50
+# 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
+# SUBAGENT_MAX_TURNS_FALLBACK 随之迁入；此处 import 兼有 re-export 作用（back-compat）。
+from .subagent_manager import SubAgentManager, SUBAGENT_MAX_TURNS_FALLBACK  # noqa: E402,F401
+from . import agent_result  # noqa: E402 — 子 agent 结果信封纯函数（CAP-P1 STEP 1）
+from . import runtime_events  # noqa: E402 — 单一 RuntimeEvent 流（RUNTIME-P1）
 
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
 # 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
@@ -188,6 +190,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
         self.task_manager = task_manager if task_manager is not None else TaskManager()
         self._background_tasks: set[asyncio.Task] = set()
+        # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
+        self._subagents = SubAgentManager(self)
 
         # Permission whitelist (shared with sub-agents via ctor param)
         self._confirmed_paths: set[str] = confirmed_paths if confirmed_paths is not None else set()
@@ -455,7 +459,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         return sub_agent._captured_text()
 
     def _emit_block(self, text: str) -> None:
-        self._sink.assistant_markdown(text)
+        self._dispatch_event("assistant_block", text=text)
 
     # ─── REPL commands ────────────────────────────────────────
 
@@ -883,68 +887,26 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return None
         return max(0, self.max_turns - self.current_turns)
 
-    # ─── P4 concurrency / depth caps ─────────────────────────────
+    # ─── P4 concurrency / depth caps（策略已抽入 SubAgentManager，CAP-P1；以下为委托 shim）─────
 
     def _running_background_subagent_count(self) -> int:
-        """当前并发运行的后台子 agent 数：本 agent 持有的 detached task 中，回指一个
-        SubAgentRecord（owner_agent_id 非空）且 status=='running' 的 TaskRecord 计数。
-
-        以 owner_agent_id 而非 kind=='subagent' 判定，使 memory curator/eval/optimize
-        这些同样跑后台子 agent 的任务也计入上限——否则它们会绕过 max_threads。
-        shell 后台任务 owner_agent_id 为 None，不计。
-        以 TaskManager 的权威状态为准（detached 协程结束落终态），不靠 task.done()。"""
-        n = 0
-        for t in self._background_tasks:
-            tid = getattr(t, "_nanocode_task_id", None)
-            if not tid:
-                continue
-            rec = self.task_manager.get_task(tid)
-            if rec and rec.owner_agent_id and rec.status == "running":
-                n += 1
-        return n
+        return self._subagents.running_background_count()
 
     def _depth_cap_exceeded(self) -> bool:
-        """新 spawn 的子 agent 深度（self.depth + 1）是否超过 max_depth。
-
-        主 agent depth=0，其子 depth=1。今天子不能 spawn 孙（agent 工具被剥），故 live
-        depth 结构上恒为 1；max_depth 是前瞻性纵深防御 backstop。"""
-        from ..tools import load_agents_config
-        max_depth = load_agents_config().get("max_depth")
-        if not max_depth or max_depth <= 0:
-            return False
-        return (self.depth + 1) > max_depth
+        return self._subagents.depth_cap_exceeded()
 
     def _max_threads(self) -> int:
-        from ..tools import load_agents_config
-        return load_agents_config().get("max_threads") or 0
+        return self._subagents.max_threads()
 
     def _background_subagent_cap_reached(self) -> bool:
-        """后台子 agent 是否已达 max_threads 上限。curator/eval 与 agent 工具共用此判定，
-        使「计入」与「受限」一致——否则 curator 计入计数却不受限，自相矛盾。"""
-        mt = self._max_threads()
-        return mt > 0 and self._running_background_subagent_count() >= mt
+        return self._subagents.background_cap_reached()
 
     @staticmethod
     def _foreground_timeout(tool_timeout_ms, config: dict, fleet_cfg: dict):
-        """前台子 agent 的有效超时：工具入参 > manifest 'timeout-ms' > settings
-        [agents] default_timeout_ms（item 2/4）。全缺省 -> None（无 wall-clock 超时）。"""
-        if tool_timeout_ms is not None:
-            return tool_timeout_ms
-        if config.get("timeout_ms") is not None:
-            return config.get("timeout_ms")
-        return fleet_cfg.get("default_timeout_ms")
+        return SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
 
     def _bounded_sub_agent_max_turns(self, manifest_max_turns: int | None) -> int:
-        """计算前台子 agent 的 turn 上限：
-
-        manifest max-turns 优先，否则回退 SUBAGENT_MAX_TURNS_FALLBACK；
-        若父有剩余 turn 预算，clamp 到 min(value, parent_remaining)——子绝不超过父。
-        """
-        value = manifest_max_turns if (manifest_max_turns and manifest_max_turns > 0) else SUBAGENT_MAX_TURNS_FALLBACK
-        remaining = self._parent_remaining_turns()
-        if remaining is not None:
-            value = min(value, remaining)
-        return value
+        return self._subagents.bounded_max_turns(manifest_max_turns)
 
     def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None,
                          background=False, max_turns=None, model=None,
@@ -1142,90 +1104,21 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return None
 
     # ─── Structured AgentResult + bounded envelope ────────────────
-
-    # 小结果直通阈值：raw text <= 此字节数时整段作为 summary 直通父上下文
-    # （concise explore/plan deliverable 不应被截断丢失）；超出则截断 + 指针。
-    _ENVELOPE_PASSTHROUGH_BYTES = 4096
-    _ENVELOPE_MAX_FINDINGS = 10
-    _ENVELOPE_MAX_FILES = 10
+    # 纯函数（无 self / IO / 模型循环）已抽入 agent_result.py（CAP-P1 STEP 1）；以下为委托 shim。
 
     def _build_agent_result(self, sub_agent: "Agent", text: str,
                             tokens: dict, result_path: str | None) -> dict:
-        """装配 AgentResult：宿主派生文件事实 + 模型自述 summary/findings（可选结构块解析，回退兜底）。
-
-        files_read / files_modified 取自 SUB-AGENT 实例的观测集合（宿主派生，不信任模型）。
-        summary / findings 由 parse_structured_result 解析子 agent 最终文本；无结构块则
-        summary=首 ~500 字符、findings=[]。tokens 已折叠进父，仅展示。
-        """
-        from ..subagents.result import parse_structured_result
-        parsed = parse_structured_result(text or "")
-        files_read = sorted(getattr(sub_agent, "_files_read", None) or set())
-        files_modified = sorted(getattr(sub_agent, "_files_modified", None) or set())
-        return {
-            "summary": parsed["summary"],
-            "findings": parsed["findings"],
-            "files_read": files_read,
-            "files_modified": files_modified,
-            "tokens": {"input": tokens.get("input", 0), "output": tokens.get("output", 0)},
-            "result_path": result_path,
-        }
+        return agent_result.build_agent_result(sub_agent, text, tokens, result_path)
 
     def _render_agent_result_envelope(self, result: dict, raw_text: str) -> str:
-        """渲染**有界、定形**的信封——父上下文看到的就是这个（不再是整段 transcript）。
+        return agent_result.render_agent_result_envelope(result, raw_text)
 
-        规则：
-        - raw_text 小（<= ~4KB）→ 整段直通作为 summary（concise deliverable 不丢失）；
-          否则用模型 summary，并附 "... [truncated — full result at <path>, use read_file]" 指针。
-        - 始终追加：top findings（cap ~10）、files_modified（cap ~10 名 + 溢出计数）、
-          files_read 计数、tokens、result_path。
-        - 无论 findings/files 多少都有界。
-        """
-        raw_text = raw_text or ""
-        result_path = result.get("result_path")
-        explicit_summary = (result.get("summary") or "").strip()
-        small = len(raw_text.encode("utf-8")) <= self._ENVELOPE_PASSTHROUGH_BYTES
-        if not raw_text.strip():
-            # 空 transcript：若调用方已显式给了 summary（如超时/错误终态的原因），用它；
-            # 否则给"无输出"提示。两种都仍带 result_path 指针。
-            if explicit_summary:
-                body = explicit_summary + (f"\nFull result at {result_path}, use read_file"
-                                           if result_path else "")
-            else:
-                body = (f"(sub-agent produced no output; see {result_path})"
-                        if result_path else "(sub-agent produced no output)")
-        elif small:
-            body = raw_text.strip()
-        else:
-            summary = explicit_summary or "(no summary)"
-            pointer = (f"\n... [truncated — full result at {result_path}, use read_file]"
-                       if result_path else
-                       "\n... [truncated — full result not persisted]")
-            body = summary + pointer
-
-        lines = [body]
-
-        findings = result.get("findings") or []
-        if findings:
-            shown = findings[:self._ENVELOPE_MAX_FINDINGS]
-            lines.append("\nFindings:")
-            lines.extend(f"  - {f}" for f in shown)
-            if len(findings) > len(shown):
-                lines.append(f"  - (+{len(findings) - len(shown)} more)")
-
-        modified = result.get("files_modified") or []
-        if modified:
-            shown = modified[:self._ENVELOPE_MAX_FILES]
-            lines.append("\nFiles modified:")
-            lines.extend(f"  - {p}" for p in shown)
-            if len(modified) > len(shown):
-                lines.append(f"  - (+{len(modified) - len(shown)} more)")
-
-        read_count = len(result.get("files_read") or [])
-        tok = result.get("tokens") or {}
-        lines.append(f"\nFiles read: {read_count}")
-        lines.append(f"Tokens: {tok.get('input', 0)} in / {tok.get('output', 0)} out")
-        lines.append(f"Result: {result_path or '(not persisted)'}")
-        return "\n".join(lines)
+    def _dispatch_event(self, _type: str, **fields) -> None:
+        """RUNTIME-P1：单流发射。durable → tracer（写 wire），UI → projection（读 live
+        self.tracer / self._sink）。过渡期逐类把 self._sink.* + tracer.emit(...) 收敛到此；
+        wire 与 UI 行为与双发逐字等价（byte-parity gate）。"""
+        runtime_events.dispatch_event(
+            runtime_events.RuntimeEvent(_type, fields), self.tracer, self._sink)
 
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
         """把子 agent 已花费的 token 折叠进父——成功/超时/错误都要折，否则一个跑了很久
