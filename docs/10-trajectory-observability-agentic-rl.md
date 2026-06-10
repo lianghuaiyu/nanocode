@@ -383,6 +383,8 @@ if trajectory_enabled:
 
 注意：不要在 `Tracer.emit()` 里做复杂摘要、读取文件、计算 diff。`Tracer` 应保持轻量，复杂语义在调用点或 exporter 做。
 
+**trajectory-level 在 fanout 之前生效（debug trace 不绕过 summary）。** 注入 trajectory 信封与 SUMMARY 整形（`apply_summary_shaping`）都在 `Tracer.emit()` 内**就地改 `event`，发生在 `for sink in self.sinks: sink.write(event)` 之前**。因此该事件以**同一（已整形）**形态发给**所有** sink——always-on wire **和** opt-in debug trace（`--trace`）都拿到整形后的事件。即：`--trace --trajectory --trajectory-level summary` 下，debug trace **也是 summary 形态**，不会绕过整形拿到全量。这是**有意**取舍（trajectory 模式 = 整条流按 level 收敛，保持单一事实账本，不为 debug 另维护一份全量）；若将来确需「wire 收敛、debug 保全」，需把整形从 `emit()` 内**上移为 per-sink 决策**（当前不做）。
+
 ### `src/nanocode/agent/openai_backend.py` 与 `anthropic_backend.py`
 
 按 level 控制重字段：
@@ -557,6 +559,8 @@ src/nanocode/trajectory/
 - `trace/report.py` 当前读顶层字段
 - `events.models.SessionEvent.from_wire` 已按 envelope/data 派生视图工作
 - flat-additive 对老 reader 更友好
+
+**`trajectory` / `trajectory_id` / `trajectory_level` 的定位：metadata，不进 `ENVELOPE_KEYS`。** 这三个是 trajectory 采集的**元数据**键，按 flat-additive 约定写在 wire 事件顶层；读侧 `SessionEvent.from_wire` 把所有非-`ENVELOPE_KEYS` 顶层键归集进 `SessionEvent.data`，故它们落在 `data`（`ev.data["trajectory_id"]`），而**不**进 `ENVELOPE_KEYS`、不成为 `SessionEvent` 的结构字段。这是**有意**的——`ENVELOPE_KEYS` 只保留事件树结构键（`id`/`seq`/`parent_id`/`turn_id`/`agent_id`/`branch_id`…），trajectory 是「关于这次采集」的元数据而非事件树结构；消费方（`trajectory.project._traj_id`、resume fallback 测试）统一从 `data` 读取。（曾评估把它们提升进 `ENVELOPE_KEYS`，但 `test_trajectory_resume_fallback` 等已锁定 `req.data.get("trajectory") is True`，提升会破坏该设计，故保持 metadata-in-data。）summary 整形产生的 `messages_hash` / `messages_chars` / `result_summary` / `result_hash` 是**被替换的 payload**，本就属 `data`。
 
 ### 对 resume
 
