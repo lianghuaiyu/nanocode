@@ -110,13 +110,11 @@ def _pytest_outcome(result_text: str) -> dict:
     text = result_text or ""
     for n, word in re.findall(r"(\d+)\s+(passed|failed|error|errors)", text, flags=re.IGNORECASE):
         cnt = _as_int(n)
-        w = word.lower()
-        if w == "passed":
+        matched = True
+        if word.lower() == "passed":
             passed += cnt
-            matched = True
         else:  # failed / error / errors
             failed += cnt
-            matched = True
     return {"passed": passed, "failed": failed, "matched": matched}
 
 
@@ -225,10 +223,12 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
                 pending_llm_req_ts = ts
 
             elif etype == "llm_response":
-                total_input_tokens += _as_int(data.get("input_tokens"))
-                total_output_tokens += _as_int(data.get("output_tokens"))
-                ab["input_tokens"] += _as_int(data.get("input_tokens"))
-                ab["output_tokens"] += _as_int(data.get("output_tokens"))
+                in_tokens = _as_int(data.get("input_tokens"))
+                out_tokens = _as_int(data.get("output_tokens"))
+                total_input_tokens += in_tokens
+                total_output_tokens += out_tokens
+                ab["input_tokens"] += in_tokens
+                ab["output_tokens"] += out_tokens
                 if pending_llm_req_ts is not None:
                     d = _delta_ms(pending_llm_req_ts, ts)
                     if d is not None:
@@ -252,11 +252,10 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
                 else:
                     pending_tool_fifo.append((tool, ts, command))
                 # files_touched：文件类工具的 input.file_path。
-                if tool in _FILE_TOOLS:
-                    if isinstance(inp, dict):
-                        fp = inp.get("file_path")
-                        if isinstance(fp, str) and fp:
-                            files_touched.add(fp)
+                if tool in _FILE_TOOLS and isinstance(inp, dict):
+                    fp = inp.get("file_path")
+                    if isinstance(fp, str) and fp:
+                        files_touched.add(fp)
 
             elif etype == "tool_result":
                 tool = data.get("tool") or "<unknown>"

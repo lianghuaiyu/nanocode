@@ -258,10 +258,7 @@ def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "
                 if tool in _SHELL_TOOLS or "(exit" in text:
                     m = _EXIT_RE.search(text)
                     if m:
-                        try:
-                            code = int(m.group(1))
-                        except (TypeError, ValueError):
-                            code = None
+                        code = _as_int(m.group(1))
                         if code is not None and code != 0:
                             out.append(_eval_record(
                                 step_id=sid, turn_id=turn_id, agent_id=agent_id,
@@ -276,15 +273,9 @@ def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "
                     pm = _TESTS_PASS_RE.search(text)
                     n_fail = 0
                     if fm:
-                        try:
-                            n_fail += int(fm.group(1))
-                        except (TypeError, ValueError):
-                            pass
+                        n_fail += _as_int(fm.group(1)) or 0
                     if em:
-                        try:
-                            n_fail += int(em.group(1))
-                        except (TypeError, ValueError):
-                            pass
+                        n_fail += _as_int(em.group(1)) or 0
                     if n_fail > 0:
                         out.append(_eval_record(
                             step_id=sid, turn_id=turn_id, agent_id=agent_id,
@@ -292,10 +283,7 @@ def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "
                             detail=_snippet(text),
                         ))
                     elif pm:
-                        try:
-                            n_pass = int(pm.group(1))
-                        except (TypeError, ValueError):
-                            n_pass = 0
+                        n_pass = _as_int(pm.group(1)) or 0
                         if n_pass > 0:
                             out.append(_eval_record(
                                 step_id=sid, turn_id=turn_id, agent_id=agent_id,
@@ -367,6 +355,18 @@ def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "
     return out
 
 
+def _is_failure_eval(ev: dict) -> bool:
+    """一条 eval 是否表征失败（负向信号）：命中 ``_FAILURE_SIGNALS``，或 shell_exit_code 非零。
+
+    attach_rewards（据此给 step 负 reward）与 failure_attribution（据此定位首因）共用此判定，
+    保证「什么算失败」单一来源。
+    """
+    signal = ev.get("signal")
+    if signal in _FAILURE_SIGNALS:
+        return True
+    return signal == SIG_SHELL_EXIT_CODE and ev.get("value") not in (0, None)
+
+
 # ─── P4 API：attach_rewards ──────────────────────────────────────────────────
 
 def attach_rewards(steps: "list", evals: "list[dict]") -> "list":
@@ -380,7 +380,7 @@ def attach_rewards(steps: "list", evals: "list[dict]") -> "list":
     仅能关联到 step_id 的 eval 才参与（其余 eval 按 turn/agent 聚合，不在此回填）。绝不抛。
     """
     if not steps:
-        return list(steps) if steps else []
+        return []
 
     # 收集「带负向信号的 step_id」。
     penalized: set = set()
@@ -391,10 +391,7 @@ def attach_rewards(steps: "list", evals: "list[dict]") -> "list":
             sid = ev.get("step_id")
             if sid is None:
                 continue
-            signal = ev.get("signal")
-            if signal in _FAILURE_SIGNALS:
-                penalized.add(sid)
-            elif signal == SIG_SHELL_EXIT_CODE and ev.get("value") not in (0, None):
+            if _is_failure_eval(ev):
                 penalized.add(sid)
         except Exception:
             continue
@@ -452,11 +449,7 @@ def failure_attribution(events: "list[SessionEvent]", evals: "list[dict]") -> "d
         try:
             if not isinstance(ev, dict):
                 continue
-            signal = ev.get("signal")
-            if signal in _FAILURE_SIGNALS:
-                first = ev
-                break
-            if signal == SIG_SHELL_EXIT_CODE and ev.get("value") not in (0, None):
+            if _is_failure_eval(ev):
                 first = ev
                 break
         except Exception:
