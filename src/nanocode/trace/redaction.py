@@ -73,11 +73,8 @@ def apply_summary_shaping(event: dict) -> None:
             event["messages_hash"] = payload_hash(messages)
         elif etype == "tool_result" and "result" in event:
             result = event.pop("result")
-            try:
-                result_str = result if isinstance(result, str) else str(result)
-            except Exception:
-                result_str = ""
-            event["result_summary"] = truncate(result_str, SUMMARY_RESULT_SNIPPET_CHARS)
+            # truncate() 自身做 str 强转 + defensive 兜底，无需在此重复
+            event["result_summary"] = truncate(result, SUMMARY_RESULT_SNIPPET_CHARS)
             event["result_hash"] = payload_hash(result)
     except Exception:
         return

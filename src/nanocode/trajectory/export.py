@@ -111,30 +111,14 @@ def _derive_metadata(
     - n_steps：len(steps)。
     """
     traj_id = f"traj_{session_id}" if session_id else "traj_"
-    model: "str | None" = None
     start_time: "str | None" = None
     end_time: "str | None" = None
-    final_status: "str | None" = None
 
-    try:
-        for ev in events:
-            d = _ev_data(ev)
-            tid = d.get("trajectory_id")
-            if tid:
-                traj_id = _str(tid)
-                break
-    except Exception:
-        pass
-
-    try:
-        for ev in events:
-            d = _ev_data(ev)
-            m = d.get("model")
-            if m:
-                model = _str(m)
-                break
-    except Exception:
-        pass
+    # trajectory_id / model：各取首个带该键且值为真的事件 data；缺则保留默认。
+    found_traj_id = _first_data_value(events, "trajectory_id")
+    if found_traj_id is not None:
+        traj_id = found_traj_id
+    model = _first_data_value(events, "model")
 
     try:
         if events:
@@ -249,6 +233,18 @@ def _write_jsonl(path: Path, records) -> None:
 def _ev_data(ev) -> dict:
     d = getattr(ev, "data", None)
     return d if isinstance(d, dict) else {}
+
+
+def _first_data_value(events: list, key: str) -> "str | None":
+    """取首个 ``data[key]`` 为真的事件的该值（``_str`` 后），缺则 None。绝不抛。"""
+    try:
+        for ev in events:
+            v = _ev_data(ev).get(key)
+            if v:
+                return _str(v)
+    except Exception:
+        return None
+    return None
 
 
 def _str(val) -> str:

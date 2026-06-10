@@ -31,6 +31,28 @@ DURABLE_TYPES = frozenset({
     "permission_decision", "tool_blocked", "compaction", "turn_end", "session_end",
 })
 
+# durable wire schema 契约（RUNTIME-P1 ↔ Trajectory 桥）：每个 durable type 在 wire 上的稳定
+# payload 字段。trajectory.project/metrics/eval 与 resume 重建都依赖它们；改任一 type 或字段名
+# = 破契约（trajectory 会静默崩）。约束：只能 flat-additive 增字段，不改名/不删（docs/10 §兼容性、
+# docs/12 边界 5）。SUMMARY 级整形见 trace.redaction：llm_request.messages → messages_hash/
+# messages_chars，tool_result.result → result_summary/result_hash（投影层 project 有兜底）。
+# guard: tests/agent/test_durable_schema_contract.py。
+DURABLE_EVENT_FIELDS: "dict[str, frozenset[str]]" = {
+    "session_start": frozenset({"model", "cwd", "permission_mode", "is_sub_agent", "workspace_trusted"}),
+    "user_message": frozenset({"text"}),
+    "llm_request": frozenset({"model", "message_count", "messages"}),
+    "assistant_message": frozenset({"text", "thinking", "tool_uses"}),
+    "llm_response": frozenset({"input_tokens", "output_tokens"}),
+    "budget_exceeded": frozenset({"reason"}),
+    "tool_call": frozenset({"tool", "input", "tool_use_id"}),
+    "tool_result": frozenset({"tool", "tool_use_id", "chars", "result"}),
+    "permission_decision": frozenset({"tool", "action", "message"}),
+    "tool_blocked": frozenset({"tool", "reason", "agent_type", "artifact_id"}),
+    "compaction": frozenset({"kind", "message_count_before", "message_count_after"}),
+    "turn_end": frozenset({"input_tokens", "output_tokens", "turns"}),
+    "session_end": frozenset({"input_tokens", "output_tokens", "turns"}),
+}
+
 # 仅 UI、不落 wire 的 RuntimeEvent type。流式文本/思考的 UI 经 ephemeral assistant_block /
 # assistant_thinking 逐 block 渲染（durable 记录是整段 assistant_message，本身**不**做 UI 投影，
 # 既避免重复渲染、又保留 Anthropic 的逐 block 流式）。tool_call / tool_result 是 durable type

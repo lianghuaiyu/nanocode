@@ -75,7 +75,6 @@ def build_steps(events: "list[SessionEvent]") -> list[Step]:
         # 索引便于配对：按 (agent_id, tool_use_id) 找 tool_result；按 agent 顺序找 assistant/llm_response。
         tool_results = _index_tool_results(events)
 
-        n = len(events)
         # 待消费的 llm_request（按 agent_id 暂存，等其后的 assistant_message + llm_response）。
         pending_llm: dict[str, SessionEvent] = {}
 
@@ -84,8 +83,7 @@ def build_steps(events: "list[SessionEvent]") -> list[Step]:
             _link(step, last_step_by_branch, event_to_step, branch_first_parent, anchor)
             steps.append(step)
 
-        for i in range(n):
-            ev = events[i]
+        for i, ev in enumerate(events):
             etype = _safe_type(ev)
             agent = _safe_agent(ev)
 
