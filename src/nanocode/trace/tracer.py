@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..events.models import event_id
+from .redaction import apply_summary_shaping
 from .sinks import Sink
 
 SCHEMA_VERSION = 1
@@ -27,6 +28,9 @@ class Tracer:
         agent_id: str = "main",
         branch_id: str = "main",
         start_seq: int = 0,
+        trajectory_enabled: bool = False,
+        trajectory_level: str = "summary",
+        trajectory_id: "str | None" = None,
     ) -> None:
         self.session_id = session_id
         self.parent_session_id = parent_session_id
@@ -34,6 +38,13 @@ class Tracer:
         self.agent_id = agent_id
         self.branch_id = branch_id
         self._seq = start_seq
+        # trajectory 采集（docs/10）：execution-fact wire 的附加投影开关；flat-additive 信封键，
+        # 关闭/FULL 时 payload byte-identical，SUMMARY 时由 apply_summary_shaping 整形（见 emit）。
+        self.trajectory_enabled = trajectory_enabled
+        self.trajectory_level = trajectory_level
+        self.trajectory_id = trajectory_id or (
+            f"traj_{session_id}" if trajectory_enabled else None
+        )
         # resume-safe 链接：若从 wire tail 续号（start_seq>0），首个新事件的 parent
         # 即上一轮 tail 的（可确定性反推的）id evt_{agent_id}_{start_seq-1}。
         self._last_event_id: "str | None" = (
@@ -67,6 +78,12 @@ class Tracer:
             # authoritative（含 v/ts/session_id/parent_session_id/seq/type）。否则同名 payload
             # kwarg（如误传 seq=）会篡改 envelope，造成 id↔seq 错位、resume 续号被污染。
             event = dict(fields)
+            # 硬边界（用户强制）：reward / eval_result 是**派生标签**，绝不进 wire 事实源。
+            # 即便调用方误传（tracer.emit(..., reward=...)）也在此无条件剥除——靠守卫而非约定，
+            # 使「metrics/evals never contaminate wire」成为结构保证。derived 标签只活在
+            # trajectory 的 metrics.json / evals.jsonl（export 层落盘，绝不回写 wire）。
+            event.pop("reward", None)
+            event.pop("eval_result", None)
             event["v"] = SCHEMA_VERSION
             event["ts"] = datetime.now(timezone.utc).isoformat()
             event["session_id"] = self.session_id
@@ -85,6 +102,14 @@ class Tracer:
                 self._pending_parent_event_id = None
             self._last_event_id = ev_id
             self._seq += 1
+            # trajectory 投影信封（flat-additive，落到读侧 SessionEvent.data）：
+            # 关闭/FULL 时 payload 不变；SUMMARY 时丢重型 payload、补摘要+hash。
+            if self.trajectory_enabled:
+                event["trajectory"] = True
+                event["trajectory_id"] = self.trajectory_id
+                event["trajectory_level"] = self.trajectory_level
+                if self.trajectory_level == "summary":
+                    apply_summary_shaping(event)
         except Exception:
             return
         for sink in self.sinks:
@@ -107,6 +132,9 @@ class Tracer:
             parent_session_id=self.session_id,
             agent_id=agent_id or session_id,
             branch_id=self.branch_id,
+            trajectory_enabled=self.trajectory_enabled,
+            trajectory_level=self.trajectory_level,
+            trajectory_id=self.trajectory_id,
         )
 
     def close(self) -> None:
@@ -124,6 +152,9 @@ class NullTracer:
     parent_session_id = None
     agent_id = "main"
     branch_id = "main"
+    trajectory_enabled = False
+    trajectory_level = "summary"
+    trajectory_id = None
 
     def begin_turn(self, *args: Any, **kwargs: Any) -> str:
         return ""

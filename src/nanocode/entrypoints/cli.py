@@ -21,8 +21,14 @@ from ..ui import print_welcome, print_error, print_info, print_plan_for_approval
 from ..session import load_session, get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
-from ..trace import is_enabled as _trace_is_enabled, trace_file as _trace_file
+from ..trace import (
+    is_enabled as _trace_is_enabled,
+    trace_file as _trace_file,
+    trajectory_enabled as _trajectory_enabled,
+    trajectory_level as _trajectory_level,
+)
 from .trace_cmd import run as _run_trace_cmd
+from .trajectory_cmd import run as _run_trajectory_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
@@ -31,7 +37,7 @@ from .commands.runner import dispatch, NOT_A_COMMAND
 from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
-_SUBCOMMANDS = {"trace": _run_trace_cmd}
+_SUBCOMMANDS = {"trace": _run_trace_cmd, "trajectory": _run_trajectory_cmd}
 
 
 # REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
@@ -369,6 +375,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--trace", action="store_true",
                         help="Record agent trajectory to ./.nanocode/traces/<session>.jsonl")
+    parser.add_argument("--trajectory", action="store_true",
+                        help="Project the always-on wire into a trajectory (analysis/RL lane)")
+    parser.add_argument("--trajectory-level", choices=["summary", "full"], default=None,
+                        help="summary (default): drop heavy payloads, keep hash+summary; "
+                             "full: keep full prompts/messages/tool results (may contain secrets)")
     parser.add_argument("--memory-backend", choices=["auto", "simplemem", "markdown", "off"],
                         default=None,
                         help="Long-term memory backend (default: auto)")
@@ -609,7 +620,11 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
-  --trace             Record agent trajectory to ./.nanocode/traces/<session>.jsonl
+  --trace             Debug lane: record agent trace to ./.nanocode/traces/<session>.jsonl
+  --trajectory        Project the always-on wire into a trajectory (analysis/RL lane)
+  --trajectory-level {summary,full}
+                      summary (default): drop heavy payloads, keep hash + summary.
+                      full: keep full prompts/messages/tool results — may contain secrets.
   --verbose           Print per-turn token cost and MCP connection logs (default: quiet)
   --memory-backend B  Long-term memory: auto|simplemem|markdown|off (default: auto)
   --help, -h          Show this help
@@ -631,6 +646,10 @@ Examples:
   nanocode trace                 # list recorded trace sessions
   nanocode trace <id>            # print a session timeline (--full to expand)
   nanocode trace <id> --summary  # aggregate stats for a session
+
+  nanocode trajectory             # list wire sessions available as trajectories
+  nanocode trajectory show <id>   # per-step table + metrics summary for a session
+  nanocode trajectory export <id> # export a session as a trajectory bundle (--out DIR)
 """)
         sys.exit(0)
 
@@ -690,6 +709,11 @@ Examples:
     from ..memory import select_backend
     mem_backend = select_backend(args.memory_backend, on_warning=print_info)
 
+    # trajectory 采集（DERIVED 投影 / RL 分析专用，与 --trace debug lane 区分）：
+    # 显式 flag 或 NANOCODE_TRAJECTORY 环境变量开启；level 非法/缺省退回 "summary"。
+    traj_on = _trajectory_enabled(args.trajectory)
+    traj_lvl = _trajectory_level(args.trajectory_level)
+
     agent = Agent(
         permission_mode=permission_mode,
         model=model,
@@ -700,6 +724,8 @@ Examples:
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
         trace_enabled=_trace_is_enabled(args.trace),
+        trajectory_enabled=traj_on,
+        trajectory_level=traj_lvl,
         workspace_trusted=workspace_trusted,
         session_id=adopt_sid,
         memory_backend=mem_backend,
@@ -707,6 +733,18 @@ Examples:
 
     if _trace_is_enabled(args.trace):
         print_info(f"tracing → {_trace_file(agent.session_id)}")
+
+    if traj_on:
+        if traj_lvl == "full":
+            print_info(f"trajectory: on (level=full) — records full prompts/messages/tool "
+                       f"results — may contain secrets")
+        else:
+            print_info(f"trajectory: on (level={traj_lvl})")
+    elif args.trajectory_level is not None:
+        # --trajectory-level 不开启采集（需 --trajectory / NANOCODE_TRAJECTORY）——给出可见提示，
+        # 否则用户以为开了 full 采集却毫无效果（审阅 LOW UX）。
+        print_info("note: --trajectory-level has no effect without --trajectory "
+                   "(or NANOCODE_TRAJECTORY=1)")
 
     # Resume session (after Agent is constructed with adopted session_id)
     if args.resume and resume_data:

@@ -116,6 +116,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         is_sub_agent: bool = False,
         trace_enabled: bool = False,
         trace_parent=None,
+        trajectory_enabled: bool = False,
+        trajectory_level: str = "summary",
         workspace_trusted: bool = True,
         task_manager: "TaskManager | None" = None,
         session_id: str | None = None,
@@ -169,6 +171,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.artifact_id = artifact_id or "main"
         if not self.is_sub_agent:
             os.environ["NANOCODE_SESSION_ID"] = self.session_id
+        # trajectory 采集开关（docs/10）：在 _build_tracer 之前置好，供 Tracer 派生 trajectory_id。
+        # DERIVED 投影的 wire 整形开关；关闭/FULL 时 payload byte-identical。
+        self.trajectory_enabled = trajectory_enabled
+        self.trajectory_level = trajectory_level
         self.tracer = self._build_tracer(trace_enabled=trace_enabled, trace_parent=trace_parent)
         self.tracer.emit(
             "session_start", model=self.model, cwd=str(Path.cwd()),
@@ -304,7 +310,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         tracer = Tracer(self.session_id, [*sinks, *debug_sinks],
                         parent_session_id=parent_session_id,
-                        agent_id=self.artifact_id, start_seq=start_seq)
+                        agent_id=self.artifact_id, start_seq=start_seq,
+                        trajectory_enabled=self.trajectory_enabled,
+                        trajectory_level=self.trajectory_level)
         # 标记 debug sink，供子 agent 继承（区别于 per-agent wire sink）。
         tracer._debug_sinks = debug_sinks
         return tracer
@@ -946,6 +954,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             session_id=session_id or self.session_id,
             task_manager=self.task_manager,
             trace_parent=self.tracer,
+            # 子 agent 继承 trajectory 采集开关；trajectory_id 不显式传，由子 Tracer 从
+            # session_id 派生（traj_<session_id>）。父子共享同一 session_id（上面
+            # session_id=session_id or self.session_id，无调用方传子 session_id），故父子
+            # trajectory_id 必然一致——这是个隐式不变量：若将来给子 agent 独立 session_id，
+            # 需改为显式透传 trajectory_id，否则父子 trajectory_id 会悄悄分叉。
+            trajectory_enabled=self.trajectory_enabled,
+            trajectory_level=self.trajectory_level,
             max_turns=max_turns,
             artifact_id=artifact_id,
             allowed_tool_names=allowed_tool_names,
