@@ -88,6 +88,18 @@ async def _cost(ctx: CommandContext, args: str) -> Local:
     return Local()
 
 
+async def _context(ctx: CommandContext, args: str) -> Local:
+    """/context —— 展示 ContextRuntime 组装的上下文 packs + token 预算 + survival matrix（docs/15 §8.2）。"""
+    import os
+    from ...context import BudgetPolicy, ContextRequest, ContextRuntime
+    a = ctx.agent
+    budget = BudgetPolicy.for_window(getattr(a, "effective_window", 200000))
+    req = ContextRequest(cwd=os.getcwd(), is_sub_agent=getattr(a, "is_sub_agent", False))
+    plan = await ContextRuntime(budget=budget).collect(req)
+    print_info(plan.ledger.render_summary())
+    return Local()
+
+
 async def _compact(ctx: CommandContext, args: str) -> Local:
     try:
         await ctx.agent.compact()
@@ -512,6 +524,7 @@ _BUILTINS = [
     ("/clear", _clear, "exact", "Clear conversation history", ""),
     ("/plan", _plan, "exact", "Toggle plan mode (read-only)", ""),
     ("/cost", _cost, "exact", "Show token usage and cost", ""),
+    ("/context", _context, "exact", "Show context packs, token budget & compaction survival", ""),
     ("/compact", _compact, "exact", "Manually compact the conversation", ""),
     ("/memory consolidate", _memory_consolidate, "exact",
      "Run a curator pass to merge/rewrite/archive memories", ""),
