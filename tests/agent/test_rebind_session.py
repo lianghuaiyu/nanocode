@@ -53,9 +53,10 @@ def test_rebind_swaps_all_session_keyed_state():
     a.total_input_tokens = 100; a.total_output_tokens = 50
     a.last_input_token_count = 80; a.current_turns = 3
 
-    # 目标 session 有 canonical 树
-    SessionManager.create("NEW").append_message(T.user_message("new-conversation"))
-    a.rebind_session("NEW")
+    # 目标 session 有 canonical 树（create 默认持写锁 → 即 runtime lease.manager 的等价物）
+    new_mgr = SessionManager.create("NEW")
+    new_mgr.append_message(T.user_message("new-conversation"))
+    a.rebind_session(new_mgr)
 
     import os
     assert a.session_id == "NEW"
@@ -82,7 +83,7 @@ def test_rebind_to_same_session_is_noop():
     a._session_mgr = SessionManager.create("SAME")
     old_tracer = a.tracer
     a.total_input_tokens = 42
-    a.rebind_session("SAME")
+    a.rebind_session(a._session_mgr)                         # 同一 mgr/sid → no-op
     assert a.tracer is old_tracer                            # 未 finalize/重建
     assert a.total_input_tokens == 42                        # 未复位
 
@@ -92,7 +93,7 @@ def test_rebind_rejected_for_sub_agent():
     a.is_sub_agent = True
     import pytest
     with pytest.raises(RuntimeError):
-        a.rebind_session("OTHER")
+        a.rebind_session(SessionManager.create("OTHER"))
 
 
 def test_rebind_drift_guard_matches_fresh_agent():
@@ -103,7 +104,7 @@ def test_rebind_drift_guard_matches_fresh_agent():
     reb._session_mgr = SessionManager.create("OLD2")
     # 脏化后 rebind 到一个全新空 session
     reb._confirmed_paths.add("/a"); reb.total_input_tokens = 5; reb._files_read.add("/b")
-    reb.rebind_session("NEW2")
+    reb.rebind_session(SessionManager.create("NEW2"))
     assert _working_set(reb) == _working_set(fresh)
     assert reb._system_prompt == reb._base_system_prompt   # 非 plan → 不带 plan 提示
 
@@ -115,7 +116,7 @@ def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
     a._session_mgr = SessionManager.create("POLD")
     old_plan_path = a._plan_file_path
     assert old_plan_path and "POLD" in old_plan_path and "POLD" in a._system_prompt
-    a.rebind_session("PNEW")
+    a.rebind_session(SessionManager.create("PNEW"))
     assert a.permission_mode == "plan"                       # baseline=plan → 新 session 仍 plan
     assert a._plan_file_path and "PNEW" in a._plan_file_path and a._plan_file_path != old_plan_path
     assert "POLD" not in a._system_prompt                    # 旧 sid plan 路径不泄漏进新 prompt
@@ -128,29 +129,27 @@ def test_rebind_from_toggled_plan_reverts_to_base_mode():
     a._session_mgr = SessionManager.create("TOG")
     a.toggle_plan_mode()
     assert a.permission_mode == "plan"
-    a.rebind_session("TOG2")
+    a.rebind_session(SessionManager.create("TOG2"))
     assert a.permission_mode == "default"                    # 回到 baseline，不残留 plan
     assert a._plan_file_path is None
     assert a._system_prompt == a._base_system_prompt
 
 
-def test_rebind_atomic_on_unreadable_new_session(monkeypatch):
-    # codex B1：新 session open 抛错时，rebind 必须在 finalize 旧 session **之前**失败，旧 session 不动。
+def test_rebind_does_not_open_or_lock_trusts_injected_mgr(monkeypatch):
+    # docs/14 SessionLease：rebind 不再 open/lock——它信任 runtime lease 注入的**已加锁、已校验** mgr。
+    # acquire-validate-new-before-release-old 的原子/fail-closed 闸移到 _switch_via_rebind
+    # （busy/corrupt 的 no-leak 由 tests/session/test_session_lock.py 经真实路径覆盖）。
     import pytest
     from nanocode.session.manager import SessionManager as SM
-    a = _agent("ATOM")
-    a._session_mgr = SessionManager.create("ATOM")
-    a._session_mgr.append_message(T.user_message("keepme"))
-    SessionManager.create("BADNEW")                          # exists → True，使 rebind 走 open 分支
-    old_tracer = a.tracer
+    a = _agent("TRUST")
+    a._session_mgr = SessionManager.create("TRUST")
+    new_mgr = SessionManager.create("TNEW")
+    new_mgr.append_message(T.user_message("hello"))
 
-    def boom(sid, **kw):
-        raise T.SessionTreeError("corrupt")
+    def _no_open(*args, **kw):
+        raise AssertionError("rebind_session must not call SessionManager.open (trusts injected mgr)")
 
-    monkeypatch.setattr(SM, "open", boom)
-    with pytest.raises(T.SessionTreeError):
-        a.rebind_session("BADNEW")
-    # 旧 session 原封不动（pre-flight 在 finalize 前抛）
-    assert a.session_id == "ATOM"
-    assert a.tracer is old_tracer
-    assert a._session_mgr.session_id == "ATOM"
+    monkeypatch.setattr(SM, "open", _no_open)
+    a.rebind_session(new_mgr)                         # 不得触发 SM.open
+    assert a.session_id == "TNEW" and a._session_mgr is new_mgr
+    assert "hello" in str(a._anthropic_messages)

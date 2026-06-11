@@ -1,15 +1,13 @@
-"""P3：resume 走 build_context（树优先 + 快照降级兜底，docs/13 §9-P3 / 评审 M3）。
-
-验证：① 有树 → restore_session 从树重建、续聊等价；② 树比 legacy 短（compaction 缺口）→ 回退
-legacy，无 resume 数据丢失；③ 无树 → 既有行为不变；④ resume_from_tree 隔离单元。
+"""docs/14 SessionLease：resume = runtime 激活会话写者租约（SessionLease.open with lock）+ 从
+canonical 树渲染上下文（cli._load_from_manager）。canonical `session.jsonl` 树是**唯一**权威——
+无 flat fallback、无 runtime 自动迁移（离线 `nanocode sessions migrate`）；空树 → 空上下文。
 """
 
-import json
-
 from nanocode.agent.engine import Agent
-from nanocode.session import tree
+from nanocode.session import tree, capture
 from nanocode.session.manager import SessionManager
-from nanocode.session.resume_from_tree import resume_from_tree
+from nanocode.session.lease import SessionLease
+from nanocode.entrypoints.cli import _load_from_manager
 
 LIVE = [
     {"role": "user", "content": "do it"},
@@ -39,66 +37,38 @@ def _norm(msgs):
     return out
 
 
-# ─── resume_from_tree 隔离单元 ────────────────────────────────────────────────
-def test_resume_from_tree_none_when_no_tree():
-    assert resume_from_tree("nope", provider="anthropic", model="claude-x") is None
-
-
-def test_resume_from_tree_renders_tree():
-    mgr = SessionManager.create("p3t")
-    mgr.append_message(tree.user_message("hi"))
-    mgr.append_message(tree.assistant_message([tree.text_block("yo")], provider="anthropic",
-                       api="anthropic", model="claude-x", stop_reason="stop"))
-    got = resume_from_tree("p3t", provider="anthropic", model="claude-x")
-    assert [m["role"] for m in got] == ["user", "assistant"]
-
-
-# ─── restore_session：树优先 ──────────────────────────────────────────────────
-def test_restore_prefers_tree_when_complete():
-    # 完整 turn 落进树（S1 后由 message-end 写；此处直接 seed 一棵完整树）
-    from nanocode.session import capture
-    mgr = SessionManager.create("p3sess")
-    for n in capture.capture_provider_messages(LIVE, "anthropic", model="claude-x"):
+def _seed(sid, provider_msgs):
+    mgr = SessionManager.create(sid)        # 持写锁
+    for n in capture.capture_provider_messages(provider_msgs, "anthropic", model="claude-x"):
         mgr.append_message(n)
-    # B 同 session resume：data 给快照；树完整 → 应从树重建，续聊等价
-    b = _agent("p3sess")
-    b.model = "claude-x"
-    b.restore_session({"anthropicMessages": list(LIVE)})
+    mgr.close()                             # 释放，供随后 lease open
+
+
+def test_resume_loads_full_tree_into_active_list():
+    _seed("p3sess", LIVE)
+    b = _agent("p3sess"); b.model = "claude-x"
+    b._session_mgr = SessionLease.open_or_create("p3sess").manager     # 激活写者租约
+    _load_from_manager(b)
     assert _norm(b._anthropic_messages) == _norm(LIVE)
-    # 确实来自树：树里有 4 条 message entry
     assert sum(1 for e in SessionManager.open("p3sess").entries() if e.type == tree.MESSAGE) == 4
 
 
-def test_restore_uses_tree_authority_even_if_shorter_than_legacy():
-    # docs/14 §4.2：树是 resume 唯一权威。树比 legacy 快照短（如压缩后）→ 用树，不再回退快照。
-    mgr = SessionManager.create("p3short")
-    mgr.append_message(tree.user_message("partial1"))
-    mgr.append_message(tree.assistant_message([tree.text_block("partial2")], provider="anthropic",
-                       api="anthropic", model="claude-x", stop_reason="stop"))
-    b = _agent("p3short")
-    b.model = "claude-x"
-    b.restore_session({"anthropicMessages": list(LIVE)})  # 快照 4 条，但树只有 2 条
-    roles = [m["role"] for m in b._anthropic_messages]
-    assert roles == ["user", "assistant"]                 # 用了树（2），非快照（4）
-    assert "partial1" in str(b._anthropic_messages)
-    assert "done" not in str(b._anthropic_messages)       # 快照独有内容不出现
-
-
-def test_restore_auto_migrates_legacy_to_tree():
-    # docs/14 §4.2：无 canonical 树但有盘上 legacy 快照 → restore 自动迁移建树再从树重建。
+def test_resume_tree_is_sole_authority_ignores_legacy_flat():
+    # 树是唯一权威：即便磁盘上有 legacy flat 快照，resume 也只看树（绝不读 flat）。
     from nanocode.session.store import save_session
-    save_session("p3mig", {"metadata": {"id": "p3mig"}, "anthropicMessages": list(LIVE)})
-    assert not SessionManager.exists("p3mig")
-    b = _agent("p3mig")
-    b.model = "claude-x"
-    b.restore_session({"anthropicMessages": list(LIVE)})
-    assert SessionManager.exists("p3mig")                 # 迁移建了 canonical 树
-    assert "do it" in str(b._anthropic_messages)
+    save_session("p3auth", {"metadata": {"id": "p3auth"}, "anthropicMessages": list(LIVE)})
+    mgr = SessionManager.create("p3auth")
+    mgr.append_message(tree.user_message("only-tree")); mgr.close()
+    b = _agent("p3auth"); b.model = "claude-x"
+    b._session_mgr = SessionLease.open_or_create("p3auth").manager
+    _load_from_manager(b)
+    assert "only-tree" in str(b._anthropic_messages)
+    assert "do it" not in str(b._anthropic_messages)        # legacy flat 内容不出现
 
 
-def test_restore_no_tree_no_legacy_uses_inmemory_snapshot_fallback():
-    # 无树、盘上无 legacy（迁移无果）→ 末路兜底装入 data 的 flat 列表（P7 删 legacy 后消失）。
-    b = _agent("p3none")
-    b.model = "claude-x"
-    b.restore_session({"anthropicMessages": list(LIVE)})
-    assert _norm(b._anthropic_messages) == _norm(LIVE)
+def test_resume_empty_tree_yields_empty_context():
+    SessionManager.create("p3empty").close()                 # header-only 空树
+    b = _agent("p3empty"); b.model = "claude-x"
+    b._session_mgr = SessionLease.open_or_create("p3empty").manager
+    _load_from_manager(b)
+    assert b._anthropic_messages == []                       # 空树 → 空上下文（不静默丢、不回退 flat）

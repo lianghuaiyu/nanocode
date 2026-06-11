@@ -3,9 +3,10 @@
 run_turn() 负责一个 turn 的编排外壳（委托 AgentCore=Agent.chat：begin_turn / user_message /
 模型循环 / turn_end / _auto_save / 取消语义）；move_to() 做 in-file 导航（canonical 树 leaf）。
 
-docs/14 P7：原 P3/P5 的 SessionContextBuilder（wire/snapshot resume + 事件树 fork）已退役——
-resume 由 Agent.rebind_session / restore_session 从 canonical session.jsonl 重建，fork 由 P4 的
-runtime thread_fork（Pi before-user fork）承担；二者都不再经此对象。
+docs/14 SessionLease：原 SessionContextBuilder（wire/snapshot resume + 事件树 fork）与
+`Agent.restore_session` 均已退役——resume 由 runtime 激活会话写者租约（SessionLease.open + rebind /
+cli._load_from_manager）从 canonical session.jsonl 重建；in-file /fork、/clear、/tree 经本对象的
+move_to（移 leaf），跨文件 /clone 经 runtime.thread_clone；二者都不再读 legacy flat 快照。
 """
 
 from __future__ import annotations
@@ -32,22 +33,21 @@ class AgentSession:
         结构化结果由 RuntimeThread 的 TurnResult 承载。"""
         await self.agent.chat(prompt)
 
-    def move_to(self, entry_id: str, *, agent_id: str = "main") -> list:
-        """docs/14 P6：把 active leaf 移到 canonical 树的 `entry_id`（in-file 导航 / checkout），
-        从该 leaf 重建上下文并装入 live agent。导航即日志（写一条 leaf entry），后续 turn 在此 leaf
-        下追加（in-file 分支，不覆盖原分支）。fail-closed：树缺 / entry 不存在 → ValueError，不动会话。
-        返回重建的 provider 消息列表。"""
-        from ..session.manager import SessionManager
+    def move_to(self, entry_id: "str | None", *, agent_id: str = "main") -> list:
+        """docs/14 P6：把 active leaf 移到 canonical 树的 `entry_id`（in-file 导航 / checkout / fork-before）。
+        `entry_id=None` → 复位到 root（空上下文；/fork 选中第一条消息、/clear 等用）。从该 leaf 重建上下文
+        并装入 live agent。导航即日志（写一条 leaf entry），后续 turn 在此 leaf 下追加（in-file 分支，不覆盖
+        原分支）。fail-closed：无 active 写者租约 / entry 不存在 → ValueError，不动会话。返回重建的消息列表。"""
         from ..session.render import ModelCtx, render
         a = self.agent
         mgr = a._session_mgr
         if mgr is None:
-            if not SessionManager.exists(self.session_id):
-                raise ValueError("no canonical session tree for this session")
-            mgr = a._session_mgr = SessionManager.open(self.session_id)
-        if entry_id not in {e.id for e in mgr.entries()}:
+            # docs/14 SessionLease：in-file 导航是写操作（set_leaf），必须经 active 写者租约——
+            # 缺租约 fail-closed，不再 lazy 打开未加锁 mgr。
+            raise ValueError("no active session writer lease; cannot navigate the tree")
+        if entry_id is not None and entry_id not in {e.id for e in mgr.entries()}:
             raise ValueError(f"entry '{entry_id}' not found in session tree; session left unchanged")
-        mgr.set_leaf(entry_id)
+        mgr.set_leaf(entry_id)                  # None → 复位到 root
         built = mgr.build_context()
         provider = "openai" if a.use_openai else "anthropic"
         api = "openai-completions" if a.use_openai else "anthropic"

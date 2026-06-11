@@ -18,7 +18,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
 from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
-from ..session import load_session, get_latest_session_id
+from ..session import get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
 from ..trace import (
@@ -403,48 +403,37 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-def _resolve_resume_session() -> tuple:
-    """Resolve resume target: (adopt_session_id_or_None, data_or_None).
+def _load_from_manager(agent, built=None) -> None:
+    """把 canonical 树折叠出的上下文渲染进 agent 的 active 消息列表（docs/14 SessionLease 激活/恢复）。
 
-    v2 session → adopts original session_id + returns data with state.
-    Flat JSON → (None, data) without id adoption.
-    No session → (None, None).
-    """
-    session_id = get_latest_session_id()
-    if not session_id:
-        return None, None
-    # Check for v2 session first
-    state = _session_v2.read_state(session_id)
-    if state is not None:
-        # v2 session: adopt the original session_id
-        session = load_session(session_id)
-        data = {}
-        if session:
-            data["anthropicMessages"] = session.get("anthropicMessages")
-            data["openaiMessages"] = session.get("openaiMessages")
-        data["state"] = state
-        data["v2"] = True
-        return session_id, data
-    # Flat JSON fallback
-    session = load_session(session_id)
-    if session:
-        return None, {
-            "anthropicMessages": session.get("anthropicMessages"),
-            "openaiMessages": session.get("openaiMessages"),
-        }
-    return None, None
+    built 缺省时现 build_context。空树 → 空 active 列表（OpenAI 仍含 system）。替代已退役的
+    restore_session：不再读 legacy flat 快照，树是唯一权威。"""
+    from ..session.render import ModelCtx, render
+    mgr = agent._session_mgr
+    if built is None:
+        built = mgr.build_context()
+    provider = "openai" if agent.use_openai else "anthropic"
+    api = "openai-completions" if agent.use_openai else "anthropic"
+    sysp = agent._system_prompt if agent.use_openai else None
+    agent._load_messages(render(built.messages,
+                                ModelCtx(provider=provider, api=api, model_id=agent.model),
+                                system_prompt=sysp)["messages"])
 
 
-async def run_repl(agent: Agent) -> None:
-    """Interactive REPL loop."""
+async def run_repl(agent: Agent, lease=None) -> None:
+    """Interactive REPL loop.
+
+    docs/14 SessionLease：`lease` 是 main() 在 welcome 前激活的会话写者租约（已注入 agent._session_mgr）。
+    REPL 退出（任何 break / 双 Ctrl-C）时释放当前 thread 的租约；rebind（/new /resume /clone）会把旧租约
+    交接/关闭、新 thread 持新租约，故退出时只需释放 current_thread 的那把。"""
 
     # docs/14 P1：会话宿主——把"当前 thread"从固定局部闭包解放出来。lifecycle 替换（/new /resume
     # /clone /fork、子父导航）由 runtime 原子换掉整组 Agent/AgentSession/RuntimeThread，命令 handler
     # 永远对 host.current_thread 操作、不缓存 agent/session。这里显式构造 session+thread（保留
     # AgentSession 这个可注入 seam）并注册进 registry——而非 adopt（adopt 在 runtime 内部建 session，
-    # 会绕过测试对 cli.AgentSession 的替身）。
+    # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
     _runtime = AgentRuntime()
-    _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent)))
+    _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
     _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY)
 
     # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（取 host 的 current_thread）。
@@ -472,13 +461,6 @@ async def run_repl(agent: Agent) -> None:
         elif action == "replace_thread" and payload.get("kind") == "clone":
             if host.runtime.thread_clone(host, payload.get("sourceSid"), payload.get("entryId")) is None:
                 print_error("clone failed (no canonical tree / nothing to clone).")
-        elif action == "fork":
-            thread, selected = host.runtime.thread_fork(host, payload.get("sourceSid"),
-                                                        payload.get("selectedEntryId"))
-            if thread is None:
-                print_error("fork failed (invalid selection).")
-            elif selected:
-                print_info(f"Forked before your message. Re-enter to send:\n  {selected}")
         elif action == "resume":
             sid = payload.get("sessionId")
             if sid == host.current_thread.thread_id:
@@ -547,6 +529,10 @@ async def run_repl(agent: Agent) -> None:
             sigint_count += 1
             if sigint_count >= 2:
                 print("\nBye!\n")
+                try:
+                    _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
+                except Exception:
+                    pass
                 sys.exit(0)
             print("\n  Press Ctrl+C again to exit.")
 
@@ -646,6 +632,13 @@ async def run_repl(agent: Agent) -> None:
             if "abort" not in str(e).lower():
                 print_error(str(e))
 
+    # docs/14 SessionLease：REPL 退出（正常 break / exit / quit / 双 Ctrl-C-at-prompt）→ 释放当前
+    # thread 的会话写锁。rebind 已交接/关闭旧租约，故只需释放 current_thread 的那把（幂等）。
+    try:
+        _host.current_thread.release_lease()
+    except Exception:
+        pass
+
 
 def main() -> None:
     _argv = sys.argv[1:]
@@ -744,13 +737,22 @@ Examples:
     _interactive = not bool(args.prompt) and sys.stdin.isatty()
     workspace_trusted = ensure_workspace_trust(Path.cwd(), interactive=_interactive)
 
-    # Resolve resume BEFORE constructing Agent (so we can adopt session_id)
+    # Resolve resume BEFORE constructing Agent (so we adopt the session_id).
+    # docs/14 SessionLease：--resume = 恢复最近的 canonical session（latest header）；无则保持新建。
+    # 不再读 legacy flat 快照——canonical 树是唯一 resume 权威（迁移走离线 `nanocode sessions migrate`）。
     adopt_sid = None
-    resume_data = None
     if args.resume:
-        adopt_sid, resume_data = _resolve_resume_session()
-        if not resume_data:
+        from ..session.manager import SessionManager
+        adopt_sid = get_latest_session_id()
+        if adopt_sid is None:
             print_info("No previous sessions found.")
+        elif not SessionManager.exists(adopt_sid):
+            # get_latest_session_id 也会返回 legacy <sid>.json / v2 state.json 的 sid（无 canonical 树）。
+            # 若对它 open_or_create 会**新建空树**、把旧历史静默丢弃（review high：data loss）。改为拒绝
+            # 续此 sid、回退新建一个全新 session（绝不 clobber 旧 id），并提示离线迁移。
+            print_info(f"Latest session '{adopt_sid}' has no canonical tree (legacy/v2). "
+                       f"Run `nanocode sessions migrate {adopt_sid}` to import it; starting a fresh session.")
+            adopt_sid = None
 
     # Long-term memory backend (CLI > env > auto). auto silently degrades to
     # markdown when no embeddings endpoint is configured; explicit --memory-backend
@@ -797,9 +799,28 @@ Examples:
         print_info("note: --trajectory-level has no effect without --trajectory "
                    "(or NANOCODE_TRAJECTORY=1)")
 
-    # Resume session (after Agent is constructed with adopted session_id)
-    if args.resume and resume_data:
-        agent.restore_session(resume_data)
+    # docs/14 SessionLease：在 welcome / 任何 turn 之前激活会话写者租约（runtime 拥有 active writer）。
+    # new：open_or_create 建空树 + 持锁；--resume：open 已有树 + 持锁。busy/corrupt → fail-closed 退出。
+    from ..session.lease import SessionLease
+    from ..session.tree import SessionBusyError, SessionTreeError
+    try:
+        _lease = SessionLease.open_or_create(agent.session_id)
+    except SessionBusyError:
+        print_error(f"session '{agent.session_id}' is busy — another nanocode process holds its "
+                    f"writer lock. Start a new session, or resume a different one.")
+        sys.exit(1)
+    try:
+        _built = _lease.manager.build_context()      # 校验树可折叠（corrupt → 退出，不静默）
+    except SessionTreeError as e:
+        _lease.close()
+        print_error(f"corrupt session tree for '{agent.session_id}': {e}")
+        sys.exit(1)
+    agent._session_mgr = _lease.manager
+    _load_from_manager(agent, _built)                # 渲染初始上下文进 active 列表（空树 → 空）
+    if adopt_sid is not None:
+        agent._reload_task_state(_session_v2.read_state(adopt_sid)
+                                 if _session_v2.is_v2_session(adopt_sid) else None)
+        print_info(f"Session resumed: {adopt_sid} ({agent._get_message_count()} messages).")
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
@@ -824,7 +845,7 @@ Examples:
 
         async def _one_shot() -> None:
             if _via_runtime:
-                await AgentRuntime().adopt(agent).run(prompt)
+                await AgentRuntime().adopt(agent, lease=_lease).run(prompt)
             else:
                 await agent.chat(prompt)
 
@@ -834,11 +855,17 @@ Examples:
             print_error(str(e))
             sys.exit(1)
         finally:
+            try:
+                _lease.close()                 # 释放会话写锁（一次性模式结束）
+            except Exception:
+                pass
             _finish_trace()
     else:
         # Interactive REPL
-        asyncio.run(run_repl(agent))
-        _finish_trace()
+        try:
+            asyncio.run(run_repl(agent, _lease))
+        finally:
+            _finish_trace()                    # run_repl 退出时已 release 当前 thread 的 lease
 
 
 if __name__ == "__main__":

@@ -74,12 +74,16 @@ def test_message_end_tool_turn_records_full_round():
 
 
 def test_subagent_writes_child_tree_not_parent_tree():
-    # docs/14 full-P6b：子 agent _tree_record 写自己的 child session（_tree_session_id），不碰父 session。
+    # docs/14 full-P6b + SessionLease：子 agent _tree_record 写自己的 child session（注入的 child 租约），
+    # 不碰父 session。spawn 给子 agent 注入一把 child 写者租约（locked child mgr）。
+    from nanocode.session.lease import SessionLease
     a = _agent("s1sub")
     a.is_sub_agent = True
     a._tree_session_id = "PARENT.s1sub"
     a._child_parent_session = {"sessionId": "PARENT", "entryId": None,
                                "taskId": "s1sub", "agentId": "s1sub"}
+    a._session_mgr = SessionLease.open_or_create(
+        a._tree_session_id, parent_session=a._child_parent_session).manager
     a._tree_record({"role": "user", "content": "x"})
     assert session_file("PARENT.s1sub").exists()       # 写到 child session
     assert not session_file("PARENT").exists()          # 不碰父 session
@@ -97,3 +101,18 @@ def test_s2_request_built_from_tree_not_flat_list():
     req = a._build_request_messages()
     joined = str(req)
     assert "FROM-TREE" in joined and "FROM-FLAT" not in joined
+
+
+def test_required_tree_record_reraises_on_write_failure(monkeypatch):
+    # review medium：user 消息是 required 写——树是唯一权威、本轮请求从树渲染，写失败若被吞掉会向模型
+    # 发缺失上下文。required=True 时 _tree_record 须重抛（fail loudly）；默认 best-effort 仍吞掉。
+    import pytest
+    from nanocode.session.lease import SessionLease
+    a = _agent("reqw")
+    a._session_mgr = SessionLease.open_or_create("reqw").manager
+    def boom(*args, **kw):
+        raise OSError("disk full")
+    monkeypatch.setattr(a._session_mgr, "append_message", boom)
+    with pytest.raises(OSError):
+        a._tree_record({"role": "user", "content": "hi"}, required=True)   # 必写 → 重抛
+    a._tree_record({"role": "assistant", "content": "x"})                  # 默认 best-effort → 不抛

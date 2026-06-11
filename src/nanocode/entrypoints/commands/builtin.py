@@ -314,11 +314,11 @@ async def _rewind(ctx: CommandContext, args: str) -> Local:
     for e in SessionManager.open(sid).get_branch():  # root-first；取最后一条 user 消息
         if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
             target = e
-    if target is None or not target.parentId:
+    if target is None:
         print("No user message to rewind to.")
         return Local()
     try:
-        ctx.session.move_to(target.parentId)
+        ctx.session.move_to(target.parentId)         # parentId=None（首条消息）→ 复位到 root（空上下文），与 /fork 一致
         content = (target.data.get("message") or {}).get("content")
         print(f"Rewound to before your last message (in-file branch). Re-enter it if you like:\n  {content}")
     except ValueError as e:
@@ -343,17 +343,15 @@ def _resolve_entry(mgr, target: str):
     return None, f"ambiguous/unknown id '{target}' ({len(matches)} matches)"
 
 
-async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
-    """/fork [entry] —— Pi before-user fork：在某条 user 消息**之前**开一个新 session（其前的对话
-    clone 过去，选中文本回显供重新编辑/发送）。无参 = 最近一条 user 消息。运行时经 Control →
-    thread_fork。in-file 分支请用 /tree /checkout /rewind（docs/14 P4 / §5.4）。"""
-    from ...session.manager import SessionManager
+async def _fork(ctx: CommandContext, args: str) -> "Local":
+    """/fork [entry] —— in-file fork：把 active leaf 移到某条 user 消息**之前**（其 parent），在原分支旁
+    开一条新 in-file 分支；选中文本回显供重新编辑/发送。无参 = 最近一条 user 消息（≈ /rewind）。
+    docs/14 SessionLease：/fork 是 in-file（移 leaf，不新建 session）；跨文件复制到新 session 用 /clone。"""
     from ...session import tree as T
-    sid = ctx.agent.session_id
-    if not SessionManager.exists(sid):
-        print_info("No canonical session tree yet for this session.")
+    mgr = ctx.agent._session_mgr
+    if mgr is None:
+        print_info("No active session for this agent.")
         return Local()
-    mgr = SessionManager.open(sid)
     target = args.strip()
     if target:
         resolved, err = _resolve_entry(mgr, target)
@@ -369,7 +367,14 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     if sel is None or sel.type != T.MESSAGE or (sel.data.get("message") or {}).get("role") != "user":
         print_error("No user message to fork before (pass a user-message entry id; see /tree).")
         return Local()
-    return Control("fork", {"sourceSid": sid, "selectedEntryId": sel.id})
+    try:
+        ctx.session.move_to(sel.parentId)          # in-file 移 leaf 到选中 user 消息之前（parent；None→root）
+    except ValueError as e:
+        print_error(str(e))
+        return Local()
+    content = (sel.data.get("message") or {}).get("content")
+    print_info(f"Forked before that message (in-file branch). Re-enter to send:\n  {content}")
+    return Local()
 
 
 async def _clone(ctx: CommandContext, args: str) -> "Control | Local":
@@ -392,19 +397,18 @@ async def _clone(ctx: CommandContext, args: str) -> "Control | Local":
 
 async def _name(ctx: CommandContext, args: str) -> Local:
     """/name [text] —— 无参显示当前 session 名；/name <text> 设名（写 session_info，不移动 leaf）；
-    /name --clear（或显式空）清空为 tombstone（docs/14 P4 / §5.6）。"""
-    from ...session.manager import SessionManager
-    sid = ctx.agent.session_id
+    /name --clear（或显式空）清空为 tombstone（docs/14 P4 / §5.6）。
+
+    docs/14 SessionLease：设名是写操作（append_session_info），走 active 写者租约（ctx.agent._session_mgr）；
+    缺租约则只读提示，不再 lazy 打开未加锁 mgr。"""
     mgr = ctx.agent._session_mgr
-    if mgr is None and SessionManager.exists(sid):
-        mgr = ctx.agent._session_mgr = SessionManager.open(sid)
     text = args.strip()
     if not text:
         print_info(f"Session name: {mgr.name() or '(unnamed)'}" if mgr is not None
-                   else "No session name (no canonical tree yet).")
+                   else "No session name (no active session lease).")
         return Local()
     if mgr is None:
-        print_error("No canonical session tree yet for this session.")
+        print_error("No active session writer lease for this session.")
         return Local()
     mgr.append_session_info("" if text == "--clear" else text)
     print_info("Session name cleared." if text == "--clear" else f"Session name set to {text!r}.")

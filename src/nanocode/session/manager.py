@@ -75,10 +75,33 @@ class SessionManager:
     def locked(self) -> bool:
         return self._lock_fd is not None
 
+    def _require_writer(self) -> None:
+        """所有 mutation（append/set_leaf/append_session_info/rewrite_file）的前置闸：未持写锁直接抛。
+
+        docs/14 SessionLease：写者身份归 runtime 的 active-thread lease（lock=True 打开/创建），
+        不再允许任何未加锁的 SessionManager 改树。read-only（open(lock=False) listing / build_context /
+        entries）不受影响。_persist_new 是 create/clone 的 bootstrap 原语，**豁免**（create(lock=True)
+        已在写 root 前持锁；clone 的 child 复制是交接前的 bootstrap，由后续 lease 接管）。"""
+        if not self.locked:
+            raise tree.SessionTreeError(
+                f"session {self.session_id} mutated without a writer lease (lock=True required)")
+
+    def __del__(self) -> None:
+        # 安全网：mgr 被 GC 时释放 flock fd（避免持锁 SessionManager 泄漏 fd，尤其测试进程里
+        # 大量短命 mgr）。close() 幂等且 guarded；解释器关停期属性可能已拆，故再包一层。
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     @classmethod
     def create(cls, session_id: str | None = None, *, cwd: str | None = None,
-               parent_session: dict | None = None, lock: bool = False) -> "SessionManager":
+               parent_session: dict | None = None, lock: bool = True) -> "SessionManager":
+        # docs/14 SessionLease：create 默认 lock=True——「新建一个 session」即写者意图，理应持锁。
+        # 例外是 bootstrap-then-handoff：clone() 复制 child 后交给 runtime lease 重新加锁打开，故
+        # 那里显式传 lock=False（避免同进程 clone 持锁 → rebind 重开 LOCK_NB 自锁死）。read-only
+        # 打开走 open(lock=False)。
         sid = session_id or tree.new_id("sess")
         mgr = cls(sid, [])
         if lock:
@@ -138,6 +161,7 @@ class SessionManager:
 
         parent_id 显式给定时挂到指定 entry（语义父≠行序，供子会话回填等场景）。
         """
+        self._require_writer()
         parent = parent_id if parent_id is not None else self.get_leaf()
         entry = Entry(type=entry_type, id=tree.new_id("ent"), parentId=parent,
                       sessionId=self.session_id, timestamp=tree.now_iso(), data=dict(data or {}))
@@ -227,6 +251,7 @@ class SessionManager:
             new_session_id,
             cwd=self._cwd(),
             parent_session={"sessionId": self.session_id, "entryId": leaf},
+            lock=False,                 # bootstrap-then-handoff：child 由 runtime lease 重新加锁打开
         )
         for e in msgs:
             parent = None if e.parentId in start_ids else e.parentId
@@ -242,6 +267,7 @@ class SessionManager:
 
     def rewrite_file(self) -> None:
         """整文件原子重写（GC/紧凑；Pi `_rewriteFile`）。当前写出全部 in-memory entries。"""
+        self._require_writer()
         path = session_file(self.session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".jsonl.tmp")

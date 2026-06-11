@@ -38,18 +38,20 @@ def test_compaction_entry_persisted_and_reopen():
 
 def test_compacted_session_resumes_summary_from_tree():
     # 压缩后的树（old + kept + compaction + after）resume → 摘要保留、被压缩史不复现。
+    # docs/14 SessionLease：resume = lease + cli._load_from_manager（树是唯一权威，无 flat 快照）。
+    from nanocode.session.lease import SessionLease
+    from nanocode.entrypoints.cli import _load_from_manager
     m = SessionManager.create("cr1")
     m.append_message(tree.user_message("ancient history blah"))
     kept = m.append_message(tree.user_message("kept question"))
     m.append_compaction(summary="SUMMARY-OF-OLD", first_kept_entry_id=kept.id)
     m.append_message(tree.assistant_message([tree.text_block("answer")], provider="anthropic",
                      api="anthropic", model="claude-x", stop_reason="stop"))
+    m.close()
     b = Agent(api_key="test", trace_enabled=False, session_id="cr1", permission_mode="bypassPermissions")
     b.model = "claude-x"
-    snap = [{"role": "user", "content": "[Previous conversation summary]\nSUMMARY-OF-OLD"},
-            {"role": "user", "content": "kept question"},
-            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}]
-    b.restore_session({"anthropicMessages": snap})
+    b._session_mgr = SessionLease.open_or_create("cr1").manager
+    _load_from_manager(b)
     joined = str(b._anthropic_messages)
     assert "SUMMARY-OF-OLD" in joined          # 摘要经树 resume 保留
     assert "ancient history" not in joined     # 被压缩史不复现

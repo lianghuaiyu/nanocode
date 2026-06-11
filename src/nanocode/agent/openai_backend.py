@@ -47,7 +47,7 @@ class OpenAIBackendMixin:
 
     async def _chat_openai(self, user_message: str) -> None:
         self._openai_messages.append({"role": "user", "content": user_message})
-        self._tree_record({"role": "user", "content": user_message})  # S1: message-end → tree
+        self._tree_record({"role": "user", "content": user_message}, required=True)  # S1: message-end → tree（必写）
         # Auto-compact at turn boundary only — see _chat_anthropic for rationale.
         # The last message is now plain user text, so the slice in
         # _compact_openai won't orphan a tool_calls / tool message pair.

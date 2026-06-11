@@ -131,11 +131,12 @@ class SessionTreeError(Exception):
 
 
 class SessionBusyError(Exception):
-    """另一进程已持有该 session 的写锁（docs/14 §4.6/§6a）。
+    """另一进程已持有该 session 的写锁（docs/14 §4.6/§6a + SessionLease）。
 
-    注（P6 review #3）：锁是 **best-effort 跨会话切换**保证——目前仅 rebind/`/resume` 路径取锁；
-    agent 自身的启动 session 在 lazy 创建时 lock=False（避免单进程多 Agent 同 sid 自锁死测试套），
-    故"绝无第二写者"只在显式切换间强制，完整的启动期加锁属 P6 full 硬化项。"""
+    写者身份归 runtime active-thread 的 `SessionLease`（startup / rebind / 子 agent spawn 都经
+    lease 以 lock=True 打开或创建）。`Agent.__init__` 不再取锁——构造模型 core 不等于占用 writer。
+    同进程不会对同一 sid 取两把锁（clone/fork 的 child create 用 lock=False，交给 lease 重开），
+    故无单进程自锁死。进程死亡时 flock 由内核自动释放（advisory），无需手工 stale 检测。"""
     pass
 
 

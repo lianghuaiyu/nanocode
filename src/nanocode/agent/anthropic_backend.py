@@ -47,7 +47,7 @@ class AnthropicBackendMixin:
 
     async def _chat_anthropic(self, user_message: str) -> None:
         self._anthropic_messages.append({"role": "user", "content": user_message})
-        self._tree_record({"role": "user", "content": user_message})  # S1: message-end → tree
+        self._tree_record({"role": "user", "content": user_message}, required=True)  # S1: message-end → tree（必写）
         # Auto-compact at turn boundary only — the last message is now plain
         # user text, so the slice in _compact_anthropic won't sever a
         # tool_use ↔ tool_result pair from the previous turn's tool execution.

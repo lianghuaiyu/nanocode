@@ -130,11 +130,15 @@ class RuntimeThread:
     """
 
     def __init__(self, runtime: "AgentRuntime", agent, session: AgentSession,
-                 *, capture: "BufferSink | None" = None) -> None:
+                 *, capture: "BufferSink | None" = None, lease=None) -> None:
         self._runtime = runtime
         self.agent = agent
         self.session = session
         self._capture = capture  # 若注入则用于 final_response 捕获
+        # docs/14 SessionLease：active thread 持有这把会话写者租约（lock=True 的 SessionManager）。
+        # rebind 把旧 lease 的底层 mgr close 掉、新 thread 持新 lease；真正 teardown（REPL 退出 /
+        # 一次性结束）经 release_lease() 释放。dispose() **不**碰 lease（见下）。
+        self._lease = lease
         self._disposed = False
         # thread 身份在构造时**快照** agent.session_id：in-place rebind（docs/14 P2）会原地改
         # agent.session_id，若此处用 live property，old/new thread（复用同一 Agent）的 thread_id
@@ -187,6 +191,19 @@ class RuntimeThread:
         self._runtime.unregister(self)
         self._capture = None
 
+    def release_lease(self) -> None:
+        """释放本 thread 持有的会话写锁（幂等）。真正 teardown 时调用：REPL 退出、一次性模式结束。
+
+        **与 dispose 区分**：dispose 是 rebind 时对**旧 wrapper** 的清理，此时 lease 的底层 mgr 已被
+        `Agent.rebind_session` close（或转交新 thread），旧 thread 绝不能再 close 一次 active 写锁；
+        故 dispose 不碰 lease。release_lease 只在 host 退出当前 active thread（无后继）时由调用方显式调。"""
+        if self._lease is not None:
+            try:
+                self._lease.close()
+            except Exception:
+                pass
+            self._lease = None
+
     def tokens(self) -> dict:
         return self.agent.get_token_usage()
 
@@ -197,37 +214,42 @@ class AgentRuntime:
     """Codex 化 in-process facade：管 thread 生命周期。
 
     本步只对接已构造的 Agent（CLI 仍负责 Agent 构造/配置）；thread_start/resume 把它包成
-    RuntimeThread。thread_fork / 协议 / server 留待 P5 / P6。
+    RuntimeThread。协议 / server 留待后续；in-file /fork 由 AgentSession.move_to 承担（无 thread_fork）。
     """
 
     def __init__(self) -> None:
         self._threads: dict[str, RuntimeThread] = {}
 
     def adopt(self, agent, *, approvals: "ApprovalManager | None" = None,
-              capture_response: bool = False) -> RuntimeThread:
+              capture_response: bool = False, lease=None) -> RuntimeThread:
         """把一个已构造的 Agent 纳管为 RuntimeThread（in-process 起点）。
 
         capture_response=True 时，给主 agent 的 sink 外挂一个 BufferSink（经 TeeSink 与现有
         显示 sink 并存），使 TurnResult.final_response 能取回助手文本而不影响终端打印。
-        """
+
+        lease（docs/14 SessionLease）：调用方（CLI bootstrap）已激活的会话写者租约——其
+        `lease.manager` 注入给 agent 作 _session_mgr。adopt 不自己取锁/建树。"""
         if approvals is not None:
             approvals.attach(agent)
+        if lease is not None:
+            agent._session_mgr = lease.manager
         capture: "BufferSink | None" = None
         if capture_response:
             capture = BufferSink()
             agent._sink = TeeSink(agent._sink, capture)
         session = AgentSession(agent)
-        thread = RuntimeThread(self, agent, session, capture=capture)
+        thread = RuntimeThread(self, agent, session, capture=capture, lease=lease)
         return self.register(thread)
 
     def thread_start(self, config: "AgentConfig", *, approvals: "ApprovalManager | None" = None,
-                     capture_response: bool = False) -> RuntimeThread:
+                     capture_response: bool = False, lease=None) -> RuntimeThread:
         """从 AgentConfig 构造一个全新 Agent 并 adopt 为首个 thread（docs/14 §3.1）。
 
         CLI / SDK / AppServer 的统一入口：config.build_agent() 造 Agent，再 adopt（attach 审批 +
-        可选 capture + 注册）。live 切换（/new /resume…）走 thread_new/thread_resume（in-place
-        rebind），不经此路径——thread_start 仅用于"开新一个 runtime 上的首 thread"。"""
-        return self.adopt(config.build_agent(), approvals=approvals, capture_response=capture_response)
+        可选 capture + 注入 lease + 注册）。live 切换（/new /resume…）走 thread_new/thread_resume
+        （in-place rebind），不经此路径。"""
+        return self.adopt(config.build_agent(), approvals=approvals,
+                          capture_response=capture_response, lease=lease)
 
     def register(self, thread: "RuntimeThread") -> RuntimeThread:
         """把 thread 纳入 registry（按 thread_id）。adopt / runtime 构造器（P2）/ host.replace_thread 共用入口。"""
@@ -256,14 +278,30 @@ class AgentRuntime:
         """把 host 当前 thread 的 Agent 原地 rebind 到 new_sid，建新 AgentSession+RuntimeThread
         包**同一** agent，经 host.replace_thread 切入（register 新 + dispose 旧）。返回新 thread。
 
-        调用方负责先过 host.can_switch() fail-closed 闸；本方法不重复判（但 rebind 自身对
-        sub-agent / same-sid 有保护）。新建的 AgentSession 重新绑 agent 当前 session_id，
-        因此修复了 unsafe-switch 的 stale context_builder 问题。"""
+        docs/14 SessionLease：在此**一处**完成 acquire-validate-new-before-release-old：
+        ① `SessionLease.open_or_create(new_sid)` 取目标写锁（busy → SessionBusyError 上抛，
+           不动旧 lease）；② `build_context()` 校验可折叠（torn/cyclic → 释放刚取的锁再上抛，
+           避免泄漏/自锁死）；③ `rebind_session(lease.manager)` finalize 旧（close 旧锁）+ 装载新；
+        ④ 新 RuntimeThread 持新 lease。调用方负责先过 host.can_switch() fail-closed 闸。
+
+        resume 到**当前** session = no-op：直接返回当前 thread，绝不对同一 sid 取第二把锁（自锁死）。"""
         agent = host.current_thread.agent
-        agent.rebind_session(new_sid, parent_session=parent_session)
-        new_thread = RuntimeThread(self, agent, AgentSession(agent),
-                                   capture=host.current_thread._capture)
-        host.replace_thread(new_thread)
+        if new_sid == agent.session_id:
+            return host.current_thread
+        from ..session.lease import SessionLease
+        lease = SessionLease.open_or_create(new_sid, parent_session=parent_session)
+        try:
+            lease.manager.build_context()       # 校验目标树可折叠（在 finalize 旧 session 之前）
+            agent.rebind_session(lease.manager)  # finalize 旧（close 旧锁）+ rebuild 新
+            new_thread = RuntimeThread(self, agent, AgentSession(agent),
+                                       capture=host.current_thread._capture, lease=lease)
+            host.replace_thread(new_thread)
+        except BaseException:
+            # 整个切换都 fail-closed：build_context / rebind rebuild / 包 thread 任一步抛错，都释放刚取的
+            # 新锁，避免新 lease 的 fd 泄漏（review medium：rebind 在 old_mgr.close() 后仍有 render/prompt
+            # 重建步骤可能抛，那时新锁只由局部变量 lease 持有、不 close 就泄漏 + host 停在旧 closed thread）。
+            lease.close()
+            raise
         return new_thread
 
     def thread_new(self, host) -> RuntimeThread:
@@ -277,19 +315,21 @@ class AgentRuntime:
         return self._switch_via_rebind(host, sid)
 
     def thread_resume(self, host, session_id: str) -> "RuntimeThread | None":
-        """切到一个已存在的 session（/resume <id>）。无 canonical 树时尝试 legacy 迁移；
-        迁移仍不出可用树 → 返回 None（调用方提示失败、保留当前 thread）。"""
+        """切到一个已存在的 session（/resume <id>）。docs/14 SessionLease：canonical 树是唯一权威——
+        树缺 → 返回 None（不再 runtime 自动迁移；legacy 迁移是离线 `nanocode sessions migrate`）。
+        目标被占用 → `_switch_via_rebind` 抛 SessionBusyError（调用方提示 `--fork`）。"""
         from ..session.manager import SessionManager
         if not SessionManager.exists(session_id):
-            from ..session.migration import migrate_session
-            rep = migrate_session(session_id)
-            if rep.get("status") not in ("migrated", "skipped") or not SessionManager.exists(session_id):
-                return None
+            return None
         return self._switch_via_rebind(host, session_id)
 
     def thread_clone(self, host, source_sid: str, entry_id: "str | None" = None) -> "RuntimeThread | None":
         """跨文件 clone（/clone [entry]）：复制 source 的 path-to-root 到新 session（header 记
-        parentSession 血缘）并切入。源无 canonical 树 / clone 失败 → None。"""
+        parentSession 血缘）并切入。源无 canonical 树 / clone 失败 → None。
+
+        docs/14 SessionLease：跨文件复制是 `/clone` 的唯一职责；in-file fork（移 leaf 到 user 消息之前）
+        改由 `/fork` 经 AgentSession.move_to 完成（不再有 runtime.thread_fork——已删，避免「fork = 新 session」
+        与「fork = in-file 分支」语义混淆）。"""
         from ..session.manager import SessionManager
         if not SessionManager.exists(source_sid):
             return None
@@ -298,32 +338,3 @@ class AgentRuntime:
         except Exception:
             return None
         return self._switch_via_rebind(host, child.session_id)
-
-    def thread_fork(self, host, source_sid: str, selected_entry_id: str) -> "tuple[RuntimeThread | None, str | None]":
-        """Pi before-user fork（/fork）：在 **选中 user 消息之前** 重新开始。fork point = 该 user
-        消息的 parent；新 session = clone(fork_point)（不含选中消息及其后），返回 (新 thread, 选中文本)
-        ——选中文本回给调用方供用户重新编辑/发送。selected 无效 → (None, None)。"""
-        from ..session.manager import SessionManager
-        from ..session import tree as _tree
-        if not SessionManager.exists(source_sid):
-            return None, None
-        src = SessionManager.open(source_sid)
-        sel = next((e for e in src.entries() if e.id == selected_entry_id), None)
-        if sel is None:
-            return None, None
-        selected_text = (sel.data.get("message") or {}).get("content") if sel.type == _tree.MESSAGE else None
-        fork_point = sel.parentId
-        # pre-3a 盘上树：首消息 parentId 指向 session_start（header）→ 视同 None（fork 到空）。
-        if fork_point is not None:
-            fp = next((e for e in src.entries() if e.id == fork_point), None)
-            if fp is not None and fp.type == _tree.SESSION_START:
-                fork_point = None
-        try:
-            if fork_point is None:
-                # 选中是 branch root（第一条消息）→ fork 到空 session（其前无内容）
-                child = SessionManager.create(parent_session={"sessionId": source_sid, "entryId": None})
-            else:
-                child = src.clone(fork_point)
-        except Exception:
-            return None, None
-        return self._switch_via_rebind(host, child.session_id), selected_text

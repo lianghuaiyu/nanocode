@@ -21,10 +21,16 @@ def _agent(**kw):
 
 
 def _stub_run_once(agent, text="sub done", history=None):
-    """Stub run_once on a specific Agent instance: 写入 messages 历史 + 返回固定文本/token。"""
+    """Stub run_once on a specific Agent instance: 写入 messages 历史 + 返回固定文本/token。
+
+    docs/14 SessionLease：真实 run_once 会把消息写进（child）树——stub 也落树（agent 有 child 租约时），
+    使 resume 能从 child 树重载历史；v2 messages.json 仍由 _persist_agent_messages 落（向后兼容断言）。"""
     async def _ro(prompt: str) -> dict:
         agent._anthropic_messages.append({"role": "user", "content": prompt})
         agent._anthropic_messages.append({"role": "assistant", "content": text})
+        if agent._session_mgr is not None:
+            agent._tree_record({"role": "user", "content": prompt})
+            agent._tree_record({"role": "assistant", "content": text})
         if history is not None:
             history.append(prompt)
         return {"text": text, "tokens": {"input": 11, "output": 7}}
@@ -141,7 +147,11 @@ def test_resume_reloads_history_and_appends(monkeypatch):
         sub = real_build(**kw)
 
         async def _ro(prompt):
-            reloaded["history_len_before_run"] = len(sub._anthropic_messages)
+            from nanocode.session import tree as _T
+            # docs/14 SessionLease：resume 历史在 child 树（_build_sub_agent 已打开已存在的 child 租约），
+            # 不再装进 flat 列表——从 child 树分支量历史。
+            reloaded["history_len_before_run"] = sum(
+                1 for e in sub._session_mgr.get_branch() if e.type == _T.MESSAGE)
             sub._anthropic_messages.append({"role": "user", "content": prompt})
             sub._anthropic_messages.append({"role": "assistant", "content": "second"})
             return {"text": "second", "tokens": {"input": 3, "output": 2}}
@@ -237,3 +247,16 @@ def test_current_provider_openai():
                    permission_mode="bypassPermissions",
                    api_base="https://example.com/v1", session_id="osid")
     assert parent._current_provider() == "openai"
+
+
+def test_resume_rejects_in_flight_subagent():
+    # review medium：resume 一个仍 running/idle 的子 agent 会对其 child session 取第二把 flock
+    # （同进程第二 fd）→ SessionBusyError + 误导消息。须先 fail-closed 拒绝、给清晰提示。
+    parent = _agent()
+    rec = parent.task_manager.create_subagent(type="coder", description="d",
+                                              model=parent.model, provider="anthropic")
+    parent.task_manager.update_subagent(rec.id, status="running")
+    res = asyncio.run(parent._execute_agent_tool(
+        {"description": "d", "prompt": "p", "resume": rec.id}))
+    assert "running" in res.lower() and "cannot resume" in res.lower()
+    assert "locked by another writer" not in res          # 不再是误导的锁错误

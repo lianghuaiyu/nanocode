@@ -38,9 +38,12 @@ def migrate_session(session_id: str, *, model: str = "") -> dict:
     neutral = capture.capture_provider_messages(msgs, provider, model=model)
     if not neutral:
         return {"session_id": session_id, "status": "empty"}
-    mgr = SessionManager.create(session_id)
-    for n in neutral:
-        mgr.append_message(n)
+    mgr = SessionManager.create(session_id)     # 离线迁移：create 默认持写锁
+    try:
+        for n in neutral:
+            mgr.append_message(n)
+    finally:
+        mgr.close()                             # 迁移即结束，立即释放写锁
     return {
         "session_id": session_id, "status": "migrated", "provider": provider,
         "messages": len(neutral),

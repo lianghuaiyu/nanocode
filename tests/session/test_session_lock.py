@@ -16,7 +16,7 @@ def _agent(sid):
 
 def _host(sid):
     a = _agent(sid)
-    a._session_mgr = SessionManager.create(sid)      # 当前 session 不持锁（测试构造）
+    a._session_mgr = SessionManager.create(sid)      # 当前 session 持写锁（create 默认 lock=True）
     rt = AgentRuntime()
     t = rt.register(RuntimeThread(rt, a, AgentSession(a)))
     return a, rt, t, RuntimeHost(rt, t, registry=None)
@@ -50,10 +50,8 @@ def test_thread_resume_to_busy_session_raises_busy():
 
 
 def test_rebind_releases_old_lock_and_holds_new():
-    a, rt, t, host = _host("oldlk")
-    # 给当前 session 一把锁（模拟 writer），rebind 应释放它并锁住新 session
-    a._session_mgr = SessionManager.open("oldlk", lock=True)
-    SessionManager.create("newlk")                   # 目标存在、未被占
+    a, rt, t, host = _host("oldlk")                  # 当前 session "oldlk" 已持写锁（_host）
+    SessionManager.create("newlk", lock=False)       # 目标存在、未被占（交给 lease 加锁）
     rt.thread_resume(host, "newlk")
     assert a.session_id == "newlk" and a._session_mgr.locked
     # 旧 session 锁已释放 → 可再次取
@@ -76,10 +74,26 @@ def test_rebind_corrupt_new_session_does_not_leak_lock():
     with session_file("corruptlk").open("a", encoding="utf-8") as f:
         f.write(json.dumps({"v": 1, "id": "ent_leafbad", "parentId": None, "sessionId": "corruptlk",
                             "type": "leaf", "timestamp": "t", "data": {"targetId": "ent_NOPE"}}) + "\n")
+    mgr.close()                                          # 释放写锁 → lease 能取锁、build_context 才暴露 corrupt
     a, rt, t, host = _host("curcorrupt")
     with pytest.raises(SessionTreeError):
         rt.thread_resume(host, "corruptlk")
     assert a.session_id == "curcorrupt"                  # 未切换
     again = SessionManager.open("corruptlk", lock=True)   # 锁未泄漏 → 可再取
+    assert again.locked
+    again.close()
+
+
+def test_switch_via_rebind_closes_new_lease_when_rebind_raises(monkeypatch):
+    # review medium：rebind 在 old_mgr.close() 后仍有 render/prompt 重建步骤可能抛——_switch_via_rebind
+    # 必须把整段（含 rebind + 包 thread）纳入 try/except，失败时 close 刚取的新 lease，否则其 fd 泄漏。
+    a, rt, t, host = _host("rbfail_cur")
+    SessionManager.create("rbfail_tgt", lock=False)        # 目标存在、未占
+    def boom(new_mgr, **kw):
+        raise RuntimeError("rebuild blew up after old close")
+    monkeypatch.setattr(a, "rebind_session", boom)
+    with pytest.raises(RuntimeError):
+        rt.thread_resume(host, "rbfail_tgt")
+    again = SessionManager.open("rbfail_tgt", lock=True)   # 新 lease 已释放 → 可再取（无泄漏）
     assert again.locked
     again.close()

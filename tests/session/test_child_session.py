@@ -21,12 +21,16 @@ def _ctx(a):
 
 
 def _sub_with_child(parent, agent_id, spawn_leaf):
-    """复刻 _build_sub_agent 给子 agent 接上 child-tree 接线（不跑真实模型循环）。"""
+    """复刻 _build_sub_agent + spawn 给子 agent 接上 child-tree 接线（不跑真实模型循环）：
+    docs/14 SessionLease——spawn 给子 agent 注入一把 child 写者租约（locked child mgr）。"""
+    from nanocode.session.lease import SessionLease
     parent._subagent_spawn_leaf[agent_id] = spawn_leaf
     sub = _agent("subx", is_sub_agent=True)
     sub._tree_session_id = parent.child_session_id(agent_id)
     sub._child_parent_session = {"sessionId": parent.session_id, "entryId": spawn_leaf,
                                  "taskId": agent_id, "agentId": agent_id}
+    sub._session_mgr = SessionLease.open_or_create(
+        sub._tree_session_id, parent_session=sub._child_parent_session).manager
     return sub
 
 
@@ -68,14 +72,18 @@ def test_subagent_child_tree_accumulates_across_runs():
     assert msgs == ["one", "two"]                                                     # 累积
 
 
-def test_empty_subagent_creates_no_child_session():
-    # 子从未 _tree_record（空/取消运行）→ child 不建（不污染 children()/resume）。
+def test_empty_subagent_leaves_headeronly_child_session():
+    # docs/14 SessionLease：spawn 即给子 agent 注入一把 child 写者租约（open_or_create 建 child 树 header）。
+    # 子从未 _tree_record（空/取消运行）→ child 树仅 header、无 MESSAGE。/resume 隐藏 child（有 parentSession），
+    # 不污染顶层 resume 列表；children() 仍可发现这棵（空）child——与「child 是从 spawn 起的真实 session」一致。
     parent = _agent("EP")
     parent._session_mgr = SessionManager.create("EP")
     sub = _sub_with_child(parent, "a-empty", None)
     parent._persist_agent_messages("a-empty", sub)
-    assert not SessionManager.exists(parent.child_session_id("a-empty"))
-    assert children("EP") == []
+    child_sid = parent.child_session_id("a-empty")
+    assert SessionManager.exists(child_sid)                          # 租约在 spawn 时建了 header
+    child = SessionManager.open(child_sid)
+    assert [e for e in child.entries() if e.type == T.MESSAGE] == []  # 但无任何 MESSAGE entry
 
 
 def test_parent_command_navigates_to_parent_session():

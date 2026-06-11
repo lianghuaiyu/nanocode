@@ -58,13 +58,14 @@ def test_thread_resume_unknown_session_returns_none():
     assert a.session_id == "CUR2"                         # 未切换
 
 
-def test_thread_resume_migrates_legacy_session():
-    # 无 canonical 树但有 legacy flat 快照 → thread_resume 先迁移再切。
+def test_thread_resume_legacy_only_returns_none_no_runtime_migration():
+    # docs/14 SessionLease：canonical 树是唯一 resume 权威。runtime 不再自动迁移 legacy——
+    # 无 session.jsonl → thread_resume 返回 None、不切换、不建树（迁移走离线 `nanocode sessions migrate`）。
     from nanocode.session.store import save_session
     save_session("LEG", {"metadata": {"id": "LEG"},
                          "anthropicMessages": [{"role": "user", "content": "legacy-msg"}]})
     a, rt, t, host = _host("CUR3")
     new_t = rt.thread_resume(host, "LEG")
-    assert new_t is not None and a.session_id == "LEG"
-    assert SessionManager.exists("LEG")                  # 迁移建了 canonical 树
-    assert "legacy-msg" in str(a._anthropic_messages)
+    assert new_t is None                                 # 无 canonical 树 → 不可 resume
+    assert a.session_id == "CUR3"                        # 未切换
+    assert not SessionManager.exists("LEG")              # runtime 未迁移建树

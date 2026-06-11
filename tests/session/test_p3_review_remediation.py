@@ -1,6 +1,8 @@
 """docs/14 P3 review remediation 回归：pre-3a 盘上树（首消息 parentId 指向 session_start）下的
-clone/fork 不污染、不产空 fork；tree-only resume 在树空时回退 legacy；tree 仅含注入（无真实
-MESSAGE）时 _build_request_messages 回退 flat（不挤掉真实 user 消息）。
+clone 不污染（无双 session_start）；in-file /fork before 首消息 → 复位到空上下文（同 session）。
+
+（原「空树回退 legacy」「树仅注入回退 flat」两个用例已删——SessionLease 下无 flat fallback、
+canonical 树是唯一权威；见文件末说明。）
 """
 
 from nanocode.agent import AgentRuntime, AgentSession, RuntimeThread
@@ -37,39 +39,22 @@ def test_clone_pre3a_tree_no_double_session_start():
     assert msgs[1].data["message"]["role"] == "assistant"
 
 
-def test_fork_pre3a_first_message_yields_clean_empty_child():
+def test_fork_pre3a_first_message_in_file_resets_to_empty():
+    # docs/14 SessionLease：/fork 是 in-file（移 leaf，不新建 session）。pre-3a 盘上树（首消息 parentId
+    # 指向 session_start）下 /fork before 首消息 → move_to(其 parent=session_start，folded→空) → 空上下文。
+    import asyncio
+    from nanocode.entrypoints.commands.builtin import _fork
+    from nanocode.entrypoints.commands.types import CommandContext, Local
     mgr, start_id, u1 = _seed_pre3a_tree("pre3a_fork")
     a = _agent("pre3a_fork")
     a._session_mgr = mgr
-    rt = AgentRuntime()
-    t = rt.register(RuntimeThread(rt, a, AgentSession(a)))
-    host = RuntimeHost(rt, t)
-    # fork before the FIRST user message (its parentId points at session_start → treated as None)
-    new_t, selected = rt.thread_fork(host, "pre3a_fork", u1.id)
-    assert new_t is not None and selected == "first q"
-    child = SessionManager.open(a.session_id)
-    starts = [e for e in child.entries() if e.type == T.SESSION_START]
-    assert len(starts) == 1                                  # 干净空 child（无双 session_start）
-    assert child.build_context().messages == []             # fork 到空（其前无内容）
+    ctx = CommandContext(agent=a, session=AgentSession(a), out=a._sink)
+    res = asyncio.run(_fork(ctx, u1.id[-8:]))
+    assert isinstance(res, Local)
+    assert a.session_id == "pre3a_fork"                      # in-file：同 session（不新建）
+    assert a._session_mgr.build_context().messages == []     # fork 到空（其前无内容）
 
 
-def test_restore_empty_tree_falls_back_to_legacy():
-    # 树存在但只有 header（build_context 空）→ resume 用 legacy 兜底，不静默丢历史（P3 review #4）。
-    SessionManager.create("emptytree")                       # header-only 树
-    a = _agent("emptytree")
-    a.model = "claude-x"
-    a.restore_session({"anthropicMessages": [{"role": "user", "content": "legacy-hist"}]})
-    assert "legacy-hist" in str(a._anthropic_messages)       # 空树未遮蔽 legacy
-
-
-def test_build_request_falls_back_to_flat_when_tree_has_only_injection():
-    # 模拟 user 消息 _tree_record 失败但注入成功：树只有 custom_message、无真实 MESSAGE →
-    # _build_request_messages 回退 flat（保住真实 user 消息，不只发注入文本，P3 review #8）。
-    a = _agent("onlyinject")
-    mgr = SessionManager.create("onlyinject")
-    a._session_mgr = mgr
-    a._anthropic_messages = [{"role": "user", "content": "IMPORTANT USER QUESTION"}]
-    mgr.append(T.CUSTOM_MESSAGE, {"customType": "skill_listing", "content": "SKILL-LISTING", "display": False})
-    req = a._build_request_messages()
-    joined = str(req)
-    assert "IMPORTANT USER QUESTION" in joined               # 真实 user 消息未被挤掉
+# docs/14 SessionLease：删除「空树回退 legacy」与「树仅 custom_message 回退 flat」两个用例——
+# 二者断言的 flat fallback 已彻底移除（canonical 树是唯一权威；user 消息先于 build_request 入树；
+# restore_session 已退役）。无 flat fallback、缺 lease 即 fatal，是新设计的硬不变量。

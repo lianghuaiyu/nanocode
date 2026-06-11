@@ -79,16 +79,19 @@ def test_checkout_bad_id_fails_closed(capsys):
     assert "not found" in capsys.readouterr().out
 
 
-def test_fork_returns_before_user_control():
-    # docs/14 P4：/fork 是 Pi before-user fork——handler resolve 最近 user 消息并返回 Control("fork")。
-    from nanocode.entrypoints.commands.types import Control
+def test_fork_before_user_moves_leaf_in_file():
+    # docs/14 SessionLease：/fork 是 in-file before-user fork——把 active leaf 移到选中 user 消息之前
+    # （其 parent），同 session（不新建）、返回 Local；选中文本回显供重编辑。
+    from nanocode.entrypoints.commands.types import Local
     a = _agent("fk1")
     mgr = _seed(a, "fk1")
-    u = mgr.append_message(T.user_message("q"))
+    a1 = mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
+                            api="anthropic", model="claude-x", stop_reason="stop"))
+    mgr.append_message(T.user_message("q"))               # 无参 /fork → fork before this
     res = asyncio.run(_fork(_ctx(a), ""))
-    assert isinstance(res, Control) and res.action == "fork"
-    assert res.payload["selectedEntryId"] == u.id        # 选中最近 user 消息
-    assert a.session_id == "fk1"                          # handler 不切换（runtime 才切）
+    assert isinstance(res, Local)                         # in-file，不发 Control
+    assert a.session_id == "fk1"                          # 不切换/不新建
+    assert a._session_mgr.get_leaf() == a1.id             # leaf 移到选中 user 消息之前（其 parent）
 
 
 def test_resume_lists_sessions(capsys):
@@ -116,3 +119,13 @@ def test_resume_id_returns_resume_control():
     assert isinstance(res, Control)
     assert res.action == "resume" and res.payload.get("sessionId") == "tgt"
     assert a.session_id == "cur2"                     # handler 不切换（切换在 runtime 层）
+
+
+def test_rewind_before_first_message_resets_to_root():
+    # review low：post-3a 树首条 user 消息 parentId=None；/rewind 旧守卫 `not target.parentId` 会误判
+    # 「无可回退」。修复后与 /fork 一致：move_to(None) → 复位 root（空上下文）。
+    a = _agent("rwfirst")
+    mgr = _seed(a, "rwfirst")
+    mgr.append_message(T.user_message("only q"))      # 首条 user 消息，parentId=None
+    asyncio.run(_rewind(_ctx(a), ""))
+    assert a._session_mgr.get_leaf() is None          # 回退到 root（修复前被拒、leaf 不动）
