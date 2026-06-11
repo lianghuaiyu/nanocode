@@ -55,6 +55,7 @@ from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
 from ..tasks.inject import render_task_reminder, collect_pending_injections
 from ..session import v2 as _session_v2
+from ..session import tree as _tree
 from ..tools import tasks_tool
 
 from .models import (
@@ -442,6 +443,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             "turn_end", input_tokens=self.total_input_tokens,
             output_tokens=self.total_output_tokens, turns=self.current_turns,
         )
+        # docs/14 Milestone B：把 turn-end 累计遥测落进树（trajectory 的 total_turns + 终态 step 从此派生）。
+        self._tree_event(_tree.TURN_END, inputTokens=self.total_input_tokens,
+                         outputTokens=self.total_output_tokens, turns=self.current_turns,
+                         finalStatus="cancelled" if self._aborted else "completed")
         if not self.is_sub_agent:
             self._auto_save()
 
@@ -715,6 +720,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._tree_session_id, parent_session=self._child_parent_session).manager
 
     def _tree_record(self, provider_msg: dict, *, stop_reason: "str | None" = None,
+                     usage: "dict | None" = None, latency_ms: "int | None" = None,
                      required: bool = False) -> None:
         """docs/13 cutover S1 + docs/14 SessionLease：把一条 live provider 消息以**干净原文**写进
         canonical session.jsonl 树（`_session_mgr` = runtime lease 注入 / turn 开始 _ensure 自取的
@@ -733,7 +739,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             provider = "openai" if self.use_openai else "anthropic"
             neutral_sr = capture.neutral_stop_reason(provider, stop_reason)
             cap = capture.capture_openai if self.use_openai else capture.capture_anthropic
-            for neutral in cap(provider_msg, model=self.model, stop_reason=neutral_sr):
+            for neutral in cap(provider_msg, model=self.model, stop_reason=neutral_sr,
+                               usage=usage, latency_ms=latency_ms):
                 self._session_mgr.append_message(neutral)
         except Exception as e:
             # tree 写入默认 best-effort（§10#5 接受），但失败必须**可观测**——否则 tree-only resume 会
@@ -744,6 +751,19 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 pass
             if required:
                 raise          # required 写（user 消息）失败 → fail loudly（本轮请求会缺这条上下文）
+
+    def _tree_event(self, entry_type: str, **data) -> None:
+        """docs/14 Milestone B：把一条派生遥测写成**注解型**树 entry（不在 FOLD_TYPES、不推进 leaf、
+        对 LLM 不可见），供 trajectory 从树派生（取代原只进 wire 的 tracer.emit）。全 guarded：绝不破坏
+        live turn。**防御性剔除 reward/eval_result**——派生标签绝不进事实源（docs/10 三层边界：
+        tree=facts / metrics·evals=labels-never-in-tree；取代原 Tracer.emit 的同名剥除）。"""
+        data.pop("reward", None)
+        data.pop("eval_result", None)
+        try:
+            if self._session_mgr is not None:
+                self._session_mgr.append(entry_type, data)
+        except Exception:
+            pass
 
     def _build_request_messages(self) -> list:
         """docs/13 cutover S2 + docs/14 SessionLease：从 canonical 树渲染本轮请求（`render(build_context())`）。
@@ -960,6 +980,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         if self._tool_blocked_by_allowlist(name):
             self.tracer.emit("tool_blocked", tool=name, reason="not_in_allowlist",
                              agent_type=self.agent_type, artifact_id=self.artifact_id)
+            self._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",
+                             agentType=self.agent_type, artifactId=self.artifact_id)
             return f"Error: tool '{name}' is not permitted for this sub-agent."
         if name == "run_shell" and inp.get("run_in_background"):
             tid = await self._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
@@ -1052,6 +1074,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         if self._tool_blocked_by_allowlist("run_shell"):
             self.tracer.emit("tool_blocked", tool="run_shell", reason="hook_not_in_allowlist",
                              agent_type=self.agent_type, artifact_id=self.artifact_id)
+            self._tree_event(_tree.TOOL_BLOCKED, tool="run_shell", reason="hook_not_in_allowlist",
+                             agentType=self.agent_type, artifactId=self.artifact_id)
             return False, (f"hook command blocked: run_shell is not permitted for this sub-agent "
                            f"({h['skill']} {h['event']})")
         perm = check_permission("run_shell", {"command": cmd}, self.permission_mode)
@@ -2212,6 +2236,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         """
         d = self.permission.check(name, inp)
         self.tracer.emit("permission_decision", tool=name, action=d.action, message=d.message)
+        self._tree_event(_tree.PERMISSION_DECISION, tool=name, action=d.action, message=d.message)
         if d.action == "deny":
             self._sink.info(f"Denied: {d.message}")
             return False, f"Action denied: {d.message}"

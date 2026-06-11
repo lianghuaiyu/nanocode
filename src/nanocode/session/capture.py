@@ -67,9 +67,12 @@ def _is_tool_result_user(msg: dict) -> bool:
             and isinstance(c[0], dict) and c[0].get("type") == "tool_result")
 
 
-def capture_anthropic(msg: dict, *, model: str, api: str = ANTHROPIC, stop_reason: "str | None" = None) -> list[dict]:
+def capture_anthropic(msg: dict, *, model: str, api: str = ANTHROPIC, stop_reason: "str | None" = None,
+                      usage: dict | None = None, latency_ms: "int | None" = None) -> list[dict]:
     """一条 anthropic live 消息 → 0+ 条中立 Message（tool_result-user 拆成多条 toolResult）。
-    stop_reason 给定（已是中立值）时忠实采用；否则按内容推断（toolUse/stop）。"""
+    stop_reason 给定（已是中立值）时忠实采用；否则按内容推断（toolUse/stop）。
+    usage/latency_ms（docs/14 Milestone B）：assistant 消息携带 per-call token 用量 + 延迟；
+    latency_ms 也透传给 toolResult（per-tool 延迟，对 LLM 不可见，trajectory 派生用）。"""
     role = msg.get("role")
     if role == "assistant":
         content = msg.get("content")
@@ -79,14 +82,16 @@ def capture_anthropic(msg: dict, *, model: str, api: str = ANTHROPIC, stop_reaso
             blocks = [nb for b in (content or []) if (nb := _anthropic_block_to_neutral(b))]
         has_tools = any(b.get("type") == "toolCall" for b in blocks)
         return [tree.assistant_message(blocks, provider=ANTHROPIC, api=api, model=model,
-                                       stop_reason=stop_reason or _infer_stop(has_tools))]
+                                       stop_reason=stop_reason or _infer_stop(has_tools),
+                                       usage=usage, latency_ms=latency_ms)]
     if _is_tool_result_user(msg):
         out = []
         for blk in msg["content"]:
             if isinstance(blk, dict) and blk.get("type") == "tool_result":
                 out.append(tree.tool_result_message(
                     tool_call_id=blk.get("tool_use_id", ""), tool_name=blk.get("toolName", ""),
-                    content=blk.get("content", ""), is_error=bool(blk.get("is_error", False))))
+                    content=blk.get("content", ""), is_error=bool(blk.get("is_error", False)),
+                    latency_ms=blk.get("toolLatencyMs", latency_ms)))   # per-block 延迟优先（B1）
         return out
     if role == "user":
         content = msg.get("content")
@@ -96,7 +101,8 @@ def capture_anthropic(msg: dict, *, model: str, api: str = ANTHROPIC, stop_reaso
     return []
 
 
-def capture_openai(msg: dict, *, model: str, api: str = "openai-completions", stop_reason: "str | None" = None) -> list[dict]:
+def capture_openai(msg: dict, *, model: str, api: str = "openai-completions", stop_reason: "str | None" = None,
+                   usage: dict | None = None, latency_ms: "int | None" = None) -> list[dict]:
     role = msg.get("role")
     if role == "system":
         return []  # system 不入树（render 侧 Context，docs/13 §3.2 M5）
@@ -123,10 +129,12 @@ def capture_openai(msg: dict, *, model: str, api: str = "openai-completions", st
             blocks.append(blk)
         has_tools = bool(msg.get("tool_calls"))
         return [tree.assistant_message(blocks, provider=OPENAI, api=api, model=model,
-                                       stop_reason=stop_reason or _infer_stop(has_tools))]
+                                       stop_reason=stop_reason or _infer_stop(has_tools),
+                                       usage=usage, latency_ms=latency_ms)]
     if role == "tool":
         return [tree.tool_result_message(tool_call_id=msg.get("tool_call_id", ""),
-                                         tool_name="", content=msg.get("content", ""))]
+                                         tool_name="", content=msg.get("content", ""),
+                                         latency_ms=latency_ms)]
     return []
 
 

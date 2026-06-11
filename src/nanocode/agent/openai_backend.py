@@ -11,6 +11,7 @@ import time
 
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
+from ..session import tree as _tree
 from .models import _to_openai_tools, _with_retry
 
 
@@ -102,7 +103,12 @@ class OpenAIBackendMixin:
                 message_count=len(self._openai_messages),
                 messages=self._openai_messages,
             )
+            self._tree_event(_tree.LLM_REQUEST, model=self.model,    # B1：llm_request sizing 落树
+                             messageCount=len(self._openai_messages),
+                             messagesChars=len(json.dumps(self._openai_messages, default=str)))
+            _t_req = time.time()
             response = await self._call_openai_stream()
+            _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not self.is_sub_agent:
                 self._sink.spinner_stop()
@@ -118,7 +124,11 @@ class OpenAIBackendMixin:
             message = choice.get("message", {})
 
             self._openai_messages.append(message)
-            self._tree_record(message, stop_reason=choice.get("finish_reason"))  # S1 + 真实 finish_reason
+            self._tree_record(message, stop_reason=choice.get("finish_reason"),
+                              usage={"inputTokens": _u.get("prompt_tokens", 0),
+                                     "outputTokens": _u.get("completion_tokens", 0)}
+                              if (_u := (response.get("usage") or {})) else None,
+                              latency_ms=_latency_ms)  # S1 + 真实 finish_reason + per-call usage/latency（B1）
 
             _tcs = message.get("tool_calls") or []
             self._dispatch_event(
@@ -150,6 +160,7 @@ class OpenAIBackendMixin:
             if budget["exceeded"]:
                 self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
+                self._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
                 break
 
             # Phase 1: Parse & permission-check (serial)
@@ -189,17 +200,19 @@ class OpenAIBackendMixin:
                     break
 
                 if batch["concurrent"]:
-                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, int]:
+                        _t0 = time.time()
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
+                        _lat = int((time.time() - _t0) * 1000)
                         self._dispatch_event("tool_result", tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
-                        return ct_item, res
+                        return ct_item, res, _lat
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                    for ct_item, res in results:
+                    for ct_item, res, _lat in results:
                         tmsg = {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res}
                         self._openai_messages.append(tmsg)
-                        self._tree_record(tmsg)  # S1: message-end → tree
+                        self._tree_record(tmsg, latency_ms=_lat)  # S1: message-end → tree (+per-tool latency B1)
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
@@ -207,8 +220,10 @@ class OpenAIBackendMixin:
                             self._openai_messages.append(dmsg)
                             self._tree_record(dmsg)  # S1: message-end → tree
                             continue
+                        _t_tool = time.time()
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
+                        _lat = int((time.time() - _t_tool) * 1000)
                         self._dispatch_event("tool_result", tool=ct["fn"], tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
 
                         if self._context_cleared:
@@ -220,7 +235,7 @@ class OpenAIBackendMixin:
                             break
                         rmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res}
                         self._openai_messages.append(rmsg)
-                        self._tree_record(rmsg)  # S1: message-end → tree
+                        self._tree_record(rmsg, latency_ms=_lat)  # S1: message-end → tree (+per-tool latency B1)
 
             self._context_cleared = False
             if not oai_context_break:

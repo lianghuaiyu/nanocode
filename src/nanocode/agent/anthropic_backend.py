@@ -12,6 +12,7 @@ from typing import Any
 
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
+from ..session import tree as _tree
 from .models import _get_max_output_tokens, _with_retry
 
 
@@ -105,11 +106,13 @@ class AnthropicBackendMixin:
             # if it's concurrency-safe and auto-allowed. If so, start execution
             # immediately — the tool runs while the model still generates.
             early_executions: dict[str, asyncio.Task] = {}
+            early_started: dict[str, float] = {}      # tool_use_id → start ts（B1 per-tool latency）
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     # 早执行判定经同一 PermissionEngine；allowlist 兜底仍在 _execute_tool_call。
                     if self.permission.check(block["name"], block["input"]).action == "allow":
+                        early_started[block["id"]] = time.time()
                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
@@ -121,7 +124,15 @@ class AnthropicBackendMixin:
                 message_count=len(self._anthropic_messages),
                 messages=self._anthropic_messages,
             )
+            # docs/14 Milestone B：把 llm_request sizing 落树（messagesChars 是渲染后大小，事后不可重建，
+            # 必须 emit-time 捕获——trajectory 的 observation summary 从此派生）。
+            import json as _json
+            self._tree_event(_tree.LLM_REQUEST, model=self.model,
+                             messageCount=len(self._anthropic_messages),
+                             messagesChars=len(_json.dumps(self._anthropic_messages, default=str)))
+            _t_req = time.time()
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not self.is_sub_agent:
                 self._sink.spinner_stop()
@@ -138,7 +149,10 @@ class AnthropicBackendMixin:
                 "content": [self._block_to_dict(b) for b in response.content],
             }
             self._anthropic_messages.append(assistant_msg)
-            self._tree_record(assistant_msg, stop_reason=getattr(response, "stop_reason", None))  # S1 + 真实 stopReason
+            self._tree_record(assistant_msg, stop_reason=getattr(response, "stop_reason", None),
+                              usage={"inputTokens": response.usage.input_tokens,
+                                     "outputTokens": response.usage.output_tokens},
+                              latency_ms=_latency_ms)  # S1 + 真实 stopReason + per-call usage/latency（B1）
             self._dispatch_event(
                 "assistant_message",
                 text="".join(b.text for b in response.content if b.type == "text"),
@@ -165,6 +179,7 @@ class AnthropicBackendMixin:
             if budget["exceeded"]:
                 self._sink.info(f"Budget exceeded: {budget['reason']}")
                 self.tracer.emit("budget_exceeded", reason=budget["reason"])
+                self._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
                 break
 
             # Process tools: early-started ones (from streaming) just await
@@ -182,18 +197,23 @@ class AnthropicBackendMixin:
                 if early_task:
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
+                    _lat = int((time.time() - early_started.get(tu.id, time.time())) * 1000)
                     self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                         "toolName": tu.name, "toolLatencyMs": _lat})
                     continue
 
                 # Permission check for tools not started early（单一决策入口 + 审批）
                 allowed, denial = await self._authorize_dispatch(tu.name, inp)
                 if not allowed:
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial})
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial,
+                                         "toolName": tu.name})
                     continue
 
+                _t_tool = time.time()
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
+                _lat = int((time.time() - _t_tool) * 1000)
                 self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
 
                 if self._context_cleared:
@@ -203,7 +223,8 @@ class AnthropicBackendMixin:
                     self._tree_record(cb_msg)  # S1: message-end → tree
                     context_break = True
                     break
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                     "toolName": tu.name, "toolLatencyMs": _lat})
 
             if not context_break and tool_results:
                 tr_msg = {"role": "user", "content": tool_results}

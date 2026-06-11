@@ -49,6 +49,12 @@ SESSION_INFO = "session_info"
 PERMISSION_DECISION = "permission_decision"
 TASK_UPDATE = "task_update"
 SESSION_END = "session_end"
+# docs/14 Milestone B：把原本只进 wire 的派生遥测落进 canonical 树（trajectory 从树派生、不再读 wire）。
+# 这些都是**注解型** entry——不入 FOLD_TYPES（对 LLM 不可见）、不推进 leaf（见 leaf_id_after_entry）。
+TOOL_BLOCKED = "tool_blocked"
+BUDGET_EXCEEDED = "budget_exceeded"
+TURN_END = "turn_end"
+LLM_REQUEST = "llm_request"
 
 # fold 进上下文的 entry（消息族 + 派生上下文）。设置类只参与标量 fold；其余对 LLM 不可见。
 FOLD_TYPES = frozenset({MESSAGE, CUSTOM_MESSAGE, COMPACTION, BRANCH_SUMMARY})
@@ -100,13 +106,15 @@ _UNCHANGED = _Unchanged()
 
 def leaf_id_after_entry(e: Entry) -> Any:
     """统一规则：``leaf`` entry → 其 ``targetId``（可为 None=重置到 root）；
-    ``session_start``/``label``/``session_info`` → 不变（哨兵）；其余 → 自身 id。
+    ``session_start``/``label``/``session_info`` 及派生遥测（permission_decision/tool_blocked/
+    budget_exceeded/turn_end/session_end/llm_request）→ 不变（哨兵）；其余 → 自身 id。
 
-    session_start 是 **header / metadata**（cheap listing / cwd / parentSession），不是对话
-    branch 的节点：不推进 leaf，空会话 leaf 恒为 None、build_context 为空（docs/14 §4.1）。"""
+    session_start 是 **header / metadata**，遥测是 **注解**——都不推进对话 branch：不移动 leaf，
+    使后续消息的 parentId 链不穿过它们、build_context branch 干净（docs/14 §4.1 / Milestone B）。"""
     if e.type == LEAF:
         return e.data.get("targetId")
-    if e.type in (SESSION_START, LABEL, SESSION_INFO):
+    if e.type in (SESSION_START, LABEL, SESSION_INFO,
+                  PERMISSION_DECISION, TOOL_BLOCKED, BUDGET_EXCEEDED, TURN_END, SESSION_END, LLM_REQUEST):
         return _UNCHANGED
     return e.id
 
@@ -243,6 +251,7 @@ def assistant_message(
     model: str,
     stop_reason: str,
     usage: dict | None = None,
+    latency_ms: int | None = None,
     timestamp: str | None = None,
 ) -> dict:
     m = {
@@ -254,8 +263,12 @@ def assistant_message(
         "stopReason": stop_reason,
         "timestamp": timestamp or now_iso(),
     }
+    # docs/14 Milestone B：per-call 遥测落在消息上（trajectory 派生用）。render.py 只读
+    # role/content/provider/... 的固定字段，不读 usage/latencyMs → 绝不发回 provider（对 LLM 不可见）。
     if usage is not None:
         m["usage"] = usage
+    if latency_ms is not None:
+        m["latencyMs"] = latency_ms
     return m
 
 
@@ -266,6 +279,7 @@ def tool_result_message(
     content: list[dict] | str,
     is_error: bool = False,
     details: Any | None = None,
+    latency_ms: int | None = None,
     timestamp: str | None = None,
 ) -> dict:
     m = {
@@ -278,4 +292,6 @@ def tool_result_message(
     }
     if details is not None:
         m["details"] = details
+    if latency_ms is not None:
+        m["latencyMs"] = latency_ms       # docs/14 Milestone B：per-tool 延迟（render 忽略，trajectory 派生用）
     return m
