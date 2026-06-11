@@ -9,10 +9,10 @@ import asyncio
 import json
 import time
 
-from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
+from ..tools import CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from ..session import tree as _tree
-from .models import _to_openai_tools, _with_retry
+from .providers import StreamCallbacks
 
 
 class OpenAIBackendMixin:
@@ -102,7 +102,11 @@ class OpenAIBackendMixin:
                              messageCount=len(self._openai_messages),
                              messagesChars=len(json.dumps(self._openai_messages, default=str)))
             _t_req = time.time()
-            response = await self._call_openai_stream()
+            cb = StreamCallbacks(spinner_stop=self._sink.spinner_stop,
+                                 text_block=self._emit_block, retry=self._sink.retry)
+            response = await self._provider.stream(
+                model=self.model, system=None, tools=self.tools,
+                messages=self._openai_messages, thinking_mode=self._thinking_mode, callbacks=cb)
             _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not self.is_sub_agent:
@@ -228,73 +232,3 @@ class OpenAIBackendMixin:
             self._context_cleared = False
             if not oai_context_break:
                 self._inject_pending_skill_bodies(self._openai_messages)
-
-    async def _call_openai_stream(self) -> dict:
-        async def _do():
-            stream = await self._openai_client.chat.completions.create(
-                model=self.model,
-                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
-                messages=self._openai_messages,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-
-            content = ""
-            tool_calls: dict[int, dict] = {}
-            finish_reason = ""
-            usage = None
-
-            async for chunk in stream:
-                if chunk.usage:
-                    usage = {
-                        "prompt_tokens": chunk.usage.prompt_tokens,
-                        "completion_tokens": chunk.usage.completion_tokens,
-                    }
-
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-
-                if delta and delta.content:
-                    content += delta.content
-
-                if delta and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        existing = tool_calls.get(tc.index)
-                        if existing:
-                            if tc.function and tc.function.arguments:
-                                existing["arguments"] += tc.function.arguments
-                        else:
-                            tool_calls[tc.index] = {
-                                "id": tc.id or "",
-                                "name": (tc.function.name if tc.function else "") or "",
-                                "arguments": (tc.function.arguments if tc.function else "") or "",
-                            }
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
-            if content:
-                self._sink.spinner_stop()
-                self._emit_block(content)
-
-            assembled = None
-            if tool_calls:
-                assembled = [
-                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                    for _, tc in sorted(tool_calls.items())
-                ]
-
-            return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": content or None,
-                        "tool_calls": assembled,
-                    },
-                    "finish_reason": finish_reason or "stop",
-                }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
-            }
-
-        return await _with_retry(_do, on_retry=self._sink.retry)

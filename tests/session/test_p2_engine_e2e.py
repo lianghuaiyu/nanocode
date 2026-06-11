@@ -39,10 +39,10 @@ def _agent(sid):
 def test_message_end_writes_clean_tree():
     a = _agent("s1e")
 
-    async def fake_stream(on_tool_block_complete=None):
+    async def fake_stream(**_kw):
         return _FakeResp([_FakeBlock("text", text="hi there")])
 
-    a._call_anthropic_stream = fake_stream
+    a._provider.stream = fake_stream
     asyncio.run(a.chat("hello"))
 
     assert session_file("s1e").exists()
@@ -57,13 +57,13 @@ def test_message_end_tool_turn_records_full_round():
     a = _agent("s1t")
     calls = {"n": 0}
 
-    async def fake_stream(on_tool_block_complete=None):
+    async def fake_stream(**_kw):
         calls["n"] += 1
         if calls["n"] == 1:
             return _FakeResp([_FakeBlock("tool_use", id="t1", name="list_files", input={"path": "."})])
         return _FakeResp([_FakeBlock("text", text="done")])
 
-    a._call_anthropic_stream = fake_stream
+    a._provider.stream = fake_stream
     asyncio.run(a.chat("list"))
 
     msgs = SessionManager.open("s1t").build_context().messages

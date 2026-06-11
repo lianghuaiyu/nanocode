@@ -269,6 +269,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
 
+        # docs/15 STEP B：provider 流式 + capture 收敛到 ProviderAdapter（backend mixin 经 self._provider
+        # .stream 委托,engine 不再持 _call_*_stream）。clients 在 rebind 不变,故 _provider 跨 rebind 有效。
+        from .providers import make_provider_adapter
+        self._provider = make_provider_adapter(
+            use_openai=self.use_openai,
+            anthropic_client=self._anthropic_client, openai_client=self._openai_client)
+
     def _apply_permission_mode_prompt(self) -> None:
         """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
         plan 模式：_system_prompt = base + plan 提示（文本内嵌 plan-<sid>.md 路径）；否则 = base。"""

@@ -113,11 +113,11 @@ def test_live_request_built_from_message_list_baseline():
     a._mcp_initialized = True  # 跳过 MCP 连接
     captured = {}
 
-    async def fake_stream(on_tool_block_complete=None):
+    async def fake_stream(**_kw):
         captured["messages"] = copy.deepcopy(a._anthropic_messages)
         return _FakeResp()
 
-    a._call_anthropic_stream = fake_stream
+    a._provider.stream = fake_stream
     asyncio.run(a.chat("hello-baseline"))
     msgs = captured["messages"]
     assert any("hello-baseline" in str(m.get("content", "")) for m in msgs)  # user msg 进入请求

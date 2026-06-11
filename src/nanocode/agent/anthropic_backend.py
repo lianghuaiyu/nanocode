@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
 
-from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
+from ..tools import CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
 from ..session import tree as _tree
-from .models import _get_max_output_tokens, _with_retry
+from .providers import StreamCallbacks
 
 
 class AnthropicBackendMixin:
@@ -126,7 +125,16 @@ class AnthropicBackendMixin:
                              messageCount=len(self._anthropic_messages),
                              messagesChars=len(_json.dumps(self._anthropic_messages, default=str)))
             _t_req = time.time()
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            cb = StreamCallbacks(
+                spinner_stop=self._sink.spinner_stop,
+                text_block=self._emit_block,
+                thinking_block=lambda t: self._dispatch_event("assistant_thinking", text=t),
+                tool_block=_on_tool_block,
+                retry=self._sink.retry,
+            )
+            response = await self._provider.stream(
+                model=self.model, system=self._system_prompt, tools=self.tools,
+                messages=self._anthropic_messages, thinking_mode=self._thinking_mode, callbacks=cb)
             _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not self.is_sub_agent:
@@ -232,83 +240,3 @@ class AnthropicBackendMixin:
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": dict(block.input) if hasattr(block.input, 'items') else block.input}
         # Fallback
         return {"type": block.type}
-
-    async def _call_anthropic_stream(self, on_tool_block_complete=None):
-        """Stream an Anthropic API call. When a tool_use content block finishes
-        during streaming, on_tool_block_complete fires immediately so the caller
-        can start execution before the full response arrives (streaming tool
-        execution triggered on each content block stop)."""
-        async def _do():
-            max_output = _get_max_output_tokens(self.model)
-            create_params: dict[str, Any] = {
-                "model": self.model,
-                "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
-                "system": self._system_prompt,
-                "tools": get_active_tool_definitions(self.tools),
-                "messages": self._anthropic_messages,
-            }
-
-            if self._thinking_mode in ("adaptive", "enabled"):
-                create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
-
-            thinking_parts: list[str] = []
-            text_blocks: dict[int, list] = {}
-            thinking_blocks: dict[int, list] = {}
-            # Track in-flight tool_use blocks by index for streaming execution
-            tool_blocks_by_index: dict[int, dict] = {}
-
-            async with self._anthropic_client.messages.stream(**create_params) as stream:
-                async for event in stream:
-                    if not hasattr(event, 'type'):
-                        continue
-
-                    if event.type == "content_block_start":
-                        cb = getattr(event, 'content_block', None)
-                        if cb and getattr(cb, 'type', None) == "tool_use":
-                            tool_blocks_by_index[event.index] = {
-                                "id": cb.id, "name": cb.name, "input_json": "",
-                            }
-
-                    elif event.type == "content_block_delta":
-                        delta = event.delta
-                        if hasattr(delta, 'text'):
-                            text_blocks.setdefault(event.index, []).append(delta.text)
-                        elif hasattr(delta, 'thinking'):
-                            thinking_parts.append(delta.thinking)
-                            thinking_blocks.setdefault(event.index, []).append(delta.thinking)
-                        elif hasattr(delta, 'partial_json'):
-                            tb = tool_blocks_by_index.get(event.index)
-                            if tb:
-                                tb["input_json"] += delta.partial_json
-
-                    elif event.type == "content_block_stop":
-                        if event.index in text_blocks:
-                            self._sink.spinner_stop()
-                            self._emit_block("".join(text_blocks.pop(event.index)))
-                        elif event.index in thinking_blocks:
-                            buf = thinking_blocks.pop(event.index)
-                            # sink 自行决定渲染/抑制（BufferSink 下 thinking/spinner 均 no-op，
-                            # 等价于旧 is_sub_agent 抑制）；core 不再判 _output_buffer。
-                            self._sink.spinner_stop()
-                            self._dispatch_event("assistant_thinking", text="".join(buf))
-                        else:
-                            tb = tool_blocks_by_index.pop(event.index, None)
-                            if tb and on_tool_block_complete:
-                                import json as _json
-                                try:
-                                    parsed = _json.loads(tb["input_json"] or "{}")
-                                except Exception:
-                                    parsed = {}
-                                on_tool_block_complete({
-                                    "type": "tool_use", "id": tb["id"],
-                                    "name": tb["name"], "input": parsed,
-                                })
-
-                final_message = await stream.get_final_message()
-
-            # Filter out thinking blocks
-            final_message._nanocode_thinking = "".join(thinking_parts)
-            final_message.content = [b for b in final_message.content if b.type != "thinking"]
-            return final_message
-
-        return await _with_retry(_do, on_retry=self._sink.retry)
