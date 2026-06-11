@@ -7,7 +7,7 @@ from nanocode.agent.engine import Agent
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False, **kw)
+    return Agent(api_key="test", **kw)
 
 
 def test_agent_adopts_session_id():
@@ -27,7 +27,7 @@ def test_main_agent_writes_env():
 
 def test_sub_agent_does_not_overwrite_env(monkeypatch):
     monkeypatch.setenv("NANOCODE_SESSION_ID", "PARENT")
-    Agent(api_key="test", trace_enabled=False, is_sub_agent=True, session_id="childsid")
+    Agent(api_key="test", is_sub_agent=True, session_id="childsid")
     assert os.environ.get("NANOCODE_SESSION_ID") == "PARENT"
 
 

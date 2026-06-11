@@ -2,6 +2,21 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _raise_fd_limit():
+    """docs/14 SessionLease：create() 默认持 flock fd，单测进程会创建大量短命 locked mgr
+    （__del__ 兜底释放，但 GC 时机非确定）。把软 RLIMIT_NOFILE 顶到硬上限，消除「Too many open
+    files」天花板。非 POSIX / 不可调时静默跳过。"""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except Exception:
+        pass
+    yield
+
+
 @pytest.fixture(autouse=True)
 def nanocode_home(tmp_path, monkeypatch):
     """每个测试用独立的 ~/.nanocode 根，隔离 sessions/memory/tool-results。"""

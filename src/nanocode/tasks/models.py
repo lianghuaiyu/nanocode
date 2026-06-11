@@ -25,6 +25,9 @@ class TaskRecord:
     injected: bool = False
     error: str | None = None
     exit_code: int | None = None
+    # docs/14 §6b：spawn 时父 session 的 leaf entry id。background 完成回注的 custom_message 据此
+    # pin 到 spawn 分支（而非完成时的 live leaf）。随 state.json 持久（survives resume）。
+    spawn_entry_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

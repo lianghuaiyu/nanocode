@@ -108,19 +108,19 @@ def test_subagent_detail_text_unknown():
 
 
 def test_subagent_detail_text_surfaces_artifact_paths():
+    # docs/14 Milestone B：wire.jsonl 已退役——artifact 只剩 Result/Meta/Prompt（无 Wire 行）。
     from nanocode.session import v2
     m = TaskManager()
     a = m.create_subagent("coder", "d", model="claude-opus-4-6", provider="anthropic")
-    # no artifacts yet -> no Wire/Result lines even with session_id
+    # no artifacts yet -> no Result line even with session_id
     txt = tt.subagent_detail_text(m, a.id, "detsid")
-    assert "Wire:" not in txt and "Result:" not in txt
+    assert "Result:" not in txt and "Wire:" not in txt
     # write artifacts, then they should be surfaced
     v2.write_agent_result("detsid", a.id, "done")
     v2.write_agent_prompt("detsid", a.id, "task")
-    v2.agent_wire_path("detsid", a.id).write_text('{"type":"session_start"}\n')
     txt2 = tt.subagent_detail_text(m, a.id, "detsid")
-    assert "Wire:" in txt2 and "wire.jsonl" in txt2
     assert "Result:" in txt2 and "result.md" in txt2
     assert "Prompt:" in txt2
+    assert "Wire:" not in txt2                          # wire 已退役，不再 surface
     # without session_id (back-compat) no artifact lines
-    assert "Wire:" not in tt.subagent_detail_text(m, a.id)
+    assert "Result:" not in tt.subagent_detail_text(m, a.id)

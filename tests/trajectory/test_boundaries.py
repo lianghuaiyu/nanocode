@@ -29,15 +29,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC = _REPO_ROOT / "src" / "nanocode"
 
-# 用户边界点名的 runtime 模块（绝不得 import trajectory）。
+# 用户边界点名的 runtime 模块（绝不得 import trajectory）。docs/14 Milestone B：trace/ 已删除，
+# runtime 事实源现为 engine/backends/session（写 canonical 树）+ runtime_events（内存事件流）。
 _RUNTIME_SOURCES = (
     _SRC / "agent" / "engine.py",
     _SRC / "agent" / "anthropic_backend.py",
     _SRC / "agent" / "openai_backend.py",
-    _SRC / "agent" / "context_builder.py",
     _SRC / "agent" / "session.py",
-    _SRC / "trace" / "tracer.py",
-    _SRC / "trace" / "redaction.py",
+    _SRC / "agent" / "runtime_events.py",
 )
 
 # 任务点名的「import trajectory」文本形态（兜底子串扫描用）。
@@ -151,70 +150,34 @@ def test_importing_trajectory_does_not_pull_runtime():
     assert "OK" in proc.stdout
 
 
-# ── (c) Tracer wire 绝不含 reward / eval_result ────────────────────
+# ── (c) canonical 树绝不含 reward / eval_result（三层边界：tree=facts / labels-never-in-tree）──
 
 
-class _MemSink:
-    """内存 sink：收集 emit 出的事件 dict 供断言。"""
+def test_tree_entries_never_contain_reward_or_eval():
+    """docs/14 Milestone B：Tracer/wire 已删——派生标签的事实源边界现守在 **canonical 树写入路径**。
 
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-
-    def write(self, event: dict) -> None:
-        self.events.append(event)
-
-    def close(self) -> None:  # noqa: D401 - sink 协议
-        pass
-
-
-def _emit_variety(level: str) -> list[dict]:
-    """通过一个 trajectory-enabled Tracer（指定 level）emit 各类事件，返回收集到的事件。
-
-    刻意把 ``reward`` / ``eval_result`` 作为 payload kwarg 传进去——验证即便上游误传，
-    wire emit 路径也不应把它们留在事实源里。注：当前 Tracer.emit 不主动注入 reward/eval，
-    本测试既验证「emit 不注入」，也作为防御回归（若未来误加注入即红）。
+    刻意把 ``reward`` / ``eval_result`` 当 kwarg 误传进 ``_tree_event``，并写一条普通消息，断言落树的
+    entry/message 绝不含这两个键（``engine._tree_event`` 防御性 pop，取代原 ``Tracer.emit`` 的同名剥除）。
+    reward / eval_result 只存在于 Step（steps.jsonl / evals.jsonl），由 eval 回填——绝不进 session.jsonl。
     """
-    from nanocode.trace.tracer import Tracer
+    from nanocode.agent.engine import Agent
+    from nanocode.session import tree as T
+    from nanocode.session.manager import SessionManager
 
-    sink = _MemSink()
-    tr = Tracer(
-        "sess-boundary",
-        [sink],
-        agent_id="main",
-        trajectory_enabled=True,
-        trajectory_level=level,
-    )
-    tr.begin_turn("turn-1")
-    tr.emit("llm_request", model="m", message_count=1,
-            messages=[{"role": "user", "content": "hi" * 2000}])
-    # 刻意把派生标签作为 payload kwarg 误传进 emit —— 验证 wire 守卫无条件剥除它们
-    # （Tracer.emit pop reward/eval_result），即「即便上游误传也绝不进事实源」。
-    tr.emit("assistant_message", text="ok", tool_uses=[{"id": "t1", "name": "read_file"}],
-            reward=0.5, eval_result={"signal": "should_be_stripped"})
-    tr.emit("llm_response", input_tokens=10, output_tokens=5)
-    tr.emit("tool_call", tool="read_file", tool_use_id="t1", input={"file_path": "/x"})
-    tr.emit("tool_result", tool="read_file", tool_use_id="t1", result="big result " * 500,
-            reward=-1.0, eval_result={"signal": "tool_error"})
-    tr.emit("permission_decision", tool="run_shell", action="deny")
-    tr.emit("compaction", kind="auto", message_count_before=10, message_count_after=3)
-    tr.emit("turn_end", final_status="completed", reward=1.0)
-    tr.emit("session_end", final_status="completed", eval_result={"final": "ok"})
-    tr.close()
-    return sink.events
+    a = Agent(api_key="test", session_id="boundtree", permission_mode="bypassPermissions")
+    a._session_mgr = SessionManager.create("boundtree")     # 持写锁（create 默认 lock=True）
+    # 注解型遥测 entry：误传派生标签
+    a._tree_event(T.PERMISSION_DECISION, tool="run_shell", action="deny",
+                  reward=0.5, eval_result={"signal": "should_be_stripped"})
+    a._tree_event(T.TURN_END, inputTokens=1, outputTokens=2, turns=1,
+                  reward=-1.0, eval_result={"final": "ok"})
+    # 普通消息 entry
+    a._tree_record({"role": "user", "content": "hi"})
+    a._tree_record({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
 
-
-def test_tracer_wire_never_contains_reward_or_eval():
-    for level in ("full", "summary"):
-        events = _emit_variety(level)
-        assert events, f"expected emitted events at level={level}"
-        for ev in events:
-            assert "reward" not in ev, (
-                f"wire event must NEVER carry 'reward' (derived label) "
-                f"at level={level}: {ev.get('type')}"
-            )
-            assert "eval_result" not in ev, (
-                f"wire event must NEVER carry 'eval_result' (derived label) "
-                f"at level={level}: {ev.get('type')}"
-            )
-        # 同时确认 trajectory 信封键确实在（说明确为 trajectory-enabled wire，而非空跑）。
-        assert all(ev.get("trajectory") is True for ev in events)
+    entries = a._session_mgr.entries()
+    assert entries, "expected tree entries"
+    for e in entries:
+        blob = str(e.to_dict())
+        assert "reward" not in blob, f"tree entry must NEVER carry 'reward' (derived label): {e.type}"
+        assert "eval_result" not in blob, f"tree entry must NEVER carry 'eval_result' (derived label): {e.type}"

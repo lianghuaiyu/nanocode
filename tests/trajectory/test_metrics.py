@@ -1,23 +1,24 @@
-"""tests for trajectory.metrics.compute_metrics（P3 harness 指标聚合）。
+"""tests for trajectory.metrics.compute_metrics（P3 harness 指标聚合，docs/14 Milestone B2）。
 
-构造 SessionEvent 列表（经 from_wire，贴近真实 wire 行），断言每个指标的计数/比率，
-并覆盖 legacy / summary / malformed 容忍与 per_agent / per_tool breakdown。
+构造 TrajEvent 列表（树适配器重建的事件等价物），断言每个指标的计数/比率，并覆盖
+summary / malformed 容忍与 per_agent / per_tool breakdown。延迟优先取事件 data 上显式的
+``latency_ms``（毫秒级，树适配器从 message.usage/latencyMs 取真值）。
 """
 from __future__ import annotations
 
-from nanocode.events.models import SessionEvent
+from nanocode.trajectory._tree_events import TrajEvent
 from nanocode.trajectory.metrics import compute_metrics
 from nanocode.trajectory.schema import Step
 
 
-def _ev(etype, *, agent_id="main", seq=0, ts=None, **payload):
-    """构造一条 SessionEvent（经 from_wire），payload 落到 .data。"""
+def _ev(etype, *, agent_id="main", seq=0, ts=None, **payload) -> TrajEvent:
+    """构造一条 TrajEvent（payload 落到 .data）。"""
     if ts is None:
         ts = f"2026-06-09T00:00:{seq:02d}+00:00"
-    d = {"type": etype, "seq": seq, "ts": ts, "session_id": "s1", "agent_id": agent_id, **payload}
-    # 带 id 即非 legacy；from_wire 会据 ENVELOPE_KEYS 归集 payload 到 .data。
-    d["id"] = f"evt_{agent_id}_{seq}"
-    return SessionEvent.from_wire(d, agent_id=agent_id)
+    return TrajEvent(
+        type=etype, agent_id=agent_id, seq=seq, ts=ts, session_id="s1",
+        id=f"evt_{agent_id}_{seq}", line_no=seq, data=dict(payload),
+    )
 
 
 def test_empty_events_all_zero():
@@ -52,7 +53,6 @@ def test_turns_and_tokens_and_cost():
     assert m["total_turns"] == 2
     assert m["total_input_tokens"] == 1_000_000
     assert m["total_output_tokens"] == 2_000_000
-    # 1M in * $3/M + 2M out * $15/M = 3 + 30 = 33
     assert abs(m["est_cost_usd"] - 33.0) < 1e-9
 
 
@@ -67,7 +67,7 @@ def test_tool_calls_and_failure_rate():
     ]
     m = compute_metrics(events)
     assert m["total_tool_calls"] == 3
-    assert m["tool_failure_count"] == 2  # Error + Warning
+    assert m["tool_failure_count"] == 2
     assert abs(m["tool_failure_rate"] - (2 / 3)) < 1e-9
 
 
@@ -81,23 +81,17 @@ def test_failure_prefix_is_case_insensitive_and_leading_ws():
 
 
 def test_summary_level_result_uses_result_summary():
-    # SUMMARY 级别：无 full result，只有 result_summary（apply_summary_shaping 形态）。
     events = [
         _ev("tool_call", seq=0, tool="run_shell", input={"command": "x"}, tool_use_id="a"),
         _ev("tool_result", seq=1, tool="run_shell", tool_use_id="a",
-            result_summary="Error: failed", result_hash="sha256:deadbeef", chars=13),
+            result_summary="Error: failed", result_hash="sha256:deadbeef"),
     ]
     m = compute_metrics(events)
     assert m["tool_failure_count"] == 1
 
 
 def test_lone_tool_blocked_is_informational_not_a_call():
-    # 孤立 tool_blocked（无配对 tool_call/result，如 hook 拦截路径）：只记 tool_blocked_count，
-    # 不计入 total_tool_calls / tool_failure_count（生产里 call 由 tool_call 计、failure 由
-    # "Error: ... not permitted" 的 tool_result 计）。修审阅 HIGH 双计。
-    events = [
-        _ev("tool_blocked", seq=0, tool="run_shell", reason="not_in_allowlist"),
-    ]
+    events = [_ev("tool_blocked", seq=0, tool="run_shell", reason="not_in_allowlist")]
     m = compute_metrics(events)
     assert m["tool_blocked_count"] == 1
     assert m["total_tool_calls"] == 0
@@ -106,8 +100,6 @@ def test_lone_tool_blocked_is_informational_not_a_call():
 
 
 def test_blocked_tool_triple_counts_once():
-    # 生产真实序列：tool_call -> tool_blocked -> tool_result("Error: tool ... not permitted")。
-    # 一次被挡调用必须只记 1 call + 1 failure + 1 blocked（修审阅 HIGH：曾记 2 call + 2 failure）。
     events = [
         _ev("tool_call", seq=0, tool="run_shell", input={"command": "ls"}, tool_use_id="t0"),
         _ev("tool_blocked", seq=1, tool="run_shell", reason="not_in_allowlist"),
@@ -143,34 +135,39 @@ def test_compaction_count():
     assert m["compaction_count"] == 2
 
 
-def test_model_latency_pairing():
+def test_model_latency_from_explicit_latency_ms():
+    # B2：树 ts 秒级，model latency 取 llm_response 上显式 latency_ms（毫秒级真值）。
     events = [
-        _ev("llm_request", seq=0, ts="2026-06-09T00:00:00+00:00"),
-        _ev("llm_response", seq=1, ts="2026-06-09T00:00:02+00:00", input_tokens=1, output_tokens=1),
-        _ev("llm_request", seq=2, ts="2026-06-09T00:00:05+00:00"),
-        _ev("llm_response", seq=3, ts="2026-06-09T00:00:06+00:00", input_tokens=1, output_tokens=1),
+        _ev("llm_request", seq=0),
+        _ev("llm_response", seq=1, input_tokens=1, output_tokens=1, latency_ms=2000),
+        _ev("llm_request", seq=2),
+        _ev("llm_response", seq=3, input_tokens=1, output_tokens=1, latency_ms=1000),
     ]
     m = compute_metrics(events)
-    # 2000ms + 1000ms = 3000ms; avg 1500
     assert m["model_latency_ms"]["sum"] == 3000
     assert m["model_latency_ms"]["count"] == 2
     assert m["model_latency_ms"]["avg"] == 1500.0
 
 
-def test_tool_latency_pairing_by_tool_use_id():
+def test_model_latency_falls_back_to_ts_delta():
+    # 无显式 latency_ms 时退回 ts 差（兼容旧 wire 派生流）。
     events = [
-        _ev("tool_call", seq=0, tool="read_file", input={"file_path": "/a"}, tool_use_id="t0",
-            ts="2026-06-09T00:00:00+00:00"),
-        _ev("tool_call", seq=1, tool="grep_search", input={}, tool_use_id="t1",
-            ts="2026-06-09T00:00:00+00:00"),
-        # result 顺序与 call 顺序不同——靠 tool_use_id 正确配对。
-        _ev("tool_result", seq=2, tool="grep_search", tool_use_id="t1", result="ok",
-            ts="2026-06-09T00:00:03+00:00"),
-        _ev("tool_result", seq=3, tool="read_file", tool_use_id="t0", result="ok",
-            ts="2026-06-09T00:00:01+00:00"),
+        _ev("llm_request", seq=0, ts="2026-06-09T00:00:00+00:00"),
+        _ev("llm_response", seq=1, ts="2026-06-09T00:00:02+00:00", input_tokens=1, output_tokens=1),
     ]
     m = compute_metrics(events)
-    # grep_search: 3000ms; read_file: 1000ms
+    assert m["model_latency_ms"]["sum"] == 2000
+    assert m["model_latency_ms"]["count"] == 1
+
+
+def test_tool_latency_from_explicit_latency_ms_by_tool():
+    events = [
+        _ev("tool_call", seq=0, tool="read_file", input={"file_path": "/a"}, tool_use_id="t0"),
+        _ev("tool_result", seq=1, tool="read_file", tool_use_id="t0", result="ok", latency_ms=1000),
+        _ev("tool_call", seq=2, tool="grep_search", input={}, tool_use_id="t1"),
+        _ev("tool_result", seq=3, tool="grep_search", tool_use_id="t1", result="ok", latency_ms=3000),
+    ]
+    m = compute_metrics(events)
     assert m["tool_latency_ms"]["sum"] == 4000
     assert m["tool_latency_ms"]["count"] == 2
     assert m["per_tool"]["read_file"]["latency_ms_avg"] == 1000.0
@@ -185,7 +182,7 @@ def test_files_touched_dedup_and_sorted():
         _ev("tool_call", seq=3, tool="grep_search", input={"file_path": "/ignored"}, tool_use_id="d"),
     ]
     m = compute_metrics(events)
-    assert m["files_touched"] == ["/a.py", "/b.py"]  # deduped + sorted, grep ignored
+    assert m["files_touched"] == ["/a.py", "/b.py"]
 
 
 def test_tests_run_pass_fail_heuristic():
@@ -197,7 +194,7 @@ def test_tests_run_pass_fail_heuristic():
         _ev("tool_result", seq=3, tool="run_shell", tool_use_id="b", result="hi"),
     ]
     m = compute_metrics(events)
-    assert m["tests_run"] == 1  # only the pytest one
+    assert m["tests_run"] == 1
     assert m["tests_passed"] == 3
     assert m["tests_failed"] == 1
 
@@ -226,7 +223,7 @@ def test_high_risk_from_steps_records():
     recs = [
         {"metadata": {"risk_level": "high"}},
         {"metadata": {"risk_level": "medium"}},
-        {"risk_level": "high"},  # flat fallback
+        {"risk_level": "high"},
     ]
     m = compute_metrics([], steps=recs)
     assert m["high_risk_action_count"] == 2
@@ -264,47 +261,26 @@ def test_per_tool_breakdown():
     assert m["per_tool"]["read_file"]["failures"] == 1
 
 
-def test_legacy_rows_do_not_crash():
-    # legacy 行：无 id（from_wire 会反推），缺 turn_id 等；应正常计入而不抛。
-    legacy = SessionEvent.from_wire(
-        {"type": "tool_call", "seq": 0, "ts": "2026-06-09T00:00:00+00:00",
-         "tool": "read_file", "input": {"file_path": "/x"}, "tool_use_id": "t"},
-        agent_id="main",
-    )
-    assert legacy.legacy is True
-    result = SessionEvent.from_wire(
-        {"type": "tool_result", "seq": 1, "ts": "2026-06-09T00:00:01+00:00",
-         "tool": "read_file", "tool_use_id": "t", "result": "ok"},
-        agent_id="main",
-    )
-    m = compute_metrics([legacy, result])
-    assert m["total_tool_calls"] == 1
-    assert m["files_touched"] == ["/x"]
-    assert m["tool_latency_ms"]["count"] == 1
-
-
 def test_malformed_missing_fields_do_not_crash():
-    # 缺 tool / input / ts / tokens 的事件不应崩。
     events = [
-        _ev("tool_call", seq=0),  # no tool, no input
-        _ev("tool_result", seq=1),  # no tool, no result
-        _ev("llm_response", seq=2),  # no tokens
-        _ev("permission_decision", seq=3),  # no action
-        SessionEvent.from_wire({"type": "tool_call", "id": "evt_main_4"}, agent_id="main"),  # no seq/ts
+        _ev("tool_call", seq=0),
+        _ev("tool_result", seq=1),
+        _ev("llm_response", seq=2),
+        _ev("permission_decision", seq=3),
+        TrajEvent(type="tool_call", agent_id="main", seq=4, ts="", session_id="s1"),
     ]
     m = compute_metrics(events)
-    assert m["total_tool_calls"] == 2  # two tool_call events
+    assert m["total_tool_calls"] == 2
     assert m["total_input_tokens"] == 0
     assert m["permission_deny_count"] == 0
-    # <unknown> bucket created for tool-less calls
     assert "<unknown>" in m["per_tool"]
 
 
 def test_negative_latency_clamped_to_zero():
-    # result ts 早于 call ts（时钟回拨等）→ 钳为 0，不出负数。
+    # 显式 latency_ms 为负（异常上游）→ 钳为 0，不出负数。
     events = [
-        _ev("tool_call", seq=0, tool="x", input={}, tool_use_id="a", ts="2026-06-09T00:00:05+00:00"),
-        _ev("tool_result", seq=1, tool="x", tool_use_id="a", result="ok", ts="2026-06-09T00:00:00+00:00"),
+        _ev("tool_call", seq=0, tool="x", input={}, tool_use_id="a"),
+        _ev("tool_result", seq=1, tool="x", tool_use_id="a", result="ok", latency_ms=-5),
     ]
     m = compute_metrics(events)
     assert m["tool_latency_ms"]["sum"] == 0

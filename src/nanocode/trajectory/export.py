@@ -1,15 +1,16 @@
-"""trajectory.export — 把一个 session 的 merged wire 导出为 trajectory bundle（docs/10 P5）。
+"""trajectory.export — 把一个 session 的 canonical 树导出为 trajectory bundle（docs/10 P5 / docs/14 B2）。
 
 DERIVED 只读导出层（硬边界，见 trajectory/__init__.py）：
-- 本模块**只读** merged wire（经 ``events.reader.merge_session_events``），把 projection /
-  metrics / eval 三路派生产物落盘为一个 bundle，**绝不**写回 wire、**绝不**驱动 runtime、
-  **绝不**参与 resume / fork。
-- 仅 import 同包的 ``project`` / ``metrics`` / ``eval`` 读侧 API、``schema``（PURE），与
-  ``events.reader`` / ``session.v2`` 的读侧路径 helper；**绝不** import 任何 runtime 模块。
+- 本模块**只读** canonical 树（经 ``_tree_events.tree_events`` 重建），把 projection / metrics /
+  eval 三路派生产物落盘为一个 bundle，**绝不**写回树/wire、**绝不**驱动 runtime、**绝不**参与
+  resume / fork。
+- 仅 import 同包的 ``project`` / ``metrics`` / ``eval`` 读侧 API、``schema``（PURE）、``_tree_events``
+  与 ``session.manager.session_root``（只读路径 helper）；**绝不** import 任何 runtime 模块 /
+  ``events.*`` / ``trace.*``。
 - reward / eval_result 是派生标签：只落 ``steps.jsonl`` / ``metrics.json`` / ``evals.jsonl``，
-  绝不污染 wire。
+  绝不污染树。
 
-健壮性铁律：导出绝不崩。空 / 缺失 session（无 wire）也产出合法 bundle——4 个文件齐全、
+健壮性铁律：导出绝不崩。空 / 缺失 session（无树）也产出合法 bundle——4 个文件齐全、
 内容为空（空 steps.jsonl / evals.jsonl、零值 metrics / metadata）。所有解析在兜底内。
 """
 from __future__ import annotations
@@ -17,8 +18,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..events.reader import merge_session_events
-from ..session.v2 import session_root
+from ..session.manager import session_root
+from ._tree_events import tree_events
 from . import eval as _eval
 from . import metrics as _metrics
 from . import project as _project
@@ -34,8 +35,8 @@ _EVALS_FILE = "evals.jsonl"
 def bundle_dir(session_id: str, out_dir: "str | Path | None" = None) -> Path:
     """trajectory bundle 的目标目录。
 
-    默认 = ``session.v2.session_root(session_id) / "trajectory"``——与 wire 同 session 根、
-    但**独立子目录**（绝不落在 ``agents/*/`` 下，保持 derived 投影与 execution-fact wire 物理分离）。
+    默认 = ``session.manager.session_root(session_id) / "trajectory"``——与会话同根、但**独立
+    子目录**（绝不落在 ``agents/*/`` 下，保持 derived 投影与 canonical 事实源物理分离）。
     传 ``out_dir`` 则覆盖为该目录（导出仍写入其下）。
     """
     if out_dir is not None:
@@ -46,8 +47,8 @@ def bundle_dir(session_id: str, out_dir: "str | Path | None" = None) -> Path:
 def export_bundle(session_id: str, out_dir: "str | Path | None" = None) -> Path:
     """把一个 session 导出为 trajectory bundle，返回 bundle 目录 Path。
 
-    步骤（全只读 wire）：
-      1. ``events = merge_session_events(session_id)``（跨 agent 读时 merge）。
+    步骤（全只读 canonical 树）：
+      1. ``events = tree_events(session_id)``（父会话 + 子会话 fan-out 重建为统一事件流）。
       2. ``steps = project.build_steps(events)``；``metrics = metrics.compute_metrics(events, steps)``；
          ``evals = eval.online_evals(events, steps)``。
       3. 写入 bundle_dir：``metadata.json``（从 events 派生的 TrajectoryMetadata）、
@@ -58,9 +59,9 @@ def export_bundle(session_id: str, out_dir: "str | Path | None" = None) -> Path:
     out = bundle_dir(session_id, out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # ── 只读 merge + 三路派生（各自内部已 defensive，绝不抛）──────────
+    # ── 只读重建 + 三路派生（各自内部已 defensive，绝不抛）──────────
     try:
-        events = merge_session_events(session_id)
+        events = tree_events(session_id)
     except Exception:
         events = []
     try:

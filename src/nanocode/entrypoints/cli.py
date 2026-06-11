@@ -16,28 +16,27 @@ from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager
+from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
 from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
-from ..session import load_session, get_latest_session_id
+from ..session import get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
-from ..trace import (
-    is_enabled as _trace_is_enabled,
-    trace_file as _trace_file,
+from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
     trajectory_level as _trajectory_level,
 )
-from .trace_cmd import run as _run_trace_cmd
 from .trajectory_cmd import run as _run_trajectory_cmd
+from .sessions_cmd import run as _run_sessions_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
-from .commands.types import CommandContext, Local, Prompt
+from .commands.types import CommandContext, Local, Prompt, Control
 from .commands.runner import dispatch, NOT_A_COMMAND
+from .host import RuntimeHost
 from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
-_SUBCOMMANDS = {"trace": _run_trace_cmd, "trajectory": _run_trajectory_cmd}
+_SUBCOMMANDS = {"trajectory": _run_trajectory_cmd, "sessions": _run_sessions_cmd}
 
 
 # REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
@@ -373,10 +372,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
-    parser.add_argument("--trace", action="store_true",
-                        help="Record agent trajectory to ./.nanocode/traces/<session>.jsonl")
     parser.add_argument("--trajectory", action="store_true",
-                        help="Project the always-on wire into a trajectory (analysis/RL lane)")
+                        help="Project the canonical session tree into a trajectory (analysis/RL lane)")
     parser.add_argument("--trajectory-level", choices=["summary", "full"], default=None,
                         help="summary (default): drop heavy payloads, keep hash+summary; "
                              "full: keep full prompts/messages/tool results (may contain secrets)")
@@ -401,57 +398,83 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-def _resolve_resume_session() -> tuple:
-    """Resolve resume target: (adopt_session_id_or_None, data_or_None).
+def _load_from_manager(agent, built=None) -> None:
+    """把 canonical 树折叠出的上下文渲染进 agent 的 active 消息列表（docs/14 SessionLease 激活/恢复）。
 
-    v2 session → adopts original session_id + returns data with state.
-    Flat JSON → (None, data) without id adoption.
-    No session → (None, None).
-    """
-    session_id = get_latest_session_id()
-    if not session_id:
-        return None, None
-    # Check for v2 session first
-    state = _session_v2.read_state(session_id)
-    if state is not None:
-        # v2 session: adopt the original session_id
-        session = load_session(session_id)
-        data = {}
-        if session:
-            data["anthropicMessages"] = session.get("anthropicMessages")
-            data["openaiMessages"] = session.get("openaiMessages")
-        data["state"] = state
-        data["v2"] = True
-        return session_id, data
-    # Flat JSON fallback
-    session = load_session(session_id)
-    if session:
-        return None, {
-            "anthropicMessages": session.get("anthropicMessages"),
-            "openaiMessages": session.get("openaiMessages"),
-        }
-    return None, None
+    built 缺省时现 build_context。空树 → 空 active 列表（OpenAI 仍含 system）。替代已退役的
+    restore_session：不再读 legacy flat 快照，树是唯一权威。"""
+    from ..session.render import ModelCtx, render
+    mgr = agent._session_mgr
+    if built is None:
+        built = mgr.build_context()
+    provider = "openai" if agent.use_openai else "anthropic"
+    api = "openai-completions" if agent.use_openai else "anthropic"
+    sysp = agent._system_prompt if agent.use_openai else None
+    agent._load_messages(render(built.messages,
+                                ModelCtx(provider=provider, api=api, model_id=agent.model),
+                                system_prompt=sysp)["messages"])
 
 
-async def run_repl(agent: Agent) -> None:
-    """Interactive REPL loop."""
+async def run_repl(agent: Agent, lease=None) -> None:
+    """Interactive REPL loop.
 
-    # P3 seam：主 turn 经 AgentSession.run_turn 驱动（当前委托 agent.chat，行为不变）。
-    session = AgentSession(agent)
+    docs/14 SessionLease：`lease` 是 main() 在 welcome 前激活的会话写者租约（已注入 agent._session_mgr）。
+    REPL 退出（任何 break / 双 Ctrl-C）时释放当前 thread 的租约；rebind（/new /resume /clone）会把旧租约
+    交接/关闭、新 thread 持新租约，故退出时只需释放 current_thread 的那把。"""
 
-    # CMD-P0/P1：slash 命令经 registry/runner 分发（_REGISTRY 为模块级单源，与补全/--help 共用）。
-    _ctx = CommandContext(agent=agent, session=session, out=agent._sink, registry=_REGISTRY)
+    # docs/14 P1：会话宿主——把"当前 thread"从固定局部闭包解放出来。lifecycle 替换（/new /resume
+    # /clone /fork、子父导航）由 runtime 原子换掉整组 Agent/AgentSession/RuntimeThread，命令 handler
+    # 永远对 host.current_thread 操作、不缓存 agent/session。这里显式构造 session+thread（保留
+    # AgentSession 这个可注入 seam）并注册进 registry——而非 adopt（adopt 在 runtime 内部建 session，
+    # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
+    _runtime = AgentRuntime()
+    _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
+    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY)
 
-    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（复用现有 session，不新建）。
+    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（取 host 的 current_thread）。
     # NANOCODE_REPL_VIA_RUNTIME=0 可回退到直接 session.run_turn（cancel/approval 回归时的逃生阀）。
     _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
-    _thread = RuntimeThread(AgentRuntime(), agent, session)
 
     async def _drive_turn(prompt: str) -> None:
+        t = _host.current_thread
         if _via_runtime:
-            await _thread.run(prompt)
+            await t.run(prompt)
         else:
-            await session.run_turn(prompt)
+            await t.session.run_turn(prompt)
+
+    async def _apply_control(host: RuntimeHost, ctrl: Control) -> None:
+        """消费 lifecycle Control（docs/14 P2）：先过 host.can_switch() fail-closed 闸，再交
+        runtime-owned replacement（thread_new / thread_resume → rebind_session）。handler 只发信号，
+        所有 live agent 替换都在此统一路由。"""
+        ok, reason = host.can_switch()
+        if not ok:
+            print_info(f"cannot switch sessions right now: {reason}")
+            return
+        action, payload = ctrl.action, (ctrl.payload or {})
+        if action == "replace_thread" and payload.get("kind") == "new":
+            host.runtime.thread_new(host)          # rebind 已 sink.info "Session → ..."
+        elif action == "replace_thread" and payload.get("kind") == "clone":
+            if host.runtime.thread_clone(host, payload.get("sourceSid"), payload.get("entryId")) is None:
+                print_error("clone failed (no canonical tree / nothing to clone).")
+        elif action == "resume":
+            sid = payload.get("sessionId")
+            if sid == host.current_thread.thread_id:
+                print_info(f"Already on session {sid}.")
+                return
+            if payload.get("fork"):
+                # --fork：把目标 clone 成新 session 切入（绝不做第二个 writer，docs/14 §5.2）
+                if host.runtime.thread_clone(host, sid) is None:
+                    print_error(f"cannot fork-resume '{sid}'.")
+                return
+            from ..session.tree import SessionBusyError
+            try:
+                if host.runtime.thread_resume(host, sid) is None:
+                    print_error(f"cannot resume '{sid}' (no canonical tree; legacy migration failed).")
+            except SessionBusyError:
+                print_error(f"session '{sid}' is busy (another writer holds it). "
+                            f"Use `/resume {sid} --fork` to fork it into a new session.")
+        else:
+            print_info(f"(control '{action}' is not wired yet — coming in a later phase)")
 
     async def confirm_fn(message: str) -> bool:
         answer = await _async_read_line("  Allow? (y/n): ", persistent=False)
@@ -501,6 +524,10 @@ async def run_repl(agent: Agent) -> None:
             sigint_count += 1
             if sigint_count >= 2:
                 print("\nBye!\n")
+                try:
+                    _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
+                except Exception:
+                    pass
                 sys.exit(0)
             print("\n  Press Ctrl+C again to exit.")
 
@@ -551,10 +578,10 @@ async def run_repl(agent: Agent) -> None:
 
         # REPL slash commands —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
         # !shell / exit / quit / 全角归一 / 未知斜杠 fallthrough 仍在本 loop 处理（见上下）。
-        _result = await dispatch(inp, _REGISTRY, _ctx)
+        _result = await dispatch(inp, _REGISTRY, _host.context())
         if _result is not NOT_A_COMMAND:
             # 按 CommandResult variant 路由（Codex cross-review MED）：Prompt 驱动一个 turn；
-            # Local 打印 output / 可退出；Control 留给 CMD-P3+ lifecycle。当前 builtin 全为 Local()。
+            # Local 打印 output / 可退出；Control 经 _apply_control 路由 lifecycle（P2 起接通）。
             if isinstance(_result, Prompt):
                 await _drive_turn(_result.prompt)
                 continue
@@ -565,7 +592,10 @@ async def run_repl(agent: Agent) -> None:
                     print("\nBye!\n")
                     break
                 continue
-            continue  # Control（CMD-P3+）：落地时在此路由 replace_thread/switch_runtime…
+            if isinstance(_result, Control):
+                await _apply_control(_host, _result)
+                continue
+            continue
 
         # Skill invocation: /<skill-name> [args]
         if inp.startswith("/"):
@@ -597,6 +627,13 @@ async def run_repl(agent: Agent) -> None:
             if "abort" not in str(e).lower():
                 print_error(str(e))
 
+    # docs/14 SessionLease：REPL 退出（正常 break / exit / quit / 双 Ctrl-C-at-prompt）→ 释放当前
+    # thread 的会话写锁。rebind 已交接/关闭旧租约，故只需释放 current_thread 的那把（幂等）。
+    try:
+        _host.current_thread.release_lease()
+    except Exception:
+        pass
+
 
 def main() -> None:
     _argv = sys.argv[1:]
@@ -620,8 +657,7 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
-  --trace             Debug lane: record agent trace to ./.nanocode/traces/<session>.jsonl
-  --trajectory        Project the always-on wire into a trajectory (analysis/RL lane)
+  --trajectory        Project the canonical session tree into a trajectory (analysis/RL lane)
   --trajectory-level {summary,full}
                       summary (default): drop heavy payloads, keep hash + summary.
                       full: keep full prompts/messages/tool results — may contain secrets.
@@ -643,11 +679,7 @@ Examples:
   nanocode --resume
   nanocode  # starts interactive REPL
 
-  nanocode trace                 # list recorded trace sessions
-  nanocode trace <id>            # print a session timeline (--full to expand)
-  nanocode trace <id> --summary  # aggregate stats for a session
-
-  nanocode trajectory             # list wire sessions available as trajectories
+  nanocode trajectory             # list sessions available as trajectories
   nanocode trajectory show <id>   # per-step table + metrics summary for a session
   nanocode trajectory export <id> # export a session as a trajectory bundle (--out DIR)
 """)
@@ -695,13 +727,22 @@ Examples:
     _interactive = not bool(args.prompt) and sys.stdin.isatty()
     workspace_trusted = ensure_workspace_trust(Path.cwd(), interactive=_interactive)
 
-    # Resolve resume BEFORE constructing Agent (so we can adopt session_id)
+    # Resolve resume BEFORE constructing Agent (so we adopt the session_id).
+    # docs/14 SessionLease：--resume = 恢复最近的 canonical session（latest header）；无则保持新建。
+    # 不再读 legacy flat 快照——canonical 树是唯一 resume 权威（迁移走离线 `nanocode sessions migrate`）。
     adopt_sid = None
-    resume_data = None
     if args.resume:
-        adopt_sid, resume_data = _resolve_resume_session()
-        if not resume_data:
+        from ..session.manager import SessionManager
+        adopt_sid = get_latest_session_id()
+        if adopt_sid is None:
             print_info("No previous sessions found.")
+        elif not SessionManager.exists(adopt_sid):
+            # get_latest_session_id 也会返回 legacy <sid>.json / v2 state.json 的 sid（无 canonical 树）。
+            # 若对它 open_or_create 会**新建空树**、把旧历史静默丢弃（review high：data loss）。改为拒绝
+            # 续此 sid、回退新建一个全新 session（绝不 clobber 旧 id），并提示离线迁移。
+            print_info(f"Latest session '{adopt_sid}' has no canonical tree (legacy/v2). "
+                       f"Run `nanocode sessions migrate {adopt_sid}` to import it; starting a fresh session.")
+            adopt_sid = None
 
     # Long-term memory backend (CLI > env > auto). auto silently degrades to
     # markdown when no embeddings endpoint is configured; explicit --memory-backend
@@ -709,12 +750,14 @@ Examples:
     from ..memory import select_backend
     mem_backend = select_backend(args.memory_backend, on_warning=print_info)
 
-    # trajectory 采集（DERIVED 投影 / RL 分析专用，与 --trace debug lane 区分）：
+    # trajectory 采集（canonical 树的 DERIVED 投影 / RL 分析专用）：
     # 显式 flag 或 NANOCODE_TRAJECTORY 环境变量开启；level 非法/缺省退回 "summary"。
     traj_on = _trajectory_enabled(args.trajectory)
     traj_lvl = _trajectory_level(args.trajectory_level)
 
-    agent = Agent(
+    # docs/14 P2：Agent 构造收敛到 AgentConfig（CLI/SDK/AppServer 共用 bootstrap 数据载体）。
+    # main() 仍负责交互 I/O（trust gate / memory backend 选择 / resume 解析），把结果灌进 config。
+    agent = AgentConfig(
         permission_mode=permission_mode,
         model=model,
         thinking=args.thinking,
@@ -723,16 +766,12 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
-        trace_enabled=_trace_is_enabled(args.trace),
         trajectory_enabled=traj_on,
         trajectory_level=traj_lvl,
         workspace_trusted=workspace_trusted,
         session_id=adopt_sid,
         memory_backend=mem_backend,
-    )
-
-    if _trace_is_enabled(args.trace):
-        print_info(f"tracing → {_trace_file(agent.session_id)}")
+    ).build_agent()
 
     if traj_on:
         if traj_lvl == "full":
@@ -746,21 +785,32 @@ Examples:
         print_info("note: --trajectory-level has no effect without --trajectory "
                    "(or NANOCODE_TRAJECTORY=1)")
 
-    # Resume session (after Agent is constructed with adopted session_id)
-    if args.resume and resume_data:
-        agent.restore_session(resume_data)
+    # docs/14 SessionLease：在 welcome / 任何 turn 之前激活会话写者租约（runtime 拥有 active writer）。
+    # new：open_or_create 建空树 + 持锁；--resume：open 已有树 + 持锁。busy/corrupt → fail-closed 退出。
+    from ..session.lease import SessionLease
+    from ..session.tree import SessionBusyError, SessionTreeError
+    try:
+        _lease = SessionLease.open_or_create(agent.session_id)
+    except SessionBusyError:
+        print_error(f"session '{agent.session_id}' is busy — another nanocode process holds its "
+                    f"writer lock. Start a new session, or resume a different one.")
+        sys.exit(1)
+    try:
+        _built = _lease.manager.build_context()      # 校验树可折叠（corrupt → 退出，不静默）
+    except SessionTreeError as e:
+        _lease.close()
+        print_error(f"corrupt session tree for '{agent.session_id}': {e}")
+        sys.exit(1)
+    agent._session_mgr = _lease.manager
+    _load_from_manager(agent, _built)                # 渲染初始上下文进 active 列表（空树 → 空）
+    if adopt_sid is not None:
+        agent._reload_task_state(_session_v2.read_state(adopt_sid)
+                                 if _session_v2.is_v2_session(adopt_sid) else None)
+        print_info(f"Session resumed: {adopt_sid} ({agent._get_message_count()} messages).")
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
-    def _finish_trace() -> None:
-        try:
-            agent.tracer.emit("session_end",
-                              input_tokens=agent.total_input_tokens,
-                              output_tokens=agent.total_output_tokens,
-                              turns=agent.current_turns)
-            agent.tracer.close()
-        except Exception:
-            pass
+    def _finish_session() -> None:
         try:
             cleanup_persist_sandbox(agent.session_id)
         except Exception:
@@ -773,7 +823,7 @@ Examples:
 
         async def _one_shot() -> None:
             if _via_runtime:
-                await AgentRuntime().adopt(agent).run(prompt)
+                await AgentRuntime().adopt(agent, lease=_lease).run(prompt)
             else:
                 await agent.chat(prompt)
 
@@ -783,11 +833,17 @@ Examples:
             print_error(str(e))
             sys.exit(1)
         finally:
-            _finish_trace()
+            try:
+                _lease.close()                 # 释放会话写锁（一次性模式结束）
+            except Exception:
+                pass
+            _finish_session()
     else:
         # Interactive REPL
-        asyncio.run(run_repl(agent))
-        _finish_trace()
+        try:
+            asyncio.run(run_repl(agent, _lease))
+        finally:
+            _finish_session()                  # run_repl 退出时已 release 当前 thread 的 lease
 
 
 if __name__ == "__main__":

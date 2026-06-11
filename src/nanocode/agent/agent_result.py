@@ -34,6 +34,9 @@ def build_agent_result(sub_agent, text: str, tokens: dict, result_path: str | No
         "files_modified": files_modified,
         "tokens": {"input": tokens.get("input", 0), "output": tokens.get("output", 0)},
         "result_path": result_path,
+        # docs/14 SessionLease：结构化 child session 回指（= 子 agent 自己写树的 child sid），供父侧
+        # 导航/审计，不靠 result 文本或命名约定（child header 的 parentSession 仍是 children() 权威）。
+        "childSessionId": getattr(sub_agent, "_tree_session_id", None),
     }
 
 

@@ -1,4 +1,10 @@
-"""P3：AgentSession 会话层 seam + SessionContextBuilder（快照源，P5 将换事件树）。"""
+"""AgentSession 会话层 seam：run_turn 委托 chat、move_to in-file 导航。
+
+docs/14 P7：SessionContextBuilder（P3 快照 / P5 事件树重建）已退役——resume 由
+Agent.rebind_session/restore_session 从 canonical session.jsonl 重建（见 tests/agent/
+test_rebind_session.py、tests/session/test_p3_resume.py），fork 由 runtime thread_fork（Pi
+before-user fork，tests/entrypoints/test_commands_pi.py）承担。故本文件只保留会话层 seam 测试。
+"""
 
 from __future__ import annotations
 
@@ -6,13 +12,13 @@ import asyncio
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.session import AgentSession
-from nanocode.agent.context_builder import SessionContextBuilder
-from nanocode.session import v2 as _v2
+from nanocode.session import tree as T
+from nanocode.session.manager import SessionManager
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="p3sid", **kw)
+    return Agent(api_key="test", session_id="p3sid", **kw)
 
 
 def test_run_turn_delegates_to_chat():
@@ -30,39 +36,21 @@ def test_run_turn_delegates_to_chat():
     assert s.aborted is a._aborted
 
 
-def test_context_builder_reads_main_snapshot():
+def test_move_to_navigates_in_file_and_reloads():
     a = _agent()
-    _v2.write_main_messages(a.session_id, [{"role": "user", "content": "snap"}])
-    b = SessionContextBuilder(a.session_id)
-    assert b.resume_messages() == [{"role": "user", "content": "snap"}]
-    assert b.resume_messages(agent_id="agent-001") == []  # 无快照 → 空
-
-
-def test_session_resume_loads_via_builder_into_store():
-    a = _agent()
-    _v2.write_main_messages(a.session_id, [{"role": "user", "content": "prior"}])
+    mgr = a._session_mgr = SessionManager.create("p3sid")
+    u1 = mgr.append_message(T.user_message("first"))
+    mgr.append_message(T.user_message("second"))
     s = AgentSession(a)
-    loaded = s.resume()
-    assert loaded == [{"role": "user", "content": "prior"}]
-    # 装入 agent 的活动 MessageStore（anthropic 默认）
-    assert a._anthropic_messages == [{"role": "user", "content": "prior"}]
+    s.move_to(u1.id)                    # in-file 导航回 first
+    assert mgr.get_leaf() == u1.id
+    assert "first" in str(a._anthropic_messages) and "second" not in str(a._anthropic_messages)
 
 
-def test_session_resume_empty_snapshot_does_not_clobber():
+def test_move_to_unknown_entry_fails_closed():
     a = _agent()
-    a._append_message({"role": "user", "content": "live"})
-    s = AgentSession(a)
-    s.resume()  # 无快照 → 不覆盖现有
-    assert a._anthropic_messages == [{"role": "user", "content": "live"}]
-
-
-def test_builder_injectable_into_session():
-    a = _agent()
-
-    class FakeBuilder(SessionContextBuilder):
-        def resume_messages(self, *, agent_id="main", prefer_events=True):
-            return [{"role": "user", "content": f"built:{agent_id}"}]
-
-    s = AgentSession(a, context_builder=FakeBuilder(a.session_id))
-    s.resume()
-    assert a._anthropic_messages == [{"role": "user", "content": "built:main"}]
+    a._session_mgr = SessionManager.create("p3sid")
+    import pytest
+    with pytest.raises(ValueError):
+        s = AgentSession(a)
+        s.move_to("ent_nonexistent")

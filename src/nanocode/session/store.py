@@ -40,14 +40,27 @@ def list_sessions() -> list[dict[str, Any]]:
 
 
 def get_latest_session_id() -> str | None:
-    candidates = [(m.get("startTime", ""), m.get("id")) for m in list_sessions()]
+    candidates = [(m.get("startTime", ""), m.get("id")) for m in list_sessions()]   # legacy <sid>.json
     d = sessions_dir()
     if d.exists():
         for entry in d.iterdir():
-            if entry.is_dir():
-                st = v2.read_state(entry.name)
-                if st:
-                    candidates.append((st.get("startTime", ""), st.get("id") or entry.name))
+            if not entry.is_dir():
+                continue
+            # docs/14 P7：canonical session.jsonl header（timestamp 作 startTime；child session——有
+            # parentSession——不作 --resume-last 目标）。无树则回退 legacy v2 state.json。
+            sj = entry / "session.jsonl"
+            if sj.exists():
+                try:
+                    h = json.loads(sj.open(encoding="utf-8").readline() or "{}")
+                except Exception:
+                    h = {}
+                if h.get("type") == "session_start":
+                    if not (h.get("data") or {}).get("parentSession"):
+                        candidates.append((h.get("timestamp", ""), h.get("sessionId") or entry.name))
+                    continue
+            st = v2.read_state(entry.name)
+            if st:
+                candidates.append((st.get("startTime", ""), st.get("id") or entry.name))
     candidates = [(t, i) for t, i in candidates if i]
     if not candidates:
         return None

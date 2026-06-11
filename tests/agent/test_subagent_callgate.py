@@ -20,7 +20,7 @@ from nanocode.subagents import config
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="cgsid", **kw)
+    return Agent(api_key="test", session_id="cgsid", **kw)
 
 
 def _read_only_sub(parent):

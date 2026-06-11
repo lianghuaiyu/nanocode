@@ -1,18 +1,19 @@
 """trajectory.eval — P4 在线启发式评估 / reward / failure attribution（DERIVED 派生标签）。
 
 硬边界（用户强制，不可违反）：
-- 本模块是对 merged wire 的**只读派生投影**：只读 ``list[SessionEvent]``，产出 plain data
-  （eval 记录 / 带 reward 的 step 副本 / attribution dict）。
-- eval / reward 是**派生标签**：绝不写回 wire、绝不调用任何 tracer/emit/sink，绝不污染
+- 本模块是对 canonical 树派生事件的**只读派生投影**：只读 ``list[TrajEvent]``（由
+  ``_tree_events.tree_events`` 重建），产出 plain data（eval 记录 / 带 reward 的 step 副本 /
+  attribution dict）。
+- eval / reward 是**派生标签**：绝不写回树/wire、绝不调用任何 tracer/emit/sink，绝不污染
   execution-fact 事件源。reward 只该落 metrics.json / evals.jsonl（由 export 层负责），
   本模块只负责**计算**，不负责落盘。
-- 不得 import 任何 runtime 模块（engine / backend / context_builder / session / tracer /
-  redaction 的写侧逻辑）。允许：``nanocode.events.models``（纯数据）、
-  ``nanocode.trace.redaction.truncate``（纯叶子 helper）、``nanocode.trajectory.schema``。
+- 不得 import 任何 runtime 模块（engine / backend / context_builder / session 写侧 / tracer /
+  redaction 的写侧逻辑）、``events.*``、``trace.*``。允许：``_tree_events``（只读 session.manager/tree）、
+  ``_text.truncate``（纯叶子 helper）、``trajectory.schema``。
 
-容错铁律（docs/10「读侧应容忍」）：legacy flat 行、malformed/缺字段、summary-mode 事件
-（无 full messages/result，仅 result_summary/result_hash/chars/messages_chars）都**绝不**
-得令投影崩溃——退化为 summary 字段或空串。所有解析在 try 内兜底。
+容错铁律（docs/10「读侧应容忍」）：malformed/缺字段、summary-mode 事件（无 full messages/result，
+仅 result_summary/result_hash/chars/messages_chars）都**绝不**得令投影崩溃——退化为 summary 字段
+或空串。所有解析在 try 内兜底。
 
 reward 是 **provisional（暂定）** 的有界启发式：tool_error / permission_denied /
 budget_exceeded 等失败信号给负 reward；干净 step 留 ``None``（待 offline evaluator 或
@@ -23,8 +24,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from ..events.models import SessionEvent
-from ..trace.redaction import truncate
+from ._text import truncate
+from ._tree_events import TrajEvent
+
+# Milestone B2：投影逻辑保留，仅换 source（wire → canonical 树适配器）。SessionEvent 名沿用为
+# TrajEvent 的别名，最小化类型注解 diff。
+SessionEvent = TrajEvent
 
 # ─── 信号常量 ────────────────────────────────────────────────────────────────
 

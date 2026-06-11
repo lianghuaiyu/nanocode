@@ -9,13 +9,42 @@ from __future__ import annotations
 import asyncio
 
 from nanocode.agent.engine import Agent
-from nanocode.agent.runtime import AgentRuntime, RuntimeThread, TurnResult, ApprovalManager
+from nanocode.agent.runtime import AgentRuntime, RuntimeThread, TurnResult, ApprovalManager, AgentConfig
 from nanocode.agent.sink import TeeSink, BufferSink, TerminalSink
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="p4sid", **kw)
+    return Agent(api_key="test", session_id="p4sid", **kw)
+
+
+def test_agent_config_build_agent_applies_fields():
+    cfg = AgentConfig(api_key="test", model="claude-x", permission_mode="bypassPermissions",
+                      max_turns=7, session_id="cfgsid")
+    a = cfg.build_agent()
+    assert isinstance(a, Agent)
+    assert a.model == "claude-x" and a.session_id == "cfgsid"
+    assert a.max_turns == 7 and a.permission_mode == "bypassPermissions"
+    assert a.use_openai is False                      # 无 api_base → anthropic
+
+
+def test_agent_config_api_base_selects_openai():
+    cfg = AgentConfig(api_key="test", api_base="https://x/v1", session_id="cfgoa",
+                      permission_mode="bypassPermissions")
+    a = cfg.build_agent()
+    assert a.use_openai is True
+
+
+def test_thread_start_builds_and_registers_thread():
+    rt = AgentRuntime()
+    cfg = AgentConfig(api_key="test", session_id="tsid", permission_mode="bypassPermissions",
+                      )
+    th = rt.thread_start(cfg)
+    assert isinstance(th, RuntimeThread)
+    assert th.thread_id == "tsid"
+    assert rt.thread("tsid") is th
+    assert th.agent.model == cfg.model
+
 
 
 def test_adopt_returns_thread_and_registers():

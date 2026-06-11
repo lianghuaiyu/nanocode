@@ -10,7 +10,7 @@ from nanocode.subagents import config
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="fgsid", **kw)
+    return Agent(api_key="test", session_id="fgsid", **kw)
 
 
 def _spy_build(parent, *, run_once=None, text="fg done",

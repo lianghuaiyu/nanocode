@@ -51,7 +51,7 @@ def agent_dir(session_id: str, agent_id: str) -> Path:
     """每个 agent 的 artifact 主目录 = <session>/agents/<agent_id>/。
 
     主 agent 用 agent_id="main"；子 agent 用其 SubAgentRecord id（如 "agent-001"）。
-    messages.json / meta.json / prompt.txt / result.md / wire.jsonl 全部落在此目录下，
+    messages.json / meta.json / prompt.txt / result.md 全部落在此目录下，
     保证「同一 agent 的全部产物自包含于一处」。
     """
     d = session_root(session_id) / "agents" / agent_id
@@ -61,7 +61,7 @@ def agent_dir(session_id: str, agent_id: str) -> Path:
 
 # 一个 agent 的标准 artifact 文件名（label -> filename）。集中此处的路径 grammar，
 # 避免上层（tasks_tool 等）手拼 'agents'/<id>/<filename>（PERSIST-P1 的唯一真实去散点）。
-AGENT_ARTIFACT_FILES = (("Wire", "wire.jsonl"), ("Result", "result.md"),
+AGENT_ARTIFACT_FILES = (("Result", "result.md"),
                         ("Meta", "meta.json"), ("Prompt", "prompt.txt"))
 
 
@@ -101,11 +101,6 @@ def write_agent_result(session_id: str, agent_id: str, text: str) -> str:
     p = agent_dir(session_id, agent_id) / "result.md"
     p.write_text(text or "", encoding="utf-8")
     return str(p)
-
-
-def agent_wire_path(session_id: str, agent_id: str) -> Path:
-    """每个 agent 的 always-on 事件账本 <agent_dir>/wire.jsonl 的路径。"""
-    return agent_dir(session_id, agent_id) / "wire.jsonl"
 
 
 def task_dir(session_id: str, task_id: str) -> Path:

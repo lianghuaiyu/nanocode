@@ -16,7 +16,7 @@ from rich.text import Text
 console = Console(highlight=False)
 
 BULLET = "⏺"
-CONNECTOR = "⎿"
+CONNECTOR = "↳"
 THINK = "✻"
 
 # 详细程度：默认安静（不自动打印每轮 Tokens/cost、MCP 成功连接日志）。

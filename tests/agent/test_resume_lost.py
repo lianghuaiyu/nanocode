@@ -16,7 +16,7 @@ from nanocode.tasks.models import TaskRecord, SubAgentRecord
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False,
+    return Agent(api_key="test",
                  permission_mode="bypassPermissions", session_id="rlsid", **kw)
 
 
@@ -31,7 +31,7 @@ def test_restore_loads_tasks_from_state():
         "subagents": [],
         "task_seq": 1, "agent_seq": 0,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     t = a.task_manager.get_task("task-001")
     assert t is not None
     assert t.description == "run tests"
@@ -45,7 +45,7 @@ def test_restore_loads_subagents_from_state():
                        "description": "do x", "model": "m", "provider": "anthropic"}],
         "task_seq": 0, "agent_seq": 1,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     rec = a.task_manager.get_subagent("agent-001")
     assert rec is not None
     assert rec.type == "coder"
@@ -59,7 +59,7 @@ def test_restore_marks_running_task_as_lost():
         "subagents": [],
         "task_seq": 1, "agent_seq": 0,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     t = a.task_manager.get_task("task-001")
     assert t.status == "lost"
 
@@ -72,7 +72,7 @@ def test_restore_preserves_completed_task():
         "subagents": [],
         "task_seq": 1, "agent_seq": 0,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     t = a.task_manager.get_task("task-001")
     assert t.status == "completed"
 
@@ -85,7 +85,7 @@ def test_restore_marks_running_subagent_as_lost():
                        "description": "sub"}],
         "task_seq": 0, "agent_seq": 1,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     rec = a.task_manager.get_subagent("agent-001")
     assert rec.status == "lost"
 
@@ -98,7 +98,7 @@ def test_restore_marks_idle_subagent_as_lost():
                        "description": "sub"}],
         "task_seq": 0, "agent_seq": 1,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     rec = a.task_manager.get_subagent("agent-001")
     assert rec.status == "lost"
 
@@ -111,7 +111,7 @@ def test_restore_preserves_completed_subagent():
                        "description": "sub"}],
         "task_seq": 0, "agent_seq": 1,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     rec = a.task_manager.get_subagent("agent-001")
     assert rec.status == "completed"
 
@@ -126,7 +126,7 @@ def test_restore_seq_no_collision():
                        "description": "old sub"}],
         "task_seq": 3, "agent_seq": 2,
     }
-    a.restore_session({"state": state})
+    a._reload_task_state(state)
     new_t = a.task_manager.create_task("shell", "new")
     new_a = a.task_manager.create_subagent(type="coder", description="new sub")
     assert new_t.id == "task-004"
@@ -134,9 +134,9 @@ def test_restore_seq_no_collision():
 
 
 def test_restore_noop_when_no_state():
-    """无 state 时 noop。"""
+    """无 state 时 noop（docs/14 SessionLease：state 重载由 _reload_task_state 承担）。"""
     a = _agent()
-    a.restore_session({"anthropicMessages": [{"role": "user", "content": "hi"}]})
+    a._reload_task_state(None)
     assert a.task_manager.list_tasks() == []
     assert a.task_manager.list_subagents() == []
 

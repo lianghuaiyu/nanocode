@@ -44,9 +44,3 @@ def test_write_agent_result_returns_path():
     assert "agent-001" in path
     p = v2.agent_dir("sE", "agent-001") / "result.md"
     assert p.read_text(encoding="utf-8") == "# final\nbody"
-
-
-def test_agent_wire_path_shape():
-    wp = v2.agent_wire_path("sF", "main")
-    assert wp.name == "wire.jsonl"
-    assert wp.parent == v2.agent_dir("sF", "main")

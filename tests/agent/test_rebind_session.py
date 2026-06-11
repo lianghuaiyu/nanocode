@@ -1,0 +1,150 @@
+"""docs/14 P2：Agent.rebind_session —— 原地 finalize 旧 session 状态 + rebuild 新 session 状态。
+
+锁定不变量：session_id/env/tracer/_session_mgr/task_manager 全部重指；计数与 working set 复位；
+旧 wire 被 finalize（session_end）；消息从新树重载。drift guard 守 _reset_working_sets 不漏字段。
+"""
+
+from nanocode.agent.engine import Agent
+from nanocode.session import tree as T
+from nanocode.session.manager import SessionManager
+from nanocode.session import v2 as _session_v2
+
+
+def _agent(sid):
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+
+
+# 受 rebind 复位的 session 维度字段（drift guard 比对 fresh-vs-rebound）
+def _working_set(a) -> dict:
+    return {
+        "_sent_skill_names": a._sent_skill_names,
+        "_pending_skill_bodies": a._pending_skill_bodies,
+        "_activated_path_skills": a._activated_path_skills,
+        "_active_hooks": a._active_hooks,
+        "_confirmed_paths": a._confirmed_paths,
+        "_read_file_state": a._read_file_state,
+        "_files_read": a._files_read,
+        "_files_modified": a._files_modified,
+        "_already_surfaced_memories": a._already_surfaced_memories,
+        "_session_memory_bytes": a._session_memory_bytes,
+        "_pre_plan_mode": a._pre_plan_mode,
+        "_context_cleared": a._context_cleared,
+        "permission_mode": a.permission_mode,
+        "_plan_file_path": a._plan_file_path,
+        "total_input_tokens": a.total_input_tokens,
+        "total_output_tokens": a.total_output_tokens,
+        "last_input_token_count": a.last_input_token_count,
+        "current_turns": a.current_turns,
+    }
+
+
+def test_rebind_swaps_all_session_keyed_state():
+    a = _agent("OLD")
+    a._session_mgr = SessionManager.create("OLD")
+    a._session_mgr.append_message(T.user_message("old-conversation"))
+    old_tm = a.task_manager
+    # 脏化 working set + 计数，证明 rebind 复位
+    a._confirmed_paths.add("/secret"); a._sent_skill_names.add("foo")
+    a._files_read.add("/x"); a._read_file_state["/x"] = 1.0
+    a._already_surfaced_memories.add("m"); a._session_memory_bytes = 999
+    a._active_hooks.append({"k": 1}); a._pre_plan_mode = "default"; a._context_cleared = True
+    a.total_input_tokens = 100; a.total_output_tokens = 50
+    a.last_input_token_count = 80; a.current_turns = 3
+
+    # 目标 session 有 canonical 树（create 默认持写锁 → 即 runtime lease.manager 的等价物）
+    new_mgr = SessionManager.create("NEW")
+    new_mgr.append_message(T.user_message("new-conversation"))
+    a.rebind_session(new_mgr)
+
+    import os
+    assert a.session_id == "NEW"
+    assert os.environ["NANOCODE_SESSION_ID"] == "NEW"
+    assert a._session_mgr.session_id == "NEW"
+    assert a.task_manager is not old_tm                      # fresh task_manager
+    # 计数 + working set 全复位（permission_mode 复位到 baseline、非 falsy）
+    for k, v in _working_set(a).items():
+        if k == "permission_mode":
+            assert v == "bypassPermissions"
+            continue
+        assert not v, f"{k} not reset: {v!r}"
+    # 消息从新树重载
+    live = str(a._anthropic_messages)
+    assert "new-conversation" in live and "old-conversation" not in live
+    # 旧 session 树未被破坏（docs/14 Milestone B：Tracer/wire 已退役，不再断言旧 wire session_end）
+    assert any(e.type == T.MESSAGE for e in SessionManager.open("OLD").entries())
+
+
+def test_rebind_to_same_session_is_noop():
+    a = _agent("SAME")
+    a._session_mgr = SessionManager.create("SAME")
+    a.total_input_tokens = 42
+    a.rebind_session(a._session_mgr)                         # 同一 mgr/sid → no-op
+    assert a.session_id == "SAME"                            # 未切换
+    assert a.total_input_tokens == 42                        # 未复位（no-op 不 finalize/rebuild）
+
+
+def test_rebind_rejected_for_sub_agent():
+    a = _agent("SUB")
+    a.is_sub_agent = True
+    import pytest
+    with pytest.raises(RuntimeError):
+        a.rebind_session(SessionManager.create("OTHER"))
+
+
+def test_rebind_drift_guard_matches_fresh_agent():
+    # fresh agent（直接构造到空 session）vs rebound agent（OLD→空 NEW2）：working set 必须逐字段相等。
+    # 若 _reset_working_sets 漏了某个 __init__ 设的 session 字段，本测试炸——守复位清单不漂移。
+    fresh = _agent("FRESH")
+    reb = _agent("OLD2")
+    reb._session_mgr = SessionManager.create("OLD2")
+    # 脏化后 rebind 到一个全新空 session
+    reb._confirmed_paths.add("/a"); reb.total_input_tokens = 5; reb._files_read.add("/b")
+    reb.rebind_session(SessionManager.create("NEW2"))
+    assert _working_set(reb) == _working_set(fresh)
+    assert reb._system_prompt == reb._base_system_prompt   # 非 plan → 不带 plan 提示
+
+
+def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
+    # 启动即 --plan 的 agent（baseline=plan）：rebind 后新 session 仍 plan，但 plan 文件/提示重指新 sid，
+    # 旧 sid 路径不泄漏（修复 P2 review 的 HIGH：plan prompt/path 跨会话泄漏）。
+    a = Agent(api_key="test", session_id="POLD", permission_mode="plan")
+    a._session_mgr = SessionManager.create("POLD")
+    old_plan_path = a._plan_file_path
+    assert old_plan_path and "POLD" in old_plan_path and "POLD" in a._system_prompt
+    a.rebind_session(SessionManager.create("PNEW"))
+    assert a.permission_mode == "plan"                       # baseline=plan → 新 session 仍 plan
+    assert a._plan_file_path and "PNEW" in a._plan_file_path and a._plan_file_path != old_plan_path
+    assert "POLD" not in a._system_prompt                    # 旧 sid plan 路径不泄漏进新 prompt
+    assert a._pre_plan_mode is None
+
+
+def test_rebind_from_toggled_plan_reverts_to_base_mode():
+    # 运行中 toggle 进 plan（baseline=default）：rebind 后回到 default、_system_prompt 复位为 base。
+    a = Agent(api_key="test", session_id="TOG", permission_mode="default")
+    a._session_mgr = SessionManager.create("TOG")
+    a.toggle_plan_mode()
+    assert a.permission_mode == "plan"
+    a.rebind_session(SessionManager.create("TOG2"))
+    assert a.permission_mode == "default"                    # 回到 baseline，不残留 plan
+    assert a._plan_file_path is None
+    assert a._system_prompt == a._base_system_prompt
+
+
+def test_rebind_does_not_open_or_lock_trusts_injected_mgr(monkeypatch):
+    # docs/14 SessionLease：rebind 不再 open/lock——它信任 runtime lease 注入的**已加锁、已校验** mgr。
+    # acquire-validate-new-before-release-old 的原子/fail-closed 闸移到 _switch_via_rebind
+    # （busy/corrupt 的 no-leak 由 tests/session/test_session_lock.py 经真实路径覆盖）。
+    import pytest
+    from nanocode.session.manager import SessionManager as SM
+    a = _agent("TRUST")
+    a._session_mgr = SessionManager.create("TRUST")
+    new_mgr = SessionManager.create("TNEW")
+    new_mgr.append_message(T.user_message("hello"))
+
+    def _no_open(*args, **kw):
+        raise AssertionError("rebind_session must not call SessionManager.open (trusts injected mgr)")
+
+    monkeypatch.setattr(SM, "open", _no_open)
+    a.rebind_session(new_mgr)                         # 不得触发 SM.open
+    assert a.session_id == "TNEW" and a._session_mgr is new_mgr
+    assert "hello" in str(a._anthropic_messages)

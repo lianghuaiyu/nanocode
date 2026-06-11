@@ -1,57 +1,47 @@
-"""Task 7: CLI _resolve_resume_session — v2 采纳 session_id + state。
-
-- v2 session → (original_id, data with state & v2=True)
-- 旧 flat JSON → (None, data without state)
-- 空 → (None, None)
+"""docs/14 SessionLease：CLI `--resume` 解析 = `get_latest_session_id()`（canonical header 优先），
+激活 = `SessionLease.open_or_create` + `cli._load_from_manager`。原 `_resolve_resume_session`
+（v2-adopt / flat-json 区分 + `load_session` 读 flat 快照）已退役——canonical 树是唯一 resume 权威。
 """
 
-from nanocode.entrypoints import cli as _cli_mod
-from nanocode.session import v2 as _session_v2
+from nanocode.agent.engine import Agent
+from nanocode.session import tree as T
+from nanocode.session.lease import SessionLease
+from nanocode.session.manager import SessionManager
+from nanocode.session.store import get_latest_session_id
+from nanocode.entrypoints.cli import _load_from_manager
 
 
-def test_resolve_resume_v2_adopts_session_id(monkeypatch, tmp_path):
-    """v2 session: returns (session_id, data) with state and v2=True."""
-    sid = "v2sess01"
-    # Setup: write v2 state to make is_v2_session true
-    monkeypatch.setattr(_session_v2, "session_root", lambda s: tmp_path / s)
-    state = {"tasks": [], "subagents": [], "task_seq": 0, "agent_seq": 0}
-    _session_v2.write_state(sid, state)
-
-    # Stub the imports at the cli module level
-    monkeypatch.setattr(_cli_mod, "get_latest_session_id", lambda: sid)
-    monkeypatch.setattr(_cli_mod, "load_session", lambda _sid: {
-        "anthropicMessages": [{"role": "user", "content": "hi"}],
-    })
-
-    adopt_sid, data = _cli_mod._resolve_resume_session()
-    assert adopt_sid == sid
-    assert data["v2"] is True
-    assert data["state"] == state
-    assert data["anthropicMessages"] == [{"role": "user", "content": "hi"}]
+def _agent(sid):
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
-def test_resolve_resume_flat_json_no_adopt(monkeypatch, tmp_path):
-    """Flat JSON session: returns (None, data) without session_id adoption."""
-    sid = "flatsess"
-    monkeypatch.setattr(_session_v2, "session_root", lambda s: tmp_path / s)
-    # No v2 state file → flat path
-
-    monkeypatch.setattr(_cli_mod, "get_latest_session_id", lambda: sid)
-    monkeypatch.setattr(_cli_mod, "load_session", lambda _sid: {
-        "anthropicMessages": [{"role": "user", "content": "flat"}],
-    })
-
-    adopt_sid, data = _cli_mod._resolve_resume_session()
-    assert adopt_sid is None
-    assert data is not None
-    assert data.get("state") is None
-    assert data["anthropicMessages"] == [{"role": "user", "content": "flat"}]
+def test_latest_resolves_canonical_session_for_resume():
+    SessionManager.create("rtgt").close()
+    assert get_latest_session_id() == "rtgt"
 
 
-def test_resolve_resume_empty_returns_none(monkeypatch):
-    """No session found: returns (None, None)."""
-    monkeypatch.setattr(_cli_mod, "get_latest_session_id", lambda: None)
+def test_resume_activation_loads_latest_canonical_into_agent():
+    # --resume 全链路：get_latest → lease open(lock) → _load_from_manager 渲染树进 active 列表。
+    m = SessionManager.create("radopt")
+    m.append_message(T.user_message("resumed-content"))
+    m.close()
+    assert get_latest_session_id() == "radopt"
+    a = _agent("radopt")
+    a._session_mgr = SessionLease.open_or_create("radopt").manager     # cli 激活
+    _load_from_manager(a)
+    assert "resumed-content" in str(a._anthropic_messages)
 
-    adopt_sid, data = _cli_mod._resolve_resume_session()
-    assert adopt_sid is None
-    assert data is None
+
+def test_no_session_resolves_none():
+    assert get_latest_session_id() is None
+
+
+def test_legacy_only_session_is_not_canonical_resume_target():
+    # review high：get_latest_session_id 也会返回 legacy <sid>.json 的 sid（无 canonical 树）。main()
+    # --resume 守卫用 SessionManager.exists 区分之 → 拒绝对它 open_or_create（否则会新建空树、静默丢旧
+    # 历史 = data loss），改新建全新 session。本测试锚定守卫前提。
+    from nanocode.session.store import save_session
+    save_session("legonly", {"metadata": {"id": "legonly"},
+                             "anthropicMessages": [{"role": "user", "content": "old history"}]})
+    assert get_latest_session_id() == "legonly"            # latest 解析到 legacy sid
+    assert not SessionManager.exists("legonly")            # 但无 canonical 树 → 守卫触发、不 clobber

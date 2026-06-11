@@ -1,5 +1,8 @@
-"""Anthropic 后端：流式对话循环、流式工具早期执行、内容块转字典、
-摘要压缩与分层裁剪（budget / snip / microcompact）。"""
+"""Anthropic 后端：流式对话循环、流式工具早期执行、内容块转字典、摘要压缩（summary-compaction）。
+
+注（docs/14 P5）：原 snip/microcompact 多层 in-place 裁剪 tier（CompressionPipeline）已删除——大工具
+输出由 tools.shared 的 per-result cap（MAX_RESULT_CHARS）+ compaction.persist_large_result 控制，
+上下文压缩只保留 summary-compaction 一条路径（写 compaction 树 entry）。"""
 
 from __future__ import annotations
 
@@ -9,17 +12,18 @@ from typing import Any
 
 from ..tools import get_active_tool_definitions, CONCURRENCY_SAFE_TOOLS
 from ..memory import start_memory_prefetch, format_memories_for_injection, MemoryPrefetch
+from ..session import tree as _tree
 from .models import _get_max_output_tokens, _with_retry
 
 
 class AnthropicBackendMixin:
-    async def _compact_anthropic(self) -> None:
+    async def _compact_anthropic(self) -> "str | None":
         # Invariant: caller must ensure the last message is a plain user-text
         # message (not a tool_result). We slice it off below; if it were a
         # tool_result, the preceding assistant's tool_use would be orphaned
         # and the API would reject the summarize call.
         if len(self._anthropic_messages) < 4:
-            return
+            return None
         last_user_msg = self._anthropic_messages[-1]
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
@@ -38,15 +42,13 @@ class AnthropicBackendMixin:
         if last_user_msg.get("role") == "user":
             self._anthropic_messages.append(last_user_msg)
         self.last_input_token_count = 0
-
-    # Budget/snip/microcompact tier 实现（含 _find_tool_use_by_id）已上移至
-    # compaction.CompressionPipeline；本 backend 不再实现细节，
-    # engine._run_compression_pipeline 每轮调用 facade（行为不变）。
+        return summary_text  # S4: engine 据此 additive 写 compaction 树 entry
 
     # ─── Anthropic backend ───────────────────────────────────────
 
     async def _chat_anthropic(self, user_message: str) -> None:
         self._anthropic_messages.append({"role": "user", "content": user_message})
+        self._tree_record({"role": "user", "content": user_message}, required=True)  # S1: message-end → tree（必写）
         # Auto-compact at turn boundary only — the last message is now plain
         # user text, so the slice in _compact_anthropic won't sever a
         # tool_use ↔ tool_result pair from the previous turn's tool execution.
@@ -67,8 +69,6 @@ class AnthropicBackendMixin:
             if self._aborted:
                 break
 
-            self._run_compression_pipeline()
-
             # Consume memory prefetch if settled (non-blocking poll, zero-wait).
             # Append to last user message to maintain user/assistant alternation.
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
@@ -77,15 +77,18 @@ class AnthropicBackendMixin:
                     memories = memory_prefetch.task.result()
                     if memories:
                         injection_text = format_memories_for_injection(memories)
-                        last = self._anthropic_messages[-1] if self._anthropic_messages else None
-                        if last and last.get("role") == "user":
-                            content = last.get("content", "")
-                            if isinstance(content, str):
-                                last["content"] = content + "\n\n" + injection_text
-                            elif isinstance(content, list):
-                                content.append({"type": "text", "text": injection_text})
-                        else:
-                            self._anthropic_messages.append({"role": "user", "content": injection_text})
+                        # docs/14 §4.5：写 custom_message tree entry（memory prefetch 已 guard not
+                        # is_sub_agent → 主 agent）。树写失败 → flat 兜底，绝不静默丢（P3 review #7）。
+                        if not self._tree_custom_message("memory", injection_text):
+                            last = self._anthropic_messages[-1] if self._anthropic_messages else None
+                            if last and last.get("role") == "user":
+                                content = last.get("content", "")
+                                if isinstance(content, str):
+                                    last["content"] = content + "\n\n" + injection_text
+                                elif isinstance(content, list):
+                                    content.append({"type": "text", "text": injection_text})
+                            else:
+                                self._anthropic_messages.append({"role": "user", "content": injection_text})
                         for m in memories:
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += len(m.content.encode())
@@ -103,20 +106,28 @@ class AnthropicBackendMixin:
             # if it's concurrency-safe and auto-allowed. If so, start execution
             # immediately — the tool runs while the model still generates.
             early_executions: dict[str, asyncio.Task] = {}
+            early_started: dict[str, float] = {}      # tool_use_id → start ts（B1 per-tool latency）
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     # 早执行判定经同一 PermissionEngine；allowlist 兜底仍在 _execute_tool_call。
                     if self.permission.check(block["name"], block["input"]).action == "allow":
+                        early_started[block["id"]] = time.time()
                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
-            self.tracer.emit(
-                "llm_request", model=self.model,
-                message_count=len(self._anthropic_messages),
-                messages=self._anthropic_messages,
-            )
+            # S2（docs/13）：从 canonical 树渲染本轮请求（含 S1 消息 + P5 注入 custom_message），
+            # 覆盖扁平列表——树是会话事实源，扁平列表降为本轮投影。
+            self._anthropic_messages = self._build_request_messages()
+            # docs/14 Milestone B：把 llm_request sizing 落树（messagesChars 是渲染后大小，事后不可重建，
+            # 必须 emit-time 捕获——trajectory 的 observation summary 从此派生）。
+            import json as _json
+            self._tree_event(_tree.LLM_REQUEST, model=self.model,
+                             messageCount=len(self._anthropic_messages),
+                             messagesChars=len(_json.dumps(self._anthropic_messages, default=str)))
+            _t_req = time.time()
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not self.is_sub_agent:
                 self._sink.spinner_stop()
@@ -128,10 +139,15 @@ class AnthropicBackendMixin:
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
-            self._anthropic_messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "content": [self._block_to_dict(b) for b in response.content],
-            })
+            }
+            self._anthropic_messages.append(assistant_msg)
+            self._tree_record(assistant_msg, stop_reason=getattr(response, "stop_reason", None),
+                              usage={"inputTokens": response.usage.input_tokens,
+                                     "outputTokens": response.usage.output_tokens},
+                              latency_ms=_latency_ms)  # S1 + 真实 stopReason + per-call usage/latency（B1）
             self._dispatch_event(
                 "assistant_message",
                 text="".join(b.text for b in response.content if b.type == "text"),
@@ -141,11 +157,6 @@ class AnthropicBackendMixin:
                      "input": dict(b.input) if hasattr(b.input, "items") else b.input}
                     for b in response.content if b.type == "tool_use"
                 ],
-            )
-            self.tracer.emit(
-                "llm_response",
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
             )
 
             if not tool_uses:
@@ -157,7 +168,7 @@ class AnthropicBackendMixin:
             budget = self._check_budget()
             if budget["exceeded"]:
                 self._sink.info(f"Budget exceeded: {budget['reason']}")
-                self.tracer.emit("budget_exceeded", reason=budget["reason"])
+                self._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
                 break
 
             # Process tools: early-started ones (from streaming) just await
@@ -175,29 +186,39 @@ class AnthropicBackendMixin:
                 if early_task:
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
+                    _lat = int((time.time() - early_started.get(tu.id, time.time())) * 1000)
                     self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                         "toolName": tu.name, "toolLatencyMs": _lat})
                     continue
 
                 # Permission check for tools not started early（单一决策入口 + 审批）
                 allowed, denial = await self._authorize_dispatch(tu.name, inp)
                 if not allowed:
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial})
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial,
+                                         "toolName": tu.name, "is_error": True})   # 拒绝=错误结果（B1 真实 isError）
                     continue
 
+                _t_tool = time.time()
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
+                _lat = int((time.time() - _t_tool) * 1000)
                 self._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
 
                 if self._context_cleared:
                     self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": res})
+                    cb_msg = {"role": "user", "content": res}
+                    self._anthropic_messages.append(cb_msg)
+                    self._tree_record(cb_msg)  # S1: message-end → tree
                     context_break = True
                     break
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                     "toolName": tu.name, "toolLatencyMs": _lat})
 
             if not context_break and tool_results:
-                self._anthropic_messages.append({"role": "user", "content": tool_results})
+                tr_msg = {"role": "user", "content": tool_results}
+                self._anthropic_messages.append(tr_msg)
+                self._tree_record(tr_msg)  # S1: message-end → tree
             self._context_cleared = False
             if not context_break:
                 self._inject_pending_skill_bodies(self._anthropic_messages)

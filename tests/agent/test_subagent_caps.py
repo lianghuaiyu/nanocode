@@ -15,7 +15,7 @@ from nanocode.paths import data_dir
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="capsid", **kw)
+    return Agent(api_key="test", session_id="capsid", **kw)
 
 
 def _set_agents_settings(monkeypatch, tmp_path, obj):

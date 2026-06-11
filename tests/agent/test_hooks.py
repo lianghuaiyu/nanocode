@@ -3,7 +3,7 @@ from nanocode.agent.engine import Agent
 
 
 def _agent():
-    return Agent(api_key="test", trace_enabled=False)
+    return Agent(api_key="test")
 
 
 def test_skill_invocation_registers_hooks(tmp_path, monkeypatch):

@@ -1,30 +1,33 @@
-"""trajectory.project — merged wire 事件 -> Step 投影（docs/10 P2）。
+"""trajectory.project — canonical 树派生事件 -> Step 投影（docs/10 P2 / docs/14 Milestone B2）。
 
-DERIVED 只读投影：把 per-agent wire 的 flat-additive 事件配对成
-``observation -> action -> result -> next_state`` 的 step 序列，供分析 / 复盘 /
-agentic-RL dataset 导出。
+DERIVED 只读投影：把 canonical ``session.jsonl`` 树（经 ``_tree_events.tree_events`` 适配器
+重建）的事件配对成 ``observation -> action -> result -> next_state`` 的 step 序列，供分析 /
+复盘 / agentic-RL dataset 导出。
 
 硬边界（用户强制）：
-- 本模块**只读** merged wire（经 ``events.reader.merge_session_events``），绝不写回 wire。
+- 本模块**只读** canonical 树（经 ``_tree_events`` 适配器），绝不写回树/wire。
 - 绝不驱动 runtime、绝不参与 resume / fork。
-- 仅 import ``events`` 读侧（reader/models）、``trace.redaction.truncate``（纯叶子 helper）
-  与 ``trajectory.schema``；**绝不** import 任何 runtime 模块。
+- 仅 import ``_tree_events``（其只读 session.manager/tree）、``_text.truncate``（纯叶子 helper）
+  与 ``trajectory.schema``；**绝不** import 任何 runtime 模块、``events.*``、``trace.*``。
 - eval_result / reward 在此恒为 None——它们是派生标签，由后续 eval pipeline 回填，
   绝不在投影里产生。
 
-健壮性（docs/10「P2 验收 / 兼容性」）：legacy flat 行、malformed/缺字段行、summary-mode
-事件（无完整 messages/result，只有 *_chars / *_hash / *_summary）都**绝不**使投影崩溃——
+健壮性（docs/10「P2 验收 / 兼容性」）：malformed/缺字段事件、summary-mode 事件
+（无完整 messages/result，只有 *_chars / *_hash / *_summary）都**绝不**使投影崩溃——
 降级为摘要字段或空串。
 """
 from __future__ import annotations
 
 import json
 
-from ..events.models import SessionEvent
-from ..events.reader import merge_session_events
-from ..trace.redaction import truncate
+from ._text import truncate
+from ._tree_events import TrajEvent, tree_events
 from . import schema
 from .schema import Step
+
+# Milestone B2：投影逻辑保留，仅换 source（wire → canonical 树适配器）。TrajEvent 与旧
+# SessionEvent 形状等价；下文类型注解沿用 ``SessionEvent`` 名以最小化 diff——别名指向 TrajEvent。
+SessionEvent = TrajEvent
 
 # 风险启发（docs/10 risk_level）：中危工具（写盘 / 执行 shell）。
 _MEDIUM_RISK_TOOLS = frozenset({"write_file", "edit_file", "run_shell", "sandbox_shell"})
@@ -40,11 +43,11 @@ _DANGEROUS_CMD_SUBSTRINGS = (
 
 
 def project_session(session_id: str) -> list[Step]:
-    """读取某 session 的 merged wire 并投影为 Step 列表。
+    """读取某 session 的 canonical 树（适配器重建的事件流）并投影为 Step 列表。
 
-    = ``build_steps(merge_session_events(session_id))``。读侧入口，绝不写回。
+    = ``build_steps(tree_events(session_id))``。读侧入口，绝不写回。
     """
-    return build_steps(merge_session_events(session_id))
+    return build_steps(tree_events(session_id))
 
 
 def build_steps(events: "list[SessionEvent]") -> list[Step]:
@@ -197,7 +200,7 @@ def _make_tool_action(
     tool_name = _safe_str(tool) if tool is not None else ""
     args_summary = _args_summary(_data(call_ev))
     result_summary = _result_summary(result_ev)
-    latency = _latency_ms(_ts(call_ev), _ts(result_ev)) if result_ev is not None else None
+    latency = _pair_latency_ms(call_ev, result_ev)
     risk = _risk_level(tool_name, _data(call_ev), agent, denied_tools)
     return Step(
         trajectory_id=_traj_id(call_ev),
@@ -230,9 +233,7 @@ def _make_llm_decision(
     if resp_ev is not None:
         in_tok = _as_int(_data(resp_ev).get("input_tokens"))
         out_tok = _as_int(_data(resp_ev).get("output_tokens"))
-    latency = None
-    if req_ev is not None and resp_ev is not None:
-        latency = _latency_ms(_ts(req_ev), _ts(resp_ev))
+    latency = _model_latency_ms(req_ev, resp_ev)
     obs = _request_observation(req_ev)
     asst_text = _safe_str(_data(asst_ev).get("text"))
     tool_uses = _safe_list(_data(asst_ev).get("tool_uses"))
@@ -445,6 +446,43 @@ def _looks_dangerous(call_data: dict) -> bool:
         return any(sub in low for sub in _DANGEROUS_CMD_SUBSTRINGS)
     except Exception:
         return False
+
+
+def _explicit_latency(ev: "SessionEvent | None") -> "int | None":
+    """事件 data 里显式携带的 latency_ms（B2：树适配器把 per-call/per-tool 延迟直接放进 data）。
+
+    优先于 ts 差——树 ts 是秒级，差值无用；适配器从 message.usage/latencyMs 取毫秒级真值。失败 None。
+    """
+    if ev is None:
+        return None
+    v = _data(ev).get("latency_ms")
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pair_latency_ms(call_ev: "SessionEvent | None",
+                     result_ev: "SessionEvent | None") -> "int | None":
+    """tool_call→tool_result 延迟：优先 result 事件的显式 latency_ms，否则退回 ts 差。"""
+    if result_ev is None:
+        return None
+    explicit = _explicit_latency(result_ev)
+    if explicit is not None:
+        return explicit
+    return _latency_ms(_ts(call_ev), _ts(result_ev))
+
+
+def _model_latency_ms(req_ev: "SessionEvent | None",
+                      resp_ev: "SessionEvent | None") -> "int | None":
+    """llm_request→llm_response 延迟：优先 response 事件的显式 latency_ms，否则退回 ts 差
+    （仅当 req/resp 都在时）。"""
+    explicit = _explicit_latency(resp_ev)
+    if explicit is not None:
+        return explicit
+    if req_ev is not None and resp_ev is not None:
+        return _latency_ms(_ts(req_ev), _ts(resp_ev))
+    return None
 
 
 def _latency_ms(start_ts: str, end_ts: str) -> "int | None":

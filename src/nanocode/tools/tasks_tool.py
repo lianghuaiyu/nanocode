@@ -85,7 +85,7 @@ def subagent_detail_text(manager, agent_id: str, session_id: str | None = None) 
         parts.append(f"Messages: {a.message_path}")
     if a.task_id:
         parts.append(f"Task: {a.task_id}")
-    # P2 artifacts: surface wire.jsonl / result.md paths if they exist on disk.
+    # P2 artifacts: surface result.md / meta.json / prompt.txt paths if they exist on disk.
     if session_id:
         try:
             from ..session import v2 as _v2

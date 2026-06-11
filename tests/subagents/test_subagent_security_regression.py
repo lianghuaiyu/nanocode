@@ -21,7 +21,7 @@ from nanocode.subagents import config
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="secsid", **kw)
+    return Agent(api_key="test", session_id="secsid", **kw)
 
 
 def _write(d, name, body):
@@ -34,7 +34,7 @@ def _write(d, name, body):
 
 def test_empty_custom_tools_does_not_widen_to_all():
     # Agent.__init__: custom_tools=[] must stay [] (None means "main agent default").
-    a = Agent(api_key="test", trace_enabled=False, is_sub_agent=True, custom_tools=[])
+    a = Agent(api_key="test", is_sub_agent=True, custom_tools=[])
     assert a.tools == []
     names = {t["name"] for t in a.tools}
     assert "agent" not in names
@@ -42,7 +42,7 @@ def test_empty_custom_tools_does_not_widen_to_all():
 
 
 def test_main_agent_none_tools_still_gets_full_table():
-    a = Agent(api_key="test", trace_enabled=False)
+    a = Agent(api_key="test")
     assert a.tools == tool_definitions
 
 

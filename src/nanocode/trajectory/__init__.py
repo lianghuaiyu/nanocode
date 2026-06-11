@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+from .config import trajectory_enabled, trajectory_level
 from .eval import online_evals
 from .export import bundle_dir, export_bundle
 from .metrics import compute_metrics
@@ -35,4 +36,6 @@ __all__ = [
     "bundle_dir",
     "Step",
     "TrajectoryMetadata",
+    "trajectory_enabled",
+    "trajectory_level",
 ]

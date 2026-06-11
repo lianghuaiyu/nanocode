@@ -1,54 +1,48 @@
-"""trajectory.project 的单测：wire 事件 -> Step 投影（docs/10 P2 验收）。
+"""trajectory.project 的单测：canonical 树派生事件 -> Step 投影（docs/14 Milestone B2）。
 
-覆盖：clean tool_action、llm_decision、summary-mode tool_result（只有 result_summary/hash）、
-legacy 行、malformed/缺字段行——断言稳定 step 输出且**绝不**崩溃。
+覆盖：clean tool_action、llm_decision、summary-mode 字段、malformed/缺字段、final from
+terminal、parent chain、多 agent 隔离——断言稳定 step 输出且**绝不**崩溃。
 
-构造方式：直接用 ``SessionEvent.from_wire`` 把 flat wire dict 解析为 SessionEvent
-（与生产读侧 reader 同路径），不依赖任何 runtime 模块。
+构造方式：用真实 ``SessionManager`` 树（tests.trajectory._fixtures）+ ``tree_events`` 适配器
+重建事件流，复刻生产读侧路径，不依赖任何 runtime 模块。直接 ``build_steps`` 单测则用
+``_te`` 合成 TrajEvent（旧 wire dict 的等价物）。
 """
 from __future__ import annotations
 
-from nanocode.events.models import SessionEvent
 from nanocode.trajectory import schema
-from nanocode.trajectory.project import build_steps
+from nanocode.trajectory._tree_events import TrajEvent, tree_events
+from nanocode.trajectory.project import build_steps, project_session
+
+from tests.trajectory import _fixtures as F
 
 
-def _ev(d: dict, *, agent_id: str = "main") -> SessionEvent:
-    """把一行 flat wire dict 解析为 SessionEvent（注入 agent_id，复刻 reader 行为）。"""
-    ev = SessionEvent.from_wire(d, agent_id=agent_id)
-    ev.line_no = d.get("seq", 0)
-    return ev
+def _te(seq: int, etype: str, *, agent: str = "main", ts: str = "",
+        parent_event_id: "str | None" = None, branch_id: str = "main", **data) -> TrajEvent:
+    """合成一条 TrajEvent（payload 落 data，等价于旧 wire 行的解析结果）。"""
+    return TrajEvent(
+        type=etype, agent_id=agent, seq=seq,
+        ts=ts or f"2026-06-09T10:00:{seq:02d}+00:00",
+        session_id="sess_test", id=f"evt_{agent}_{seq}",
+        parent_id=None, parent_event_id=parent_event_id, branch_id=branch_id,
+        turn_id="turn_main_0", line_no=seq, data=dict(data),
+    )
 
 
-def _wire(seq: int, etype: str, *, ts: str = "", agent: str = "main", **payload) -> dict:
-    """合成一行新式 wire dict（带 envelope id），payload 顶层扁平。"""
-    return {
-        "v": 1,
-        "id": f"evt_{agent}_{seq}",
-        "session_id": "sess_test",
-        "agent_id": agent,
-        "branch_id": "main",
-        "seq": seq,
-        "ts": ts or f"2026-06-09T10:00:{seq:02d}+00:00",
-        "turn_id": "turn_main_0",
-        "type": etype,
-        **payload,
-    }
-
-
-# ── clean tool_action ─────────────────────────────────────────
+# ── clean tool_action（端到端 tree → steps）────────────────────
 
 
 def test_clean_tool_action_pairs_call_and_result():
-    events = [
-        _ev(_wire(0, "assistant_message", text="I will read the file",
-                  tool_uses=[{"id": "tu_1", "name": "read_file", "input": {"path": "a.py"}}])),
-        _ev(_wire(1, "tool_call", tool="read_file", tool_use_id="tu_1",
-                  input={"path": "a.py"}, ts="2026-06-09T10:00:01+00:00")),
-        _ev(_wire(2, "tool_result", tool="read_file", tool_use_id="tu_1",
-                  chars=12, result="file contents", ts="2026-06-09T10:00:01.850000+00:00")),
-    ]
-    steps = build_steps(events)
+    m = F.new_session("s_clean")
+    F.append_user(m, "read it")
+    F.append_assistant(m, text="I will read the file",
+                       tool_calls=[{"id": "tu_1", "name": "read_file",
+                                    "arguments": {"path": "a.py"}}],
+                       input_tokens=100, output_tokens=20, latency_ms=300)
+    F.append_tool_result(m, tool_call_id="tu_1", tool_name="read_file",
+                         content="file contents", latency_ms=850)
+    m.close()
+
+    steps = project_session("s_clean")
     tool_steps = [s for s in steps if s.step_type == "tool_action"]
     assert len(tool_steps) == 1
     s = tool_steps[0]
@@ -56,18 +50,16 @@ def test_clean_tool_action_pairs_call_and_result():
                         "args_summary": '{"path": "a.py"}'}
     assert s.result_summary == "file contents"
     assert s.observation_summary == "I will read the file"
-    assert s.step_id == schema.step_id("main", 1)
-    assert s.latency_ms == 850
+    assert s.latency_ms == 850          # tool_result 的显式 latency_ms（毫秒级真值）
     assert s.risk_level == "low"
     assert s.eval_result is None and s.reward is None
     assert s.done is False
-    assert s.trajectory_id == "traj_sess_test"
-    assert s.episode_id == "sess_test"
+    assert s.trajectory_id == "traj_s_clean"
+    assert s.episode_id == "s_clean"
 
 
 def test_tool_action_without_result_has_none_latency():
-    events = [_ev(_wire(0, "tool_call", tool="read_file", tool_use_id="tu_x",
-                        input={"path": "x"}))]
+    events = [_te(0, "tool_call", tool="read_file", tool_use_id="tu_x", input={"path": "x"})]
     steps = build_steps(events)
     assert len(steps) == 1
     assert steps[0].step_type == "tool_action"
@@ -80,13 +72,10 @@ def test_tool_action_without_result_has_none_latency():
 
 def test_llm_decision_request_assistant_response():
     events = [
-        _ev(_wire(0, "llm_request", model="claude", message_count=3,
-                  messages=[{"role": "user", "content": "hi"}],
-                  ts="2026-06-09T10:00:00+00:00")),
-        _ev(_wire(1, "assistant_message", text="working on it",
-                  tool_uses=[{"id": "tu_1", "name": "read_file", "input": {}}])),
-        _ev(_wire(2, "llm_response", input_tokens=1000, output_tokens=200,
-                  ts="2026-06-09T10:00:00.500000+00:00")),
+        _te(0, "llm_request", model="claude", message_count=3, messages_chars=120),
+        _te(1, "assistant_message", text="working on it",
+            tool_uses=[{"id": "tu_1", "name": "read_file", "input": {}}]),
+        _te(2, "llm_response", input_tokens=1000, output_tokens=200, latency_ms=500),
     ]
     steps = build_steps(events)
     dec = [s for s in steps if s.step_type == "llm_decision"]
@@ -94,7 +83,7 @@ def test_llm_decision_request_assistant_response():
     s = dec[0]
     assert s.input_tokens == 1000
     assert s.output_tokens == 200
-    assert s.latency_ms == 500
+    assert s.latency_ms == 500          # 来自 llm_response 显式 latency_ms
     assert s.action["type"] == "assistant"
     assert s.action["n_tool_uses"] == 1
     assert "messages=3" in s.observation_summary
@@ -104,15 +93,13 @@ def test_llm_decision_request_assistant_response():
 
 def test_llm_decision_empty_tool_uses_produces_final():
     events = [
-        _ev(_wire(0, "llm_request", model="claude", message_count=2,
-                  messages=[{"role": "user", "content": "done?"}])),
-        _ev(_wire(1, "assistant_message", text="All done.", tool_uses=[])),
-        _ev(_wire(2, "llm_response", input_tokens=10, output_tokens=5)),
+        _te(0, "llm_request", model="claude", message_count=2, messages_chars=20),
+        _te(1, "assistant_message", text="All done.", tool_uses=[]),
+        _te(2, "llm_response", input_tokens=10, output_tokens=5, latency_ms=42),
     ]
     steps = build_steps(events)
     finals = [s for s in steps if s.step_type == "final"]
     assert len(finals) == 1
-    # 回合级最终答复 done=False（episode=session，仅 session_end 才 done=True）。
     assert finals[0].done is False
     assert finals[0].result_summary == "All done."
 
@@ -121,13 +108,10 @@ def test_llm_decision_empty_tool_uses_produces_final():
 
 
 def test_summary_mode_tool_result_uses_summary_fields():
-    # SUMMARY 级：apply_summary_shaping 已 pop result，留 result_summary + result_hash + chars
     events = [
-        _ev(_wire(0, "tool_call", tool="run_shell", tool_use_id="tu_9",
-                  input={"command": "ls"}, ts="2026-06-09T10:00:00+00:00")),
-        _ev(_wire(1, "tool_result", tool="run_shell", tool_use_id="tu_9", chars=42,
-                  result_summary="file1\nfile2", result_hash="sha256:abc",
-                  ts="2026-06-09T10:00:00.100000+00:00")),
+        _te(0, "tool_call", tool="run_shell", tool_use_id="tu_9", input={"command": "ls"}),
+        _te(1, "tool_result", tool="run_shell", tool_use_id="tu_9",
+            result_summary="file1\nfile2", result_hash="sha256:abc", latency_ms=100),
     ]
     steps = build_steps(events)
     assert len(steps) == 1
@@ -138,12 +122,9 @@ def test_summary_mode_tool_result_uses_summary_fields():
 
 
 def test_summary_mode_tool_call_only_hash_emits_summarized_placeholder():
-    # 假设 summary 级把 input 也整成 hash（防御性分支）
     events = [
-        _ev(_wire(0, "tool_call", tool="write_file", tool_use_id="tu_h",
-                  input_hash="sha256:deadbeef")),
-        _ev(_wire(1, "tool_result", tool="write_file", tool_use_id="tu_h",
-                  result_hash="sha256:cafe")),
+        _te(0, "tool_call", tool="write_file", tool_use_id="tu_h", input_hash="sha256:deadbeef"),
+        _te(1, "tool_result", tool="write_file", tool_use_id="tu_h", result_hash="sha256:cafe"),
     ]
     steps = build_steps(events)
     assert steps[0].action["args_summary"] == "(summarized)"
@@ -156,9 +137,9 @@ def test_summary_mode_tool_call_only_hash_emits_summarized_placeholder():
 
 def test_dangerous_shell_command_is_high_risk():
     events = [
-        _ev(_wire(0, "tool_call", tool="run_shell", tool_use_id="tu_rm",
-                  input={"command": "rm -rf /tmp/x"})),
-        _ev(_wire(1, "tool_result", tool="run_shell", tool_use_id="tu_rm", result="ok")),
+        _te(0, "tool_call", tool="run_shell", tool_use_id="tu_rm",
+            input={"command": "rm -rf /tmp/x"}),
+        _te(1, "tool_result", tool="run_shell", tool_use_id="tu_rm", result="ok"),
     ]
     steps = build_steps(events)
     assert steps[0].risk_level == "high"
@@ -166,11 +147,9 @@ def test_dangerous_shell_command_is_high_risk():
 
 def test_permission_deny_makes_tool_high_risk():
     events = [
-        _ev(_wire(0, "permission_decision", tool="write_file", action="deny",
-                  message="not allowed")),
-        _ev(_wire(1, "tool_call", tool="write_file", tool_use_id="tu_d",
-                  input={"path": "secret"})),
-        _ev(_wire(2, "tool_result", tool="write_file", tool_use_id="tu_d", result="denied")),
+        _te(0, "permission_decision", tool="write_file", action="deny", message="not allowed"),
+        _te(1, "tool_call", tool="write_file", tool_use_id="tu_d", input={"path": "secret"}),
+        _te(2, "tool_result", tool="write_file", tool_use_id="tu_d", result="denied"),
     ]
     steps = build_steps(events)
     tool = [s for s in steps if s.step_type == "tool_action"][0]
@@ -182,16 +161,14 @@ def test_permission_deny_makes_tool_high_risk():
 
 def test_turn_end_and_session_end_produce_final_steps():
     events = [
-        _ev(_wire(0, "turn_end", input_tokens=100, output_tokens=50, turns=2)),
-        _ev(_wire(1, "session_end", input_tokens=100, output_tokens=50, turns=2)),
+        _te(0, "turn_end", input_tokens=100, output_tokens=50, turns=2),
+        _te(1, "session_end", final_status="completed"),
     ]
     steps = build_steps(events)
     assert len(steps) == 2
     assert all(s.step_type == "final" for s in steps)
-    # episode=session：仅 session_end 终止（done=True）；turn_end 是回合边界（done=False）。
     assert steps[0].action == {"type": "turn_end"} and steps[0].done is False
     assert steps[1].action == {"type": "session_end"} and steps[1].done is True
-    # 终止标记不带累计 token（累计只在 metrics/metadata；避免 per-step 成本重复摊算）。
     assert steps[0].input_tokens == 0 and steps[0].output_tokens == 0
     assert steps[1].input_tokens == 0 and steps[1].output_tokens == 0
 
@@ -201,10 +178,10 @@ def test_turn_end_and_session_end_produce_final_steps():
 
 def test_parent_step_id_chains_within_agent():
     events = [
-        _ev(_wire(0, "tool_call", tool="read_file", tool_use_id="t0", input={})),
-        _ev(_wire(1, "tool_result", tool="read_file", tool_use_id="t0", result="r0")),
-        _ev(_wire(2, "tool_call", tool="read_file", tool_use_id="t1", input={})),
-        _ev(_wire(3, "tool_result", tool="read_file", tool_use_id="t1", result="r1")),
+        _te(0, "tool_call", tool="read_file", tool_use_id="t0", input={}),
+        _te(1, "tool_result", tool="read_file", tool_use_id="t0", result="r0"),
+        _te(2, "tool_call", tool="read_file", tool_use_id="t1", input={}),
+        _te(3, "tool_result", tool="read_file", tool_use_id="t1", result="r1"),
     ]
     steps = build_steps(events)
     assert steps[0].parent_step_id is None
@@ -213,86 +190,59 @@ def test_parent_step_id_chains_within_agent():
 
 def test_parent_chains_are_per_agent():
     events = [
-        _ev(_wire(0, "tool_call", tool="read_file", tool_use_id="m0", input={}, agent="main")),
-        _ev(_wire(0, "tool_call", tool="read_file", tool_use_id="s0", input={},
-                  agent="agent-001"), agent_id="agent-001"),
+        _te(0, "tool_call", tool="read_file", tool_use_id="m0", input={}, agent="main"),
+        _te(0, "tool_call", tool="read_file", tool_use_id="s0", input={}, agent="agent-001"),
     ]
     steps = build_steps(events)
-    # 两个不同 agent 的首个 step 都应 parent=None（链按 agent 隔离）
     assert all(s.parent_step_id is None for s in steps)
     ids = {s.agent_id for s in steps}
     assert ids == {"main", "agent-001"}
 
 
-def test_fork_branch_lineage_not_flattened():
-    """fork 分支不被压扁、且保留 branch 身份（审阅 HIGH）。
+def test_multi_agent_via_child_session():
+    """端到端：父会话 + 子会话（parentSession.agentId）→ tree_events fan-out 两个 agent。"""
+    p = F.new_session("ma_parent")
+    F.append_user(p, "spawn")
+    F.append_assistant(p, text="spawning",
+                       tool_calls=[{"id": "sub", "name": "task", "arguments": {}}],
+                       input_tokens=5, output_tokens=2, latency_ms=100)
+    F.append_tool_result(p, tool_call_id="sub", tool_name="task", content="ok", latency_ms=50)
+    c = F.child_session(p, "ma_child", agent_id="agent-001")
+    F.append_user(c, "sub task")
+    F.append_assistant(c, text="running",
+                       tool_calls=[{"id": "cs", "name": "read_file", "arguments": {}}],
+                       input_tokens=8, output_tokens=3, latency_ms=120)
+    F.append_tool_result(c, tool_call_id="cs", tool_name="read_file", content="ok", latency_ms=70)
+    p.close()
+    c.close()
 
-    main 分支跑一个 tool_action（evt_main_0），随后从该事件 fork 出分支 b1（其首事件带
-    parent_event_id=evt_main_0）。断言：b1 的 step 带 branch_id='b1'、parent 指向 fork 点的
-    step_main_0（而非被串进 main 链或丢失分支）；main step 仍 branch_id='main'、parent=None。
-    """
-    events = [
-        _ev(_wire(0, "tool_call", tool="read_file", tool_use_id="m0", input={"path": "a"})),
-        _ev(_wire(1, "tool_result", tool="read_file", tool_use_id="m0", result="ra")),
-        # fork：同 agent(main)、新 branch b1，首事件带 parent_event_id 指向 fork 点 evt_main_0。
-        _ev(_wire(2, "tool_call", tool="run_shell", tool_use_id="b0", input={"command": "ls"},
-                  branch_id="b1", parent_event_id="evt_main_0")),
-        _ev(_wire(3, "tool_result", tool="run_shell", tool_use_id="b0", result="rb",
-                  branch_id="b1")),
-    ]
-    steps = build_steps(events)
-    by_id = {s.step_id: s for s in steps}
-    main_step = by_id["step_main_0"]
-    fork_step = by_id["step_main_2"]
-    assert main_step.branch_id == "main" and main_step.parent_step_id is None
-    assert fork_step.branch_id == "b1"
-    # 分支首 step 接到 fork 点的 step（解析自 parent_event_id=evt_main_0），不被压进 main 链。
-    assert fork_step.parent_step_id == "step_main_0"
-    # branch_id 也进 to_record 的 metadata。
-    assert fork_step.to_record()["metadata"]["branch_id"] == "b1"
-
-
-# ── legacy 行 ─────────────────────────────────────────────────
+    steps = build_steps(tree_events("ma_parent"))
+    agents = {s.agent_id for s in steps}
+    assert "main" in agents
+    assert "agent-001" in agents
+    # 各 agent 链内 parent 隔离：每个 agent 的首 step parent=None。
+    for aid in agents:
+        first = next(s for s in steps if s.agent_id == aid)
+        assert first.parent_step_id is None
 
 
-def test_legacy_row_does_not_crash_and_projects():
-    # 升级前 wire：无 envelope id/branch_id，payload 在顶层
-    legacy_call = _ev({"v": 1, "ts": "2026-06-08T10:00:00Z", "session_id": "sess_test",
-                       "seq": 0, "type": "tool_call", "tool": "grep_search",
-                       "input": {"pattern": "E"}, "tool_use_id": "lu_1"})
-    legacy_res = _ev({"v": 1, "ts": "2026-06-08T10:00:01Z", "session_id": "sess_test",
-                      "seq": 1, "type": "tool_result", "tool": "grep_search",
-                      "tool_use_id": "lu_1", "result": "match"})
-    assert legacy_call.legacy is True
-    steps = build_steps([legacy_call, legacy_res])
-    assert len(steps) == 1
-    assert steps[0].step_type == "tool_action"
-    assert steps[0].action["tool"] == "grep_search"
-    assert steps[0].result_summary == "match"
-    # Z 后缀 ts 也能解析 latency（1s）
-    assert steps[0].latency_ms == 1000
-
-
-# ── malformed / missing-field 行 ──────────────────────────────
+# ── malformed / missing-field ─────────────────────────────────
 
 
 def test_malformed_and_missing_fields_never_crash():
     events = [
-        _ev({"type": "tool_call"}),  # 无 seq/tool/tool_use_id/input
-        _ev({"type": "tool_result"}),  # 无任何配对键
-        _ev({"type": "assistant_message"}),  # 无 text / tool_uses
-        _ev({"type": "llm_response"}),  # 无 token
-        _ev({"type": "unknown_event_type", "foo": "bar"}),  # 未知类型
-        _ev({}),  # 空 dict -> type=""
+        _te(0, "tool_call"),
+        _te(1, "tool_result"),
+        _te(2, "assistant_message"),
+        _te(3, "llm_response"),
+        _te(4, "unknown_event_type", foo="bar"),
+        TrajEvent(type="", agent_id="main", seq=5, ts="", session_id="sess_test"),
     ]
-    # 绝不抛
     steps = build_steps(events)
-    # 一个无 tool_use_id 的 tool_call 仍投影为 tool_action（无 result）
     tool_steps = [s for s in steps if s.step_type == "tool_action"]
     assert len(tool_steps) == 1
     assert tool_steps[0].result_summary == ""
     assert tool_steps[0].action["tool"] == ""
-    # assistant_message 无 tool_uses -> llm_decision + final
     types = [s.step_type for s in steps]
     assert "llm_decision" in types
     assert "final" in types
@@ -302,14 +252,18 @@ def test_build_steps_empty_input():
     assert build_steps([]) == []
 
 
+def test_project_missing_session_returns_empty():
+    assert project_session("never-existed") == []
+
+
 def test_eval_and_reward_always_none_in_projection():
     events = [
-        _ev(_wire(0, "tool_call", tool="read_file", tool_use_id="e0", input={})),
-        _ev(_wire(1, "tool_result", tool="read_file", tool_use_id="e0", result="r")),
-        _ev(_wire(2, "turn_end", input_tokens=1, output_tokens=1, turns=1)),
+        _te(0, "tool_call", tool="read_file", tool_use_id="e0", input={}),
+        _te(1, "tool_result", tool="read_file", tool_use_id="e0", result="r"),
+        _te(2, "turn_end", input_tokens=1, output_tokens=1, turns=1),
     ]
     steps = build_steps(events)
-    assert steps  # non-empty
+    assert steps
     for s in steps:
         assert s.eval_result is None
         assert s.reward is None
@@ -317,10 +271,8 @@ def test_eval_and_reward_always_none_in_projection():
 
 def test_to_record_shape_round_trips():
     events = [
-        _ev(_wire(0, "tool_call", tool="edit_file", tool_use_id="r0",
-                  input={"path": "z"}, ts="2026-06-09T10:00:00+00:00")),
-        _ev(_wire(1, "tool_result", tool="edit_file", tool_use_id="r0",
-                  result="done", ts="2026-06-09T10:00:00.250000+00:00")),
+        _te(0, "tool_call", tool="edit_file", tool_use_id="r0", input={"path": "z"}),
+        _te(1, "tool_result", tool="edit_file", tool_use_id="r0", result="done", latency_ms=250),
     ]
     rec = build_steps(events)[0].to_record()
     assert rec["step_type"] == "tool_action"
@@ -330,3 +282,25 @@ def test_to_record_shape_round_trips():
     assert rec["metadata"]["agent_id"] == "main"
     assert rec["reward"] is None
     assert rec["eval_result"] is None
+
+
+def test_tree_events_forked_branches_get_distinct_ids_and_fork_point():
+    # review medium 回归：in-file fork（同 conv parent 的第二个 conv 子）→ 独立 branch_id + fork-point
+    # parent_event_id，不再全部线性混入 "main"（取代硬编码 branch_id="main"）。
+    from nanocode.trajectory._tree_events import tree_events
+    from nanocode.session.manager import SessionManager
+    from nanocode.session import tree as T
+    m = SessionManager.create("forktraj")
+    u1 = m.append_message(T.user_message("q1"))
+    m.append_message(T.assistant_message([T.text_block("a1")], provider="anthropic",
+                     api="anthropic", model="cx", stop_reason="stop"))   # u1 的首子 → main
+    # fork：u1 的第二个 conv 子（divergent branch）
+    u2 = m.append(T.MESSAGE, {"message": T.user_message("q1-redo")}, parent_id=u1.id)
+    m.append_message(T.assistant_message([T.text_block("a2")], provider="anthropic",
+                     api="anthropic", model="cx", stop_reason="stop"))   # u2 的子 → b1
+    evs = tree_events("forktraj")
+    branches = {e.branch_id for e in evs}
+    assert "main" in branches and "b1" in branches            # 两条 branch，不再线性
+    # b1 首个 emitted event 链到 fork point u1（user 消息不产 event，故挂在 a2 的 assistant_message 上）
+    b1_evs = [e for e in evs if e.branch_id == "b1"]
+    assert b1_evs and b1_evs[0].parent_event_id == u1.id
