@@ -67,8 +67,7 @@ from .models import (
 )
 from .compaction import persist_large_result
 from .plan_mode import PlanModeMixin
-from .anthropic_backend import AnthropicBackendMixin
-from .openai_backend import OpenAIBackendMixin
+from .core import AgentCore
 
 
 # ─── Agent ───────────────────────────────────────────────────
@@ -90,7 +89,7 @@ async def _auto_deny_confirm(_command: str) -> bool:
     return False
 
 
-class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
+class Agent(PlanModeMixin):
     # 记忆巩固 curator 的内置保留类型（与 subagents.prompts.MEMORY_CURATOR_TYPE 对齐）。
     _MEMORY_CURATOR_TYPE = "memory-curator"
     # 记忆 EVAL-mode curator 的内置保留类型（与 subagents.prompts.MEMORY_EVAL_CURATOR_TYPE 对齐）。
@@ -275,6 +274,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._provider = make_provider_adapter(
             use_openai=self.use_openai,
             anthropic_client=self._anthropic_client, openai_client=self._openai_client)
+        # docs/15 STEP C：模型循环上移到 AgentCore（host=self 注入 collaborators）。无状态,可共享。
+        self._core = AgentCore()
 
     def _apply_permission_mode_prompt(self) -> None:
         """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
@@ -376,7 +377,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         self._aborted = False
         self._ensure_session_lease()  # 确保持有会话写者租约（runtime 已注入则 no-op；headless/直接构造则自取）
-        coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
+        coro = self._core.run_turn(self, user_message)
         self._current_task = asyncio.current_task()
         try:
             await coro
@@ -480,6 +481,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     async def compact(self) -> None:
         await self._compact_conversation()
+
+    # docs/15 STEP C：compaction 逻辑随循环上移到 AgentCore；保留 Agent 薄委托作单一调用点
+    # （_compact_conversation 仍调 self._compact_*()，测试可在实例上 monkeypatch 这两个点）。
+    async def _compact_anthropic(self) -> "str | None":
+        return await self._core._compact_anthropic(self)
+
+    async def _compact_openai(self) -> "str | None":
+        return await self._core._compact_openai(self)
 
     # ─── Message-list ownership（docs/13 S5：plain list，MessageStore 抽象已删）──────
     # _anthropic_messages / _openai_messages 是普通 list（每轮 build_context 投影 + 注入装饰）；
