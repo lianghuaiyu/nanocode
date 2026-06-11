@@ -1,20 +1,18 @@
-"""trajectory.metrics — 从 merged wire 派生的 P3 harness 指标聚合（docs/10 P3）。
+"""trajectory.metrics — 从 canonical 树派生事件聚合的 P3 harness 指标（docs/10 P3 / docs/14 Milestone B2）。
 
 DERIVED 投影层（硬边界，见 trajectory/__init__.py）：
-- 本模块**只读** merged wire（``list[SessionEvent]``），绝不写回 wire、绝不驱动 runtime、
-  绝不参与 resume / fork。reward / eval_result 是派生标签，只来自传入的 ``steps``，绝不
-  从这里写进 wire。
-- 仅依赖标准库与（可选）``nanocode.trajectory.schema``（PURE）；**不**得 import 任何
-  runtime 模块。``nanocode.trace.redaction.truncate`` 可按需复用，但本聚合不需截断。
+- 本模块**只读**树派生事件（``list[TrajEvent]``，由 ``_tree_events.tree_events`` 重建），绝不写回
+  树/wire、绝不驱动 runtime、绝不参与 resume / fork。reward / eval_result 是派生标签，只来自传入
+  的 ``steps``，绝不从这里写进树。
+- 仅依赖标准库（不 import ``events.*`` / ``trace.*`` / 任何 runtime 模块）。
 
-健壮性铁律：投影绝不崩。legacy 行（``.legacy`` True）、summary 级事件（无 full
-``messages``/``result``，只有 ``messages_chars``/``result_summary`` 等）、malformed/缺字段
-的行都必须容忍——缺数据降级为 0/None，绝不抛进调用方。
+健壮性铁律：投影绝不崩。summary 级事件（无 full ``messages``/``result``，只有
+``messages_chars``/``result_summary`` 等）、malformed/缺字段的事件都必须容忍——缺数据降级为
+0/None，绝不抛进调用方。
 
-输入：``events`` 为 ``nanocode.events.reader.merge_session_events(session_id)`` 的产物
-（展示序 ``(ts, agent_id, seq, line_no)``）。配对（llm_request→llm_response、
+输入：``events`` 为 ``_tree_events.tree_events(session_id)`` 的产物。配对（llm_request→llm_response、
 tool_call→tool_result）在**单 agent 内**按 seq 进行——跨兄弟 agent 无全序，故先按 agent_id
-分桶再配对。
+分桶再配对。模型/工具延迟优先取事件 data 上显式的 ``latency_ms``（毫秒级真值），缺则退回 ts 差。
 """
 from __future__ import annotations
 
@@ -61,6 +59,23 @@ def _delta_ms(a, b) -> "int | None":
     try:
         ms = int((tb - ta).total_seconds() * 1000)
     except Exception:
+        return None
+    return ms if ms >= 0 else 0
+
+
+def _explicit_ms(data: dict) -> "int | None":
+    """事件 data 里显式携带的 ``latency_ms``（B2：树适配器从 message.usage/latencyMs 取毫秒级真值）。
+
+    优先于 ts 差——canonical 树 ts 仅秒级、差值无意义。缺/不可解析 → None（调用方退回 ts 差）。
+    """
+    if not isinstance(data, dict):
+        return None
+    v = data.get("latency_ms")
+    if v is None:
+        return None
+    try:
+        ms = int(v)
+    except (TypeError, ValueError):
         return None
     return ms if ms >= 0 else 0
 
@@ -229,12 +244,15 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
                 total_output_tokens += out_tokens
                 ab["input_tokens"] += in_tokens
                 ab["output_tokens"] += out_tokens
-                if pending_llm_req_ts is not None:
+                # B2：优先树适配器在 llm_response 上直接给的毫秒级 latency_ms（树 ts 仅秒级、ts 差无用）；
+                # 缺则退回 llm_request→llm_response 的 ts 差（兼容旧 wire 派生流）。
+                d = _explicit_ms(data)
+                if d is None and pending_llm_req_ts is not None:
                     d = _delta_ms(pending_llm_req_ts, ts)
-                    if d is not None:
-                        model_latencies.append(d)
-                        ab["model_latency_ms_sum"] += d
-                    pending_llm_req_ts = None
+                if d is not None:
+                    model_latencies.append(d)
+                    ab["model_latency_ms_sum"] += d
+                pending_llm_req_ts = None
 
             elif etype == "tool_call":
                 total_tool_calls += 1
@@ -272,14 +290,16 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
                     _, call_ts, call_cmd = pending_tool_calls.pop(tuid)
                 elif pending_tool_fifo:
                     _, call_ts, call_cmd = pending_tool_fifo.pop(0)
-                if call_ts is not None:
+                # B2：优先 tool_result 上显式的毫秒级 latency_ms；缺则退回 call→result 的 ts 差。
+                d = _explicit_ms(data)
+                if d is None and call_ts is not None:
                     d = _delta_ms(call_ts, ts)
-                    if d is not None:
-                        tool_latencies.append(d)
-                        ab["tool_latency_ms_sum"] += d
-                        tbk = _tool_bucket(tool)
-                        tbk["latency_ms_sum"] += d
-                        tbk["latency_ms_count"] += 1
+                if d is not None:
+                    tool_latencies.append(d)
+                    ab["tool_latency_ms_sum"] += d
+                    tbk = _tool_bucket(tool)
+                    tbk["latency_ms_sum"] += d
+                    tbk["latency_ms_count"] += 1
                 if failed:
                     _tool_bucket(tool)["failures"] += 1
                 # tests_run/passed/failed（best-effort，仅 run_shell 的 pytest/test 命令）。

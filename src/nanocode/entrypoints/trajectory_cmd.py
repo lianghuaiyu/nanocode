@@ -1,11 +1,11 @@
-"""`nanocode trajectory` 子命令：把 always-on wire 投影为 trajectory（只读 DERIVED 视图）。
+"""`nanocode trajectory` 子命令：把 canonical 会话树投影为 trajectory（只读 DERIVED 视图）。
 
 `list` / `show <id>` / `export <id> [--out DIR]`：
-- list   —— 列出可投影的 wire 会话（复用 trace.report.render_wire_session_list）。
+- list   —— 列出可投影的 canonical 会话（trajectory._tree_events.list_tree_sessions）。
 - show   —— 投影 steps（trajectory.project_session）+ 指标摘要（trajectory.compute_metrics）。
 - export —— 导出 trajectory bundle（trajectory.export_bundle）并打印 bundle 路径。
 
-硬边界：本命令只**读** merged wire，绝不写回 wire；trajectory 是 DERIVED 投影，绝不驱动 runtime。
+硬边界：本命令只**读** canonical 树，绝不写回；trajectory 是 DERIVED 投影，绝不驱动 runtime。
 坏 id 容忍：print_error + 返回 1。
 """
 from __future__ import annotations
@@ -18,11 +18,11 @@ from ..ui import console, print_error, print_info
 def run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="nanocode trajectory",
-        description="Project the always-on wire into a trajectory (read-only analysis/RL view).",
+        description="Project the canonical session tree into a trajectory (read-only analysis/RL view).",
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("list", help="list wire sessions available as trajectories")
+    sub.add_parser("list", help="list sessions available as trajectories")
 
     p_show = sub.add_parser("show", help="per-step table + metrics summary for a session")
     p_show.add_argument("session", help="session id prefix or 'latest'")
@@ -44,32 +44,47 @@ def run(argv: list[str]) -> int:
     return 1
 
 
-def _run_list() -> int:
-    from ..events import reader
-    from ..trace import report
+def _render_session_list(sessions: list[dict]) -> str:
+    if not sessions:
+        return "No sessions found under ~/.nanocode/sessions/."
+    lines = [f"{'SESSION':18}  {'WHEN':19}  {'AGENTS':>6}  {'EVENTS':>6}  FIRST MESSAGE"]
+    for s in sessions:
+        when = (s.get("start_ts") or "")[:19].replace("T", " ")
+        msg = (s.get("first_user_msg") or "").replace("\n", " ")
+        if len(msg) > 50:
+            msg = msg[:50] + "…"
+        lines.append(
+            f"{s['session_id']:18}  {when:19}  {s.get('n_agents', 1):>6}  "
+            f"{s.get('n_events', 0):>6}  {msg}"
+        )
+    return "\n".join(lines)
 
-    console.print(report.render_wire_session_list(reader.list_wire_sessions()))
+
+def _run_list() -> int:
+    from ..trajectory._tree_events import list_tree_sessions
+
+    console.print(_render_session_list(list_tree_sessions()))
     return 0
 
 
 def _resolve(session_arg: str) -> "str | None":
-    from ..events import reader
+    from ..trajectory._tree_events import resolve_tree_session
 
     try:
-        return reader.resolve_wire_session(session_arg)
+        return resolve_tree_session(session_arg)
     except (FileNotFoundError, ValueError) as e:
         print_error(str(e))
         return None
 
 
 def _run_show(session_arg: str) -> int:
-    from ..events import reader
     from .. import trajectory
+    from ..trajectory._tree_events import tree_events
 
     sid = _resolve(session_arg)
     if sid is None:
         return 1
-    events = reader.merge_session_events(sid)
+    events = tree_events(sid)
     steps = trajectory.project_session(sid)
 
     console.print(f"trajectory {sid} — {len(steps)} step(s)")
