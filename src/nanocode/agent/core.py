@@ -127,7 +127,7 @@ class AgentCore:
             host._tree_record(assistant_msg, stop_reason=getattr(response, "stop_reason", None),
                               usage={"inputTokens": response.usage.input_tokens,
                                      "outputTokens": response.usage.output_tokens},
-                              latency_ms=_latency_ms)
+                              latency_ms=_latency_ms, required=True)  # §7.6②：删 flat 后必须 fail-loud
             host._dispatch_event(
                 "assistant_message",
                 text="".join(b.text for b in response.content if b.type == "text"),
@@ -185,7 +185,7 @@ class AgentCore:
                     host._context_cleared = False
                     cb_msg = {"role": "user", "content": res}
                     host._anthropic_messages.append(cb_msg)
-                    host._tree_record(cb_msg)
+                    host._tree_record(cb_msg, required=True)
                     context_break = True
                     break
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
@@ -194,7 +194,7 @@ class AgentCore:
             if not context_break and tool_results:
                 tr_msg = {"role": "user", "content": tool_results}
                 host._anthropic_messages.append(tr_msg)
-                host._tree_record(tr_msg)
+                host._tree_record(tr_msg, required=True)  # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
             host._context_cleared = False
             if not context_break:
                 host._inject_pending_skill_bodies(host._anthropic_messages)
@@ -273,7 +273,7 @@ class AgentCore:
                               usage={"inputTokens": _u.get("prompt_tokens", 0),
                                      "outputTokens": _u.get("completion_tokens", 0)}
                               if (_u := (response.get("usage") or {})) else None,
-                              latency_ms=_latency_ms)
+                              latency_ms=_latency_ms, required=True)  # §7.6②：删 flat 后必须 fail-loud
 
             _tcs = message.get("tool_calls") or []
             host._dispatch_event(
@@ -343,13 +343,13 @@ class AgentCore:
                     for ct_item, res, _lat in results:
                         tmsg = {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res}
                         host._openai_messages.append(tmsg)
-                        host._tree_record(tmsg, latency_ms=_lat)
+                        host._tree_record(tmsg, latency_ms=_lat, required=True)  # §7.6①
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
                             dmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]}
                             host._openai_messages.append(dmsg)
-                            host._tree_record(dmsg)
+                            host._tree_record(dmsg, required=True)  # §7.6①：denied 也是 toolResult,必须落树
                             continue
                         _t_tool = time.time()
                         raw = await host._execute_tool_call(ct["fn"], ct["inp"])
@@ -361,12 +361,12 @@ class AgentCore:
                             host._context_cleared = False
                             cbmsg = {"role": "user", "content": res}
                             host._openai_messages.append(cbmsg)
-                            host._tree_record(cbmsg)
+                            host._tree_record(cbmsg, required=True)
                             oai_context_break = True
                             break
                         rmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res}
                         host._openai_messages.append(rmsg)
-                        host._tree_record(rmsg, latency_ms=_lat)
+                        host._tree_record(rmsg, latency_ms=_lat, required=True)  # §7.6①
 
             host._context_cleared = False
             if not oai_context_break:
