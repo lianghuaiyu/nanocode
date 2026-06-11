@@ -196,7 +196,7 @@ class AnthropicBackendMixin:
                 allowed, denial = await self._authorize_dispatch(tu.name, inp)
                 if not allowed:
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial,
-                                         "toolName": tu.name})
+                                         "toolName": tu.name, "is_error": True})   # 拒绝=错误结果（B1 真实 isError）
                     continue
 
                 _t_tool = time.time()

@@ -715,6 +715,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     async def _compact_conversation(self) -> None:
         tokens_before = self.last_input_token_count
+        before_count = self._get_message_count()        # 压缩前消息数（B1 落树供 trajectory/eval 详情）
         # bug#1（docs/14 §4.4 + P3 review #5）：kept-tail 起点必须与 backend 实际保留的对齐。
         # backend 仅当末条消息是 user 时才把它接到 summary 之后（_compact_*: last_user_msg.role=='user'），
         # 否则 summary 之后不留任何旧消息。auto-compact 触发于刚记完 user 消息时（leaf==该 user）→
@@ -739,7 +740,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 if self._session_mgr is not None:
                     self._session_mgr.append_compaction(
                         summary=summary, tokens_before=tokens_before,
-                        first_kept_entry_id=first_kept)
+                        first_kept_entry_id=first_kept, kind="auto",
+                        message_count_before=before_count,
+                        message_count_after=self._get_message_count())
             except Exception:
                 pass
         self._sink.info("Conversation compacted.")

@@ -282,3 +282,25 @@ def test_to_record_shape_round_trips():
     assert rec["metadata"]["agent_id"] == "main"
     assert rec["reward"] is None
     assert rec["eval_result"] is None
+
+
+def test_tree_events_forked_branches_get_distinct_ids_and_fork_point():
+    # review medium 回归：in-file fork（同 conv parent 的第二个 conv 子）→ 独立 branch_id + fork-point
+    # parent_event_id，不再全部线性混入 "main"（取代硬编码 branch_id="main"）。
+    from nanocode.trajectory._tree_events import tree_events
+    from nanocode.session.manager import SessionManager
+    from nanocode.session import tree as T
+    m = SessionManager.create("forktraj")
+    u1 = m.append_message(T.user_message("q1"))
+    m.append_message(T.assistant_message([T.text_block("a1")], provider="anthropic",
+                     api="anthropic", model="cx", stop_reason="stop"))   # u1 的首子 → main
+    # fork：u1 的第二个 conv 子（divergent branch）
+    u2 = m.append(T.MESSAGE, {"message": T.user_message("q1-redo")}, parent_id=u1.id)
+    m.append_message(T.assistant_message([T.text_block("a2")], provider="anthropic",
+                     api="anthropic", model="cx", stop_reason="stop"))   # u2 的子 → b1
+    evs = tree_events("forktraj")
+    branches = {e.branch_id for e in evs}
+    assert "main" in branches and "b1" in branches            # 两条 branch，不再线性
+    # b1 首个 emitted event 链到 fork point u1（user 消息不产 event，故挂在 a2 的 assistant_message 上）
+    b1_evs = [e for e in evs if e.branch_id == "b1"]
+    assert b1_evs and b1_evs[0].parent_event_id == u1.id

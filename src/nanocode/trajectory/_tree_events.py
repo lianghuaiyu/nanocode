@@ -89,9 +89,60 @@ class _SeqGen:
         return self._n
 
 
-def _emit_for_entry(entry: T.Entry, *, agent_id: str, session_id: str,
-                    seqgen: _SeqGen) -> "list[TrajEvent]":
-    """把一条树 entry 重建为 0+ 条 TrajEvent（与旧 wire 配对一致）。绝不抛。"""
+# 不推进对话 branch 的 entry 类型（header / 注解 / leaf 移动）——它们不是 branch DAG 的节点。
+# 与 tree.leaf_id_after_entry 的 _UNCHANGED 集 + LEAF 对齐。
+_NON_BRANCH_TYPES = frozenset({
+    T.SESSION_START, T.LABEL, T.SESSION_INFO, T.LEAF,
+    T.PERMISSION_DECISION, T.TOOL_BLOCKED, T.BUDGET_EXCEEDED, T.TURN_END, T.SESSION_END, T.LLM_REQUEST,
+})
+
+
+def _assign_branches(entries: "list[T.Entry]") -> "tuple[dict, dict]":
+    """从 canonical 树派生每个 conversation entry 的 branch_id + fork parent（取代硬编码 "main"）。
+
+    conversation DAG 只由「推进 leaf」的 entry 组成（MESSAGE/COMPACTION/CUSTOM_MESSAGE…）；注解型
+    entry（LLM_REQUEST/TURN_END/permission…）不入 DAG（它们 parentId=写时 leaf、不推进 leaf）。
+    fork = 某 conv parent 有 >1 个 conv 子（in-file /fork、/tree 导航后续写、clone）；/clear→set_leaf(None)
+    后的新对话 parentId=None → 第二个 root → 新 branch。第一个 root = "main"；额外 branch = b1/b2…。
+
+    返回 (branch_of: conv entry_id→branch_id, branch_fork_point: branch_id→fork point parent entry id)。
+    fork point 按 **branch_id** 记（而非 branch 起点 entry id）——因 branch 起点可能是 user MESSAGE，它不产
+    projection event，故 parent_event_id 须挂到该 branch **首个 emitted** event 上（见 _branch_events）。
+    """
+    is_branch = {e.id: (e.type not in _NON_BRANCH_TYPES) for e in entries}
+    seen_conv_children: dict = {}        # parent_id → 已见 conv 子计数
+    branch_of: dict = {}
+    branch_fork_point: dict = {}
+    counter = [0]
+
+    def _new_branch() -> str:
+        b = "main" if counter[0] == 0 else f"b{counter[0]}"
+        counter[0] += 1
+        return b
+
+    for e in entries:
+        if not is_branch.get(e.id):
+            continue
+        p = e.parentId
+        if p is None or not is_branch.get(p):
+            branch_of[e.id] = _new_branch()      # root conv 节点（首个=main；/clear 后的新对话=b{n}）
+        else:
+            n = seen_conv_children.get(p, 0)
+            seen_conv_children[p] = n + 1
+            if n == 0:
+                branch_of[e.id] = branch_of.get(p, "main")   # 首子继承 parent branch
+            else:
+                nb = _new_branch()                           # 兄弟分叉 → 新 branch
+                branch_of[e.id] = nb
+                branch_fork_point[nb] = p                    # fork point（供 project parent_event_id 链接）
+    return branch_of, branch_fork_point
+
+
+def _emit_for_entry(entry: T.Entry, *, agent_id: str, session_id: str, seqgen: _SeqGen,
+                    branch_id: str, turn_id: "str | None") -> "list[TrajEvent]":
+    """把一条树 entry 重建为 0+ 条 TrajEvent（与旧 wire 配对一致）。绝不抛。
+    branch_id / turn_id 由 _branch_events 据树 fork 结构 + turn 边界派生（取代硬编码）；
+    branch 起点的 parent_event_id 由 _branch_events 在返回的首个 event 上回填。"""
     out: list[TrajEvent] = []
     etype = entry.type
     data = entry.data if isinstance(entry.data, dict) else {}
@@ -102,7 +153,7 @@ def _emit_for_entry(entry: T.Entry, *, agent_id: str, session_id: str,
         return TrajEvent(
             type=ev_type, agent_id=agent_id, seq=seq, ts=ts,
             session_id=session_id, id=entry.id, parent_id=entry.parentId,
-            branch_id="main", turn_id="main", line_no=seq, data=ev_data,
+            branch_id=branch_id, turn_id=turn_id, line_no=seq, data=ev_data,
         )
 
     if etype == T.LLM_REQUEST:
@@ -213,19 +264,40 @@ def _branch_events(mgr: "SessionManager", agent_id: str) -> "list[TrajEvent]":
     用 ``entries()``（写入序）而非 ``get_branch()``：B1 的派生遥测 entry（LLM_REQUEST / TURN_END /
     SESSION_END / PERMISSION_DECISION / TOOL_BLOCKED / BUDGET_EXCEEDED）是**注解型**——不推进 leaf，
     故不在对话 branch 上（leaf→root 链穿不过它们）。trajectory 要的是「实际发生了什么」的完整执行
-    轨迹（对齐旧 append-only wire），而非「当前逻辑上下文」，故取写入序全量。写入序 = 各 entry 的
-    时间序，正是事件流所需的配对顺序。
+    轨迹（对齐旧 append-only wire），而非「当前逻辑上下文」，故取写入序全量。
+
+    branch/fork 还原（review medium）：据 conv-DAG（_assign_branches）给每条 conv entry 派生 branch_id +
+    fork point，注解 entry 继承其 parent 的 branch；turn_id 按 TURN_END 边界递增。这恢复了 project.py 的
+    per-(agent, branch) 隔离与 fork-point 链接（取代硬编码 "main"，使 in-file /fork、/clear、clone 后的
+    step 谱系正确、被弃分支不再线性混入活分支）。
     """
     out: list[TrajEvent] = []
     try:
         all_entries = mgr.entries()
     except Exception:
         all_entries = []
+    try:
+        branch_of, branch_fork_point = _assign_branches(all_entries)
+    except Exception:
+        branch_of, branch_fork_point = {}, {}
     seqgen = _SeqGen()
+    turn_n = [0]
+    emitted_branches: set = set()
     for entry in all_entries:
         try:
-            out.extend(_emit_for_entry(entry, agent_id=agent_id,
-                                       session_id=mgr.session_id, seqgen=seqgen))
+            # branch_id：conv entry 取自身；注解 entry 继承其 parent（写时 leaf）的 branch。
+            bid = branch_of.get(entry.id) or branch_of.get(entry.parentId) or "main"
+            tid = f"turn_{agent_id}_{turn_n[0]}"
+            evs = _emit_for_entry(entry, agent_id=agent_id, session_id=mgr.session_id,
+                                  seqgen=seqgen, branch_id=bid, turn_id=tid)
+            if evs and bid not in emitted_branches:
+                emitted_branches.add(bid)
+                fp = branch_fork_point.get(bid)
+                if fp is not None:
+                    evs[0].parent_event_id = fp     # 该 branch 首个 emitted event 链到 fork point
+            out.extend(evs)
+            if entry.type == T.TURN_END:
+                turn_n[0] += 1                  # TURN_END 关闭当前 turn，后续 entry 归下一 turn
         except Exception:
             continue
     return out

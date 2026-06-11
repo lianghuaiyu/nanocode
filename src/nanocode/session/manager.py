@@ -172,12 +172,19 @@ class SessionManager:
         return self.append(tree.MESSAGE, {"message": message}, parent_id=parent_id)
 
     def append_compaction(self, *, summary: str, tokens_before=None,
-                          first_kept_entry_id: str | None = None, parent_id: str | None = None) -> Entry:
+                          first_kept_entry_id: str | None = None, parent_id: str | None = None,
+                          kind: str | None = None, message_count_before: int | None = None,
+                          message_count_after: int | None = None) -> Entry:
         """S4（docs/13）：append 一条 compaction entry（summary + firstKeptEntryId），供
-        build_context 两区 fold（context.py：摘要顶替被覆盖史 + 保留 firstKeptEntryId 起的消息）。"""
+        build_context 两区 fold（context.py：摘要顶替被覆盖史 + 保留 firstKeptEntryId 起的消息）。
+
+        kind / messageCountBefore / messageCountAfter（docs/14 Milestone B）：原只进 wire 的 compaction
+        细节落树，供 trajectory 派生（eval 的 before/after 详情）；缺省 None（旧会话 fallback tokensBefore）。"""
         return self.append(tree.COMPACTION, {
             "summary": summary, "tokensBefore": tokens_before,
             "firstKeptEntryId": first_kept_entry_id,
+            "kind": kind, "messageCountBefore": message_count_before,
+            "messageCountAfter": message_count_after,
         }, parent_id=parent_id)
 
     def append_session_info(self, name: str) -> Entry:
