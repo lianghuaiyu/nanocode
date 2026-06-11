@@ -1,20 +1,19 @@
-"""单一 RuntimeEvent 流 + dispatcher + sinks/projection（RUNTIME-P1 Step 1，Pi-aligned）。
+"""单一 RuntimeEvent 流 + dispatcher + sinks/projection（Pi-aligned）。
 
-目标模型（Pi 证明 core event stream 才是核心，EventBus/dispatcher 只做 fanout，
-session/wire/UI 互不调用）：
+目标模型（Pi 证明 core event stream 才是核心，dispatcher 只做 fanout，
+session/UI 互不调用）：
 
     Agent core ── emit RuntimeEvent ──►
-        ├─ durable sink   ：经 Tracer.emit 写 wire.jsonl（过渡期复用现有 Tracer，不另造 wire 逻辑）
         ├─ EventSinkProjection：渲染终端 UI（EventSink 的 12 个方法）
         ├─（后续）Buffer 订阅：TurnResult.final_response capture
         ├─（后续）RuntimeThread.events()：in-process subscription
         └─（后续）JSON-RPC notification：protocol projection
 
-逐类把双发改成一次 dispatch(RuntimeEvent)，由 durable sink 与 projection 分别处理。
-进度（RUNTIME-P1）：tool_call / tool_result（tool I/O 类）已迁移（Step 2a）；其余事件仍双发，逐类推进。
+durable 持久化已不在本流：Milestone B 把派生遥测落进 canonical session.jsonl 树（Agent._tree_event
+/_tree_record），wire/Tracer 已退役。本流只做 UI 投影（project → EventSink）。
 
-byte-parity 第一铁律：分类（durable / ephemeral）是**静态、按 type 字符串的表**，绝不作为事件
-payload 上的 kwarg —— 否则 ui=/ui_only= 会落进 wire 顶层并折进 SessionEvent.data 污染 wire。
+第一铁律：分类（durable / ephemeral）仍是**静态、按 type 字符串的表**，绝不作为事件 payload 上的
+kwarg —— 历史上用于 wire byte-parity，现仍用于区分哪些 type 有 UI 投影。
 """
 
 from __future__ import annotations
@@ -22,21 +21,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-# 今天经 tracer.emit 落 wire.jsonl 的 13 个 type。DURABLE 集必须**精确等于**此集：
-#   - 增（如 sub_agent_start/end、spinner、retry、逐 block 的 assistant 文本）→ wire 多出新行 → 破 parity；
-#   - 删（如因 tool_blocked 无 summarizer 而过滤掉）→ wire 丢行 → 破 parity。
+# 历史上经 tracer.emit 落 wire 的 13 个 type（wire 已退役）。保留作 RuntimeEvent 的**静态分类**：
+# 这些 type 的持久化等价物现写进 canonical 树（Agent._tree_event/_tree_record），故 project()
+# 对它们多为 no-op（除 tool_call/tool_result 有 UI 投影）。
 DURABLE_TYPES = frozenset({
     "session_start", "user_message", "llm_request", "assistant_message",
     "llm_response", "budget_exceeded", "tool_call", "tool_result",
     "permission_decision", "tool_blocked", "compaction", "turn_end", "session_end",
 })
 
-# durable wire schema 契约（RUNTIME-P1 ↔ Trajectory 桥）：每个 durable type 在 wire 上的稳定
-# payload 字段。trajectory.project/metrics/eval 与 resume 重建都依赖它们；改任一 type 或字段名
-# = 破契约（trajectory 会静默崩）。约束：只能 flat-additive 增字段，不改名/不删（docs/10 §兼容性、
-# docs/12 边界 5）。SUMMARY 级整形见 trace.redaction：llm_request.messages → messages_hash/
-# messages_chars，tool_result.result → result_summary/result_hash（投影层 project 有兜底）。
-# guard: tests/agent/test_durable_schema_contract.py。
+# 历史 durable schema 契约：每个 durable type 在事件流上的稳定 payload 字段。沿用作 RuntimeEvent
+# payload 形状参考（trajectory 现从 canonical 树派生，B2）。约束：只能 flat-additive 增字段，
+# 不改名/不删。
 DURABLE_EVENT_FIELDS: "dict[str, frozenset[str]]" = {
     "session_start": frozenset({"model", "cwd", "permission_mode", "is_sub_agent", "workspace_trusted"}),
     "user_message": frozenset({"text"}),
@@ -53,8 +49,8 @@ DURABLE_EVENT_FIELDS: "dict[str, frozenset[str]]" = {
     "session_end": frozenset({"input_tokens", "output_tokens", "turns"}),
 }
 
-# 仅 UI、不落 wire 的 RuntimeEvent type。流式文本/思考的 UI 经 ephemeral assistant_block /
-# assistant_thinking 逐 block 渲染（durable 记录是整段 assistant_message，本身**不**做 UI 投影，
+# 仅 UI 的 RuntimeEvent type（无树持久化等价物）。流式文本/思考的 UI 经 ephemeral assistant_block /
+# assistant_thinking 逐 block 渲染（持久记录是整段 assistant_message，本身**不**做 UI 投影，
 # 既避免重复渲染、又保留 Anthropic 的逐 block 流式）。tool_call / tool_result 是 durable type
 # （同名 sink 方法是其 UI 投影）。
 EPHEMERAL_UI_TYPES = frozenset({
@@ -65,7 +61,7 @@ EPHEMERAL_UI_TYPES = frozenset({
 
 
 def is_durable(event_type: str) -> bool:
-    """该 type 是否应被持久化到 wire.jsonl。"""
+    """该 type 是否属 durable 分类（持久化等价物落 canonical 树；wire 已退役）。"""
     return event_type in DURABLE_TYPES
 
 
@@ -119,30 +115,25 @@ def project(event: RuntimeEvent, sink) -> None:
     # 其余 durable type 无 UI 投影 → no-op。
 
 
-def dispatch_event(event: RuntimeEvent, tracer, sink) -> None:
-    """fan-out 一条 RuntimeEvent：durable → tracer.emit（写 wire），always → UI projection。
+def dispatch_event(event: RuntimeEvent, sink) -> None:
+    """fan-out 一条 RuntimeEvent：UI projection（durable 持久化已迁出本流——见 Agent._tree_event/
+    _tree_record 落 canonical 树；wire/Tracer 已退役）。
 
-    tracer/sink 由调用方在**调用时**提供（Agent 传 live self.tracer / self._sink，避免缓存
-    过期——adopt() 可能把 _sink 包成 TeeSink）。Agent._dispatch_event 与 EventDispatcher 共用本函数。
+    sink 由调用方在**调用时**提供（Agent 传 live self._sink，避免缓存过期——adopt() 可能把 _sink
+    包成 TeeSink）。Agent._dispatch_event 与 EventDispatcher 共用本函数。
     """
-    if is_durable(event.type):
-        tracer.emit(event.type, **event.fields)
     project(event, sink)
 
 
 class EventDispatcher:
-    """单一 RuntimeEvent 流的 fan-out：durable → Tracer（写 wire），always → UI projection。
+    """单一 RuntimeEvent 流的 fan-out：UI projection（经 project() 调 EventSink）。
 
-    过渡期 durable sink **复用现有 Tracer.emit**（byte-identical，不另造 wire 逻辑）；UI 经
-    project() 调 EventSink。后续可再挂 Buffer capture / RuntimeThread.events() / 协议 notification
-    等订阅者——它们都只是同一条流的投影，互不调用。
-
-    Step 1 不接 live path（backends 仍直接双发）；本类先存在 + 被 parity 测试 exercise。
+    后续可再挂 Buffer capture / RuntimeThread.events() / 协议 notification 等订阅者——它们都只是
+    同一条流的投影，互不调用。durable 持久化不在本流（已迁至 canonical 树）。
     """
 
-    def __init__(self, tracer, sink) -> None:
-        self._tracer = tracer   # durable sink（现有 Tracer；emit(type, **fields) 写 wire）
+    def __init__(self, sink) -> None:
         self._sink = sink       # UI EventSink
 
     def dispatch(self, event: RuntimeEvent) -> None:
-        dispatch_event(event, self._tracer, self._sink)
+        dispatch_event(event, self._sink)

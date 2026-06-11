@@ -21,13 +21,10 @@ from ..ui import print_welcome, print_error, print_info, print_plan_for_approval
 from ..session import get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
-from ..trace import (
-    is_enabled as _trace_is_enabled,
-    trace_file as _trace_file,
+from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
     trajectory_level as _trajectory_level,
 )
-from .trace_cmd import run as _run_trace_cmd
 from .trajectory_cmd import run as _run_trajectory_cmd
 from .sessions_cmd import run as _run_sessions_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
@@ -39,7 +36,7 @@ from .host import RuntimeHost
 from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
-_SUBCOMMANDS = {"trace": _run_trace_cmd, "trajectory": _run_trajectory_cmd, "sessions": _run_sessions_cmd}
+_SUBCOMMANDS = {"trajectory": _run_trajectory_cmd, "sessions": _run_sessions_cmd}
 
 
 # REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
@@ -375,10 +372,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
-    parser.add_argument("--trace", action="store_true",
-                        help="Record agent trajectory to ./.nanocode/traces/<session>.jsonl")
     parser.add_argument("--trajectory", action="store_true",
-                        help="Project the always-on wire into a trajectory (analysis/RL lane)")
+                        help="Project the canonical session tree into a trajectory (analysis/RL lane)")
     parser.add_argument("--trajectory-level", choices=["summary", "full"], default=None,
                         help="summary (default): drop heavy payloads, keep hash+summary; "
                              "full: keep full prompts/messages/tool results (may contain secrets)")
@@ -662,8 +657,7 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
-  --trace             Debug lane: record agent trace to ./.nanocode/traces/<session>.jsonl
-  --trajectory        Project the always-on wire into a trajectory (analysis/RL lane)
+  --trajectory        Project the canonical session tree into a trajectory (analysis/RL lane)
   --trajectory-level {summary,full}
                       summary (default): drop heavy payloads, keep hash + summary.
                       full: keep full prompts/messages/tool results — may contain secrets.
@@ -685,11 +679,7 @@ Examples:
   nanocode --resume
   nanocode  # starts interactive REPL
 
-  nanocode trace                 # list recorded trace sessions
-  nanocode trace <id>            # print a session timeline (--full to expand)
-  nanocode trace <id> --summary  # aggregate stats for a session
-
-  nanocode trajectory             # list wire sessions available as trajectories
+  nanocode trajectory             # list sessions available as trajectories
   nanocode trajectory show <id>   # per-step table + metrics summary for a session
   nanocode trajectory export <id> # export a session as a trajectory bundle (--out DIR)
 """)
@@ -760,7 +750,7 @@ Examples:
     from ..memory import select_backend
     mem_backend = select_backend(args.memory_backend, on_warning=print_info)
 
-    # trajectory 采集（DERIVED 投影 / RL 分析专用，与 --trace debug lane 区分）：
+    # trajectory 采集（canonical 树的 DERIVED 投影 / RL 分析专用）：
     # 显式 flag 或 NANOCODE_TRAJECTORY 环境变量开启；level 非法/缺省退回 "summary"。
     traj_on = _trajectory_enabled(args.trajectory)
     traj_lvl = _trajectory_level(args.trajectory_level)
@@ -776,16 +766,12 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
-        trace_enabled=_trace_is_enabled(args.trace),
         trajectory_enabled=traj_on,
         trajectory_level=traj_lvl,
         workspace_trusted=workspace_trusted,
         session_id=adopt_sid,
         memory_backend=mem_backend,
     ).build_agent()
-
-    if _trace_is_enabled(args.trace):
-        print_info(f"tracing → {_trace_file(agent.session_id)}")
 
     if traj_on:
         if traj_lvl == "full":
@@ -824,15 +810,7 @@ Examples:
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
-    def _finish_trace() -> None:
-        try:
-            agent.tracer.emit("session_end",
-                              input_tokens=agent.total_input_tokens,
-                              output_tokens=agent.total_output_tokens,
-                              turns=agent.current_turns)
-            agent.tracer.close()
-        except Exception:
-            pass
+    def _finish_session() -> None:
         try:
             cleanup_persist_sandbox(agent.session_id)
         except Exception:
@@ -859,13 +837,13 @@ Examples:
                 _lease.close()                 # 释放会话写锁（一次性模式结束）
             except Exception:
                 pass
-            _finish_trace()
+            _finish_session()
     else:
         # Interactive REPL
         try:
             asyncio.run(run_repl(agent, _lease))
         finally:
-            _finish_trace()                    # run_repl 退出时已 release 当前 thread 的 lease
+            _finish_session()                  # run_repl 退出时已 release 当前 thread 的 lease
 
 
 if __name__ == "__main__":

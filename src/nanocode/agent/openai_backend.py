@@ -98,11 +98,6 @@ class OpenAIBackendMixin:
             # S2（docs/13）：从 canonical 树渲染本轮请求（含 S1 消息 + P5 注入 custom_message），
             # 覆盖扁平列表——树是会话事实源，扁平列表降为本轮投影。
             self._openai_messages = self._build_request_messages()
-            self.tracer.emit(
-                "llm_request", model=self.model,
-                message_count=len(self._openai_messages),
-                messages=self._openai_messages,
-            )
             self._tree_event(_tree.LLM_REQUEST, model=self.model,    # B1：llm_request sizing 落树
                              messageCount=len(self._openai_messages),
                              messagesChars=len(json.dumps(self._openai_messages, default=str)))
@@ -142,12 +137,6 @@ class OpenAIBackendMixin:
                     for tc in _tcs
                 ],
             )
-            _usage = response.get("usage") or {}
-            self.tracer.emit(
-                "llm_response",
-                input_tokens=_usage.get("prompt_tokens", 0),
-                output_tokens=_usage.get("completion_tokens", 0),
-            )
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
@@ -159,7 +148,6 @@ class OpenAIBackendMixin:
             budget = self._check_budget()
             if budget["exceeded"]:
                 self._sink.info(f"Budget exceeded: {budget['reason']}")
-                self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 self._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
                 break
 

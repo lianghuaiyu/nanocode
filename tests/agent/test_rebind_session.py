@@ -11,7 +11,7 @@ from nanocode.session import v2 as _session_v2
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 # 受 rebind 复位的 session 维度字段（drift guard 比对 fresh-vs-rebound）
@@ -42,9 +42,7 @@ def test_rebind_swaps_all_session_keyed_state():
     a = _agent("OLD")
     a._session_mgr = SessionManager.create("OLD")
     a._session_mgr.append_message(T.user_message("old-conversation"))
-    old_tracer = a.tracer
     old_tm = a.task_manager
-    old_wire = _session_v2.agent_wire_path("OLD", "main")
     # 脏化 working set + 计数，证明 rebind 复位
     a._confirmed_paths.add("/secret"); a._sent_skill_names.add("foo")
     a._files_read.add("/x"); a._read_file_state["/x"] = 1.0
@@ -62,7 +60,6 @@ def test_rebind_swaps_all_session_keyed_state():
     assert a.session_id == "NEW"
     assert os.environ["NANOCODE_SESSION_ID"] == "NEW"
     assert a._session_mgr.session_id == "NEW"
-    assert a.tracer is not old_tracer and a.tracer.session_id == "NEW"
     assert a.task_manager is not old_tm                      # fresh task_manager
     # 计数 + working set 全复位（permission_mode 复位到 baseline、非 falsy）
     for k, v in _working_set(a).items():
@@ -73,19 +70,17 @@ def test_rebind_swaps_all_session_keyed_state():
     # 消息从新树重载
     live = str(a._anthropic_messages)
     assert "new-conversation" in live and "old-conversation" not in live
-    # 旧 session 被 finalize：旧 wire 写了 session_end，且旧树未被破坏
-    assert old_wire.exists() and "session_end" in old_wire.read_text()
+    # 旧 session 树未被破坏（docs/14 Milestone B：Tracer/wire 已退役，不再断言旧 wire session_end）
     assert any(e.type == T.MESSAGE for e in SessionManager.open("OLD").entries())
 
 
 def test_rebind_to_same_session_is_noop():
     a = _agent("SAME")
     a._session_mgr = SessionManager.create("SAME")
-    old_tracer = a.tracer
     a.total_input_tokens = 42
     a.rebind_session(a._session_mgr)                         # 同一 mgr/sid → no-op
-    assert a.tracer is old_tracer                            # 未 finalize/重建
-    assert a.total_input_tokens == 42                        # 未复位
+    assert a.session_id == "SAME"                            # 未切换
+    assert a.total_input_tokens == 42                        # 未复位（no-op 不 finalize/rebuild）
 
 
 def test_rebind_rejected_for_sub_agent():
@@ -112,7 +107,7 @@ def test_rebind_drift_guard_matches_fresh_agent():
 def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
     # 启动即 --plan 的 agent（baseline=plan）：rebind 后新 session 仍 plan，但 plan 文件/提示重指新 sid，
     # 旧 sid 路径不泄漏（修复 P2 review 的 HIGH：plan prompt/path 跨会话泄漏）。
-    a = Agent(api_key="test", trace_enabled=False, session_id="POLD", permission_mode="plan")
+    a = Agent(api_key="test", session_id="POLD", permission_mode="plan")
     a._session_mgr = SessionManager.create("POLD")
     old_plan_path = a._plan_file_path
     assert old_plan_path and "POLD" in old_plan_path and "POLD" in a._system_prompt
@@ -125,7 +120,7 @@ def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
 
 def test_rebind_from_toggled_plan_reverts_to_base_mode():
     # 运行中 toggle 进 plan（baseline=default）：rebind 后回到 default、_system_prompt 复位为 base。
-    a = Agent(api_key="test", trace_enabled=False, session_id="TOG", permission_mode="default")
+    a = Agent(api_key="test", session_id="TOG", permission_mode="default")
     a._session_mgr = SessionManager.create("TOG")
     a.toggle_plan_mode()
     assert a.permission_mode == "plan"

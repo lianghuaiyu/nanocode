@@ -48,7 +48,7 @@ def test_compacted_session_resumes_summary_from_tree():
     m.append_message(tree.assistant_message([tree.text_block("answer")], provider="anthropic",
                      api="anthropic", model="claude-x", stop_reason="stop"))
     m.close()
-    b = Agent(api_key="test", trace_enabled=False, session_id="cr1", permission_mode="bypassPermissions")
+    b = Agent(api_key="test", session_id="cr1", permission_mode="bypassPermissions")
     b.model = "claude-x"
     b._session_mgr = SessionLease.open_or_create("cr1").manager
     _load_from_manager(b)
@@ -72,7 +72,7 @@ def test_last_user_message_id_picks_last_user_not_leaf():
 def test_engine_compaction_auto_cut_point_is_last_user_when_leaf(monkeypatch):
     # auto-compact 触发于刚记完 user 消息（leaf == 该 user）→ firstKeptEntryId = 该 user（保留它）。
     import asyncio
-    a = Agent(api_key="test", trace_enabled=False, session_id="s4auto", permission_mode="bypassPermissions")
+    a = Agent(api_key="test", session_id="s4auto", permission_mode="bypassPermissions")
     a.model = "claude-x"
     mgr = SessionManager.create("s4auto")
     a._session_mgr = mgr
@@ -90,7 +90,7 @@ def test_engine_compaction_manual_cut_point_none_when_leaf_is_assistant(monkeypa
     # manual /compact 在 turn 间（leaf = assistant）→ firstKeptEntryId = None（旧消息全被 summary 顶替，
     # 与 backend 行为一致：末条非 user 时 summary 后不留旧消息，docs/14 P3 review #5）。
     import asyncio
-    a = Agent(api_key="test", trace_enabled=False, session_id="s4man", permission_mode="bypassPermissions")
+    a = Agent(api_key="test", session_id="s4man", permission_mode="bypassPermissions")
     a.model = "claude-x"
     mgr = SessionManager.create("s4man")
     a._session_mgr = mgr

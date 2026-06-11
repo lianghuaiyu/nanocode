@@ -12,7 +12,7 @@ from nanocode.entrypoints.cli import _load_from_manager
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 def test_latest_resolves_canonical_session_for_resume():

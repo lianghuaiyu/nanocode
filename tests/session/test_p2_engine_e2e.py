@@ -30,7 +30,7 @@ class _FakeResp:
 
 
 def _agent(sid):
-    a = Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
     a._mcp_initialized = True  # 跳过 MCP
     a.model = "claude-x"
     return a

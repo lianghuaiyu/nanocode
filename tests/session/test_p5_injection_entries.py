@@ -10,7 +10,7 @@ ANTH = ModelCtx("anthropic", "anthropic", "claude-x")
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 def test_tree_custom_message_folds_and_merges_into_user():

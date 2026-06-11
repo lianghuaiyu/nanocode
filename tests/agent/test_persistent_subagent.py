@@ -16,7 +16,7 @@ from nanocode.session import v2 as _session_v2
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False,
+    return Agent(api_key="test",
                  permission_mode="bypassPermissions", session_id="psid", **kw)
 
 
@@ -243,7 +243,7 @@ def test_current_provider_anthropic():
 
 
 def test_current_provider_openai():
-    parent = Agent(api_key="test", trace_enabled=False,
+    parent = Agent(api_key="test",
                    permission_mode="bypassPermissions",
                    api_base="https://example.com/v1", session_id="osid")
     assert parent._current_provider() == "openai"

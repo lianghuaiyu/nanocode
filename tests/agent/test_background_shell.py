@@ -3,7 +3,7 @@ from nanocode.agent.engine import Agent
 
 
 def _agent():
-    return Agent(api_key="test", trace_enabled=False, permission_mode="bypassPermissions")
+    return Agent(api_key="test", permission_mode="bypassPermissions")
 
 
 def test_agent_has_task_manager():
@@ -13,7 +13,7 @@ def test_agent_has_task_manager():
 
 def test_subagent_shares_parent_task_manager():
     parent = _agent()
-    child = Agent(api_key="test", trace_enabled=False, is_sub_agent=True,
+    child = Agent(api_key="test", is_sub_agent=True,
                   task_manager=parent.task_manager)
     assert child.task_manager is parent.task_manager
 

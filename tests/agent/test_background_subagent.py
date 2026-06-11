@@ -18,7 +18,7 @@ from nanocode.tools import tool_definitions, tasks_tool
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="bgsid", **kw)
+    return Agent(api_key="test", session_id="bgsid", **kw)
 
 
 def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):

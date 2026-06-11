@@ -17,7 +17,7 @@ from nanocode.session import v2 as _session_v2
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="p3sid", **kw)
+    return Agent(api_key="test", session_id="p3sid", **kw)
 
 
 # ─── host-derived file tracking ─────────────────────────────

@@ -21,7 +21,6 @@ def make_leased_agent(session_id: str, **agent_kw):
     返回 (agent, mgr)。默认 bypassPermissions + trace 关，便于纯逻辑用例。"""
     from nanocode.agent.engine import Agent
     agent_kw.setdefault("api_key", "test")
-    agent_kw.setdefault("trace_enabled", False)
     agent_kw.setdefault("permission_mode", "bypassPermissions")
     a = Agent(session_id=session_id, **agent_kw)
     mgr = leased_manager(session_id)

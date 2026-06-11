@@ -49,7 +49,6 @@ from ..skills.discovery import (
 )
 from ..subagents import get_sub_agent_config
 from ..mcp import McpManager
-from ..trace import Tracer, JsonlSink, build_default_sinks, is_enabled as _trace_is_enabled
 from ..tasks.manager import TaskManager
 from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
@@ -112,8 +111,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         custom_system_prompt: str | None = None,
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
-        trace_enabled: bool = False,
-        trace_parent=None,
         trajectory_enabled: bool = False,
         trajectory_level: str = "summary",
         workspace_trusted: bool = True,
@@ -167,7 +164,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.workspace_trusted = workspace_trusted
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = session_id or uuid.uuid4().hex[:8]
-        # artifact_id：本 agent 全部产物（messages/meta/prompt/result/wire）的目录键。
+        # artifact_id：本 agent 全部产物（messages/meta/prompt/result）的目录键。
         # 主 agent 默认 "main"；子 agent 由 _build_sub_agent 传入其 SubAgentRecord id。
         self.artifact_id = artifact_id or "main"
         # docs/13 cutover S1：主 agent 持一个 SessionManager，每条消息在 message-end 写进
@@ -181,19 +178,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._child_parent_session = None
         if not self.is_sub_agent:
             os.environ["NANOCODE_SESSION_ID"] = self.session_id
-        # trajectory 采集开关（docs/10）：在 _build_tracer 之前置好，供 Tracer 派生 trajectory_id。
-        # DERIVED 投影的 wire 整形开关；关闭/FULL 时 payload byte-identical。
+        # trajectory 采集开关（docs/10）：plain attrs，gate `nanocode trajectory export`（从 canonical
+        # 树派生，B2）。子 agent 经 _build_sub_agent 继承这两个开关。
         self.trajectory_enabled = trajectory_enabled
         self.trajectory_level = trajectory_level
-        # 保存 trace 开关原值：rebind_session（docs/14 P2）切 session 时要用同样的 debug-trace
-        # 设置重建 tracer（_build_tracer 内仍按 _trace_is_enabled 复核 flag|env）。
-        self._trace_enabled = trace_enabled
-        self.tracer = self._build_tracer(trace_enabled=trace_enabled, trace_parent=trace_parent)
-        self.tracer.emit(
-            "session_start", model=self.model, cwd=str(Path.cwd()),
-            permission_mode=self.permission_mode, is_sub_agent=self.is_sub_agent,
-            workspace_trusted=self.workspace_trusted,
-        )
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         self.total_input_tokens = 0
@@ -291,54 +279,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
 
-    def _build_tracer(self, *, trace_enabled: bool, trace_parent):
-        """构造本 agent 的 Tracer：始终带一个 always-on 的 per-agent wire sink，
-        外加可选的 debug 轨迹 sink（--trace / NANOCODE_TRACE，或父携带的 debug sink）。
-
-        - wire sink 永远独立：写 agent_dir(session, artifact_id)/wire.jsonl，绝不与父
-          复用（否则所有子 agent 事件会并进父文件）。
-        - debug sink：子继承父的 _debug_sinks（父若开了 debug trace，子共写
-          ./.nanocode/traces/<parent_sid>.jsonl）；但 wire sink 是各自独立的。
-        - parent_session_id：子 agent = 父 session_id；主 agent = NANOCODE_TRACE_PARENT env。
-        - 失败保护：JsonlSink 已对 I/O 故障自禁用；wire 路径解析若抛错也吞掉、退化为无 wire
-          sink，绝不让 __init__ 失败。
-        """
-        # 1) per-agent wire sink（always-on，独立文件）
-        sinks: list = []
-        start_seq = 0
-        try:
-            wire_path = _session_v2.agent_wire_path(self.session_id, self.artifact_id)
-            # resume-safe：从既有 wire tail 续 seq，避免 evt_{agent_id}_{seq} 跨运行碰撞。
-            from ..events.reader import next_seq_from_wire
-            start_seq = next_seq_from_wire(wire_path)
-            sinks.append(JsonlSink(wire_path))
-        except Exception:
-            pass  # 仪表化绝不影响 agent 启动
-
-        # 2) 可选 debug sink
-        debug_sinks: list = []
-        if trace_parent is not None:
-            # 子 agent：继承父的 debug sink（若有），不继承父的 wire sink。
-            debug_sinks = list(getattr(trace_parent, "_debug_sinks", []) or [])
-            parent_session_id = trace_parent.session_id
-        else:
-            # 主 agent：trace_enabled 或 NANOCODE_TRACE 开启时附加 ./.nanocode/traces sink。
-            if _trace_is_enabled(trace_enabled):
-                try:
-                    debug_sinks = list(build_default_sinks(self.session_id))
-                except Exception:
-                    debug_sinks = []
-            parent_session_id = os.environ.get("NANOCODE_TRACE_PARENT", "").strip() or None
-
-        tracer = Tracer(self.session_id, [*sinks, *debug_sinks],
-                        parent_session_id=parent_session_id,
-                        agent_id=self.artifact_id, start_seq=start_seq,
-                        trajectory_enabled=self.trajectory_enabled,
-                        trajectory_level=self.trajectory_level)
-        # 标记 debug sink，供子 agent 继承（区别于 per-agent wire sink）。
-        tracer._debug_sinks = debug_sinks
-        return tracer
-
     def _resolve_thinking_mode(self) -> str:
         if not self.thinking:
             return "disabled"
@@ -429,8 +369,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
         self._aborted = False
         self._ensure_session_lease()  # 确保持有会话写者租约（runtime 已注入则 no-op；headless/直接构造则自取）
-        self.tracer.begin_turn()  # 一次用户输入 = 一个 turn；后续事件携带该 turn_id
-        self.tracer.emit("user_message", text=user_message)
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.current_task()
         try:
@@ -439,10 +377,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._aborted = True
         finally:
             self._current_task = None
-        self.tracer.emit(
-            "turn_end", input_tokens=self.total_input_tokens,
-            output_tokens=self.total_output_tokens, turns=self.current_turns,
-        )
         # docs/14 Milestone B：把 turn-end 累计遥测落进树（trajectory 的 total_turns + 终态 step 从此派生）。
         self._tree_event(_tree.TURN_END, inputTokens=self.total_input_tokens,
                          outputTokens=self.total_output_tokens, turns=self.current_turns,
@@ -460,16 +394,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             resetter()
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
-        try:
-            await self.chat(prompt)
-        finally:
-            # always-on wire sink：无论成功/异常/取消都 emit session_end + 关闭句柄，
-            # 否则错误/超时/取消路径会泄漏每个子 agent 的 wire.jsonl 文件句柄。
-            self.tracer.emit(
-                "session_end", input_tokens=self.total_input_tokens,
-                output_tokens=self.total_output_tokens, turns=self.current_turns,
-            )
-            self.tracer.close()
+        await self.chat(prompt)
         return {
             "text": self._captured_text(),
             "tokens": {
@@ -594,15 +519,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     # ─── Runtime replacement：原地重指 session（docs/14 P2）────────────────────────
 
-    def _finalize_tracer(self) -> None:
-        """emit session_end + close 当前 tracer（flush 缓冲、释放 wire.jsonl 句柄）。guarded。"""
-        try:
-            self.tracer.emit("session_end", input_tokens=self.total_input_tokens,
-                             output_tokens=self.total_output_tokens, turns=self.current_turns)
-            self.tracer.close()
-        except Exception:
-            pass
-
     def _reset_working_sets(self) -> None:
         """复位 session 维度的 working set（rebind_session 用——切到新 session 不应继承旧 session 的
         审批白名单 / 读文件状态 / 已播报 skill / 已浮现 memory 等）。plan/permission 态另由
@@ -651,7 +567,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         built = new_mgr.build_context()         # 已由 _switch_via_rebind 校验过；纯内存 fold，无 I/O
         # ── FINALIZE 旧 session（均为低风险/guarded 操作）──
         old_mgr = self._session_mgr
-        self._finalize_tracer()                 # session_end + close（释放旧 wire 句柄）
         self._auto_save()                       # 旧 session 的 v2 state
         if old_mgr is not None and old_mgr is not new_mgr:
             old_mgr.close()                     # 释放旧 session 写锁（旧 lease 的底层 mgr）
@@ -666,10 +581,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self.artifact_id = artifact_id
         os.environ["NANOCODE_SESSION_ID"] = new_sid
         self._session_mgr = new_mgr             # runtime lease 持有的已加锁 mgr
-        self.tracer = self._build_tracer(trace_enabled=self._trace_enabled, trace_parent=None)
-        self.tracer.emit("session_start", model=self.model, cwd=str(Path.cwd()),
-                         permission_mode=self.permission_mode, is_sub_agent=False,
-                         workspace_trusted=self.workspace_trusted)
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # task_manager：fresh + load 目标 session 的 state + 非终态标 lost
         self.task_manager = TaskManager()
@@ -744,9 +655,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self._session_mgr.append_message(neutral)
         except Exception as e:
             # tree 写入默认 best-effort（§10#5 接受），但失败必须**可观测**——否则 tree-only resume 会
-            # 静默丢这条消息（docs/14 P3 review #3）。emit 一条 tracer 事件供审计/告警。
+            # 静默丢这条消息（docs/14 P3 review #3）。经 sink.info 记一条（wire/Tracer 已退役）。
             try:
-                self.tracer.emit("tree_record_failed", role=provider_msg.get("role"), error=str(e))
+                self._sink.info(f"[tree] record failed: {e}")
             except Exception:
                 pass
             if required:
@@ -803,7 +714,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
-        before = self._get_message_count()
         tokens_before = self.last_input_token_count
         # bug#1（docs/14 §4.4 + P3 review #5）：kept-tail 起点必须与 backend 实际保留的对齐。
         # backend 仅当末条消息是 user 时才把它接到 summary 之后（_compact_*: last_user_msg.role=='user'），
@@ -832,10 +742,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                         first_kept_entry_id=first_kept)
             except Exception:
                 pass
-        # 保留事件名 compaction（report.py 硬读它），additive 补压缩前后消息数——供 /tree 与审计。
-        # 注：rebuild 经 llm_request 快照 oracle 已忠实反映 post-compaction 状态，无需 supersession 重放。
-        self.tracer.emit("compaction", kind="auto",
-                         message_count_before=before, message_count_after=self._get_message_count())
         self._sink.info("Conversation compacted.")
         self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
@@ -978,8 +884,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # 这是覆盖前台 + 后台 run_shell 的单一咽喉点：run_shell 后台分支在下方先于 meta
         # 拦截返回，若不在此处先判，read-only agent 仍能借 run_in_background 跑 run_shell。
         if self._tool_blocked_by_allowlist(name):
-            self.tracer.emit("tool_blocked", tool=name, reason="not_in_allowlist",
-                             agent_type=self.agent_type, artifact_id=self.artifact_id)
             self._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",
                              agentType=self.agent_type, artifactId=self.artifact_id)
             return f"Error: tool '{name}' is not permitted for this sub-agent."
@@ -1072,8 +976,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # P4 安全基石：skill hook 会以 run_shell 身份跑命令。若本（子）agent 的有效集
         # 不含 run_shell，则它不得借 skill hook 旁路获得 shell——按 allowlist fail-closed。
         if self._tool_blocked_by_allowlist("run_shell"):
-            self.tracer.emit("tool_blocked", tool="run_shell", reason="hook_not_in_allowlist",
-                             agent_type=self.agent_type, artifact_id=self.artifact_id)
             self._tree_event(_tree.TOOL_BLOCKED, tool="run_shell", reason="hook_not_in_allowlist",
                              agentType=self.agent_type, artifactId=self.artifact_id)
             return False, (f"hook command blocked: run_shell is not permitted for this sub-agent "
@@ -1155,7 +1057,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         与 Claude Code / Kimi Code 对齐：
         - 子继承父 permission_mode（硬规则「子不得高于父」，不再无条件 bypass）。
         - 共享父 confirm_fn + _confirmed_paths（确认回流到父，同一引用）。
-        - 共享 session_id + task_manager；trace 父子靠 trace_parent 对象。
+        - 共享 session_id + task_manager。
         - is_sub_agent 工具表强制剔除 agent（子不能 spawn 孙）。
         - max_turns：前台子 agent 传入有界 turn 上限（_check_budget 强制），保证有界。
         - model：可选 per-agent 模型覆盖（manifest 'model'）；None 则继承父 model。
@@ -1184,12 +1086,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             confirmed_paths=confirmed_paths,
             session_id=session_id or self.session_id,
             task_manager=self.task_manager,
-            trace_parent=self.tracer,
-            # 子 agent 继承 trajectory 采集开关；trajectory_id 不显式传，由子 Tracer 从
-            # session_id 派生（traj_<session_id>）。父子共享同一 session_id（上面
-            # session_id=session_id or self.session_id，无调用方传子 session_id），故父子
-            # trajectory_id 必然一致——这是个隐式不变量：若将来给子 agent 独立 session_id，
-            # 需改为显式透传 trajectory_id，否则父子 trajectory_id 会悄悄分叉。
+            # 子 agent 继承 trajectory 采集开关（plain attrs，gate trajectory export）。父子共享同一
+            # session_id（上面 session_id=session_id or self.session_id），故父子 trajectory_id
+            # （traj_<session_id>）必然一致——隐式不变量：若将来给子 agent 独立 session_id，trajectory_id
+            # 会随之分叉，届时需显式透传。
             trajectory_enabled=self.trajectory_enabled,
             trajectory_level=self.trajectory_level,
             max_turns=max_turns,
@@ -1244,8 +1144,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             )
             skill_name = inp.get("skill_name", "")
             fork_prompt = inp.get("args") or "Execute this skill task."
-            # 每次 fork 注册独立 SubAgentRecord → 各自的 artifact_id/dir/wire，
-            # 避免多次 skill-fork 把事件并入同一个 agents/skill-fork/wire.jsonl。
+            # 每次 fork 注册独立 SubAgentRecord → 各自的 artifact_id/dir，
+            # 避免多次 skill-fork 把产物并入同一个 agents/skill-fork/ 目录。
             rec = self.task_manager.create_subagent(
                 type="skill-fork", description=skill_name,
                 model=self.model, provider=self._current_provider(),
@@ -1391,11 +1291,10 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         return agent_result.render_agent_result_envelope(result, raw_text)
 
     def _dispatch_event(self, _type: str, **fields) -> None:
-        """RUNTIME-P1：单流发射。durable → tracer（写 wire），UI → projection（读 live
-        self.tracer / self._sink）。过渡期逐类把 self._sink.* + tracer.emit(...) 收敛到此；
-        wire 与 UI 行为与双发逐字等价（byte-parity gate）。"""
+        """单流发射：UI → projection（读 live self._sink）。durable 持久化已迁出本流——派生遥测经
+        _tree_event/_tree_record 落 canonical 树（Milestone B），wire/Tracer 已退役。"""
         runtime_events.dispatch_event(
-            runtime_events.RuntimeEvent(_type, fields), self.tracer, self._sink)
+            runtime_events.RuntimeEvent(_type, fields), self._sink)
 
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
         """把子 agent 已花费的 token 折叠进父——成功/超时/错误都要折，否则一个跑了很久
@@ -2227,7 +2126,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     async def _authorize_dispatch(self, name: str, inp: dict) -> "tuple[bool, str | None]":
         """两后端派发前共用的授权 + 审批交互（单一入口，de-dup）。返回 ``(allowed, denial)``。
 
-        - 经 ``self.permission.check`` 取 policy 决策并 emit ``permission_decision``；
+        - 经 ``self.permission.check`` 取 policy 决策并写树 ``permission_decision``；
         - ``deny`` → 打印并返回 ``"Action denied: …"``；
         - ``confirm`` → 走 ``_confirm_if_needed``（dedupe + 身份装饰）；拒则返回固定文案。
 
@@ -2235,7 +2134,6 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         拒绝消息 "Error: tool '…' is not permitted" 与 prompt-then-block 行为不变）。
         """
         d = self.permission.check(name, inp)
-        self.tracer.emit("permission_decision", tool=name, action=d.action, message=d.message)
         self._tree_event(_tree.PERMISSION_DECISION, tool=name, action=d.action, message=d.message)
         if d.action == "deny":
             self._sink.info(f"Denied: {d.message}")

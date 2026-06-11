@@ -18,7 +18,7 @@ from nanocode.session.manager import SessionManager
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="p3sid", **kw)
+    return Agent(api_key="test", session_id="p3sid", **kw)
 
 
 def test_run_turn_delegates_to_chat():

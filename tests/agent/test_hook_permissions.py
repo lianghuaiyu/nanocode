@@ -13,7 +13,7 @@ from nanocode.tools import run_shell, permissions, sandbox_shell
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False, **kw)
+    return Agent(api_key="test", **kw)
 
 
 def _hook(cmd):

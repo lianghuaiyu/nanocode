@@ -16,7 +16,7 @@ from nanocode.tasks.models import TaskRecord, SubAgentRecord
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False,
+    return Agent(api_key="test",
                  permission_mode="bypassPermissions", session_id="rlsid", **kw)
 
 

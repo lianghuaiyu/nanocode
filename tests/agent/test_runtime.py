@@ -15,12 +15,12 @@ from nanocode.agent.sink import TeeSink, BufferSink, TerminalSink
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="p4sid", **kw)
+    return Agent(api_key="test", session_id="p4sid", **kw)
 
 
 def test_agent_config_build_agent_applies_fields():
     cfg = AgentConfig(api_key="test", model="claude-x", permission_mode="bypassPermissions",
-                      max_turns=7, session_id="cfgsid", trace_enabled=False)
+                      max_turns=7, session_id="cfgsid")
     a = cfg.build_agent()
     assert isinstance(a, Agent)
     assert a.model == "claude-x" and a.session_id == "cfgsid"
@@ -30,7 +30,7 @@ def test_agent_config_build_agent_applies_fields():
 
 def test_agent_config_api_base_selects_openai():
     cfg = AgentConfig(api_key="test", api_base="https://x/v1", session_id="cfgoa",
-                      permission_mode="bypassPermissions", trace_enabled=False)
+                      permission_mode="bypassPermissions")
     a = cfg.build_agent()
     assert a.use_openai is True
 
@@ -38,7 +38,7 @@ def test_agent_config_api_base_selects_openai():
 def test_thread_start_builds_and_registers_thread():
     rt = AgentRuntime()
     cfg = AgentConfig(api_key="test", session_id="tsid", permission_mode="bypassPermissions",
-                      trace_enabled=False)
+                      )
     th = rt.thread_start(cfg)
     assert isinstance(th, RuntimeThread)
     assert th.thread_id == "tsid"

@@ -12,7 +12,7 @@ from nanocode.subagents import config
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "default")
-    return Agent(api_key="test", trace_enabled=False, session_id="apsid", **kw)
+    return Agent(api_key="test", session_id="apsid", **kw)
 
 
 def test_subagent_confirm_message_contains_identity():
@@ -94,7 +94,7 @@ def test_decorate_helper_directly():
 def test_confirm_dedupe_key_is_identity_scoped_for_subagents():
     """A sibling sub-agent's prior approval of a raw message must NOT let another
     sub-agent skip its own identity-bearing confirmation (shared _confirmed_paths)."""
-    parent = Agent(api_key="test", trace_enabled=False, permission_mode="bypassPermissions",
+    parent = Agent(api_key="test", permission_mode="bypassPermissions",
                    session_id="dedupe")
     a = parent._build_sub_agent(system_prompt="s", tools=parent.tools,
                                 agent_type="coder", artifact_id="agent-001")
@@ -117,7 +117,7 @@ def test_confirm_if_needed_dedupes_within_agent_but_not_across_siblings():
     prior approval of the SAME raw message must NOT let another sub-agent skip its
     own identity-bearing confirmation. (Reverting to raw-message dedupe fails this.)"""
     shared = set()
-    parent = Agent(api_key="test", trace_enabled=False, permission_mode="default",
+    parent = Agent(api_key="test", permission_mode="default",
                    session_id="apdedupe", confirmed_paths=shared)
     prompts = []
 

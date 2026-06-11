@@ -15,7 +15,7 @@ SID = "evalsid"
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id=SID, **kw)
+    return Agent(api_key="test", session_id=SID, **kw)
 
 
 def _seed_session():

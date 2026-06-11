@@ -10,7 +10,7 @@ from nanocode.session.render import ModelCtx, render
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 TELEMETRY_TYPES = [T.PERMISSION_DECISION, T.TOOL_BLOCKED, T.BUDGET_EXCEEDED,

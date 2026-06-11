@@ -20,7 +20,7 @@ from nanocode.subagents.prompts import MEMORY_CURATOR_TYPE
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="memsid", **kw)
+    return Agent(api_key="test", session_id="memsid", **kw)
 
 
 def _seed_memories():

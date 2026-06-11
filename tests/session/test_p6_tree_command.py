@@ -15,7 +15,7 @@ def _ctx(a):
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 def test_tree_command_prints_entries_and_leaf(capsys):

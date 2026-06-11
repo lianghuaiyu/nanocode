@@ -92,7 +92,7 @@ def test_unknown_action():
 def test_semantic_recall_via_engine_falls_back_without_client(monkeypatch):
     # engine 拦截语义档；无可用 side_query 时回退关键词档
     from nanocode.agent.engine import Agent
-    a = Agent(api_key="test", trace_enabled=False, permission_mode="bypassPermissions")
+    a = Agent(api_key="test", permission_mode="bypassPermissions")
     mt.run({"action": "save", "name": "semantic mem", "type": "project",
             "description": "vector stuff", "content": "embeddings here"})
     # 强制 side_query 为 None → 回退关键词
@@ -104,7 +104,7 @@ def test_semantic_recall_via_engine_falls_back_without_client(monkeypatch):
 def test_semantic_recall_falls_back_to_keyword_on_empty_llm(monkeypatch):
     # 语义档 LLM 返回空（故障或无选中）→ 回退关键词档而非静默返回空
     from nanocode.agent.engine import Agent
-    a = Agent(api_key="test", trace_enabled=False, permission_mode="bypassPermissions")
+    a = Agent(api_key="test", permission_mode="bypassPermissions")
     mt.run({"action": "save", "name": "kafka note", "type": "project",
             "description": "use kafka for events", "content": "kafka topic config"})
 

@@ -490,26 +490,6 @@ async def _parent(ctx: CommandContext, args: str) -> "Control | Local":
     return Control("resume", {"sessionId": ps["sessionId"]})
 
 
-async def _trace(ctx: CommandContext, args: str) -> Local:
-    """`/trace ...` —— 复用 entrypoints.trace_cmd.run（CMD-P2）。
-
-    隔离两类会杀掉 REPL 的异常：shlex 的引号 ValueError，和 argparse 对 -h / 坏参 raise 的
-    SystemExit。trace_cmd.run 是同步的、输出直达 console，故无 await、无字符串捕获。
-    """
-    import shlex
-    from ..trace_cmd import run as run_trace
-    try:
-        argv = shlex.split(args)
-    except ValueError as e:
-        print_error(f"trace: {e}")
-        return Local()
-    try:
-        run_trace(argv)
-    except SystemExit:
-        pass  # -h / 坏参 → SystemExit；吞掉，绝不终止 REPL 进程
-    return Local()
-
-
 async def _help(ctx: CommandContext, args: str) -> Local:
     """列出 REPL 命令（与补全 / --help 共用同一 registry 来源，CMD-P1）。"""
     print_info("REPL commands:")
@@ -561,8 +541,6 @@ _BUILTINS = [
     ("/fork", _fork, "exact_or_prefix", "Fork before a user message into a new session (Pi before-user fork)", "[entry_id]"),
     ("/name", _name, "exact_or_prefix", "Show or set this session's name (/name <text> | --clear)", "[text]"),
     ("/resume", _resume, "exact_or_prefix", "List resumable sessions, or /resume <id> to switch mid-REPL", "[id]"),
-    ("/trace", _trace, "exact_or_prefix",
-     "View/summarize recorded agent traces", "[<id>] [--summary|--wire|--tree|--full]"),
     ("/help", _help, "exact", "List REPL commands", ""),
 ]
 

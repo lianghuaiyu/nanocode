@@ -159,10 +159,20 @@ def _sandbox_name_for(p: dict) -> str:
     return f"nanocode-sbx-{_session_id_of(p)}"
 
 
+def _trace_dir() -> Path:
+    """宿主侧沙箱轨迹根目录（NANOCODE_TRACE_DIR 覆盖，否则 ./.nanocode/traces/）。
+
+    sandbox 的 `/trace` bind-mount 让 in-sandbox 的嵌套 agent 把自己的轨迹写回宿主——这是独立于
+    runtime wire/Tracer（已退役）的沙箱产物落点。本地内联，避免依赖已删的 trace 包。"""
+    override = os.environ.get("NANOCODE_TRACE_DIR", "").strip()
+    d = Path(override) if override else (Path.cwd() / ".nanocode" / "traces")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _trace_host_dir_for(p: dict, trace_tag: str) -> str:
     """宿主侧沙箱子轨迹目录的绝对路径（不创建，仅计算）。session_id 来自 p。"""
-    from ..trace.config import trace_dir
-    return str(trace_dir() / _session_id_of(p) / "sandbox" / trace_tag)
+    return str(_trace_dir() / _session_id_of(p) / "sandbox" / trace_tag)
 
 
 # ─── 参数合并：显式 > 会话默认 > 内置默认 ───
@@ -206,9 +216,8 @@ def _validate_command(p: dict) -> None:
 
 def _trace_host_dir(trace_tag: str) -> str:
     """宿主侧沙箱子轨迹目录的绝对路径（不创建，仅计算）。无参兼容版：session_id 取 env。"""
-    from ..trace.config import trace_dir
     sid = os.environ.get("NANOCODE_SESSION_ID", "default")
-    return str(trace_dir() / sid / "sandbox" / trace_tag)
+    return str(_trace_dir() / sid / "sandbox" / trace_tag)
 
 
 def _common_resource_flags(p: dict) -> list[str]:

@@ -31,7 +31,7 @@ def test_auto_save_no_longer_writes_legacy_flat_snapshot():
     from nanocode.agent.engine import Agent
     from nanocode.session import tree as T
     from nanocode.paths import sessions_dir
-    a = Agent(api_key="test", trace_enabled=False, session_id="NOFLAT", permission_mode="bypassPermissions")
+    a = Agent(api_key="test", session_id="NOFLAT", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.create("NOFLAT")
     a._session_mgr.append_message(T.user_message("hi"))
     a._auto_save()

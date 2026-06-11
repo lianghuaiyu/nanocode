@@ -13,7 +13,7 @@ from nanocode.session.manager import SessionManager, children
 
 
 def _agent(sid, **kw):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions", **kw)
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions", **kw)
 
 
 def _ctx(a):

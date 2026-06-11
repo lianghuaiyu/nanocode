@@ -7,7 +7,7 @@ from nanocode.entrypoints.host import RuntimeHost
 
 
 def _agent(sid):
-    return Agent(api_key="test", trace_enabled=False, session_id=sid, permission_mode="bypassPermissions")
+    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
 
 
 def _host(sid="h"):

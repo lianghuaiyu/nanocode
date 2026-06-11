@@ -13,7 +13,7 @@ from nanocode.skills.listing import append_to_last_user
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", trace_enabled=False, session_id="char", **kw)
+    return Agent(api_key="test", session_id="char", **kw)
 
 
 # ─── append_to_last_user：3 个注入共用/重实现的 helper（最高价值 pin） ──────────

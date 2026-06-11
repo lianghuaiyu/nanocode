@@ -3,7 +3,7 @@ from nanocode.agent.engine import Agent
 
 
 def _agent():
-    return Agent(api_key="test", trace_enabled=False)
+    return Agent(api_key="test")
 
 
 def test_inject_listing_then_silent(tmp_path, monkeypatch):
@@ -25,7 +25,7 @@ def test_inject_listing_then_silent(tmp_path, monkeypatch):
 
 def test_inject_listing_skipped_for_subagent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    a = Agent(api_key="test", trace_enabled=False, is_sub_agent=True)
+    a = Agent(api_key="test", is_sub_agent=True)
     msgs = [{"role": "user", "content": "hi"}]
     a._inject_skill_listing(msgs)
     assert msgs == [{"role": "user", "content": "hi"}]

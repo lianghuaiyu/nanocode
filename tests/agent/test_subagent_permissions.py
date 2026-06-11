@@ -14,7 +14,7 @@ from nanocode.tools import tool_definitions, check_permission
 
 
 def _agent(**kw):
-    return Agent(api_key="test", trace_enabled=False, **kw)
+    return Agent(api_key="test", **kw)
 
 
 # ─── 权限模式继承（不再 bypass） ─────────────────────────────

@@ -119,11 +119,6 @@ class AnthropicBackendMixin:
             # S2（docs/13）：从 canonical 树渲染本轮请求（含 S1 消息 + P5 注入 custom_message），
             # 覆盖扁平列表——树是会话事实源，扁平列表降为本轮投影。
             self._anthropic_messages = self._build_request_messages()
-            self.tracer.emit(
-                "llm_request", model=self.model,
-                message_count=len(self._anthropic_messages),
-                messages=self._anthropic_messages,
-            )
             # docs/14 Milestone B：把 llm_request sizing 落树（messagesChars 是渲染后大小，事后不可重建，
             # 必须 emit-time 捕获——trajectory 的 observation summary 从此派生）。
             import json as _json
@@ -163,11 +158,6 @@ class AnthropicBackendMixin:
                     for b in response.content if b.type == "tool_use"
                 ],
             )
-            self.tracer.emit(
-                "llm_response",
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-            )
 
             if not tool_uses:
                 if not self.is_sub_agent:
@@ -178,7 +168,6 @@ class AnthropicBackendMixin:
             budget = self._check_budget()
             if budget["exceeded"]:
                 self._sink.info(f"Budget exceeded: {budget['reason']}")
-                self.tracer.emit("budget_exceeded", reason=budget["reason"])
                 self._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
                 break
 
