@@ -46,24 +46,6 @@ def test_restore_session_falls_back_to_snapshot_when_no_events():
     assert a._anthropic_messages == [{"role": "user", "content": "snap-fallback"}]
 
 
-def test_runtime_fork_to_creates_isolated_branch():
-    sid = "p5fk"
-    _seed_wire(sid, [
-        ("user_message", {"text": "base"}),
-        ("llm_request", {"model": "m", "messages": [{"role": "user", "content": "base"}]}),  # evt_main_1 fork pt
-        ("assistant_message", {"text": "bp", "tool_uses": []}),
-    ])
-    a = _agent(sid)
-    th = AgentRuntime().adopt(a)
-    ctx = th.fork_to("evt_main_1", "experiment")
-    # fork 上下文 = fork 点重建（base）
-    assert ctx == [{"role": "user", "content": "base"}]
-    # tracer 切到新分支，后续 emit 带 branch_id=experiment + 首事件 parent_event_id=fork 点
-    a.tracer.emit("user_message", text="on-branch")
-    evs = reader.read_agent_wire(_v2.agent_wire_path(sid, "main"), "main")
-    branch_evs = [e for e in evs if e.branch_id == "experiment"]
-    assert branch_evs and branch_evs[0].parent_event_id == "evt_main_1"
-
 
 def test_tree_render_shows_branches_and_fork_points():
     sid = "p5tree"
@@ -82,26 +64,6 @@ def test_tree_render_shows_branches_and_fork_points():
     assert "forked from evt_main_1" in out
     assert "root q" in out and "branch q" in out
 
-
-def test_fork_to_invalid_event_raises_and_leaves_session_unchanged():
-    """Codex P2: fork_to 无效 from_event_id 不得静默清空 live 历史。"""
-    sid = "p5fkbad"
-    _seed_wire(sid, [
-        ("user_message", {"text": "base"}),
-        ("llm_request", {"model": "m", "messages": [{"role": "user", "content": "base"}]}),
-    ])
-    a = _agent(sid)
-    a._append_message({"role": "user", "content": "live"})
-    th = AgentRuntime().adopt(a)
-    before = list(a._anthropic_messages)
-    before_branch = a.tracer.branch_id
-    try:
-        th.fork_to("evt_main_999", "bad")   # 不存在的 event id
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-    assert a._anthropic_messages == before           # live 历史未被清
-    assert a.tracer.branch_id == before_branch        # 未切到无效分支
 
 
 def test_restore_falls_back_to_snapshot_when_rebuild_unfaithful():

@@ -34,7 +34,6 @@ _RUNTIME_SOURCES = (
     _SRC / "agent" / "engine.py",
     _SRC / "agent" / "anthropic_backend.py",
     _SRC / "agent" / "openai_backend.py",
-    _SRC / "agent" / "context_builder.py",
     _SRC / "agent" / "session.py",
     _SRC / "trace" / "tracer.py",
     _SRC / "trace" / "redaction.py",

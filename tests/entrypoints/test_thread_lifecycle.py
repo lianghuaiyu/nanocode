@@ -39,7 +39,7 @@ def test_thread_new_switches_to_empty_session_preserving_old():
     assert any(e.type == T.MESSAGE for e in SessionManager.open("OLD").entries())
 
 
-def test_thread_resume_reloads_target_and_rebinds_context_builder():
+def test_thread_resume_reloads_target_and_rebinds_session():
     a, rt, t, host = _host("CUR")
     a._session_mgr.append_message(T.user_message("current-q"))
     SessionManager.create("TGT").append_message(T.user_message("target-conversation"))
@@ -48,8 +48,8 @@ def test_thread_resume_reloads_target_and_rebinds_context_builder():
     assert a.session_id == "TGT"
     assert "target-conversation" in str(a._anthropic_messages)
     assert "current-q" not in str(a._anthropic_messages)
-    # headline 修复：新 AgentSession 的 context_builder 重绑到新 session（不再 stale 在 CUR）
-    assert host.current_thread.session.context_builder.session_id == "TGT"
+    # docs/14 P2/P7：新 AgentSession 绑新 session（SessionContextBuilder 已退役，不再有 stale 缓存）
+    assert host.current_thread.session.session_id == "TGT"
 
 
 def test_thread_resume_unknown_session_returns_none():

@@ -35,8 +35,6 @@ from ..memory.maintenance import (
     build_eval_curator_message,
 )
 from .sink import EventSink, TerminalSink, BufferSink
-from .context_builder import SessionContextBuilder
-from ..session import save_session
 from ..prompt import build_system_prompt
 from ..skills.listing import (
     skill_listing_delta,
@@ -715,20 +713,8 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
-        try:
-            save_session(self.session_id, {
-                "metadata": {
-                    "id": self.session_id,
-                    "model": self.model,
-                    "cwd": str(Path.cwd()),
-                    "startTime": self.session_start_time,
-                    "messageCount": self._get_message_count(),
-                },
-                "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
-                "openaiMessages": self._openai_messages if self.use_openai else None,
-            })
-        except Exception:
-            pass
+        # docs/14 P7：canonical session.jsonl 树是 resume 权威——不再写 legacy flat <sid>.json 快照
+        # （之前由 store.save_session 写，现冗余）。仍按需落 v2 state.json（TaskManager/subagent 派生 cache）。
         # v2 state: persist when session has forked subagents, background tasks, or is already v2
         # （含 list_tasks：仅有后台 shell 任务、无 subagent 的 session 也要落 state，否则 /resume
         #  回来时丢任务记录——docs/14 P2 review）。
@@ -792,16 +778,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             return flat
 
     def _persist_state(self) -> None:
-        """Write v2 state (tasks + subagents + main messages) to disk."""
+        """Write v2 state (tasks + subagents) to disk —— DERIVED cache（非 resume 权威，docs/14 P7）。
+        canonical 树是会话事实源；这里只落 TaskManager/subagent 生命周期记录供 /resume 重载 + mark-lost。"""
         try:
             state = self.task_manager.to_state()
             state["session_id"] = self.session_id
             state["startTime"] = self.session_start_time
             _session_v2.write_state(self.session_id, state)
-            _session_v2.write_main_messages(
-                self.session_id,
-                self._openai_messages if self.use_openai else self._anthropic_messages,
-            )
         except Exception:
             pass
 

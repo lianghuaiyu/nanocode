@@ -187,10 +187,6 @@ class RuntimeThread:
         self._runtime.unregister(self)
         self._capture = None
 
-    def fork_to(self, from_event_id: str, branch_id: str) -> list:
-        """从某 event 创建新分支并切入（P5 fork）。后续 run() 追加到新分支，不覆盖原分支。"""
-        return self.session.fork_to(from_event_id, branch_id)
-
     def tokens(self) -> dict:
         return self.agent.get_token_usage()
 
