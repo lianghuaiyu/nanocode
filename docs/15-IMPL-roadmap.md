@@ -5,6 +5,67 @@
 
 ## 基线
 - 绿基线: **1240 passed, 4 skipped** (`.venv/bin/python -m pytest -q`, ~21s)。
+
+## 进度记录（2026-06-11,全程自主推进中）
+当前: **1325 passed, 4 skipped, 0 回归**。已提交 12 个 checkpoint（main 分支,显式 staging,无 Co-Authored-By）:
+- `6305103` Phase 0: schemas + 29 契约测试（state/events/packs/ledger/cache_policy/profile/symbols）。
+- `de916ad` Phase 1 STEP B: ProviderAdapter seam（providers.py;两 mixin 委托 self._provider.stream）。
+- `71efd40` Phase 1 STEP C: AgentCore 抽出（core.py + loop.py;删 backend mixin;Agent MRO 收窄）。
+- `58018de` Phase 2 STEP D: AgentSession state↔tree 同步（hydrate_state/record_event/verify_turn_consistency
+  + assistant/toolResult 树写 required=True §7.6）。
+- `f4cc23d` Phase 3 STEP E: ContextRuntime abstraction（providers/runtime/ledger/budgets）。
+- `9641987` Phase 4 §9.3: read_file budget caps（offset/limit/byte+line cap/截断标记）。
+- `c83d387` Phase 5: AgentProfile registry + child≤parent 权限派生（agents/permissions+registry）。
+- `e02bc16` Phase 8: TeamRuntime 骨架 + 预留 team session entry 类型。
+- `79cd35d` Phase 5: capabilities 层（PermissionContext 不可变 + dispatch taxonomy + 单一 allowlist 咽喉点）。
+- `966840f` Phase 6 foundation: typed ResultEnvelope（host-derived files + 有界 render）。
+- `31da199` Phase 3: /context 命令（packs + budget + survival matrix）。
+
+codex 交叉验证: 对 Phase 1（loop 上移）跑了 codex xhigh review,**已确认 cancel/abort poll inventory
+one-to-one 保留**（最高风险 #1 验证通过）;随后 codex runtime 在更广分析上挂起(~25min 无进展),已取消。
+Phase 1 另有自身 characterization 测试(test_providers.py + 全套 e2e via fake provider)作回归网。
+
+### 新架构落地状态（docs/15 §5 目标模块）
+**已建 + 测试**: agent/{state,events,providers,loop,core}.py · session/agent_session.py(promoted) ·
+context/{packs,ledger,cache_policy,budgets,providers,runtime}.py · agents/{profile,registry,permissions,result}.py ·
+capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py · tools/read_file.py(caps)。
+
+### 各 Phase 完成度
+- Phase 0/1/2/8 ✅ 完成。
+- Phase 3 🟡 abstraction + /context 完成;**剩余 cutover**（见下「继续指南」）。
+- Phase 4 🟡 read_file caps 完成;**剩余 tree-sitter repo map**（需加依赖 tree-sitter + grammars）。
+- Phase 5 🟡 typed profile/registry/permission + capabilities(PermissionContext/taxonomy) 完成;
+  **剩余 engine._execute_tool_call 改经 CapabilityRouter 派发**。
+- Phase 6 🟡 ResultEnvelope 完成;**剩余 spawn_child relocation**（engine.py ~1100 行 → runtime/spawn.py）。
+- Phase 7 ⬜ 未开始: CLI as runtime client。
+
+### 继续指南（剩余 = 把旧 engine.py 代码迁入新架构;每步小颗粒 + 测试 + 提交,保持全绿）
+**性质转变**: 已完成的是「建新架构」(additive,干净);剩余是「迁旧码入新家」(destructive,改 model-visible
+行为/重测试耦合)。务必小步 + 频繁提交。
+
+1. **Phase 5 router reroute**: engine._execute_tool_call 改为 `classify_capability` 分派 + `router_allowlist_blocks`
+   咽喉点。保 3 个 fail-closed 点（_execute_tool_call/run_shell 后台/_run_hook）。安全回归测试
+   (test_subagent_security_regression/caps/callgate) 必须全绿不放松。PermissionEngine(self) 可改 PermissionContext。
+2. **Phase 6 spawn_child**: engine.py 1055-2125（_execute_agent_tool/_build_sub_agent/_spawn+_run_background/
+   _finalize_*/_await_subagent_run）→ runtime/spawn.py + spawn_policy.py + capabilities/subagents.py adapter。
+   用 agents/result.ResultEnvelope。**保**: lease 隔离、resume 双 flock 守卫(engine.py:1980)、超时 vs 完成判别
+   (_await_subagent_run pending-set)、background completion pin **live** leaf(非 spawn leaf,engine.py:846-848 footgun)、
+   权限继承(agents/permissions.derive_child_profile)、`session_id==_tree_session_id 共享 trajectory_id` 不变量
+   (engine.py:1090,独立 child sid 会分叉 trajectory_id 除非显式透传)、消除 artifact_id=='main' no-lease 洞。
+3. **Phase 3 cutover**: build_system_prompt 把 {{git_context}}/{{claude_md}}/{{memory}} 置空(留 cwd/date/
+   platform/shell/skills/agents/deferred),改由 session-start custom_message packs 注入。
+   **⚠ resume-dedup gotcha**: 不能用进程内 flag dedup —— resume 时树里已有这些 pack,会重复注入。
+   必须按 customType 查树是否已注入,或仅在 session **创建**(非 resume)时注入 + compaction 后按 survival matrix
+   重注入。**需更新 e2e 测试**: test_p2_engine_e2e 的「clean tree / msgs[0]=='hello'」断言会因注入 git/项目指令
+   pack 而失效(测试 repo 有 git)。删 test_cutover_characterization.py(只钉要删的 append_to_last_user/_inject_* flat)。
+4. **Phase 7 CLI as runtime client**: RuntimeThread.events() 驱动 CLI 输出;删私有 core 访问
+   (cli 的 agent._load_messages/_system_prompt/_session_mgr 等)、删 NANOCODE_REPL_VIA_RUNTIME=0 逃生门、
+   approvals 带 thread/agent 身份。保 SIGINT-restore-in-finally + fail-closed can_switch()。
+5. **Phase 4 repo map**: 加 tree-sitter 依赖 → codeintel/{symbols(填充),index,graph,repomap,cache}.py →
+   RepoMapProvider 接入 ContextRuntime。green-field 可并行。
+
+
+
 - python 入口: `.venv/bin/python`(无全局 python)。
 - codex reviewer: `codex` 0.139.0 + `NEO_TOKEN` 已设(交叉验证用)。
 - 硬不变量(§0): `AgentCore.state` 只能是 `session.jsonl` 的**可丢弃投影**,SessionManager 是唯一 durable truth。
