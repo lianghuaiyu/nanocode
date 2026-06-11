@@ -32,6 +32,12 @@ from nanocode.entrypoints import cli
 
 # ─── 录制替身 ────────────────────────────────────────────────────
 
+class _FakeTaskManager:
+    """can_switch() 读 list_subagents()；dispatch 命令族的 tasks_tool 调用已被 monkeypatch 拦掉。"""
+    def list_subagents(self): return []
+    def list_tasks(self, status=None): return []
+
+
 class _FakeAgent:
     """记录 run_repl 直接触达的 Agent 面；不跑真实模型循环。"""
 
@@ -40,8 +46,8 @@ class _FakeAgent:
         self.session_id = "sess-test"
         self._aborted = False
         self.is_processing = False
-        self.task_manager = object()
-        self._background_tasks = object()
+        self.task_manager = _FakeTaskManager()
+        self._background_tasks = set()          # can_switch 取 len()/真值（docs/14 P2 Control 路由会查闸）
         self._sink = None  # CommandContext(out=agent._sink)；CMD-P0 handler 不用它
         # CMD-P2.5：RuntimeThread.run 读取 token 计数（turn 前后取差）
         self.total_input_tokens = 0
@@ -262,6 +268,30 @@ def test_user_invocable_skill_invokes_via_run_turn_not_raw_chat(monkeypatch):
 def test_blank_line_is_ignored(monkeypatch):
     calls = _run_script(monkeypatch, ["", "  "])
     assert not any(c[0] == "run_turn" for c in calls)
+
+
+@pytest.mark.parametrize("flag", ["1", "0"])
+def test_via_runtime_escape_hatch_both_drive_turn(monkeypatch, flag):
+    """docs/14 P1：NANOCODE_REPL_VIA_RUNTIME on(默认)/off 两条 _drive_turn 分支都驱动一个 turn。
+    on → host.current_thread.run → session.run_turn；off → session.run_turn 直驱。均落到录制 session。"""
+    monkeypatch.setenv("NANOCODE_REPL_VIA_RUNTIME", flag)
+    calls = _run_script(monkeypatch, ["hello world"])
+    assert ("run_turn", "hello world") in calls
+
+
+def test_control_result_routes_to_apply_control_not_chat(monkeypatch):
+    """docs/14 P1/P2：dispatch 返回 Control → run_repl 走 _apply_control（过 can_switch 闸后路由），
+    不落 chat、不 fall through skill。用未配线的 'switch_runtime' 避免触发真实 rebind。"""
+    from nanocode.entrypoints.commands.types import Control
+
+    async def _fake_dispatch(line, registry, ctx):
+        return Control("switch_runtime", {}) if line == "/ctl" else cli.NOT_A_COMMAND
+
+    monkeypatch.setattr(cli, "dispatch", _fake_dispatch)
+    calls = _run_script(monkeypatch, ["/ctl"])
+    assert ("run_turn", "/ctl") not in calls                       # 不落 chat
+    assert not any(c[0] == "get_skill_by_name" for c in calls)     # 未 fall through 到 skill
+    assert ("print_info",) in calls                               # _apply_control 路由到了（打印 not-wired）
 
 
 # ════════════════════════════════════════════════════════════════

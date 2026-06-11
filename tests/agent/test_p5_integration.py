@@ -27,18 +27,16 @@ def _seed_wire(sid, rows, agent_id="main"):
     t.close()
 
 
-def test_restore_session_prefers_events_over_snapshot():
+def test_restore_main_ignores_wire_events_uses_snapshot_fallback():
+    # docs/14 §4.2：main restore 不再从 wire 事件重建（canonical 树才是权威）。无树 → 回退快照。
     sid = "p5r1"
     _seed_wire(sid, [
         ("llm_request", {"model": "m", "messages": [{"role": "user", "content": "from-events"}]}),
         ("assistant_message", {"text": "ans", "tool_uses": []}),
     ])
-    a = _agent(sid)  # __init__ appends a session_start to the same wire (harmless)
-    # snapshot data 也给，但 events 为权威 → 用重建
+    a = _agent(sid)
     a.restore_session({"anthropicMessages": [{"role": "user", "content": "from-snapshot"}]})
-    msgs = a._anthropic_messages
-    assert msgs[0] == {"role": "user", "content": "from-events"}     # events 赢
-    assert msgs[-1] == {"role": "assistant", "content": "ans"}
+    assert a._anthropic_messages == [{"role": "user", "content": "from-snapshot"}]   # 快照兜底，非 wire
 
 
 def test_restore_session_falls_back_to_snapshot_when_no_events():
@@ -129,18 +127,19 @@ def test_restore_falls_back_to_snapshot_when_rebuild_unfaithful():
     assert "FILE CONTENTS" in flat
 
 
-def test_restore_continues_on_forked_branch_identity():
-    """Codex P2: 最后一轮在 fork 分支时，restore 后 tracer 须续在该 branch（非 main）。"""
+def test_restore_main_does_not_continue_wire_fork_branch():
+    """docs/14 §4.2 / risk#5：main restore 不再从 wire 续 fork 分支（树才是权威，wire branch_id 退化为 main）。
+    live forking 仍由 AgentSession.fork_to 经 wire 表达（见 test_runtime_fork_to_creates_isolated_branch）。"""
     sid = "p5rbranch"
     t = Tracer(sid, [JsonlSink(_v2.agent_wire_path(sid, "main"))], agent_id="main")
     t.begin_turn()
     t.emit("user_message", text="base")
     t.emit("llm_request", model="m", messages=[{"role": "user", "content": "base"}])  # evt_main_1
     t.begin_branch("experiment", from_event_id="evt_main_1")
-    t.emit("llm_request", model="m", messages=[{"role": "user", "content": "on-exp"}])  # branch leaf
+    t.emit("llm_request", model="m", messages=[{"role": "user", "content": "on-exp"}])
     t.emit("assistant_message", text="exp-ans", tool_uses=[])
     t.close()
     a = _agent(sid)
-    a.restore_session({})
-    assert a.tracer.branch_id == "experiment"   # 续写记到 experiment，非默认 main
-    assert a._anthropic_messages[0] == {"role": "user", "content": "on-exp"}
+    a.restore_session({})                       # 无树、无 legacy → 空，tracer 留默认 main
+    assert a.tracer.branch_id == "main"         # 不再从 wire 续 experiment 分支
+    assert a._anthropic_messages == []          # wire 不是 main resume 源

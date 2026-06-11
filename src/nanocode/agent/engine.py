@@ -35,7 +35,6 @@ from ..memory.maintenance import (
     build_eval_curator_message,
 )
 from .sink import EventSink, TerminalSink, BufferSink
-from .message_store import MessageStore
 from .context_builder import SessionContextBuilder
 from ..session import save_session
 from ..prompt import build_system_prompt
@@ -68,7 +67,7 @@ from .models import (
     _to_openai_tools,
     _with_retry,
 )
-from .compaction import persist_large_result, CompressionPipeline
+from .compaction import persist_large_result
 from .plan_mode import PlanModeMixin
 from .anthropic_backend import AnthropicBackendMixin
 from .openai_backend import OpenAIBackendMixin
@@ -131,6 +130,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         sink: "EventSink | None" = None,
     ):
         self.permission_mode = permission_mode
+        # 构造时配置的 baseline permission_mode（plan toggle 前）：rebind_session 切 session 时
+        # 据此复位——plan 是 session 工作态、不应跨会话（docs/14 P2 review）。
+        self._base_permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
@@ -169,12 +171,24 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         # artifact_id：本 agent 全部产物（messages/meta/prompt/result/wire）的目录键。
         # 主 agent 默认 "main"；子 agent 由 _build_sub_agent 传入其 SubAgentRecord id。
         self.artifact_id = artifact_id or "main"
+        # docs/13 cutover S1：主 agent 持一个 SessionManager，每条消息在 message-end 写进
+        # canonical session.jsonl 树（干净原文；注入是 render-time 装饰、不入树）。lazy 创建。
+        self._session_mgr = None
+        # docs/14 full-P6b：_tree_session_id 是 _session_mgr 写入的 session id，与 session_id（artifact/
+        # trajectory 目录键）**解耦**。主 agent 二者相同；子 agent 由 _build_sub_agent 置为 child sid，
+        # 使子 agent 把自己的 transcript 写进独立的 child session.jsonl（artifacts 仍 parent-keyed，
+        # trajectory_id 仍 traj_<parent>，不触 1173-1188 不变量）。_child_parent_session = child header 血缘。
+        self._tree_session_id = self.session_id
+        self._child_parent_session = None
         if not self.is_sub_agent:
             os.environ["NANOCODE_SESSION_ID"] = self.session_id
         # trajectory 采集开关（docs/10）：在 _build_tracer 之前置好，供 Tracer 派生 trajectory_id。
         # DERIVED 投影的 wire 整形开关；关闭/FULL 时 payload byte-identical。
         self.trajectory_enabled = trajectory_enabled
         self.trajectory_level = trajectory_level
+        # 保存 trace 开关原值：rebind_session（docs/14 P2）切 session 时要用同样的 debug-trace
+        # 设置重建 tracer（_build_tracer 内仍按 _trace_is_enabled 复核 flag|env）。
+        self._trace_enabled = trace_enabled
         self.tracer = self._build_tracer(trace_enabled=trace_enabled, trace_parent=trace_parent)
         self.tracer.emit(
             "session_start", model=self.model, cwd=str(Path.cwd()),
@@ -198,6 +212,9 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._background_tasks: set[asyncio.Task] = set()
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
         self._subagents = SubAgentManager(self)
+        # docs/14 §6b（additive child-session）：spawn 时记下父 leaf，finalize 镜像 child session 时
+        # 作 parentSession.entryId（pin 到 spawn 分支）。agent_id → 父 spawn leaf。
+        self._subagent_spawn_leaf: dict = {}
 
         # Permission whitelist (shared with sub-agents via ctor param)
         self._confirmed_paths: set[str] = confirmed_paths if confirmed_paths is not None else set()
@@ -241,19 +258,15 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         self._active_hooks: list[dict] = []
         self._suppress_hooks: bool = False
 
-        # Separate message histories —— 各由一个 MessageStore owner 持有。
-        # 经 _anthropic_messages / _openai_messages 属性访问（getter 返回 live list，
-        # 读/索引/切片/append/in-place 裁剪零改动；整列赋值经 setter 路由到 owner）。
-        self._anthropic_store = MessageStore()
-        self._openai_store = MessageStore()
+        # provider 消息列表（plain list）。docs/13 S5：树是会话事实源，这两个列表降为每轮
+        # 从 build_context 渲染的投影（live 请求源见 _build_request_messages）；MessageStore 抽象已删。
+        # 仅当前 provider 的列表会被填充（use_openai 决定）。
+        self._anthropic_messages: list = []
+        self._openai_messages: list = []
 
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
-        if self.permission_mode == "plan":
-            self._plan_file_path = self._generate_plan_file_path()
-            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-        else:
-            self._system_prompt = self._base_system_prompt
+        self._apply_permission_mode_prompt()
 
         # Initialize clients
         if self.use_openai:
@@ -268,6 +281,16 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 kwargs["base_url"] = anthropic_base_url
             self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
+
+    def _apply_permission_mode_prompt(self) -> None:
+        """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
+        plan 模式：_system_prompt = base + plan 提示（文本内嵌 plan-<sid>.md 路径）；否则 = base。"""
+        if self.permission_mode == "plan":
+            self._plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+        else:
+            self._plan_file_path = None
+            self._system_prompt = self._base_system_prompt
 
     def _build_tracer(self, *, trace_enabled: bool, trace_parent):
         """构造本 agent 的 Tracer：始终带一个 always-on 的 per-agent wire sink，
@@ -505,76 +528,188 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     async def compact(self) -> None:
         await self._compact_conversation()
 
-    # ─── Message-list ownership（P-1 子目标2：单一 owner 入口）──────
-    # provider 消息列表由 MessageStore 持有。getter 暴露 live list（读/索引/切片/append/
-    # in-place 裁剪零改动）；整列赋值经 setter 路由到 owner（resume/compaction/clear）。
-    # 跨 agent 场景：父**不得**直接赋值子的列表——经 _load_messages / 读经 _dump_messages。
+    # ─── Message-list ownership（docs/13 S5：plain list，MessageStore 抽象已删）──────
+    # _anthropic_messages / _openai_messages 是普通 list（每轮 build_context 投影 + 注入装饰）；
+    # 树是事实源。跨 agent：父读子经 _dump_messages、装入经 _load_messages（不直接赋子列表）。
 
-    @property
-    def _openai_messages(self) -> list:
-        return self._openai_store.items
-
-    @_openai_messages.setter
-    def _openai_messages(self, messages: list) -> None:
-        self._openai_store.load(messages)
-
-    @property
-    def _anthropic_messages(self) -> list:
-        return self._anthropic_store.items
-
-    @_anthropic_messages.setter
-    def _anthropic_messages(self, messages: list) -> None:
-        self._anthropic_store.load(messages)
-
-    def _active_store(self) -> MessageStore:
-        return self._openai_store if self.use_openai else self._anthropic_store
+    def _active_messages(self) -> list:
+        return self._openai_messages if self.use_openai else self._anthropic_messages
 
     def _load_messages(self, messages: list) -> None:
-        """load：用 history/快照接管本 agent 活动列表（resume 单一入口；含被父恢复的子 agent）。"""
-        self._active_store().load(messages)
+        """装入活动列表（resume / move_to / 父恢复子 agent 单一入口）。"""
+        if self.use_openai:
+            self._openai_messages = messages
+        else:
+            self._anthropic_messages = messages
 
     def _replace_messages(self, messages: list) -> None:
-        """replace：整列重置（compaction 摘要替换 / clear）。"""
-        self._active_store().replace(messages)
+        self._load_messages(messages)
 
     def _append_message(self, message) -> None:
-        self._active_store().append(message)
+        self._active_messages().append(message)
 
     def _dump_messages(self) -> list:
         """dump：导出活动列表（持久化只读；含父读子 agent 列表）。"""
-        return self._active_store().dump()
+        return list(self._active_messages())
 
     # ─── Session ──────────────────────────────────────────────
 
     def restore_session(self, data: dict) -> None:
-        # P5：events 为 resume 权威——优先从 wire 事件树重建主 agent 消息（llm_request 快照
-        # oracle），**仅当重建忠实**（无未闭合 tool 轮）才采用；否则回退 snapshot data
-        # （_auto_save 始终写了完整列表）——保证 resume 翻转无数据丢失（Codex/workflow blocking）。
-        builder = SessionContextBuilder(self.session_id)
-        rebuilt, faithful = builder._rebuild(agent_id="main")
-        if rebuilt and faithful:
-            self._load_messages(rebuilt)
-            # 续在正确分支上：若最后一轮在 fork 分支，tracer 须继续记到该 branch_id，
-            # 否则续写被误记为 main，破坏 /tree 与后续事件重建（Codex review P2）。
-            branch = builder.current_branch(agent_id="main")
-            if branch and branch != "main":
-                self.tracer.branch_id = branch
-        else:
-            if data.get("anthropicMessages"):
-                self._anthropic_messages = data["anthropicMessages"]
-            if data.get("openaiMessages"):
-                self._openai_messages = data["openaiMessages"]
+        """docs/14 §4.2：canonical session.jsonl 树是 resume 首选权威。
+
+        无树 → 从盘上 legacy 自动迁移建树（migration.migrate_session，best-effort）。树**非空** → 从树
+        重建（_build_request_messages 后续也从树渲染）；树空/缺 → 回退 data 的 flat 列表（此时
+        _build_request_messages 在 build_context 空时也回退 flat，二者一致）。
+        注：tree 写入是 best-effort（_tree_record guarded）；§10#5 接受舍弃旧 no-data-loss 保证，
+        但 _tree_record 失败已可观测（见其实现）；P7 删 legacy。"""
+        from ..session.manager import SessionManager
+        from ..session.render import ModelCtx, render
+        if not SessionManager.exists(self.session_id):
+            try:
+                from ..session.migration import migrate_session
+                migrate_session(self.session_id, model=self.model)
+            except Exception:
+                pass
+        legacy = (data.get("openaiMessages") if self.use_openai else data.get("anthropicMessages")) or []
+        tree_msgs = None
+        if SessionManager.exists(self.session_id):
+            self._session_mgr = SessionManager.open(self.session_id)   # 续写仍走树
+            built = self._session_mgr.build_context()
+            if built.messages:
+                api = "openai-completions" if self.use_openai else "anthropic"
+                sysp = self._system_prompt if self.use_openai else None
+                tree_msgs = render(built.messages,
+                                   ModelCtx(provider=self._current_provider(), api=api, model_id=self.model),
+                                   system_prompt=sysp)["messages"]
+        if tree_msgs:
+            self._load_messages(tree_msgs)        # 非空树 = 权威
+        elif legacy:
+            self._load_messages(legacy)           # 树空/缺 → legacy 兜底（build_context 空时请求也走 flat）
         # v2 state: load TaskManager + mark non-terminal entries as lost
-        state = data.get("state")
-        if state and isinstance(state, dict):
-            self.task_manager.load_state(state)
-            for t in self.task_manager.list_tasks():
-                if t.status not in TERMINAL_TASK_STATUSES:
-                    self.task_manager.update_task(t.id, status="lost")
-            for a in self.task_manager.list_subagents():
-                if a.status in ("running", "idle"):
-                    self.task_manager.update_subagent(a.id, status="lost")
+        self._reload_task_state(data.get("state"))
         self._sink.info(f"Session restored ({self._get_message_count()} messages).")
+
+    def _reload_task_state(self, state) -> None:
+        """load 一个 session 的 v2 state 进 task_manager，并把非终态 task/subagent 标 "lost"
+        （进程已不在跑它们）。restore_session 与 rebind_session（docs/14 P2）共用。state 缺/非 dict → no-op。"""
+        if not (state and isinstance(state, dict)):
+            return
+        self.task_manager.load_state(state)
+        for t in self.task_manager.list_tasks():
+            if t.status not in TERMINAL_TASK_STATUSES:
+                self.task_manager.update_task(t.id, status="lost")
+        for a in self.task_manager.list_subagents():
+            if a.status in ("running", "idle"):
+                self.task_manager.update_subagent(a.id, status="lost")
+
+    # ─── Runtime replacement：原地重指 session（docs/14 P2）────────────────────────
+
+    def _finalize_tracer(self) -> None:
+        """emit session_end + close 当前 tracer（flush 缓冲、释放 wire.jsonl 句柄）。guarded。"""
+        try:
+            self.tracer.emit("session_end", input_tokens=self.total_input_tokens,
+                             output_tokens=self.total_output_tokens, turns=self.current_turns)
+            self.tracer.close()
+        except Exception:
+            pass
+
+    def _reset_working_sets(self) -> None:
+        """复位 session 维度的 working set（rebind_session 用——切到新 session 不应继承旧 session 的
+        审批白名单 / 读文件状态 / 已播报 skill / 已浮现 memory 等）。plan/permission 态另由
+        _reset_session_mode 处理（保持单一职责，避免 docstring 与实现漂移，docs/14 P2 review）。
+
+        注意：与 clear_history 的复位面**刻意不同**——clear_history 只清对话 + 部分 skill 态，
+        保留 _confirmed_paths/_read_file_state/memory（同一 session 内清屏）；rebind 是换 session 需全清。"""
+        self._sent_skill_names = set()
+        self._pending_skill_bodies = []
+        self._activated_path_skills = set()
+        self._active_hooks = []
+        self._confirmed_paths.clear()           # 与子 agent 共享的同一 set（切 session 时无 live 子 agent）
+        self._read_file_state = {}
+        self._files_read = set()
+        self._files_modified = set()
+        self._already_surfaced_memories = set()
+        self._session_memory_bytes = 0
+        reset_skill_cache()
+
+    def _reset_session_mode(self) -> None:
+        """把 permission/plan 态复位到构造时 baseline（rebind 用）。plan 是 session 工作态、不跨会话：
+        新 session 要么回到 baseline 非-plan 模式，要么（若启动即 --plan）以**新 sid** 的 plan 文件/提示
+        重新进入——等价于以同一 config 全新构造一个 agent。修复 P2 review 的 plan-mode 跨会话泄漏。"""
+        self.permission_mode = self._base_permission_mode
+        self._pre_plan_mode = None
+        self._context_cleared = False
+        self._apply_permission_mode_prompt()    # 按 baseline mode 重算 _plan_file_path + _system_prompt（新 sid）
+
+    def rebind_session(self, new_sid: str, *, artifact_id: str = "main",
+                       parent_session: dict | None = None) -> None:
+        """原地把**主** agent 重指到另一个 session：finalize 旧 session 的全部 session-keyed 状态，
+        再 rebuild 新 session 的。复用同一 Agent 实例（保留 MCP/memory/clients/tools/system_prompt/
+        审批回调），只换 session 维度——使 /new /resume /clone /fork 与子父导航共用一条原子替换路径
+        （docs/14 §0/§3.3）。fail-closed 前置（turn/后台/子 agent 运行中拒绝）由 RuntimeHost.can_switch
+        在调用前保证。new_sid==当前 sid → no-op（resume 到当前会话不折腾）。"""
+        if self.is_sub_agent:
+            raise RuntimeError("rebind_session is for the main agent only")
+        if new_sid == self.session_id:
+            return
+        old_sid = self.session_id
+        from ..session.manager import SessionManager
+        from ..session.render import ModelCtx, render
+        # ── Pre-flight：先取**新** session 写锁 + open/create + build_context。任何失败（含
+        #    SessionBusyError：另一进程在写该 session）都在 finalize 旧 session **之前**抛出——保证
+        #    rebind 原子（codex B1）且 fail-closed 不让第二个 writer 进同一 session（docs/14 §6a）。
+        #    build_context 抛错（torn/cyclic 树）时必须释放刚拿的新锁，否则同进程重试 /resume 自锁死
+        #    （P6 review #1/#6）。
+        new_mgr = (SessionManager.open(new_sid, lock=True) if SessionManager.exists(new_sid)
+                   else SessionManager.create(new_sid, parent_session=parent_session, lock=True))
+        try:
+            built = new_mgr.build_context()
+        except BaseException:
+            new_mgr.close()                     # 释放刚取的新锁，避免泄漏/自锁死
+            raise
+        # ── FINALIZE 旧 session（pre-flight 已过，下面均为低风险/guarded 操作）──
+        old_mgr = self._session_mgr
+        self._finalize_tracer()                 # session_end + close（释放旧 wire 句柄）
+        self._auto_save()                       # 旧 session 的 legacy snapshot + v2 state
+        if old_mgr is not None:
+            old_mgr.close()                     # 释放旧 session 写锁
+        try:
+            from ..tools.sandbox_shell import cleanup_persist_sandbox
+            cleanup_persist_sandbox(old_sid)    # 旧 persist sandbox + fingerprint
+        except Exception:
+            pass
+        # ── REBUILD 新 session ──
+        # _session_mgr 立即指向 new_mgr：即便后续 rebuild 步骤抛错，新锁也由 agent 持有引用、不泄漏，
+        # 且 agent 不会停在引用已 close 的旧 mgr 的撕裂态（P6 review #2）。
+        self.session_id = new_sid
+        self.artifact_id = artifact_id
+        os.environ["NANOCODE_SESSION_ID"] = new_sid
+        self._session_mgr = new_mgr             # pre-flight 已 open/create + 持锁
+        self.tracer = self._build_tracer(trace_enabled=self._trace_enabled, trace_parent=None)
+        self.tracer.emit("session_start", model=self.model, cwd=str(Path.cwd()),
+                         permission_mode=self.permission_mode, is_sub_agent=False,
+                         workspace_trusted=self.workspace_trusted)
+        self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # task_manager：fresh + load 目标 session 的 state + 非终态标 lost
+        self.task_manager = TaskManager()
+        self._subagents = SubAgentManager(self)
+        self._reload_task_state(_session_v2.read_state(new_sid) if _session_v2.is_v2_session(new_sid) else None)
+        # 计数复位（新 session 从零计 cost/turns）
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.last_input_token_count = 0
+        self.current_turns = 0
+        self._aborted = False
+        self._reset_working_sets()
+        self._reset_session_mode()              # plan/permission 复位到 baseline（recompute _system_prompt，新 sid）
+        # 活动消息列表：从新 session 树（pre-flight 的 built）render 装入（空 session → []，openai 含 system）
+        provider = "openai" if self.use_openai else "anthropic"
+        api = "openai-completions" if self.use_openai else "anthropic"
+        sysp = self._system_prompt if self.use_openai else None
+        self._load_messages(render(built.messages,
+                                   ModelCtx(provider=provider, api=api, model_id=self.model),
+                                   system_prompt=sysp)["messages"])
+        self._sink.info(f"Session → {new_sid} ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
@@ -594,9 +729,67 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             })
         except Exception:
             pass
-        # v2 state: persist when session has forked subagents or is already v2
-        if _session_v2.is_v2_session(self.session_id) or self.task_manager.list_subagents():
+        # v2 state: persist when session has forked subagents, background tasks, or is already v2
+        # （含 list_tasks：仅有后台 shell 任务、无 subagent 的 session 也要落 state，否则 /resume
+        #  回来时丢任务记录——docs/14 P2 review）。
+        if (_session_v2.is_v2_session(self.session_id) or self.task_manager.list_subagents()
+                or self.task_manager.list_tasks()):
             self._persist_state()
+
+    def _tree_record(self, provider_msg: dict, *, stop_reason: "str | None" = None) -> None:
+        """docs/13 cutover S1 + docs/14 full-P6b：把一条 live provider 消息以**干净原文**写进 canonical
+        session.jsonl 树（_tree_session_id：主 agent=自身 session，子 agent=独立 child session）。
+        message-end 调用；注入是 render-time 装饰、单独以 custom_message 入树。全 guarded：绝不破坏 live turn。
+
+        stop_reason：assistant 消息记录 backend 的**真实** provider stop/finish reason（docs/14 §4.3
+        bug#2，忠实而非内容推断）；此处按 provider 映射成中立值再交 capture。"""
+        try:
+            from ..session import capture
+            from ..session.manager import SessionManager
+            if self._session_mgr is None:
+                tsid = self._tree_session_id
+                self._session_mgr = (SessionManager.open(tsid) if SessionManager.exists(tsid)
+                                     else SessionManager.create(tsid, parent_session=self._child_parent_session))
+            provider = "openai" if self.use_openai else "anthropic"
+            neutral_sr = capture.neutral_stop_reason(provider, stop_reason)
+            cap = capture.capture_openai if self.use_openai else capture.capture_anthropic
+            for neutral in cap(provider_msg, model=self.model, stop_reason=neutral_sr):
+                self._session_mgr.append_message(neutral)
+        except Exception as e:
+            # tree 写入是 best-effort（§10#5 接受），但失败必须**可观测**——否则 tree-only resume 会
+            # 静默丢这条消息（docs/14 P3 review #3）。emit 一条 tracer 事件供审计/告警。
+            try:
+                self.tracer.emit("tree_record_failed", role=provider_msg.get("role"), error=str(e))
+            except Exception:
+                pass
+
+    def _build_request_messages(self) -> list:
+        """docs/13 cutover S2：从 canonical 树渲染本轮请求（`render(build_context())`）。
+
+        树是会话事实源（含 S1 message-end 写入的消息 + P5 注入的 custom_message）；render 据当前
+        provider 整形 + 合并相邻 user（复刻注入的 append-to-last-user 定位）。无树时回退扁平列表
+        （首轮 / 未启用）。Anthropic system 走 out-of-band，OpenAI system 经 render 注入 index 0。"""
+        flat = self._openai_messages if self.use_openai else self._anthropic_messages
+        if self._session_mgr is None:
+            return flat
+        try:
+            from ..session import tree as _tree
+            from ..session.render import ModelCtx, render
+            provider = "openai" if self.use_openai else "anthropic"
+            api = "openai-completions" if self.use_openai else "anthropic"
+            sysp = self._system_prompt if self.use_openai else None
+            # 树须含真实 MESSAGE（user/assistant/toolResult）才算权威——只有 header + custom_message
+            # 注入时（如 user 消息 _tree_record 失败但注入成功）回退 flat，否则会把真实 user 消息挤掉、
+            # 只发注入文本给模型（docs/14 P3 review #8）。
+            if not any(e.type == _tree.MESSAGE for e in self._session_mgr.get_branch()):
+                return flat
+            built = self._session_mgr.build_context()
+            if not built.messages:
+                return flat
+            return render(built.messages, ModelCtx(provider=provider, api=api, model_id=self.model),
+                          system_prompt=sysp)["messages"]
+        except Exception:
+            return flat
 
     def _persist_state(self) -> None:
         """Write v2 state (tasks + subagents + main messages) to disk."""
@@ -621,10 +814,40 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
 
     async def _compact_conversation(self) -> None:
         before = self._get_message_count()
+        tokens_before = self.last_input_token_count
+        # bug#1（docs/14 §4.4 + P3 review #5）：kept-tail 起点必须与 backend 实际保留的对齐。
+        # backend 仅当末条消息是 user 时才把它接到 summary 之后（_compact_*: last_user_msg.role=='user'），
+        # 否则 summary 之后不留任何旧消息。auto-compact 触发于刚记完 user 消息时（leaf==该 user）→
+        # firstKept=该 user；manual /compact 在 turn 间（leaf 是 assistant/tool）→ firstKept=None（旧消息
+        # 全被 summary 顶替，不复现）。故 cut = last_user id 仅当它==leaf，否则 None。
+        first_kept = None
+        if self._session_mgr is not None:
+            leaf = self._session_mgr.get_leaf()
+            last_u = self._session_mgr.last_user_message_id()
+            first_kept = last_u if last_u == leaf else None
         if self.use_openai:
-            await self._compact_openai()
+            summary = await self._compact_openai()
         else:
-            await self._compact_anthropic()
+            summary = await self._compact_anthropic()
+        # S4（docs/13）：compaction-as-entry —— additive 写一条 compaction 树 entry（summary +
+        # firstKeptEntryId），供 build_context 两区 fold。**主 agent 与 full-P6b 子 agent 都写**（子写自己
+        # 的 child 树）——否则子的 _build_request_messages 从未压缩的 child 树重渲染会抵消压缩（review high）。
+        if summary:
+            try:
+                from ..session.manager import SessionManager
+                if self._session_mgr is None:
+                    self._session_mgr = (SessionManager.open(self._tree_session_id)
+                                         if SessionManager.exists(self._tree_session_id)
+                                         else SessionManager.create(self._tree_session_id,
+                                                                    parent_session=self._child_parent_session))
+                    leaf = self._session_mgr.get_leaf()
+                    last_u = self._session_mgr.last_user_message_id()
+                    first_kept = last_u if last_u == leaf else None
+                self._session_mgr.append_compaction(
+                    summary=summary, tokens_before=tokens_before,
+                    first_kept_entry_id=first_kept)
+            except Exception:
+                pass
         # 保留事件名 compaction（report.py 硬读它），additive 补压缩前后消息数——供 /tree 与审计。
         # 注：rebuild 经 llm_request 快照 oracle 已忠实反映 post-compaction 状态，无需 supersession 重放。
         self.tracer.emit("compaction", kind="auto",
@@ -637,6 +860,22 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
     def _skill_listing_budget(self) -> int:
         return max(2000, int(self.effective_window * 0.04))
 
+    def _tree_custom_message(self, custom_type: str, content, *, parent_id: "str | None" = None) -> bool:
+        """docs/13 P5 / docs/14 §4.5+full-P6b：把一次注入作为 custom_message entry 写进 canonical 树
+        （主 agent=自身树，子 agent=child 树；按 _session_mgr 而非 is_sub_agent gate）。parent_id 显式给定
+        时挂到指定 entry（background pin-to-spawn-branch 用）。返回是否真正写入——调用方据此推进 dedup /
+        flat 兜底（docs/14 P3 review #7：写失败不得静默丢注入 + 不得误推进 dedup）。"""
+        if self._session_mgr is None:
+            return False
+        try:
+            from ..session import tree as _tree
+            self._session_mgr.append(_tree.CUSTOM_MESSAGE,
+                                     {"customType": custom_type, "content": content, "display": False},
+                                     parent_id=parent_id)
+            return True
+        except Exception:
+            return False
+
     def _inject_skill_listing(self, messages: list) -> None:
         if self.is_sub_agent:
             return
@@ -644,8 +883,17 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             self._sent_skill_names, self._activated_path_skills, self._skill_listing_budget()
         )
         if text:
-            append_to_last_user(messages, text)
-            self._sent_skill_names.update(new_names)
+            # docs/14 §4.5：有树（主 agent 常态）→ 写 custom_message（请求由 _build_request_messages 从树
+            # 渲染）；无树 → flat 注入（此时 flat 是请求源）。dedup（_sent_skill_names）**只在注入真正生效后**
+            # 推进——有树但树写失败时，flat 兜底会被 _build_request_messages 丢弃，故不推进 dedup、下一轮重试，
+            # 不静默丢清单（review medium：原来无条件推进会永久丢失）。
+            if self._session_mgr is not None:
+                if self._tree_custom_message("skill_listing", text):
+                    self._sent_skill_names.update(new_names)
+                # 树写失败：不推进 dedup（下一轮重试树写）；不走 flat（会被树渲染丢弃）
+            else:
+                append_to_last_user(messages, text)        # 无树 → flat 即请求源，生效
+                self._sent_skill_names.update(new_names)
 
     def _on_file_touched(self, name: str, inp: dict) -> None:
         """成功 read/write/edit 后触发：宿主派生文件事实 + 嵌套发现 .nanocode/skills + paths 条件激活。
@@ -673,29 +921,13 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                 self._activated_path_skills.add(s.name)
 
     def _inject_pending_skill_bodies(self, messages: list) -> None:
+        # 有树（主 agent 或 full-P6b 子 agent）→ custom_message；无树 → flat 注入。
+        tree_backed = self._session_mgr is not None
         for name, body in self._pending_skill_bodies:
-            messages.append(render_skill_body_message(name, body))
+            msg = render_skill_body_message(name, body)
+            if not (tree_backed and self._tree_custom_message("skill_body", msg.get("content", ""))):
+                messages.append(msg)
         self._pending_skill_bodies = []
-
-    # ─── Multi-tier compression pipeline ──────────────────────
-
-    def _run_compression_pipeline(self) -> None:
-        # 每次 API 调用前的 in-place 多层裁剪——委托给 CompressionPipeline facade
-        # （tier 实现已从 backend 收敛到 compaction.py；此处行为不变，仍每轮跑）。
-        if self.use_openai:
-            CompressionPipeline.prepare_openai(
-                self._openai_messages,
-                last_input_token_count=self.last_input_token_count,
-                effective_window=self.effective_window,
-                last_api_call_time=self.last_api_call_time,
-            )
-        else:
-            CompressionPipeline.prepare_anthropic(
-                self._anthropic_messages,
-                last_input_token_count=self.last_input_token_count,
-                effective_window=self.effective_window,
-                last_api_call_time=self.last_api_call_time,
-            )
 
     # ─── Large result persistence ─────────────────────────────────
 
@@ -717,22 +949,33 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         return rec.id
 
     def _inject_finished_tasks(self, messages: list) -> None:
-        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder> 追加到 last user message。"""
+        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder>。主 agent（有树）→
+        custom_message entry 挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这
+        优先于 docs/14 §6b 的"pin 到 spawn 分支"：字面 parent_id=spawn_leaf 会造成 sibling 分支、
+        既不可见又会 fork 掉用户后续 turn）。spawn 血缘记在 task.spawn_entry_id（state.json 持久）供审计。
+        无树（子 agent 早期）→ flat 追加到 last user message。dedup 经 task.injected 持久标记。"""
+        if self.is_sub_agent:
+            return   # 子 agent 与父共享 TaskManager；finished-task 回注是**父**（user-facing loop）的职责，
+                     # 否则子会"偷走"并标 injected 父/兄弟的后台完成提醒，使父永不浮现（review high）。
         pending = collect_pending_injections(self.task_manager)
         if not pending:
             return
         text = "\n\n".join(render_task_reminder(t) for t in pending)
-        last = messages[-1] if messages else None
-        if last and last.get("role") == "user":
-            content = last.get("content", "")
-            if isinstance(content, str):
-                last["content"] = content + "\n\n" + text
-            elif isinstance(content, list):
-                content.append({"type": "text", "text": text})
+        wrote = (self._session_mgr is not None
+                 and self._tree_custom_message("finished_tasks", text))
+        if not wrote:                          # 无树 / 树写失败 → flat 兜底（追加到 last user message）
+            last = messages[-1] if messages else None
+            if last and last.get("role") == "user":
+                content = last.get("content", "")
+                if isinstance(content, str):
+                    last["content"] = content + "\n\n" + text
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": text})
+                else:
+                    messages.append({"role": "user", "content": text})
             else:
                 messages.append({"role": "user", "content": text})
-        else:
-            messages.append({"role": "user", "content": text})
+        # 注入已落地（树或 flat）才标 injected——避免树写失败时 dedup 误推进、丢提醒（docs/14 P3 review #7）。
         for t in pending:
             self.task_manager.update_task(t.id, injected=True)
 
@@ -942,7 +1185,7 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         confirm_fn = _auto_deny_confirm if background else self.confirm_fn
         confirmed_paths = set() if background else self._confirmed_paths
         allowed_tool_names = {t["name"] for t in safe_tools}
-        return Agent(
+        sub = Agent(
             model=model or self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
             custom_system_prompt=system_prompt,
@@ -968,6 +1211,14 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
             agent_type=agent_type,
             agent_source=agent_source,
         )
+        # docs/14 full-P6b：子 agent 把 transcript 写进独立 child session.jsonl（child sid 由 artifact_id
+        # 派生；session_id/artifacts/trajectory 仍 parent-keyed，故 1173-1188 trajectory 不变量保持）。
+        if artifact_id and artifact_id != "main":
+            sub._tree_session_id = self.child_session_id(artifact_id)
+            sub._child_parent_session = {"sessionId": self.session_id,
+                                         "entryId": self._subagent_spawn_leaf.get(artifact_id),
+                                         "taskId": artifact_id, "agentId": artifact_id}
+        return sub
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -1070,18 +1321,35 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         return "openai" if self.use_openai else "anthropic"
 
     def _persist_agent_messages(self, agent_id: str, sub_agent: "Agent") -> None:
-        """Persist sub-agent messages to v2 session storage."""
+        """Persist sub-agent messages to v2 session storage (parent-keyed artifacts；back-compat)。"""
         try:
             # 经子 agent owner 的 dump 入口读，不再直接 reach 进 sub_agent._{provider}_messages。
             msgs = sub_agent._dump_messages()
             _session_v2.write_agent_messages(self.session_id, agent_id, msgs)
         except Exception:
             pass
+        # full-P6b：子 agent transcript 已由其自身 _tree_record 实时写进 child session.jsonl（不再需要
+        # finalize 镜像）。close 子的 child SessionManager，释放句柄/锁，使 /agent 导航后续可 lock 进入。
+        try:
+            if sub_agent._session_mgr is not None:
+                sub_agent._session_mgr.close()
+        except Exception:
+            pass
+
+    def child_session_id(self, agent_id: str) -> str:
+        """子 agent 的 child session id（docs/14 §6b）。父 sid 作前缀，保证跨父唯一。"""
+        return f"{self.session_id}.{agent_id}"
 
     def _write_agent_spawn_artifacts(self, *, agent_id: str, agent_type: str,
                                      description: str, prompt: str, model: str,
                                      background: bool) -> None:
         """子 agent 创建时落 prompt.txt + meta.json(status=running)。失败绝不影响主流程。"""
+        # docs/14 §6b：记下 spawn 时父 leaf，供 finalize 镜像 child session 时 pin parentSession.entryId。
+        try:
+            self._subagent_spawn_leaf[agent_id] = (self._session_mgr.get_leaf()
+                                                   if self._session_mgr is not None else None)
+        except Exception:
+            self._subagent_spawn_leaf[agent_id] = None
         try:
             _session_v2.write_agent_prompt(self.session_id, agent_id, prompt or "")
         except Exception:
@@ -1212,6 +1480,12 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
         task_rec = self.task_manager.create_task(
             "subagent", description, owner_agent_id=sub_rec.id)
         self.task_manager.update_subagent(sub_rec.id, task_id=task_rec.id)
+        # docs/14 §6b：记下 spawn 时父 leaf，供完成回注 pin 到 spawn 分支（而非完成时的 live leaf）。
+        try:
+            self.task_manager.update_task(
+                task_rec.id, spawn_entry_id=(self._session_mgr.get_leaf() if self._session_mgr else None))
+        except Exception:
+            pass
         self._write_agent_spawn_artifacts(
             agent_id=sub_rec.id, agent_type=agent_type, description=description,
             prompt=prompt, model=eff_model, background=True)
@@ -1837,10 +2111,32 @@ class Agent(AnthropicBackendMixin, OpenAIBackendMixin, PlanModeMixin):
                     artifact_id=resume_id,
                     agent_source=config.get("source"),
                 )
-                # Reload persisted messages —— P5：events 为权威（从 wire leaf→root 重建，
-                # llm_request 快照 oracle），snapshot 兜底（重建空时回退，不丢数据）。
-                history = SessionContextBuilder(self.session_id).resume_messages(
-                    agent_id=resume_id, prefer_events=True)
+                # docs/14 P7-a：subagent resume 从其 **child session.jsonl** 重建（full-P6b 起子 agent
+                # 实时写 child 树），退役 SessionContextBuilder 的 wire/snapshot 重建。child 树缺（pre-
+                # full-P6b 旧子 agent）→ 把 v2 snapshot **seed 进 child 树**（不能只装 flat list——子的
+                # 首个 _tree_record 会建一棵只含新 prompt 的 child 树，_build_request_messages 从树渲染
+                # 会丢掉装入的 flat 历史，导致旧上下文全失，review high）。
+                from ..session import capture
+                from ..session.manager import SessionManager
+                from ..session.render import ModelCtx, render
+                child_sid = self.child_session_id(resume_id)
+                if not SessionManager.exists(child_sid):
+                    legacy = _session_v2.read_agent_messages(self.session_id, resume_id)
+                    if legacy:
+                        cmgr = SessionManager.create(child_sid, parent_session=sub_agent._child_parent_session)
+                        for n in capture.capture_provider_messages(legacy, self._current_provider(),
+                                                                   model=sub_agent.model):
+                            cmgr.append_message(n)
+                        cmgr.close()
+                if SessionManager.exists(child_sid):
+                    built = SessionManager.open(child_sid).build_context()
+                    api = "openai-completions" if self.use_openai else "anthropic"
+                    sysp = sub_agent._system_prompt if self.use_openai else None
+                    history = render(built.messages,
+                                     ModelCtx(provider=self._current_provider(), api=api, model_id=sub_agent.model),
+                                     system_prompt=sysp)["messages"]
+                else:
+                    history = []
                 sub_agent._load_messages(history)
 
                 kind, payload = await self._run_foreground_subagent(

@@ -69,3 +69,28 @@ class AgentSession:
         self.agent.tracer.begin_branch(branch_id, from_event_id=from_event_id)
         self.agent._load_messages(messages)
         return messages
+
+    def move_to(self, entry_id: str, *, agent_id: str = "main") -> list:
+        """docs/13 P6：把 active leaf 移到 canonical 树的 `entry_id`（in-file 导航 / checkout），
+        从该 leaf 重建上下文并装入 live agent。导航即日志（写一条 leaf entry），后续 turn 在此 leaf
+        下追加（in-file 分支，不覆盖原分支）。fail-closed：树缺 / entry 不存在 → ValueError，不动会话。
+        返回重建的 provider 消息列表。"""
+        from ..session.manager import SessionManager
+        from ..session.render import ModelCtx, render
+        a = self.agent
+        mgr = a._session_mgr
+        if mgr is None:
+            if not SessionManager.exists(self.session_id):
+                raise ValueError("no canonical session tree for this session")
+            mgr = a._session_mgr = SessionManager.open(self.session_id)
+        if entry_id not in {e.id for e in mgr.entries()}:
+            raise ValueError(f"entry '{entry_id}' not found in session tree; session left unchanged")
+        mgr.set_leaf(entry_id)
+        built = mgr.build_context()
+        provider = "openai" if a.use_openai else "anthropic"
+        api = "openai-completions" if a.use_openai else "anthropic"
+        sysp = a._system_prompt if a.use_openai else None
+        msgs = render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
+                      system_prompt=sysp)["messages"]
+        a._load_messages(msgs)
+        return msgs

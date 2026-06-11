@@ -16,7 +16,7 @@ from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager
+from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
 from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from ..session import load_session, get_latest_session_id
 from ..session import v2 as _session_v2
@@ -29,15 +29,17 @@ from ..trace import (
 )
 from .trace_cmd import run as _run_trace_cmd
 from .trajectory_cmd import run as _run_trajectory_cmd
+from .sessions_cmd import run as _run_sessions_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
-from .commands.types import CommandContext, Local, Prompt
+from .commands.types import CommandContext, Local, Prompt, Control
 from .commands.runner import dispatch, NOT_A_COMMAND
+from .host import RuntimeHost
 from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
-_SUBCOMMANDS = {"trace": _run_trace_cmd, "trajectory": _run_trajectory_cmd}
+_SUBCOMMANDS = {"trace": _run_trace_cmd, "trajectory": _run_trajectory_cmd, "sessions": _run_sessions_cmd}
 
 
 # REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
@@ -436,22 +438,66 @@ def _resolve_resume_session() -> tuple:
 async def run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
-    # P3 seam：主 turn 经 AgentSession.run_turn 驱动（当前委托 agent.chat，行为不变）。
-    session = AgentSession(agent)
+    # docs/14 P1：会话宿主——把"当前 thread"从固定局部闭包解放出来。lifecycle 替换（/new /resume
+    # /clone /fork、子父导航）由 runtime 原子换掉整组 Agent/AgentSession/RuntimeThread，命令 handler
+    # 永远对 host.current_thread 操作、不缓存 agent/session。这里显式构造 session+thread（保留
+    # AgentSession 这个可注入 seam）并注册进 registry——而非 adopt（adopt 在 runtime 内部建 session，
+    # 会绕过测试对 cli.AgentSession 的替身）。
+    _runtime = AgentRuntime()
+    _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent)))
+    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY)
 
-    # CMD-P0/P1：slash 命令经 registry/runner 分发（_REGISTRY 为模块级单源，与补全/--help 共用）。
-    _ctx = CommandContext(agent=agent, session=session, out=agent._sink, registry=_REGISTRY)
-
-    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（复用现有 session，不新建）。
+    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（取 host 的 current_thread）。
     # NANOCODE_REPL_VIA_RUNTIME=0 可回退到直接 session.run_turn（cancel/approval 回归时的逃生阀）。
     _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
-    _thread = RuntimeThread(AgentRuntime(), agent, session)
 
     async def _drive_turn(prompt: str) -> None:
+        t = _host.current_thread
         if _via_runtime:
-            await _thread.run(prompt)
+            await t.run(prompt)
         else:
-            await session.run_turn(prompt)
+            await t.session.run_turn(prompt)
+
+    async def _apply_control(host: RuntimeHost, ctrl: Control) -> None:
+        """消费 lifecycle Control（docs/14 P2）：先过 host.can_switch() fail-closed 闸，再交
+        runtime-owned replacement（thread_new / thread_resume → rebind_session）。handler 只发信号，
+        所有 live agent 替换都在此统一路由。"""
+        ok, reason = host.can_switch()
+        if not ok:
+            print_info(f"cannot switch sessions right now: {reason}")
+            return
+        action, payload = ctrl.action, (ctrl.payload or {})
+        if action == "replace_thread" and payload.get("kind") == "new":
+            host.runtime.thread_new(host)          # rebind 已 sink.info "Session → ..."
+        elif action == "replace_thread" and payload.get("kind") == "clone":
+            if host.runtime.thread_clone(host, payload.get("sourceSid"), payload.get("entryId")) is None:
+                print_error("clone failed (no canonical tree / nothing to clone).")
+        elif action == "fork":
+            thread, selected = host.runtime.thread_fork(host, payload.get("sourceSid"),
+                                                        payload.get("selectedEntryId"))
+            if thread is None:
+                print_error("fork failed (invalid selection).")
+            elif selected:
+                print_info(f"Forked before your message. Re-enter to send:\n  {selected}")
+        elif action == "resume":
+            sid = payload.get("sessionId")
+            if sid == host.current_thread.thread_id:
+                print_info(f"Already on session {sid}.")
+                return
+            if payload.get("fork"):
+                # --fork：把目标 clone 成新 session 切入（绝不做第二个 writer，docs/14 §5.2）
+                if host.runtime.thread_clone(host, sid) is None:
+                    print_error(f"cannot fork-resume '{sid}'.")
+                return
+            from ..session.tree import SessionBusyError
+            try:
+                if host.runtime.thread_resume(host, sid) is None:
+                    print_error(f"cannot resume '{sid}' (no canonical tree; legacy migration failed).")
+            except SessionBusyError:
+                print_error(f"session '{sid}' is busy (another writer holds it). "
+                            f"Use `/resume {sid} --fork` to fork it into a new session.")
+        else:
+            print_info(f"(control '{action}' is not wired yet — coming in a later phase)")
 
     async def confirm_fn(message: str) -> bool:
         answer = await _async_read_line("  Allow? (y/n): ", persistent=False)
@@ -551,10 +597,10 @@ async def run_repl(agent: Agent) -> None:
 
         # REPL slash commands —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
         # !shell / exit / quit / 全角归一 / 未知斜杠 fallthrough 仍在本 loop 处理（见上下）。
-        _result = await dispatch(inp, _REGISTRY, _ctx)
+        _result = await dispatch(inp, _REGISTRY, _host.context())
         if _result is not NOT_A_COMMAND:
             # 按 CommandResult variant 路由（Codex cross-review MED）：Prompt 驱动一个 turn；
-            # Local 打印 output / 可退出；Control 留给 CMD-P3+ lifecycle。当前 builtin 全为 Local()。
+            # Local 打印 output / 可退出；Control 经 _apply_control 路由 lifecycle（P2 起接通）。
             if isinstance(_result, Prompt):
                 await _drive_turn(_result.prompt)
                 continue
@@ -565,7 +611,10 @@ async def run_repl(agent: Agent) -> None:
                     print("\nBye!\n")
                     break
                 continue
-            continue  # Control（CMD-P3+）：落地时在此路由 replace_thread/switch_runtime…
+            if isinstance(_result, Control):
+                await _apply_control(_host, _result)
+                continue
+            continue
 
         # Skill invocation: /<skill-name> [args]
         if inp.startswith("/"):
@@ -714,7 +763,9 @@ Examples:
     traj_on = _trajectory_enabled(args.trajectory)
     traj_lvl = _trajectory_level(args.trajectory_level)
 
-    agent = Agent(
+    # docs/14 P2：Agent 构造收敛到 AgentConfig（CLI/SDK/AppServer 共用 bootstrap 数据载体）。
+    # main() 仍负责交互 I/O（trust gate / memory backend 选择 / resume 解析），把结果灌进 config。
+    agent = AgentConfig(
         permission_mode=permission_mode,
         model=model,
         thinking=args.thinking,
@@ -729,7 +780,7 @@ Examples:
         workspace_trusted=workspace_trusted,
         session_id=adopt_sid,
         memory_backend=mem_backend,
-    )
+    ).build_agent()
 
     if _trace_is_enabled(args.trace):
         print_info(f"tracing → {_trace_file(agent.session_id)}")

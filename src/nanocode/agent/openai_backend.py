@@ -1,5 +1,7 @@
-"""OpenAI 兼容后端：流式对话循环、并行/串行工具批处理、流式响应组装、
-摘要压缩与分层裁剪（budget / snip / microcompact）。"""
+"""OpenAI 兼容后端：流式对话循环、并行/串行工具批处理、流式响应组装、摘要压缩（summary-compaction）。
+
+注（docs/14 P5）：原 snip/microcompact 分层裁剪 tier 已删除——大工具输出由 tools.shared 的
+per-result cap（MAX_RESULT_CHARS）控制，上下文压缩只保留 summary-compaction 一条路径。"""
 
 from __future__ import annotations
 
@@ -13,13 +15,13 @@ from .models import _to_openai_tools, _with_retry
 
 
 class OpenAIBackendMixin:
-    async def _compact_openai(self) -> None:
+    async def _compact_openai(self) -> "str | None":
         # Invariant: caller must ensure the last message is a plain user-text
         # message (not a `tool` role result). Same reasoning as
         # _compact_anthropic — slicing off a tool result would orphan the
         # preceding assistant's tool_calls.
         if len(self._openai_messages) < 5:
-            return
+            return None
         system_msg = self._openai_messages[0]
         last_user_msg = self._openai_messages[-1]
         summary_resp = await self._openai_client.chat.completions.create(
@@ -39,14 +41,13 @@ class OpenAIBackendMixin:
         if last_user_msg.get("role") == "user":
             self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
-
-    # Budget/snip/microcompact tier 实现已上移至 compaction.CompressionPipeline；
-    # 本 backend 不再实现细节，engine._run_compression_pipeline 每轮调用 facade（行为不变）。
+        return summary_text  # S4: engine 据此 additive 写 compaction 树 entry
 
     # ─── OpenAI-compatible backend ───────────────────────────────
 
     async def _chat_openai(self, user_message: str) -> None:
         self._openai_messages.append({"role": "user", "content": user_message})
+        self._tree_record({"role": "user", "content": user_message})  # S1: message-end → tree
         # Auto-compact at turn boundary only — see _chat_anthropic for rationale.
         # The last message is now plain user text, so the slice in
         # _compact_openai won't orphan a tool_calls / tool message pair.
@@ -67,8 +68,6 @@ class OpenAIBackendMixin:
             if self._aborted:
                 break
 
-            self._run_compression_pipeline()
-
             # Consume memory prefetch if settled (non-blocking poll, zero-wait)
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
                 memory_prefetch.consumed = True
@@ -76,11 +75,13 @@ class OpenAIBackendMixin:
                     memories = memory_prefetch.task.result()
                     if memories:
                         injection_text = format_memories_for_injection(memories)
-                        last = self._openai_messages[-1] if self._openai_messages else None
-                        if last and last.get("role") == "user":
-                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
-                        else:
-                            self._openai_messages.append({"role": "user", "content": injection_text})
+                        # docs/14 §4.5：写 custom_message tree entry（主 agent）；树写失败 → flat 兜底（P3 review #7）。
+                        if not self._tree_custom_message("memory", injection_text):
+                            last = self._openai_messages[-1] if self._openai_messages else None
+                            if last and last.get("role") == "user":
+                                last["content"] = (last.get("content") or "") + "\n\n" + injection_text
+                            else:
+                                self._openai_messages.append({"role": "user", "content": injection_text})
                         for m in memories:
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += len(m.content.encode())
@@ -93,6 +94,9 @@ class OpenAIBackendMixin:
             if not self.is_sub_agent:
                 self._sink.spinner_start()
 
+            # S2（docs/13）：从 canonical 树渲染本轮请求（含 S1 消息 + P5 注入 custom_message），
+            # 覆盖扁平列表——树是会话事实源，扁平列表降为本轮投影。
+            self._openai_messages = self._build_request_messages()
             self.tracer.emit(
                 "llm_request", model=self.model,
                 message_count=len(self._openai_messages),
@@ -114,6 +118,7 @@ class OpenAIBackendMixin:
             message = choice.get("message", {})
 
             self._openai_messages.append(message)
+            self._tree_record(message, stop_reason=choice.get("finish_reason"))  # S1 + 真实 finish_reason
 
             _tcs = message.get("tool_calls") or []
             self._dispatch_event(
@@ -192,11 +197,15 @@ class OpenAIBackendMixin:
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                     for ct_item, res in results:
-                        self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                        tmsg = {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res}
+                        self._openai_messages.append(tmsg)
+                        self._tree_record(tmsg)  # S1: message-end → tree
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
-                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            dmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]}
+                            self._openai_messages.append(dmsg)
+                            self._tree_record(dmsg)  # S1: message-end → tree
                             continue
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
@@ -204,10 +213,14 @@ class OpenAIBackendMixin:
 
                         if self._context_cleared:
                             self._context_cleared = False
-                            self._openai_messages.append({"role": "user", "content": res})
+                            cbmsg = {"role": "user", "content": res}
+                            self._openai_messages.append(cbmsg)
+                            self._tree_record(cbmsg)  # S1: message-end → tree
                             oai_context_break = True
                             break
-                        self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                        rmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res}
+                        self._openai_messages.append(rmsg)
+                        self._tree_record(rmsg)  # S1: message-end → tree
 
             self._context_cleared = False
             if not oai_context_break:
