@@ -289,15 +289,23 @@ class AgentSession:
         """kept-suffix 起点：从分支尾部按 token 估计累计，选**预算内最近的 user MESSAGE** entry。
 
         必须是 user 消息边界——assistant/toolResult 开头的悬挂 suffix 会被 render 的
-        inverse-orphan 清洗掉（信息丢失）或形成断链。无预算内的 user 边界 → None
-        （旧消息全部由 summary 顶替）。"""
+        inverse-orphan 清洗掉（信息丢失）或形成断链。
+
+        over-budget 兜底（docs/16 #10 review fix）：尾部直到最近 user 边界已超预算时，仍取
+        **最后一条 user MESSAGE** 作 cut——保证 compaction 真正收缩（其前的全部历史进 summary）
+        且当前问题原文保留；fold 对 firstKeptEntryId=None 的语义是"无 kept suffix"，只在分支
+        完全没有 user 消息时才返回 None。"""
         from ..context.packs import estimate_tokens
         budget = self.keep_recent_tokens()
         total = 0
         cut = None
+        last_user = None
         for e in reversed(branch):
             if e.type == _tree.MESSAGE:
                 content = (e.data.get("message") or {}).get("content", "")
+                if (last_user is None
+                        and (e.data.get("message") or {}).get("role") == "user"):
+                    last_user = e.id
             elif e.type == _tree.CUSTOM_MESSAGE:
                 content = e.data.get("content", "")
             else:
@@ -308,7 +316,7 @@ class AgentSession:
             if (e.type == _tree.MESSAGE
                     and (e.data.get("message") or {}).get("role") == "user"):
                 cut = e.id
-        return cut
+        return cut if cut is not None else last_user
 
     def _project_branch_prefix(self, prefix_entries) -> "list | None":
         """branch 前缀 → provider-shaped 消息（summarizer 输入）。与请求渲染同一管线

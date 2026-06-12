@@ -94,21 +94,44 @@ def test_compaction_cut_point_keeps_recent_user_within_budget(monkeypatch):
     assert "recent" not in str(seen["messages"])        # kept suffix 不进 summarizer
 
 
-def test_compaction_cut_point_none_when_no_user_boundary_fits(monkeypatch):
-    # 末条 user 自身已超预算 → 无可保的 user 边界 → firstKept=None（旧消息全由 summary 顶替）。
+def test_compaction_over_budget_falls_back_to_last_user(monkeypatch):
+    # docs/16 #10 review fix：末条 user 自身已超预算 → 仍兜底取**最后一条 user**作 cut——
+    # compaction 必须真正收缩（其前历史进 summary）且当前问题原文保留，绝不写出
+    # "summary + 全部原文"的不缩反胀 entry（codex P2）。
     import asyncio
     a = Agent(api_key="test", session_id="s4man", permission_mode="bypassPermissions")
     a.model = "claude-x"
     mgr = SessionManager.create("s4man")
     a._session_mgr = mgr
-    mgr.append_message(tree.user_message("recent question " * 100))
+    mgr.append_message(tree.user_message("old history"))
+    mgr.append_message(tree.assistant_message([tree.text_block("a1")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+    last_user = mgr.append_message(tree.user_message("recent question " * 100))
     mgr.append_message(tree.assistant_message([tree.text_block("ans")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
     monkeypatch.setattr(a, "_compact_anthropic", _fake_summary)
     monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 1)
     asyncio.run(a.agent_session.compact())
     comp = [e for e in mgr.entries() if e.type == tree.COMPACTION]
-    assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] is None
+    assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] == last_user.id
+    # 折叠后：summary 顶替 last_user 之前的历史；last_user 起的 suffix 原文保留 → 真实收缩
+    msgs = mgr.build_context().messages
+    joined = str(msgs)
+    assert "old history" not in joined and "recent question" in joined
+
+
+def test_fold_explicit_none_first_kept_drops_pre_region():
+    # fold 对 firstKeptEntryId=None 的语义 = 无 kept suffix（前区全由 summary 顶替）——
+    # 与写者意图一致；绝不"保守保留全部前区"造成 summary+原文双份（codex P2）。
+    m = SessionManager.create("s4nonefold")
+    m.append_message(tree.user_message("ancient"))
+    m.append_message(tree.assistant_message([tree.text_block("resp")], provider="anthropic",
+                     api="anthropic", model="claude-x", stop_reason="stop"))
+    m.append_compaction(summary="ALL-REPLACED", first_kept_entry_id=None)
+    msgs = m.build_context().messages
+    joined = str(msgs)
+    assert "ALL-REPLACED" in joined
+    assert "ancient" not in joined and "resp" not in joined
 
 
 def test_compaction_skipped_when_everything_fits_keep_budget(monkeypatch):

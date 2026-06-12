@@ -85,16 +85,31 @@ def test_present_kinds_uses_fold_rendered_folded_out_reinjects():
     assert a.agent_session._session_context_present_kinds() == set()
 
 
-def test_present_kinds_keeps_pre_compaction_kept_region_no_double_inject():
-    # codex-found：custom 在 compaction 的 kept 前区(firstKeptEntryId=None=全保留)→ fold 仍渲染 → 不重复注入。
+def test_present_kinds_after_full_replacement_compaction_triggers_reinject():
+    # docs/16 #10 review fix：firstKeptEntryId=None = 前区全由 summary 顶替（无 kept suffix）——
+    # 前区的 session-context 包随之折掉 → present kinds 为空 → inject_session_context 会**重注入**
+    # 缺失 kind（其 docstring 设计：compaction 后折出渲染 → 重注入）。kept 前区仍渲染的不重复注入
+    # 性质由 test_present_kinds_in_kept_region 覆盖（firstKept 指向 kept 区起点时）。
     a = _agent("cut4b")
     mgr = SessionLease.open_or_create("cut4b").manager
     a._session_mgr = mgr
     mgr.append(T.CUSTOM_MESSAGE, {"customType": "project_instructions", "content": "X", "display": False})
     mgr.append_message(T.user_message("u1"))
-    mgr.append_compaction(summary="s", first_kept_entry_id=None)              # None → fold 保留全部前区
+    mgr.append_compaction(summary="s", first_kept_entry_id=None)              # None → 前区全顶替
     mgr.append_message(T.user_message("u2"))
-    assert "project_instructions" in a.agent_session._session_context_present_kinds()       # 仍渲染 → 不 double-inject
+    assert "project_instructions" not in a.agent_session._session_context_present_kinds()   # 已折掉 → 触发重注入
+
+
+def test_present_kinds_in_kept_region_no_double_inject():
+    # custom 在 compaction 的 **kept 区**（firstKept 指向它）→ fold 仍渲染 → 不重复注入。
+    a = _agent("cut4b2")
+    mgr = SessionLease.open_or_create("cut4b2").manager
+    a._session_mgr = mgr
+    kept = mgr.append(T.CUSTOM_MESSAGE, {"customType": "project_instructions", "content": "X", "display": False})
+    mgr.append_message(T.user_message("u1"))
+    mgr.append_compaction(summary="s", first_kept_entry_id=kept.id)           # kept 区起点 = 该包
+    mgr.append_message(T.user_message("u2"))
+    assert "project_instructions" in a.agent_session._session_context_present_kinds()
 
 
 def test_per_customtype_dedup_not_suppressed_by_other_kind():

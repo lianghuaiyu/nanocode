@@ -95,7 +95,10 @@ def fold(branch: list[Entry]) -> tuple[list[dict], ScalarState]:
         rich.append({"role": "compactionSummary", "summary": comp.data.get("summary", ""),
                      "tokensBefore": comp.data.get("tokensBefore")})
         first_kept = comp.data.get("firstKeptEntryId")
-        keeping = first_kept is None  # firstKeptEntryId 缺省 → 不丢前区（保守）
+        # firstKeptEntryId=None 的语义 = **无 kept suffix**（前区全由 summary 顶替）——与写者
+        # （AgentSession.compact）一致。docs/16 #10 review fix：旧的"None → 保守保留全部前区"
+        # 会使 over-budget compaction 不缩反胀（summary + 原文双份），打穿 overflow 恢复。
+        keeping = False
         for i in range(comp_idx):
             e = branch[i]
             if not keeping and e.id == first_kept:
