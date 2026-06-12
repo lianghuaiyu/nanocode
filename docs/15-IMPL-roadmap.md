@@ -38,12 +38,10 @@ capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py
 - Phase 4 🟡 read_file caps 完成;**剩余 tree-sitter repo map**（需加依赖 tree-sitter + grammars）。
 - Phase 5 🟡 typed profile/registry/permission + capabilities(PermissionContext/taxonomy) 完成;
   **剩余 engine._execute_tool_call 改经 CapabilityRouter 派发**。
-- Phase 6 🟡 ResultEnvelope + **spawn slices 1–4 完成**：核心子 agent 运行时已搬到 runtime/spawn.py
-  的 SubAgentRunner（build_sub_agent / 写盘 / run 原语 / finalizers / execute_agent_tool / 后台 spawn·run）。
-  engine.py **2195→1724 行**。关键模式：runner 内所有跨调走 `host._X`(engine 薄委托)而非 `self.X`,
-  保住 tests 在 agent 实例上的 monkeypatch seam。**剩余 slices**: ⑤ _spawn/_run_memory_consolidate/eval/
-  optimize(~270 行,memory curator 是 subagent,同 background 模式) ⑥ _execute_skill_tool fork(~180 行)。
-  保 background pin live leaf、双 flock、trajectory_id 不分叉。
+- Phase 6 ✅ ResultEnvelope + **spawn 搬迁完成**：SubAgentRunner(build/写盘/run 原语/finalizers/
+  execute_agent_tool/后台 spawn·run/**memory curator spawns**)全在 runtime/spawn.py。engine.py **2195→1439**。
+  runner 内跨调走 host._X 保 monkeypatch seam。**注**：_execute_skill_tool fork 留在 engine —— 它是 skill-tool
+  handler(skill 域),宜归 capabilities/skills.py(Phase 5 域),非 runtime/spawn(已记)。
 - Phase 7 ⬜ 未开始: CLI as runtime client。
 
 ### 继续指南（剩余 = 把旧 engine.py 代码迁入新架构;每步小颗粒 + 测试 + 提交,保持全绿）
