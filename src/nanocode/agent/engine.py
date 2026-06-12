@@ -84,9 +84,9 @@ from . import runtime_events  # noqa: E402 — 单一 RuntimeEvent 流（RUNTIME
 # （ALWAYS_ALLOWED_META / AGENT_META_TOOL / allowlist_blocks），由 PermissionEngine 统一持有。
 
 
-async def _auto_deny_confirm(_command: str) -> bool:
-    """后台子 agent 的 confirm_fn：无 TTY 等价拒绝（auto-deny-but-continue）。"""
-    return False
+# docs/15 Phase 6：子 agent 构造 + 产物落盘搬迁到 runtime/spawn.py（host-driven SubAgentRunner）。
+# _auto_deny_confirm 定义在 spawn.py,此处 re-export（tests + build_sub_agent 依赖同一对象身份）。
+from ..runtime.spawn import SubAgentRunner, _auto_deny_confirm  # noqa: E402,F401
 
 
 class Agent(PlanModeMixin):
@@ -198,6 +198,8 @@ class Agent(PlanModeMixin):
         self._background_tasks: set[asyncio.Task] = set()
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
         self._subagents = SubAgentManager(self)
+        # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
+        self._spawn = SubAgentRunner()
         # docs/14 §6b（additive child-session）：spawn 时记下父 leaf，finalize 镜像 child session 时
         # 作 parentSession.entryId（pin 到 spawn 分支）。agent_id → 父 spawn leaf。
         self._subagent_spawn_leaf: dict = {}
@@ -1089,49 +1091,13 @@ class Agent(PlanModeMixin):
         background=True（detached 后台子 agent）：无 TTY，需确认的危险调用一律
         auto-deny（confirm_fn=_auto_deny_confirm 恒拒），并使用**新空集** confirmed_paths
         （不与父共享，后台确认不回流父），其余继承不变。
+
+        docs/15 Phase 6：实现已搬迁到 runtime/spawn.py（host-driven）；此为薄委托。
         """
-        safe_tools = [t for t in tools if t.get("name") != "agent"]
-        confirm_fn = _auto_deny_confirm if background else self.confirm_fn
-        confirmed_paths = set() if background else self._confirmed_paths
-        allowed_tool_names = {t["name"] for t in safe_tools}
-        sub = Agent(
-            model=model or self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-            custom_system_prompt=system_prompt,
-            custom_tools=safe_tools,
-            is_sub_agent=True,
-            permission_mode=self.permission_mode,
-            confirm_fn=confirm_fn,
-            confirmed_paths=confirmed_paths,
-            session_id=session_id or self.session_id,
-            task_manager=self.task_manager,
-            # 子 agent 继承 trajectory 采集开关（plain attrs，gate trajectory export）。父子共享同一
-            # session_id（上面 session_id=session_id or self.session_id），故父子 trajectory_id
-            # （traj_<session_id>）必然一致——隐式不变量：若将来给子 agent 独立 session_id，trajectory_id
-            # 会随之分叉，届时需显式透传。
-            trajectory_enabled=self.trajectory_enabled,
-            trajectory_level=self.trajectory_level,
-            max_turns=max_turns,
-            artifact_id=artifact_id,
-            allowed_tool_names=allowed_tool_names,
-            depth=self.depth + 1,
-            agent_type=agent_type,
-            agent_source=agent_source,
-        )
-        # docs/14 full-P6b + SessionLease：子 agent 把 transcript 写进独立 child session.jsonl
-        # （child sid 由 artifact_id 派生；session_id/artifacts/trajectory 仍 parent-keyed，故 trajectory
-        # 不变量保持）。spawn 即注入一把 child 写者租约（open_or_create：fresh→建 header；resume→打开
-        # 已存在的 child 树）——单点覆盖前台/后台/skill-fork/memory 全部 spawn 路径。run 的 _ensure 见
-        # 已注入则 no-op；_persist_agent_messages 在每个终态 close 这把 child mgr（释放 child 锁）。
-        if artifact_id and artifact_id != "main":
-            from ..session.lease import SessionLease
-            sub._tree_session_id = self.child_session_id(artifact_id)
-            sub._child_parent_session = {"sessionId": self.session_id,
-                                         "entryId": self._subagent_spawn_leaf.get(artifact_id),
-                                         "taskId": artifact_id, "agentId": artifact_id}
-            sub._session_mgr = SessionLease.open_or_create(
-                sub._tree_session_id, parent_session=sub._child_parent_session).manager
-        return sub
+        return self._spawn.build_sub_agent(
+            self, system_prompt=system_prompt, tools=tools, agent_type=agent_type,
+            session_id=session_id, background=background, max_turns=max_turns,
+            model=model, artifact_id=artifact_id, agent_source=agent_source)
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -1231,73 +1197,31 @@ class Agent(PlanModeMixin):
         return f'[skill "{inp.get("skill_name", "")}" loaded — its instructions follow in the next message]'
 
     def _current_provider(self) -> str:
-        return "openai" if self.use_openai else "anthropic"
+        return self._spawn.current_provider(self)
 
     def _persist_agent_messages(self, agent_id: str, sub_agent: "Agent") -> None:
-        """Persist sub-agent messages to v2 session storage (parent-keyed artifacts；back-compat)。"""
-        try:
-            # 经子 agent owner 的 dump 入口读，不再直接 reach 进 sub_agent._{provider}_messages。
-            msgs = sub_agent._dump_messages()
-            _session_v2.write_agent_messages(self.session_id, agent_id, msgs)
-        except Exception:
-            pass
-        # full-P6b：子 agent transcript 已由其自身 _tree_record 实时写进 child session.jsonl（不再需要
-        # finalize 镜像）。close 子的 child SessionManager，释放句柄/锁，使 /agent 导航后续可 lock 进入。
-        try:
-            if sub_agent._session_mgr is not None:
-                sub_agent._session_mgr.close()
-        except Exception:
-            pass
+        """Persist sub-agent messages + close child 写锁（docs/15 Phase 6：实现在 runtime/spawn.py）。"""
+        return self._spawn.persist_agent_messages(self, agent_id, sub_agent)
 
     def child_session_id(self, agent_id: str) -> str:
         """子 agent 的 child session id（docs/14 §6b）。父 sid 作前缀，保证跨父唯一。"""
-        return f"{self.session_id}.{agent_id}"
+        return self._spawn.child_session_id(self, agent_id)
 
     def _write_agent_spawn_artifacts(self, *, agent_id: str, agent_type: str,
                                      description: str, prompt: str, model: str,
                                      background: bool) -> None:
-        """子 agent 创建时落 prompt.txt + meta.json(status=running)。失败绝不影响主流程。"""
-        # docs/14 §6b：记下 spawn 时父 leaf，供 finalize 镜像 child session 时 pin parentSession.entryId。
-        try:
-            self._subagent_spawn_leaf[agent_id] = (self._session_mgr.get_leaf()
-                                                   if self._session_mgr is not None else None)
-        except Exception:
-            self._subagent_spawn_leaf[agent_id] = None
-        try:
-            _session_v2.write_agent_prompt(self.session_id, agent_id, prompt or "")
-        except Exception:
-            pass
-        try:
-            _session_v2.write_agent_meta(self.session_id, agent_id, {
-                "id": agent_id,
-                "type": agent_type,
-                "description": description,
-                "model": model,
-                "provider": self._current_provider(),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "background": background,
-                "parent_session_id": self.session_id,
-                "status": "running",
-            })
-        except Exception:
-            pass
+        """子 agent 创建时落 prompt.txt + meta.json + 记 spawn 父 leaf（实现在 runtime/spawn.py）。"""
+        return self._spawn.write_agent_spawn_artifacts(
+            self, agent_id=agent_id, agent_type=agent_type, description=description,
+            prompt=prompt, model=model, background=background)
 
     def _finalize_agent_meta(self, agent_id: str, status: str) -> None:
-        """子 agent 终态时补 status + ended_at（合并已有 meta.json）。失败绝不影响主流程。"""
-        try:
-            meta = _session_v2.read_agent_meta(self.session_id, agent_id) or {"id": agent_id}
-            meta["status"] = status
-            meta["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            _session_v2.write_agent_meta(self.session_id, agent_id, meta)
-        except Exception:
-            pass
+        """子 agent 终态补 status + ended_at（实现在 runtime/spawn.py）。"""
+        return self._spawn.finalize_agent_meta(self, agent_id, status)
 
     def _write_agent_result(self, agent_id: str, text: str) -> str | None:
-        """把子 agent 最终文本写到 <agent_dir>/result.md，返回路径（失败返回 None）。"""
-        try:
-            return _session_v2.write_agent_result(self.session_id, agent_id, text or "")
-        except Exception:
-            return None
+        """子 agent 最终文本 → <agent_dir>/result.md（实现在 runtime/spawn.py）。"""
+        return self._spawn.write_agent_result(self, agent_id, text)
 
     # ─── Structured AgentResult + bounded envelope ────────────────
     # 纯函数（无 self / IO / 模型循环）已抽入 agent_result.py（CAP-P1 STEP 1）；以下为委托 shim。
@@ -1316,21 +1240,12 @@ class Agent(PlanModeMixin):
             runtime_events.RuntimeEvent(_type, fields), self._sink)
 
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
-        """把子 agent 已花费的 token 折叠进父——成功/超时/错误都要折，否则一个跑了很久
-        才超时/出错的子 agent 对 max_cost_usd 完全不可见（runaway 成本黑洞）。子 agent
-        是全新实例（从 0 起算），故其 total_*_tokens 即为本次增量。"""
-        try:
-            self.total_input_tokens += getattr(sub_agent, "total_input_tokens", 0) or 0
-            self.total_output_tokens += getattr(sub_agent, "total_output_tokens", 0) or 0
-        except Exception:
-            pass
+        """把子 agent 已花费的 token 折叠进父（成功/超时/错误都折；实现在 runtime/spawn.py）。"""
+        return self._spawn.fold_subagent_tokens(self, sub_agent)
 
     def _write_terminal_result(self, agent_id: str, sub_agent, reason: str) -> str | None:
-        """终态（超时/错误）写 result.md：有 partial 输出就写它，否则写 reason。
-        返回路径，供 task.result_path/last_result_path——让 reminder 指向 agent_dir
-        而非渲染误导性的空 shell 日志。"""
-        partial = self._subagent_captured_text(sub_agent)
-        return self._write_agent_result(agent_id, partial or reason)
+        """终态写 result.md：有 partial 输出写它,否则写 reason（实现在 runtime/spawn.py）。"""
+        return self._spawn.write_terminal_result(self, agent_id, sub_agent, reason)
 
     def _finalize_foreground_terminal(self, sub_agent: "Agent", record_id: str,
                                       kind: str, payload, timeout_ms: int | None) -> str:
@@ -1370,14 +1285,8 @@ class Agent(PlanModeMixin):
     # ─── Background sub-agent (detached, auto-deny-but-continue) ──
 
     def _write_subagent_result(self, task_id: str, text: str) -> str | None:
-        """把子 agent 完整输出写到 task_dir/result.md，返回路径（失败返回 None）。"""
-        try:
-            d = _session_v2.task_dir(self.session_id, task_id)
-            p = d / "result.md"
-            p.write_text(text or "", encoding="utf-8")
-            return str(p)
-        except Exception:
-            return None
+        """子 agent 完整输出 → task_dir/result.md（实现在 runtime/spawn.py）。"""
+        return self._spawn.write_subagent_result(self, task_id, text)
 
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
                                          prompt: str, timeout_ms: int | None = None) -> str:
