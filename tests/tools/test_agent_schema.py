@@ -32,5 +32,15 @@ def test_run_in_background_is_optional_boolean():
     assert props["run_in_background"]["type"] == "boolean"
 
 
-def test_required_unchanged():
-    assert SCHEMA["input_schema"]["required"] == ["description", "prompt"]
+def test_required_is_description_only():
+    # docs/16 #9：steps/tasks 编排模式下顶层 prompt 不再强制（runtime 校验"单步模式必须给
+    # prompt 或 resume"）；description 仍必填。
+    assert SCHEMA["input_schema"]["required"] == ["description"]
+
+
+def test_steps_and_tasks_orchestration_arrays():
+    props = SCHEMA["input_schema"]["properties"]
+    for key in ("steps", "tasks"):
+        assert props[key]["type"] == "array"
+        assert props[key]["items"]["required"] == ["prompt"]
+    assert "{previous}" in SCHEMA["description"]

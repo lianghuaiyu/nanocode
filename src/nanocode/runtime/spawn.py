@@ -40,6 +40,19 @@ async def _auto_deny_confirm(_command: str) -> bool:
     return False
 
 
+def _normalize_agent_type(agent_type: str) -> str:
+    """agent 工具的类型归一（单步/chain/parallel 共用）：general/coder 同义归 coder；
+    已发现的自定义类型保留；未知/保留名 → coder（general 语义）。"""
+    from ..agents.registry import RESERVED_AGENT_TYPES, discover_custom_agents
+    if agent_type in ("general", "coder"):
+        return "coder"
+    if agent_type in ("explore", "plan"):
+        return agent_type
+    if agent_type in discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
+        return agent_type
+    return "coder"
+
+
 def live_agent_profile(host) -> AgentProfile:
     """live Agent 的 profile 视图（docs/16 #7b：child 派生的 parent 侧输入）。
 
@@ -300,16 +313,8 @@ class SubAgentRunner:
     async def execute_agent_tool(self, host, inp: dict) -> str:
         """`agent` 工具的派发：类型归一 → depth backstop → background / resume / fresh 三路。
         host-driven 搬迁自 engine._execute_agent_tool（行为逐字一致）。"""
-        agent_type = inp.get("type", "general")
-        from ..agents.registry import RESERVED_AGENT_TYPES, discover_custom_agents
-        if agent_type in ("general", "coder"):
-            agent_type = "coder"
-        elif agent_type in ("explore", "plan"):
-            pass
-        elif agent_type in discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
-            pass  # 已发现的自定义类型：保留
-        else:
-            agent_type = "coder"  # 真正未知（含保留名）→ general 语义
+        from ..agents.registry import RESERVED_AGENT_TYPES
+        agent_type = _normalize_agent_type(inp.get("type", "general"))
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
         resume_id = inp.get("resume")
@@ -317,10 +322,23 @@ class SubAgentRunner:
         from ..tools import load_agents_config
         fleet_cfg = load_agents_config()
 
-        # P4 max_depth backstop（所有 spawn 路径）。
+        # P4 max_depth backstop（所有 spawn 路径，含 chain/parallel）。
         if host._subagents.depth_cap_exceeded():
             return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
                     f"cannot spawn a sub-agent at depth {host.depth + 1}.")
+
+        # ── chain / parallel fan-in（docs/16 #9：审计过的 host 原语）──
+        if inp.get("steps") is not None or inp.get("tasks") is not None:
+            if inp.get("steps") is not None and inp.get("tasks") is not None:
+                return "Error: 'steps' (chain) and 'tasks' (parallel) cannot be combined."
+            if resume_id or inp.get("run_in_background"):
+                return "Error: steps/tasks cannot be combined with resume or run_in_background."
+            if inp.get("steps") is not None:
+                return await self.execute_agent_chain(host, inp, fleet_cfg)
+            return await self.execute_agent_parallel(host, inp, fleet_cfg)
+
+        if not (prompt or "").strip() and not resume_id:
+            return "Error: 'prompt' is required (or pass steps/tasks for orchestration)."
 
         # ── run_in_background: detached subagent ──
         if inp.get("run_in_background"):
@@ -410,6 +428,16 @@ class SubAgentRunner:
             return host._finalize_foreground_result(sub_agent, result, result_path, resume_id)
 
         # ── fresh path ──
+        return await self.run_fresh_subagent(
+            host, agent_type=agent_type, description=description, prompt=prompt,
+            tool_timeout_ms=tool_timeout_ms, fleet_cfg=fleet_cfg)
+
+    async def run_fresh_subagent(self, host, *, agent_type: str, description: str,
+                                 prompt: str, tool_timeout_ms: "int | None",
+                                 fleet_cfg: dict) -> str:
+        """fresh 前台子 agent 单步原语（execute_agent_tool fresh 路径逐字抽出；
+        chain/parallel 复用——每步/每任务都是独立 record + 独立 leased child session +
+        bounded ResultEnvelope）。除 CancelledError 外不抛（错误归一为字符串）。"""
         profile = build_profile(agent_type)
         eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
         max_turns = host._subagents.bounded_max_turns(profile.max_turns)
@@ -462,6 +490,79 @@ class SubAgentRunner:
         host._finalize_agent_meta(rec.id, "completed")
         host._sink.sub_agent_end(agent_type, description)
         return host._finalize_foreground_result(sub_agent, result, result_path, rec.id)
+
+    # ─── chain / parallel fan-in（docs/16 #9：借 pi {previous} 与 fan-in 的编排点子）──
+    #
+    # 审计过的 host 原语：每步/每任务都经 run_fresh_subagent（独立 SubAgentRecord、独立
+    # leased child session、bounded ResultEnvelope、同一 fail-closed allowlist/确认链）；
+    # **不耦合** TeamRuntime（其 team_* entry 保持 non-FOLD/non-leaf，与此无涉）。
+    # 上限防御：步数/任务数封顶；parallel 并发受 settings [agents].max_threads 约束。
+
+    MAX_CHAIN_STEPS = 10
+    MAX_PARALLEL_TASKS = 8
+    PREVIOUS_PLACEHOLDER = "{previous}"
+
+    @staticmethod
+    def _validate_orchestration_items(items, *, what: str, cap: int) -> "str | None":
+        if not isinstance(items, list) or not items:
+            return f"Error: '{what}' must be a non-empty array of {{type?, description?, prompt}} objects."
+        if len(items) > cap:
+            return f"Error: too many {what} ({len(items)} > {cap})."
+        for i, it in enumerate(items, 1):
+            if not isinstance(it, dict) or not str(it.get("prompt") or "").strip():
+                return f"Error: {what}[{i}] must be an object with a non-empty 'prompt'."
+        return None
+
+    async def execute_agent_chain(self, host, inp: dict, fleet_cfg: dict) -> str:
+        """chain：按序跑 N 个独立子 agent；步 prompt 里的 {previous} 替换为上一步的
+        bounded envelope（pi index.ts:530 的 {previous} 点子）。abort 在步边界生效。"""
+        steps = inp.get("steps")
+        err = self._validate_orchestration_items(steps, what="steps", cap=self.MAX_CHAIN_STEPS)
+        if err:
+            return err
+        n = len(steps)
+        previous = "(no previous step)"
+        sections: list[str] = []
+        for i, step in enumerate(steps, 1):
+            if host._aborted:
+                sections.append(f"## Step {i}/{n} — skipped (turn aborted)")
+                break
+            agent_type = _normalize_agent_type(step.get("type", "general"))
+            description = step.get("description") or f"chain step {i}/{n}"
+            prompt = str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, previous)
+            envelope = await self.run_fresh_subagent(
+                host, agent_type=agent_type, description=description, prompt=prompt,
+                tool_timeout_ms=step.get("timeout_ms") or inp.get("timeout_ms"),
+                fleet_cfg=fleet_cfg)
+            previous = envelope
+            sections.append(f"## Step {i}/{n} [{agent_type}] {description}\n{envelope}")
+        return "\n\n".join(sections)
+
+    async def execute_agent_parallel(self, host, inp: dict, fleet_cfg: dict) -> str:
+        """parallel fan-in：并发跑 N 个独立子 agent，按任务序聚合 bounded envelope。
+        并发上限 = settings [agents].max_threads（<=0 视为不限）；取消经 gather 传播到
+        全部子任务（各自的 CancelledError 处理落终态后再上抛）。"""
+        tasks = inp.get("tasks")
+        err = self._validate_orchestration_items(tasks, what="tasks", cap=self.MAX_PARALLEL_TASKS)
+        if err:
+            return err
+        n = len(tasks)
+        cap = host._subagents.max_threads()
+        sem = asyncio.Semaphore(cap if cap and cap > 0 else n)
+
+        async def _one(i: int, t: dict) -> str:
+            agent_type = _normalize_agent_type(t.get("type", "general"))
+            description = t.get("description") or f"parallel task {i}/{n}"
+            async with sem:
+                envelope = await self.run_fresh_subagent(
+                    host, agent_type=agent_type, description=description,
+                    prompt=str(t["prompt"]),
+                    tool_timeout_ms=t.get("timeout_ms") or inp.get("timeout_ms"),
+                    fleet_cfg=fleet_cfg)
+            return f"## Task {i}/{n} [{agent_type}] {description}\n{envelope}"
+
+        sections = await asyncio.gather(*[_one(i, t) for i, t in enumerate(tasks, 1)])
+        return "\n\n".join(sections)
 
     # ─── 后台 detached 子 agent（auto-deny-but-continue,搬迁自 engine）────────────
     async def spawn_background_subagent(self, host, *, agent_type: str, description: str,
