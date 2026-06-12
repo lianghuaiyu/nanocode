@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
 
 from .session import AgentSession
-from .sink import BufferSink, TeeSink
+from .sink import BufferSink, RecordingSink, TeeSink
 
 
 # ─── 结果对象 ────────────────────────────────────────────────
@@ -129,11 +129,13 @@ class RuntimeThread:
     """
 
     def __init__(self, runtime: "AgentRuntime", agent, session: AgentSession,
-                 *, capture: "BufferSink | None" = None, lease=None) -> None:
+                 *, capture: "BufferSink | None" = None, lease=None, recorder=None) -> None:
         self._runtime = runtime
         self.agent = agent
         self.session = session
         self._capture = capture  # 若注入则用于 final_response 捕获
+        # docs/15 §6：可选 RecordingSink——events() 把本 thread 的事件流暴露给 in-process/SDK/协议订阅者。
+        self._recorder = recorder
         # docs/14 SessionLease：active thread 持有这把会话写者租约（lock=True 的 SessionManager）。
         # rebind 把旧 lease 的底层 mgr close 掉、新 thread 持新 lease；真正 teardown（REPL 退出 /
         # 一次性结束）经 release_lease() 释放。dispose() **不**碰 lease（见下）。
@@ -206,6 +208,15 @@ class RuntimeThread:
     def tokens(self) -> dict:
         return self.agent.get_token_usage()
 
+    def events(self) -> list[tuple[str, dict]]:
+        """本 thread 迄今记录的结构化事件流（docs/15 §6 in-process subscription）。
+
+        (kind, fields) 列表（assistant_markdown/tool_call/tool_result/cost/sub_agent_*/… 与 EventSink 同集）。
+        仅 adopt/thread_start 路径注入了 RecordingSink；未注入 → []。供 SDK/协议消费者驱动输出,与终端
+        显示 sink 经 TeeSink 并存、互不影响。
+        """
+        return list(self._recorder.records) if self._recorder is not None else []
+
 
 # ─── Runtime ────────────────────────────────────────────────
 
@@ -232,12 +243,17 @@ class AgentRuntime:
             approvals.attach(agent)
         if lease is not None:
             agent._session_mgr = lease.manager
+        # docs/15 §6：始终挂一个 RecordingSink（经 TeeSink 与显示 sink 并存）,使 thread.events() 可用——
+        # 不影响终端输出。capture_response 时再外挂 BufferSink 取 final_response。
+        recorder = RecordingSink()
         capture: "BufferSink | None" = None
+        sinks = [agent._sink, recorder]
         if capture_response:
             capture = BufferSink()
-            agent._sink = TeeSink(agent._sink, capture)
+            sinks.append(capture)
+        agent._sink = TeeSink(*sinks)
         session = AgentSession(agent)
-        thread = RuntimeThread(self, agent, session, capture=capture, lease=lease)
+        thread = RuntimeThread(self, agent, session, capture=capture, lease=lease, recorder=recorder)
         return self.register(thread)
 
     def thread_start(self, config: "AgentConfig", *, approvals: "ApprovalManager | None" = None,
@@ -293,7 +309,8 @@ class AgentRuntime:
             lease.manager.build_context()       # 校验目标树可折叠（在 finalize 旧 session 之前）
             agent.rebind_session(lease.manager)  # finalize 旧（close 旧锁）+ rebuild 新
             new_thread = RuntimeThread(self, agent, AgentSession(agent),
-                                       capture=host.current_thread._capture, lease=lease)
+                                       capture=host.current_thread._capture, lease=lease,
+                                       recorder=host.current_thread._recorder)
             host.replace_thread(new_thread)
         except BaseException:
             # 整个切换都 fail-closed：build_context / rebind rebuild / 包 thread 任一步抛错，都释放刚取的
