@@ -182,43 +182,5 @@ class TeeSink:
         for s in self._sinks: s.retry(attempt, max_retries, reason)
 
 
-class RecordingSink:
-    """记录结构化事件到 list（+ 可选 asyncio.Queue 实时推送）的 EventSink。
-
-    docs/15 §6：供 RuntimeThread.events() 把同一条事件流暴露给 in-process / SDK / 协议订阅者
-    （UI 投影 + buffer 捕获 + subscription 都是同一流的不同投影,互不调用）。经 TeeSink 与显示 sink 并存,
-    不影响终端输出。每条记录为 (kind, fields) 元组。
-    """
-
-    def __init__(self, queue=None) -> None:
-        self.records: list[tuple[str, dict]] = []
-        self._queue = queue
-
-    def _emit(self, kind: str, **fields) -> None:
-        rec = (kind, fields)
-        self.records.append(rec)
-        if self._queue is not None:
-            try:
-                self._queue.put_nowait(rec)
-            except Exception:
-                pass
-
-    def reset(self) -> None:
-        self.records = []
-
-    def assistant_markdown(self, text: str) -> None: self._emit("assistant_markdown", text=text)
-    def thinking(self, text: str) -> None: self._emit("thinking", text=text)
-    def spinner_start(self, label: str = "Thinking") -> None: self._emit("spinner_start", label=label)
-    def spinner_stop(self) -> None: self._emit("spinner_stop")
-    def tool_call(self, name: str, inp: dict) -> None: self._emit("tool_call", name=name, input=inp)
-    def tool_result(self, name: str, result: str) -> None: self._emit("tool_result", name=name, result=result)
-    def cost(self, input_tokens: int, output_tokens: int) -> None:
-        self._emit("cost", input_tokens=input_tokens, output_tokens=output_tokens)
-    def info(self, message: str) -> None: self._emit("info", message=message)
-    def confirmation(self, command: str) -> None: self._emit("confirmation", command=command)
-    def sub_agent_start(self, agent_type: str, description: str) -> None:
-        self._emit("sub_agent_start", agent_type=agent_type, description=description)
-    def sub_agent_end(self, agent_type: str, description: str) -> None:
-        self._emit("sub_agent_end", agent_type=agent_type, description=description)
-    def retry(self, attempt: int, max_retries: int, reason: str) -> None:
-        self._emit("retry", attempt=attempt, max_retries=max_retries, reason=reason)
+# docs/16 #4：RecordingSink 已删——thread.events()/subscribe 走 typed AgentEvent push tap
+# （RuntimeThread._on_agent_event），不再经 EventSink 投影录制。

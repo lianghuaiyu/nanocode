@@ -53,7 +53,7 @@ from .core import AgentCore
 # 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
 from .subagent_manager import SubAgentManager  # noqa: E402
 from . import agent_result  # noqa: E402 — 子 agent 结果信封纯函数（CAP-P1 STEP 1）
-from . import runtime_events  # noqa: E402 — 单一 RuntimeEvent 流（RUNTIME-P1）
+from . import runtime_events  # noqa: E402 — typed AgentEvent UI 投影（docs/16 #2/#4）
 
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
 # 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
@@ -168,6 +168,10 @@ class Agent(PlanModeMixin):
         # Abort support
         self._aborted = False
         self._current_task: asyncio.Task | None = None
+
+        # docs/16 #4：typed AgentEvent push 订阅者（RuntimeThread tap 等）。emit 的第三条扇出腿；
+        # fire-and-forget——订阅者异常绝不影响 turn。
+        self._event_subscribers: list = []
 
         # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
         self.task_manager = task_manager if task_manager is not None else TaskManager()
@@ -548,11 +552,16 @@ class Agent(PlanModeMixin):
 
     def emit(self, event) -> bool:
         """docs/16 #2：**单一事件出口**——一条 typed AgentEvent 扇出
-        `[agent_session.record_event（canonical 树）, project_agent_event（UI 投影）]`
-        （push 订阅者/recorder 在 #4 挂上同一扇出）。树先于 UI：required 写失败 fail-loud 时
+        `[agent_session.record_event（canonical 树）, project_agent_event（UI 投影）,
+        _event_subscribers（RuntimeThread push，docs/16 #4）]`。树先于 UI：required 写失败 fail-loud 时
         不画半截 UI。返回 record_event 的写入结果（ContextInjected 调用方据此推进 dedup）。"""
         written = self.agent_session.record_event(event)
         runtime_events.project_agent_event(event, self._sink)
+        for listener in list(self._event_subscribers):
+            try:
+                listener(event)
+            except Exception:
+                pass   # fire-and-forget（docs/16 #4）：push 订阅者绝不反向破坏 turn
         return written
 
     # docs/16 #3b：_tree_record/_tree_event/_tree_custom_message/_build_request_messages 已迁入

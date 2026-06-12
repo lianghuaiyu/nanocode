@@ -48,6 +48,7 @@ class _FakeAgent:
         self.is_processing = False
         self.task_manager = _FakeTaskManager()
         self._background_tasks = set()          # can_switch 取 len()/真值（docs/14 P2 Control 路由会查闸）
+        self._event_subscribers = []            # docs/16 #4：RuntimeThread push tap 挂载点
         self._sink = None  # CommandContext(out=agent._sink)；CMD-P0 handler 不用它
         # CMD-P2.5：RuntimeThread.run 读取 token 计数（turn 前后取差）
         self.total_input_tokens = 0
