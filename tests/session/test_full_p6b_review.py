@@ -29,7 +29,7 @@ def test_subagent_compaction_writes_to_its_child_tree(monkeypatch):
         return "SUB-SUMMARY"
 
     monkeypatch.setattr(sub, "_compact_anthropic", fake)
-    asyncio.run(sub._compact_conversation())
+    asyncio.run(sub.agent_session.compact())
     comp = [e for e in sub._session_mgr.entries() if e.type == T.COMPACTION]
     assert len(comp) == 1 and comp[0].data["summary"] == "SUB-SUMMARY"
 

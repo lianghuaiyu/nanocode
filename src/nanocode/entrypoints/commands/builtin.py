@@ -103,7 +103,7 @@ async def _context(ctx: CommandContext, args: str) -> Local:
 
 async def _compact(ctx: CommandContext, args: str) -> Local:
     try:
-        await ctx.agent.compact()
+        await ctx.agent.agent_session.compact()
     except Exception as e:
         print_error(str(e))
     return Local()

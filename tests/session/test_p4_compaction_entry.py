@@ -81,7 +81,7 @@ def test_engine_compaction_auto_cut_point_is_last_user_when_leaf(monkeypatch):
                        api="anthropic", model="claude-x", stop_reason="stop"))
     last_user = mgr.append_message(tree.user_message("recent question"))   # leaf == this user
     monkeypatch.setattr(a, "_compact_anthropic", _fake_summary)
-    asyncio.run(a._compact_conversation())
+    asyncio.run(a.agent_session.compact())
     comp = [e for e in mgr.entries() if e.type == tree.COMPACTION]
     assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] == last_user.id
 
@@ -98,6 +98,6 @@ def test_engine_compaction_manual_cut_point_none_when_leaf_is_assistant(monkeypa
     mgr.append_message(tree.assistant_message([tree.text_block("ans")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))   # leaf = assistant
     monkeypatch.setattr(a, "_compact_anthropic", _fake_summary)
-    asyncio.run(a._compact_conversation())
+    asyncio.run(a.agent_session.compact())
     comp = [e for e in mgr.entries() if e.type == tree.COMPACTION]
     assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] is None

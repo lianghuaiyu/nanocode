@@ -61,7 +61,15 @@ class _FakeAgent:
     def clear_history(self): self.calls.append(("clear_history",))
     def toggle_plan_mode(self): self.calls.append(("toggle_plan_mode",))
     def show_cost(self): self.calls.append(("show_cost",))
-    async def compact(self): self.calls.append(("compact",))
+
+    @property
+    def agent_session(self):
+        # docs/16 #3a：/compact 走 agent_session.compact()（compaction owner = turn shell）。
+        calls = self.calls
+        class _S:
+            async def compact(self): calls.append(("compact",))
+        return _S()
+
     async def _spawn_memory_consolidate(self): self.calls.append(("_spawn_memory_consolidate",)); return ""
     async def _spawn_memory_eval(self): self.calls.append(("_spawn_memory_eval",)); return ""
     async def _spawn_memory_optimize(self): self.calls.append(("_spawn_memory_optimize",)); return ""

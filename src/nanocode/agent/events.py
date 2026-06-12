@@ -129,10 +129,18 @@ class BudgetExceeded:
 
 @dataclass(frozen=True)
 class CompactionRequested:
-    """请求压缩（AgentSession.compact 写 COMPACTION entry，两区 fold）。"""
+    """压缩事实（AgentSession.compact 产出 summary 后发出；record_event 写 COMPACTION entry，
+    两区 fold）。additive（docs/16 #3a）：携带把它落成 entry 所需的全部事实——summary /
+    first_kept_entry_id / 前后计数（neutral 消息数，前 = fold 现状、后 = 含 pending compaction
+    的合成 fold 预测）。compaction_kind ∈ auto|manual（落 entry 的 kind 字段）。"""
 
     reason: str
     tokens_before: int | None = None
+    summary: str | None = None
+    first_kept_entry_id: str | None = None
+    message_count_before: int | None = None
+    message_count_after: int | None = None
+    compaction_kind: str = "auto"
     kind: str = "compaction_requested"
 
 

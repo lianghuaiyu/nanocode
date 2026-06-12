@@ -5,7 +5,8 @@ docs/15 STEP D：从薄包装升级为「同时知道 SessionManager 与 AgentCo
 - hydrate_state()：从 canonical 树 build_context() 重建 AgentState（可丢弃投影,§6）。
 - record_event(event)：把 AgentEvent 落成 canonical session entry（取代散落的 _tree_* 调用）。
 - run_turn(prompt)：一个 turn 的编排外壳（当前委托 AgentCore=Agent.chat；事件 inversion 渐进上移）。
-- compact()：压缩（委托 _compact_conversation，写 compaction entry + 两区 fold）。
+- compact() / check_and_compact()：compaction owner（docs/16 #3a）——summarizer 输入吃树渲染,
+  entry 经 CompactionRequested→record_event 单写（两区 fold 的唯一 shrink 通道）。
 - move_to()：in-file 树导航（移 leaf）。
 - verify_turn_consistency()：turn-end 一致性检查（§7.6）——删 flat fallback 后,树是唯一权威,
   孤儿/断链/leaf 漂移必须 fail-loud 而非静默污染下一轮。
@@ -42,8 +43,56 @@ class AgentSession:
         await self.agent.chat(prompt)
 
     async def compact(self, instructions: str | None = None) -> None:
-        """压缩当前对话（写 compaction entry + 两区 fold）。instructions 预留（自定义摘要指令）。"""
-        await self.agent._compact_conversation()
+        """压缩当前对话（docs/16 #3a：compaction owner 上移到 turn shell）。
+
+        summarizer 输入吃**树渲染**（hydrate_state().project()，与发给模型的上下文一致）——
+        不再读 flat 列表；产出经 `CompactionRequested→record_event` 写 COMPACTION entry
+        （两区 fold 的唯一 shrink 通道）。firstKept 语义保持 docs/14 §4.4 bug#1：
+        cut = last_user id 仅当它 == live leaf（auto-compact 刚记完 user 消息时），否则 None。
+        instructions 预留（自定义摘要指令）。"""
+        a = self.agent
+        mgr = a._session_mgr
+        tokens_before = a.last_input_token_count
+        before_count = len(mgr.build_context().messages) if mgr is not None else None
+        first_kept = None
+        if mgr is not None:
+            leaf = mgr.get_leaf()
+            last_u = mgr.last_user_message_id()
+            first_kept = last_u if last_u == leaf else None
+        summary = await (a._compact_openai() if a.use_openai else a._compact_anthropic())
+        if summary:
+            self.record_event(_events.CompactionRequested(
+                reason="context_window", tokens_before=tokens_before, summary=summary,
+                first_kept_entry_id=first_kept,
+                message_count_before=before_count,
+                message_count_after=self._predicted_post_compaction_count(summary, first_kept),
+            ))
+        a._sink.info("Conversation compacted.")
+        a._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
+
+    async def check_and_compact(self) -> None:
+        """auto-compact 阈值门（原 engine._check_and_compact，turn shell 职责）。"""
+        a = self.agent
+        if a.last_input_token_count > a.effective_window * 0.85:
+            a._sink.info("Context window filling up, compacting conversation...")
+            await self.compact()
+
+    def _predicted_post_compaction_count(self, summary: str, first_kept: "str | None") -> "int | None":
+        """预测 compaction entry 落树后的 neutral 消息数（entry 是 append-only，写后不可补字段，
+        故 messageCountAfter 须在写前算）：对 branch + 合成 pending compaction entry 跑**真实** fold
+        （不手写两区逻辑，与 build_context 永远一致）。"""
+        a = self.agent
+        mgr = a._session_mgr
+        if mgr is None:
+            return None
+        from ..session import context as _ctx
+        branch = mgr.get_branch()
+        fake = _tree.Entry(type=_tree.COMPACTION, id="__pending_compaction__",
+                           parentId=(branch[-1].id if branch else None),
+                           sessionId=a._tree_session_id, timestamp=_tree.now_iso(),
+                           data={"summary": summary, "firstKeptEntryId": first_kept})
+        rich, _ = _ctx.fold(branch + [fake])
+        return len(_ctx.convert_to_llm(rich))
 
     # ── state ↔ tree 同步（§6/§7）────────────────────────────────────────────
     def hydrate_state(self) -> AgentState:
@@ -108,13 +157,26 @@ class AgentSession:
         if k == "budget_exceeded":
             a._tree_event(_tree.BUDGET_EXCEEDED, reason=event.reason)
             return True
+        if k == "compaction_requested":
+            # docs/16 #3a：compaction entry 也归单写者。append 失败可观测（丢 entry = 树渲染不收缩）。
+            if a._session_mgr is None:
+                return False
+            try:
+                a._session_mgr.append_compaction(
+                    summary=event.summary or "", tokens_before=event.tokens_before,
+                    first_kept_entry_id=event.first_kept_entry_id, kind=event.compaction_kind,
+                    message_count_before=event.message_count_before,
+                    message_count_after=event.message_count_after)
+                return True
+            except Exception as e:
+                a._sink.info(f"[tree] compaction entry append failed: {e}")
+                return False
         if k in ("turn_completed", "turn_aborted"):
             a._tree_event(_tree.TURN_END, inputTokens=event.input_tokens,
                           outputTokens=event.output_tokens, turns=event.turns,
                           finalStatus="cancelled" if k == "turn_aborted" else "completed")
             return True
-        # assistant_delta / tool_call_requested / tool_result_observed / error_raised /
-        # compaction_requested → 无直接树等价物
+        # assistant_delta / tool_call_requested / tool_result_observed / error_raised → 无树等价物
         return False
 
     def _append_neutral(self, neutral_msg: dict, *, required: bool) -> None:

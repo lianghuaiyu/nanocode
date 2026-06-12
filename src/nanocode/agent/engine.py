@@ -545,11 +545,9 @@ class Agent(PlanModeMixin):
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
 
-    async def compact(self) -> None:
-        await self._compact_conversation()
-
-    # docs/15 STEP C：compaction 逻辑随循环上移到 AgentCore；保留 Agent 薄委托作单一调用点
-    # （_compact_conversation 仍调 self._compact_*()，测试可在实例上 monkeypatch 这两个点）。
+    # docs/16 #3a：compaction 流程（阈值门 + entry 写入）归 AgentSession（turn shell / compaction
+    # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（实现在 AgentCore，
+    # summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走 agent_session.compact()。
     async def _compact_anthropic(self) -> "str | None":
         return await self._core._compact_anthropic(self)
 
@@ -803,47 +801,9 @@ class Agent(PlanModeMixin):
             self._sink.info(f"[state] v2 state persist failed: {e}")
 
     # ─── Autocompact ──────────────────────────────────────────
-
-    async def _check_and_compact(self) -> None:
-        if self.last_input_token_count > self.effective_window * 0.85:
-            self._sink.info("Context window filling up, compacting conversation...")
-            await self._compact_conversation()
-
-    async def _compact_conversation(self) -> None:
-        tokens_before = self.last_input_token_count
-        before_count = self._get_message_count()        # 压缩前消息数（B1 落树供 trajectory/eval 详情）
-        # bug#1（docs/14 §4.4 + P3 review #5）：kept-tail 起点必须与 backend 实际保留的对齐。
-        # backend 仅当末条消息是 user 时才把它接到 summary 之后（_compact_*: last_user_msg.role=='user'），
-        # 否则 summary 之后不留任何旧消息。auto-compact 触发于刚记完 user 消息时（leaf==该 user）→
-        # firstKept=该 user；manual /compact 在 turn 间（leaf 是 assistant/tool）→ firstKept=None（旧消息
-        # 全被 summary 顶替，不复现）。故 cut = last_user id 仅当它==leaf，否则 None。
-        first_kept = None
-        if self._session_mgr is not None:
-            leaf = self._session_mgr.get_leaf()
-            last_u = self._session_mgr.last_user_message_id()
-            first_kept = last_u if last_u == leaf else None
-        if self.use_openai:
-            summary = await self._compact_openai()
-        else:
-            summary = await self._compact_anthropic()
-        # S4（docs/13）：compaction-as-entry —— additive 写一条 compaction 树 entry（summary +
-        # firstKeptEntryId），供 build_context 两区 fold。**主 agent 与 full-P6b 子 agent 都写**（子写自己
-        # 的 child 树）——否则子的 _build_request_messages 从未压缩的 child 树重渲染会抵消压缩（review high）。
-        if summary:
-            try:
-                # docs/14 SessionLease：_session_mgr 由 lease 注入/_ensure 自取（compaction 发生在 turn
-                # 活动期，mgr 必在）。缺则跳过；append 失败可观测（sink.info，docs/16 #2 清 silent pass）
-                # ——丢 compaction entry 意味着树渲染不收缩，必须浮现。
-                if self._session_mgr is not None:
-                    self._session_mgr.append_compaction(
-                        summary=summary, tokens_before=tokens_before,
-                        first_kept_entry_id=first_kept, kind="auto",
-                        message_count_before=before_count,
-                        message_count_after=self._get_message_count())
-            except Exception as e:
-                self._sink.info(f"[tree] compaction entry append failed: {e}")
-        self._sink.info("Conversation compacted.")
-        self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
+    # docs/16 #3a：_check_and_compact / _compact_conversation 已迁入 AgentSession
+    # （check_and_compact / compact）——compaction owner = turn shell，entry 写入经
+    # CompactionRequested→record_event 单写者。
 
     # ─── Skill progressive disclosure ─────────────────────────
 

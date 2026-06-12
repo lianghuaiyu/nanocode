@@ -59,7 +59,7 @@ class AgentCore:
     async def run_anthropic_turn(self, host, user_message: str) -> None:
         host._anthropic_messages.append({"role": "user", "content": user_message})
         self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
-        await host._check_and_compact()
+        await host.agent_session.check_and_compact()
 
         memory_prefetch = None
         if not host.is_sub_agent:
@@ -210,7 +210,7 @@ class AgentCore:
     async def run_openai_turn(self, host, user_message: str) -> None:
         host._openai_messages.append({"role": "user", "content": user_message})
         self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
-        await host._check_and_compact()
+        await host.agent_session.check_and_compact()
 
         memory_prefetch = None
         if not host.is_sub_agent:
@@ -367,52 +367,42 @@ class AgentCore:
             if not oai_context_break:
                 host._inject_pending_skill_bodies()
 
-    # ─── Summary compaction（移植自 mixin，host-driven）────────────────────────
+    # ─── Summary compaction（docs/16 #3a：summarizer 输入 = 树渲染，不再读/写 flat 列表）────
+    #
+    # flat 重写（[summary, ack, last_user] 顶替列表）已删：自 docs/13 S2 起每个请求都从树
+    # 重新渲染（_build_request_messages 每轮覆盖 flat），重写从未进过请求——真正的 shrink 是
+    # AgentSession.compact 写的 COMPACTION entry（两区 fold）。本方法只产 summary 文本。
+
     async def _compact_anthropic(self, host) -> "str | None":
-        # Invariant: caller must ensure the last message is a plain user-text message.
-        if len(host._anthropic_messages) < 4:
+        messages = host.agent_session.hydrate_state().project().messages
+        if len(messages) < 4:
             return None
-        last_user_msg = host._anthropic_messages[-1]
         summary_resp = await host._anthropic_client.messages.create(
             model=host.model,
             max_tokens=2048,
             system="You are a conversation summarizer. Be concise but preserve important details.",
             messages=[
-                *host._anthropic_messages[:-1],
+                *messages[:-1],
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
-        host._anthropic_messages = [
-            {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
-        ]
-        if last_user_msg.get("role") == "user":
-            host._anthropic_messages.append(last_user_msg)
         host.last_input_token_count = 0
         return summary_text
 
     async def _compact_openai(self, host) -> "str | None":
-        if len(host._openai_messages) < 5:
+        messages = host.agent_session.hydrate_state().project().messages
+        if len(messages) < 5:
             return None
-        system_msg = host._openai_messages[0]
-        last_user_msg = host._openai_messages[-1]
         summary_resp = await host._openai_client.chat.completions.create(
             model=host.model,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *host._openai_messages[1:-1],
+                *messages[1:-1],
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "No summary available."
-        host._openai_messages = [
-            system_msg,
-            {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
-        ]
-        if last_user_msg.get("role") == "user":
-            host._openai_messages.append(last_user_msg)
         host.last_input_token_count = 0
         return summary_text
 
