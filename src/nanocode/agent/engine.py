@@ -198,6 +198,7 @@ class Agent(PlanModeMixin):
         self._subagents = SubAgentManager(self)
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
         self._spawn = SubAgentRunner()
+        self._agent_session_obj = None     # lazy AgentSession（docs/16 #1：record_event 唯一 message 树写者）
         # docs/15 Phase 5：工具派发单一入口（allowlist 咽喉点 + meta/agent/skill/real 路由 + hooks）。
         from ..capabilities import CapabilityRouter
         self._router = CapabilityRouter()
@@ -697,6 +698,15 @@ class Agent(PlanModeMixin):
         from ..session.lease import SessionLease
         self._session_mgr = SessionLease.open_or_create(
             self._tree_session_id, parent_session=self._child_parent_session).manager
+
+    @property
+    def agent_session(self):
+        """本 agent 的 AgentSession（state↔tree 同步边界）。docs/16 #1：message family 的树写入
+        统一经 agent_session.record_event（required=True fail-loud），AgentCore 不再内联 _tree_record。"""
+        if self._agent_session_obj is None:
+            from .session import AgentSession
+            self._agent_session_obj = AgentSession(self)
+        return self._agent_session_obj
 
     def _tree_record(self, provider_msg: dict, *, stop_reason: "str | None" = None,
                      usage: "dict | None" = None, latency_ms: "int | None" = None,

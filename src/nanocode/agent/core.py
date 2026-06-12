@@ -5,9 +5,10 @@ STEP C：把原 AnthropicBackendMixin._chat_anthropic / OpenAIBackendMixin._chat
 full suite 持续 exercise（等价性证明）。
 
 §6 边界：AgentCore 自身**不**直接写 session、不 build system prompt、不发现 skills/subagents/MCP、
-不写 artifacts、不持 durable provider messages —— 这些都经 host 方法委托（host._tree_record /
-host._build_request_messages / host._execute_tool_call / host._inject_* …）。后续 STEP D/E/F 把
-host 委托逐个替换为 AgentSession.record_event / ContextRuntime / CapabilityRouter,host 角色随之收缩。
+不写 artifacts、不持 durable provider messages。docs/16 #1（STEP D-1）：**message family 的树写入
+已反转**——capture-at-emit（events_from_provider_message，#0 工厂）→ host.agent_session.record_event
+（required=True 唯一树写者）。遥测/注入/上下文仍经 host 委托（host._tree_event / host._inject_* /
+host._build_request_messages / host._execute_tool_call），由 STEP D-2/E（docs/16 #2/#6）继续反转。
 
 provider-specific 的两条循环变体保留（adapter-driven）；不强行合一。
 """
@@ -21,12 +22,24 @@ import time
 from ..memory import start_memory_prefetch, format_memories_for_injection
 from ..session import tree as _tree
 from ..tools import CONCURRENCY_SAFE_TOOLS
+from .events import events_from_provider_message
 from .loop import group_openai_batches
 from .providers import StreamCallbacks
 
 
 class AgentCore:
     """模型循环宿主。无状态（循环态都是 turn-local 局部变量或 host 上的字段）；按 host.use_openai 分派。"""
+
+    @staticmethod
+    def _record_messages(host, provider_msg: dict, *, stop_reason: "str | None" = None,
+                         usage: "dict | None" = None, latency_ms: "int | None" = None) -> None:
+        """message family 唯一树写者（docs/16 #1）：capture-at-emit（#0 工厂，与原 _tree_record 内联
+        capture 树级等价）→ AgentSession.record_event（required=True，写失败 fail-loud——树是唯一权威，
+        无 flat 兜底，缺一条 = 下一轮上下文错误）。"""
+        for ev in events_from_provider_message(
+                provider_msg, provider=("openai" if host.use_openai else "anthropic"),
+                model=host.model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms):
+            host.agent_session.record_event(ev)
 
     async def run_turn(self, host, user_message: str) -> None:
         if host.use_openai:
@@ -37,7 +50,7 @@ class AgentCore:
     # ─── Anthropic turn（移植自 _chat_anthropic，self→host）────────────────────
     async def run_anthropic_turn(self, host, user_message: str) -> None:
         host._anthropic_messages.append({"role": "user", "content": user_message})
-        host._tree_record({"role": "user", "content": user_message}, required=True)  # S1: message-end → tree（必写）
+        self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
         await host._check_and_compact()
 
         memory_prefetch = None
@@ -124,10 +137,10 @@ class AgentCore:
                 "content": [self.block_to_dict(b) for b in response.content],
             }
             host._anthropic_messages.append(assistant_msg)
-            host._tree_record(assistant_msg, stop_reason=getattr(response, "stop_reason", None),
-                              usage={"inputTokens": response.usage.input_tokens,
-                                     "outputTokens": response.usage.output_tokens},
-                              latency_ms=_latency_ms, required=True)  # §7.6②：删 flat 后必须 fail-loud
+            self._record_messages(host, assistant_msg, stop_reason=getattr(response, "stop_reason", None),
+                                  usage={"inputTokens": response.usage.input_tokens,
+                                         "outputTokens": response.usage.output_tokens},
+                                  latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
             host._dispatch_event(
                 "assistant_message",
                 text="".join(b.text for b in response.content if b.type == "text"),
@@ -185,7 +198,7 @@ class AgentCore:
                     host._context_cleared = False
                     cb_msg = {"role": "user", "content": res}
                     host._anthropic_messages.append(cb_msg)
-                    host._tree_record(cb_msg, required=True)
+                    self._record_messages(host, cb_msg)
                     context_break = True
                     break
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
@@ -194,7 +207,7 @@ class AgentCore:
             if not context_break and tool_results:
                 tr_msg = {"role": "user", "content": tool_results}
                 host._anthropic_messages.append(tr_msg)
-                host._tree_record(tr_msg, required=True)  # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
+                self._record_messages(host, tr_msg)       # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
             host._context_cleared = False
             if not context_break:
                 host._inject_pending_skill_bodies(host._anthropic_messages)
@@ -202,7 +215,7 @@ class AgentCore:
     # ─── OpenAI turn（移植自 _chat_openai，self→host）──────────────────────────
     async def run_openai_turn(self, host, user_message: str) -> None:
         host._openai_messages.append({"role": "user", "content": user_message})
-        host._tree_record({"role": "user", "content": user_message}, required=True)  # S1: message-end → tree（必写）
+        self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
         await host._check_and_compact()
 
         memory_prefetch = None
@@ -269,11 +282,11 @@ class AgentCore:
             message = choice.get("message", {})
 
             host._openai_messages.append(message)
-            host._tree_record(message, stop_reason=choice.get("finish_reason"),
-                              usage={"inputTokens": _u.get("prompt_tokens", 0),
-                                     "outputTokens": _u.get("completion_tokens", 0)}
-                              if (_u := (response.get("usage") or {})) else None,
-                              latency_ms=_latency_ms, required=True)  # §7.6②：删 flat 后必须 fail-loud
+            self._record_messages(host, message, stop_reason=choice.get("finish_reason"),
+                                  usage={"inputTokens": _u.get("prompt_tokens", 0),
+                                         "outputTokens": _u.get("completion_tokens", 0)}
+                                  if (_u := (response.get("usage") or {})) else None,
+                                  latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
 
             _tcs = message.get("tool_calls") or []
             host._dispatch_event(
@@ -343,13 +356,13 @@ class AgentCore:
                     for ct_item, res, _lat in results:
                         tmsg = {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res}
                         host._openai_messages.append(tmsg)
-                        host._tree_record(tmsg, latency_ms=_lat, required=True)  # §7.6①
+                        self._record_messages(host, tmsg, latency_ms=_lat)       # §7.6①
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
                             dmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]}
                             host._openai_messages.append(dmsg)
-                            host._tree_record(dmsg, required=True)  # §7.6①：denied 也是 toolResult,必须落树
+                            self._record_messages(host, dmsg)       # §7.6①：denied 也是 toolResult,必须落树
                             continue
                         _t_tool = time.time()
                         raw = await host._execute_tool_call(ct["fn"], ct["inp"])
@@ -361,12 +374,12 @@ class AgentCore:
                             host._context_cleared = False
                             cbmsg = {"role": "user", "content": res}
                             host._openai_messages.append(cbmsg)
-                            host._tree_record(cbmsg, required=True)
+                            self._record_messages(host, cbmsg)
                             oai_context_break = True
                             break
                         rmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res}
                         host._openai_messages.append(rmsg)
-                        host._tree_record(rmsg, latency_ms=_lat, required=True)  # §7.6①
+                        self._record_messages(host, rmsg, latency_ms=_lat)       # §7.6①
 
             host._context_cleared = False
             if not oai_context_break:
