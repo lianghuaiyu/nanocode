@@ -39,6 +39,7 @@ class ContextRequest:
     include_deferred_tools: bool = True
     include_repo_map: bool = False
     # Phase 4 个性化（§9.1）
+    user_prompt: str = ""                  # 当前用户输入（repo map 提及提取；纯数据，不含历史）
     files_read: list[str] = field(default_factory=list)
     files_modified: list[str] = field(default_factory=list)
     mentioned_files: list[str] = field(default_factory=list)
@@ -159,31 +160,36 @@ class DeferredToolsProvider:
 class RepoMapProvider:
     """Aider-style repo map 作 ContextProvider（§9.2）：按 RepoQuery 个性化 + 预算封顶,never 整文件。
 
-    已读/已改/提及文件优先;若都空则有界扫 repo(首回合也给结构)。词法 fallback(无 tree-sitter)。
-    profile 关 codeintel(include_repo_map=False) → 跳过。lifecycle=turn,不入树(persist=none)。
+    经 codeintel.get_service（进程级 per-root 缓存索引，跨 turn 复用——不再每次重建）。
+    aider 语义：personal 文件（已读/已改）是排名**种子、不渲染**；无 personal 文件（首 turn）
+    预算 ×4 给全局定向（aider map_mul_no_files 的保守版）。lifecycle=turn,不入树(persist=none)。
     """
 
     id = "repo_map"
     enable_attr = "include_repo_map"
 
+    NO_FILES_BUDGET_MULTIPLIER = 8          # aider map_mul_no_files=8
+
     async def collect(self, request):
         import os
-        from ..codeintel.index import RepoIndex, RepoQuery
-        idx = RepoIndex(request.cwd or os.getcwd())
-        touched = list(request.files_read) + list(request.files_modified) + list(request.mentioned_files)
-        if touched:
-            idx.update(touched)
-        else:
-            idx.scan_repo()
-        ranked = idx.rank(RepoQuery(
+        from ..codeintel import RepoQuery, get_service
+        svc = get_service(request.cwd or os.getcwd())
+        # 提及提取（aider get_ident_mentions/get_file_mentions 同款）：当前用户输入分词 ∩
+        # 已知 def 名/文件名——×10 ident 加权与文件 personalization 的主要触发器。
+        m_idents, m_files = svc.extract_mentions(request.user_prompt)
+        query = RepoQuery(
             files_read=request.files_read, files_modified=request.files_modified,
-            mentioned_files=request.mentioned_files, mentioned_identifiers=request.mentioned_identifiers))
-        if not ranked:
+            mentioned_files=list(request.mentioned_files) + m_files,
+            mentioned_identifiers=list(request.mentioned_identifiers) + m_idents)
+        budget = request.repo_map_budget_tokens
+        if not (request.files_read or request.files_modified or query.mentioned_files):
+            budget *= self.NO_FILES_BUDGET_MULTIPLIER     # 无 personal 文件：×8 全局定向图
+        result = svc.repo_map(query, budget_tokens=budget)
+        if not result.text:
             return None
-        text = idx.render(ranked, budget_tokens=request.repo_map_budget_tokens)
-        return ContextPack(id="repo_map", kind="repo_map", content=text, lifecycle="turn",
+        return ContextPack(id="repo_map", kind="repo_map", content=result.text, lifecycle="turn",
                            cache_policy="volatile_tail", persist_policy="none", priority=30,
-                           provenance={"source": "RepoMapProvider"})
+                           provenance={"source": "RepoMapProvider", "files": result.files})
 
 
 def default_providers() -> list:

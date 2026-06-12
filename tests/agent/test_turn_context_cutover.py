@@ -145,3 +145,68 @@ def test_volatile_tail_absent_when_no_plan():
     a._session_mgr.append_message(T.user_message("bare"))
     proj = a.agent_session.project_request()
     assert "Per-turn context" not in str(proj.messages)
+
+
+# ─── repo map 上 live 请求路径（aider-style，docs/15 §9）─────────────────────
+
+def _repo_with_code(tmp_path, monkeypatch):
+    from nanocode.codeintel import reset_services
+    reset_services()
+    (tmp_path / "applib.py").write_text("def unique_marker_fn():\n    pass\n")
+    (tmp_path / "caller.py").write_text("from applib import unique_marker_fn\n"
+                                        "def use():\n    unique_marker_fn()\n")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_repo_map_in_request_tail_never_in_tree(tmp_path, monkeypatch):
+    _repo_with_code(tmp_path, monkeypatch)
+    a = _agent("ctx6_rmap")
+    captured = {}
+
+    async def fake(**kw):
+        captured["messages"] = kw["messages"]
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a._provider.stream = fake
+    asyncio.run(a.chat("hello"))
+    tail = str(captured["messages"][-1])
+    assert "# Repo map" in tail and "unique_marker_fn" in tail   # volatile tail 携带
+    blob = str([e.to_dict() for e in SessionManager.open("ctx6_rmap").entries()])
+    assert "# Repo map" not in blob and "unique_marker_fn" not in blob   # 绝不落树
+
+
+def test_repo_map_excludes_files_read_and_uses_mentions(tmp_path, monkeypatch):
+    _repo_with_code(tmp_path, monkeypatch)
+    a = _agent("ctx6_rmap2")
+    a._files_read.add(str(tmp_path / "caller.py"))               # 宿主观测：已读
+    captured = {}
+
+    async def fake(**kw):
+        captured["messages"] = kw["messages"]
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a._provider.stream = fake
+    asyncio.run(a.chat("look at unique_marker_fn"))
+    tail = str(captured["messages"][-1])
+    assert "applib.py" in tail                                   # 被已读文件引用 + 提及 → 入图
+    assert "caller.py:" not in tail                              # personal（已读）不渲染
+
+
+def test_repo_map_settings_escape_hatch(tmp_path, monkeypatch):
+    _repo_with_code(tmp_path, monkeypatch)
+    from nanocode.tools import reset_permission_cache
+    (tmp_path / ".nanocode").mkdir(exist_ok=True)
+    (tmp_path / ".nanocode" / "settings.json").write_text('{"context": {"repo_map": false}}')
+    reset_permission_cache()
+    a = _agent("ctx6_rmap3")
+    captured = {}
+
+    async def fake(**kw):
+        captured["messages"] = kw["messages"]
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a._provider.stream = fake
+    asyncio.run(a.chat("hello"))
+    reset_permission_cache()
+    assert "# Repo map" not in str(captured["messages"])         # 逃生阀关闭注入

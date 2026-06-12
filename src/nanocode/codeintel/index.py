@@ -1,7 +1,12 @@
 """codeintel/index.py — RepoIndex：Aider-style 代码库结构感知（docs/15 §9）。
 
-Phase 4：tree-sitter 未装时用**词法 fallback**（Aider 同款回退）——正则抽 def/ref,简单个性化排名,
-预算化渲染。tree-sitter 装上后可在同一 RepoIndex 接口背后替换 symbols 抽取(SymbolTag schema 已统一)。
+抽取：Python 走 **stdlib AST**（pyast.py：defs 带签名 + refs；语法错回退词法）；其余语言词法
+defs-only。tree-sitter 装上后可在同一接口背后替换（SymbolTag schema 已统一）。
+
+排名（对照 aider repomap 语义）：personal 文件（已读/已改/chat）是**排名种子、不是输出**——
+它们的全文已在上下文里，渲染它们是浪费；map 的价值是顺着引用边把「还没读但相关」的文件拉进来。
+单跳引用加权（personal 的 refs → 命中 def 的其他文件加分），mentioned_idents 同时匹配 def 名
+与路径成分（aider 的 path-component 技巧）。不做 PageRank（GitHub 级，docs/16 §5 推迟）。
 
 repo map 不是工具,而是经 RepoMapProvider 注入的 ContextProvider（§9.2）：按任务/已读文件/提及符号
 个性化 + 预算封顶。
@@ -51,18 +56,22 @@ class RepoQuery:
     mentioned_identifiers: list[str] = field(default_factory=list)
 
 
-@dataclass
-class RankedFile:
-    rel_path: str
-    score: float
-    defs: list[SymbolTag]
-
-
 def extract_symbols(rel_path: str, abs_path: str, text: str) -> list[SymbolTag]:
-    """词法抽取一个文件的 def（按语言正则）。未知语言 → 通用回退。"""
+    """抽取一个文件的 symbols：Python → AST defs+refs（语法错回退词法）；其余语言词法 defs。"""
     lang = language_for_path(rel_path)
     if lang is None:
         return []
+    if lang == "python":
+        from .pyast import extract_python_symbols
+        try:
+            return extract_python_symbols(rel_path, abs_path, text)
+        except (SyntaxError, ValueError, RecursionError):
+            pass                                   # 语法错/病态文件 → 词法回退（aider 同款降级）
+    return _extract_lexical(rel_path, abs_path, text, lang)
+
+
+def _extract_lexical(rel_path: str, abs_path: str, text: str, lang: str) -> list[SymbolTag]:
+    """词法 defs（按语言正则；未知语言通用回退）+ Pygments refs 回填。带签名行（渲染用）。"""
     patterns = _DEF_PATTERNS.get(lang, _GENERIC_DEF)
     compiled = [re.compile(p) for p in patterns]
     out: list[SymbolTag] = []
@@ -76,8 +85,34 @@ def extract_symbols(rel_path: str, abs_path: str, text: str) -> list[SymbolTag]:
                 key = (m.group(1), i)
                 if key not in seen:
                     seen.add(key)
+                    sig = line.strip()[:120]
                     out.append(SymbolTag(rel_path=rel_path, abs_path=abs_path, line=i,
-                                         name=m.group(1), kind="def", language=lang))
+                                         name=m.group(1), kind="def", language=lang,
+                                         text=sig))
+    if out:                                            # 有 defs、无 refs → Pygments 回填
+        out.extend(_pygments_refs(rel_path, abs_path, text, lang))
+    return out
+
+
+def _pygments_refs(rel_path: str, abs_path: str, text: str, lang: str) -> list[SymbolTag]:
+    """aider 同款降级（repomap.py:339-364）：词法路径没有 refs，用 Pygments lexer 的
+    Token.Name 回填——使非 Python 文件也参与引用图（referencer 边）。line=-1（无行号语义）。"""
+    try:
+        from pygments.lexers import guess_lexer_for_filename
+        from pygments.token import Token
+        lexer = guess_lexer_for_filename(rel_path, text)
+    except Exception:
+        return []
+    out: list[SymbolTag] = []
+    seen: set[str] = set()
+    try:
+        for tok_type, value in lexer.get_tokens(text):
+            if tok_type in Token.Name and value not in seen:
+                seen.add(value)
+                out.append(SymbolTag(rel_path=rel_path, abs_path=abs_path, line=-1,
+                                     name=value, kind="ref", language=lang))
+    except Exception:
+        return []
     return out
 
 
@@ -108,7 +143,7 @@ class RepoIndex:
             self._tags[rel] = extract_symbols(rel, str(ap), text)
             self._mtime[rel] = mt
 
-    def scan_repo(self, *, max_files: int = 300) -> None:
+    def scan_repo(self, *, max_files: int = 2000) -> None:
         """有界扫描 root 下的源文件（跳过 vendor/.git 等;cap 防超大仓库）。"""
         count = 0
         for ap in sorted(self.root.rglob("*")):
@@ -124,44 +159,70 @@ class RepoIndex:
     def tags(self, file: str) -> list[SymbolTag]:
         return self._tags.get(self._rel(Path(file)), [])
 
-    def rank(self, query: RepoQuery) -> list[RankedFile]:
-        """个性化排名（词法 lite,非 PageRank）：提及符号 > 提及/已改/已读文件 > def 密度。"""
-        mentioned_ids = set(query.mentioned_identifiers)
-        personal = {self._rel(Path(f)) for f in
-                    (query.chat_files + query.files_modified + query.files_read + query.mentioned_files)}
-        ranked: list[RankedFile] = []
-        for rel, defs in self._tags.items():
-            if not defs:
-                continue
-            score = 0.0
-            if rel in personal:
-                score += 10.0
-            if any(d.name in mentioned_ids for d in defs):
-                score += 25.0
-            score += min(len(defs), 20) * 0.5          # def 密度（封顶,避免超大文件霸榜）
-            ranked.append(RankedFile(rel_path=rel, score=score, defs=defs))
-        ranked.sort(key=lambda r: (-r.score, r.rel_path))
-        return ranked
+    def ranked_tags(self, query: RepoQuery) -> list:
+        """aider get_ranked_tags 等价：个性化 PageRank + rank 分发（graph.py），输出
+        SymbolTag（def）与 (rel_path,) 裸文件 tuple 的混合列表；personal 文件已排除。
+        query 的文件路径归一为 rel（与索引键一致）后入图。"""
+        from .graph import rank_tags
+        def _rels(files):
+            return [self._rel(Path(f)) for f in files]
+        q = RepoQuery(
+            chat_files=_rels(query.chat_files),
+            files_read=_rels(query.files_read),
+            files_modified=_rels(query.files_modified),
+            mentioned_files=_rels(query.mentioned_files),
+            mentioned_identifiers=list(query.mentioned_identifiers),
+        )
+        return rank_tags(self._tags, q)
 
-    def render(self, ranked: list[RankedFile], *, budget_tokens: int = 1024,
-               max_defs_per_file: int = 12) -> str:
-        """预算化渲染（§9.1 budgeted render）：top 文件 + 其 def,累计到 token 预算即截断。"""
+    def render_map(self, tags: list, *, budget_tokens: int = 1024) -> str:
+        """aider get_ranked_tags_map_uncached 等价：对 ranked tags 数量**二分搜索**拟合
+        token 预算（误差 <15% 提前停）。选择按 rank 序，显示按文件名分组（aider to_tree
+        先 sorted 再分组——选择与显示解耦）。"""
         from ..context.packs import estimate_tokens
-        lines: list[str] = ["# Repo map (lexical)"]
-        shown_files = 0
-        for rf in ranked:
-            block = [f"\n{rf.rel_path}"]
-            for d in rf.defs[:max_defs_per_file]:
-                block.append(f"  {d.line:>4}: {d.name}")
-            if len(rf.defs) > max_defs_per_file:
-                block.append(f"  ... (+{len(rf.defs) - max_defs_per_file} more)")
-            candidate = "\n".join(lines + block)
-            if estimate_tokens(candidate) > budget_tokens and shown_files > 0:
-                lines.append(f"\n[repo map truncated at {budget_tokens} tokens; "
-                             f"{len(ranked) - shown_files} more files]")
-                break
-            lines += block
-            shown_files += 1
+        if not tags:
+            return ""
+        lower, upper = 0, len(tags)
+        best, best_tokens = None, 0
+        middle = min(max(budget_tokens // 25, 1), len(tags))
+        while lower <= upper:
+            tree = self._to_tree(tags[:middle])
+            num = estimate_tokens(tree)
+            pct_err = abs(num - budget_tokens) / max(budget_tokens, 1)
+            if (num <= budget_tokens and num > best_tokens) or pct_err < 0.15:
+                best, best_tokens = tree, num
+                if pct_err < 0.15:
+                    break
+            if num < budget_tokens:
+                lower = middle + 1
+            else:
+                upper = middle - 1
+            middle = (lower + upper) // 2
+        return best or ""
+
+    @staticmethod
+    def _to_tree(tags: list) -> str:
+        """选中的 tags → 文本（aider to_tree 的轻量版：按文件分组，def 显示签名行；
+        裸文件 tuple 只列文件名）。"""
+        by_file: dict[str, list] = {}
+        bare: list[str] = []
+        order: list[str] = []
+        for t in tags:
+            if isinstance(t, tuple):                  # 裸文件兜底
+                if t[0] not in by_file and t[0] not in bare:
+                    bare.append(t[0])
+                continue
+            if t.rel_path not in by_file:
+                by_file[t.rel_path] = []
+                order.append(t.rel_path)
+            by_file[t.rel_path].append(t)
+        lines: list[str] = ["# Repo map"]
+        for rel in sorted(order):                     # 显示按文件名排序（aider sorted(tags)）
+            lines.append(f"\n{rel}:")
+            for d in sorted(by_file[rel], key=lambda d: d.line):
+                lines.append(f"  {d.line:>4}: {d.text or d.name}")
+        for rel in sorted(b for b in bare if b not in by_file):
+            lines.append(f"\n{rel}")
         return "\n".join(lines)
 
     def _rel(self, ap: Path) -> str:

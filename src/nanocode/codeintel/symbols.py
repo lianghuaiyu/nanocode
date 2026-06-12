@@ -51,7 +51,10 @@ def language_for_path(path: str) -> str | None:
 
 @dataclass(frozen=True)
 class SymbolTag:
-    """一条 tree-sitter tag（§9.1）。frozen + hashable —— 可入 set 去重、作图节点键。"""
+    """一条 tree-sitter tag（§9.1）。frozen + hashable —— 可入 set 去重、作图节点键。
+
+    text：def 所在源行（截断后的签名，aider to_tree 渲染真实代码行的轻量版）；
+    ref 不携带（渲染只展示 defs）。additive 字段，缺省空串。"""
 
     rel_path: str
     abs_path: str
@@ -59,6 +62,7 @@ class SymbolTag:
     name: str
     kind: SymbolKind
     language: str
+    text: str = ""
 
     @property
     def is_def(self) -> bool:

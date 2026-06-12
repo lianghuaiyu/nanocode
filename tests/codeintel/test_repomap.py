@@ -1,4 +1,4 @@
-"""docs/15 Phase 4 §9：词法 RepoIndex + RepoMapProvider（defs 抽取 / 个性化排名 / 预算渲染）。"""
+"""docs/15 §9：RepoIndex + RepoMapProvider（symbols 抽取 / aider 排名 / 二分预算渲染）。"""
 
 import asyncio
 
@@ -34,28 +34,37 @@ def test_unknown_language_yields_no_tags(tmp_path):
     assert extract_symbols("data.json", str(p), p.read_text()) == []
 
 
-def test_repo_index_scan_and_rank_personalization(tmp_path):
-    _write(tmp_path, "a.py", "def alpha():\n    pass\n")
-    _write(tmp_path, "b.py", "def beta():\n    pass\ndef gamma():\n    pass\n")
+def _files_of(tags):
+    return {(t[0] if isinstance(t, tuple) else t.rel_path) for t in tags}
+
+
+def test_repo_index_scan_and_ranked_tags(tmp_path):
+    _write(tmp_path, "a.py", "def alpha_handler():\n    pass\n")
+    _write(tmp_path, "b.py", "def beta_worker():\n    pass\ndef gamma():\n    pass\n")
     _write(tmp_path, ".git/x.py", "def hidden():\n    pass\n")     # 跳过 .git
     idx = RepoIndex(str(tmp_path))
     idx.scan_repo()
-    rels = {rf.rel_path for rf in idx.rank(RepoQuery())}
+    rels = _files_of(idx.ranked_tags(RepoQuery()))
     assert "a.py" in rels and "b.py" in rels
     assert not any("x.py" in r for r in rels)                      # .git 被跳过
-    # 提及 identifier alpha → a.py 排名高于 b.py
-    ranked = idx.rank(RepoQuery(mentioned_identifiers=["alpha"]))
-    assert ranked[0].rel_path == "a.py"
+    # 提及 identifier → 该 def 的文件排第一（×10 ident 加权 + rank 分发）
+    tags = idx.ranked_tags(RepoQuery(mentioned_identifiers=["alpha_handler"]))
+    first = next(t for t in tags if not isinstance(t, tuple))
+    assert first.rel_path == "a.py"
 
 
-def test_repo_index_render_budget_truncates(tmp_path):
+def test_render_map_binary_search_fits_budget(tmp_path):
     for i in range(40):
         _write(tmp_path, f"f{i}.py", "\n".join(f"def fn{i}_{j}():\n    pass" for j in range(10)))
     idx = RepoIndex(str(tmp_path))
     idx.scan_repo()
-    out = idx.render(idx.rank(RepoQuery()), budget_tokens=200)
-    assert "# Repo map (lexical)" in out
-    assert "truncated" in out                                      # 预算封顶截断
+    from nanocode.context.packs import estimate_tokens
+    out = idx.render_map(idx.ranked_tags(RepoQuery()), budget_tokens=200)
+    assert "# Repo map" in out
+    # aider 二分语义：拟合到预算附近（≤budget 或 15% 容差内），绝不远超
+    assert estimate_tokens(out) <= 200 * 1.15
+    full = idx.render_map(idx.ranked_tags(RepoQuery()), budget_tokens=100000)
+    assert estimate_tokens(full) > 200                             # 预算确实在起约束作用
 
 
 def test_mtime_cache_skips_unchanged(tmp_path):

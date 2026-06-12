@@ -64,6 +64,34 @@ AGENTS_CONFIG_DEFAULTS: dict = {
 
 _cached_agents_config: dict | None = None
 
+# ─── Context engineering config (.nanocode/settings.json "context" section) ──
+# repo_map：是否在每 turn 的 volatile tail 注入 Aider-style repo map（默认开；
+# 陌生/超大仓库可设 false 逃生）。
+CONTEXT_CONFIG_DEFAULTS: dict = {
+    "repo_map": True,
+}
+
+_cached_context_config: dict | None = None
+
+
+def load_context_config() -> dict:
+    """读取 settings.json 的 "context" 段（用户 + 项目合并，缓存；同 load_agents_config 语义）。"""
+    global _cached_context_config
+    if _cached_context_config is not None:
+        return _cached_context_config
+    merged = dict(CONTEXT_CONFIG_DEFAULTS)
+    for settings in [_load_settings(data_dir() / "settings.json"),
+                     _load_settings(project_config_dir() / "settings.json")]:
+        if not settings or not isinstance(settings.get("context"), dict):
+            continue
+        section = settings["context"]
+        for key in CONTEXT_CONFIG_DEFAULTS:
+            if key in section:
+                merged[key] = section[key]
+    cfg = {"repo_map": bool(merged.get("repo_map", True))}
+    _cached_context_config = cfg
+    return cfg
+
 
 def _coerce_int(value, default):
     """settings 整数字段归一：非法/缺省 -> default（绝不抛）。None 透传（=无超时）。"""
@@ -359,9 +387,10 @@ def check_permission(
 
 
 def reset_permission_cache() -> None:
-    global _cached_rules, _cached_agents_config
+    global _cached_rules, _cached_agents_config, _cached_context_config
     _cached_rules = None
     _cached_agents_config = None
+    _cached_context_config = None
 
 
 # ─── Sub-agent call-time allowlist (P4) ──────────────────────────

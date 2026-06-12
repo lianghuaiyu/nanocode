@@ -68,7 +68,7 @@ class AgentSession:
         from ..context import ContextLedger
         a._context_ledger = ContextLedger()     # per-turn 全量记账（/context 可见性，docs/16 #6）
         await self.inject_session_context()     # 项目指令/memory 作 session-context 包
-        a._turn_context_plan = await self._collect_turn_volatile()   # date/git 等 per-turn volatile
+        a._turn_context_plan = await self._collect_turn_volatile(prompt)   # date/git/repo-map 等 per-turn volatile
         a.emit(_events.UserMessageAccepted(text=prompt))   # S1：user 消息先落树（请求从树渲染）
         await self.check_and_compact()
         memory_prefetch = self.start_memory_prefetch(prompt)
@@ -177,8 +177,9 @@ class AgentSession:
             "<system-reminder>\nPer-turn context (refreshed every turn; supersedes any earlier "
             "snapshot in this conversation):\n" + body + "\n</system-reminder>")]
 
-    async def _collect_turn_volatile(self):
-        """每 turn 一次的 volatile 上下文收集（docs/16 #6：date/git 移出 system prompt 的承接路径）。
+    async def _collect_turn_volatile(self, prompt: str = ""):
+        """每 turn 一次的 volatile 上下文收集（docs/16 #6：date/git 移出 system prompt 的承接路径；
+        repo map 同管道注入——aider-style，prompt 供提及提取，files_read/modified 用宿主观测事实）。
 
         collect 纯（产 packs 不写树）；ledger 并入本 turn 全量账本。仅主 agent（子 agent 的
         system prompt 来自 manifest，从未含 date/git——保持不变）。失败可观测、不破坏 turn。"""
@@ -187,15 +188,23 @@ class AgentSession:
             return None
         import os
         from ..context import BudgetPolicy, ContextRequest, ContextRuntime
-        from ..context.providers import EnvProvider, GitSnapshotProvider
+        from ..context.providers import EnvProvider, GitSnapshotProvider, RepoMapProvider
+        from ..tools.permissions import load_context_config
+        budget = BudgetPolicy.for_window(a.effective_window)
         req = ContextRequest(cwd=os.getcwd(), is_sub_agent=False,
                              include_env=True, include_git=True,
+                             include_repo_map=load_context_config()["repo_map"],
+                             user_prompt=prompt,
+                             files_read=sorted(a._files_read),
+                             files_modified=sorted(a._files_modified),
+                             repo_map_budget_tokens=budget.repo_map_tokens,
                              include_project_instructions=False, include_memory=False,
                              include_skills=False, include_agents=False,
                              include_deferred_tools=False)
         try:
-            plan = await ContextRuntime(providers=[EnvProvider(), GitSnapshotProvider()],
-                                        budget=BudgetPolicy.for_window(a.effective_window)).collect(req)
+            plan = await ContextRuntime(providers=[EnvProvider(), GitSnapshotProvider(),
+                                                   RepoMapProvider()],
+                                        budget=budget).collect(req)
         except Exception as e:
             a._sink.info(f"[context] per-turn volatile collect failed: {e}")
             return None
