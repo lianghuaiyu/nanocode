@@ -28,7 +28,7 @@ def _set_agents_settings(monkeypatch, tmp_path, obj):
 
 def _stub_running_bg_subagent(parent):
     """Register a running background subagent (record + task + a fake asyncio task in
-    _background_tasks) so _running_background_subagent_count() sees it as live."""
+    _background_tasks) so _subagents.running_background_count() sees it as live."""
     sub_rec = parent.task_manager.create_subagent(type="coder", description="bg")
     task_rec = parent.task_manager.create_task("subagent", "bg", owner_agent_id=sub_rec.id)
     parent.task_manager.update_task(task_rec.id, status="running")
@@ -97,7 +97,7 @@ def test_running_count_only_counts_running_subagent_tasks(monkeypatch, tmp_path)
         # mark one completed -> should drop out of the live count
         tid = t2._nanocode_task_id
         parent.task_manager.update_task(tid, status="completed")
-        n = parent._running_background_subagent_count()
+        n = parent._subagents.running_background_count()
         t1.cancel(); t2.cancel()
         return n
 
@@ -153,7 +153,7 @@ def test_max_depth_zero_disables_cap(monkeypatch, tmp_path):
     parent = _agent()
     sub = parent._build_sub_agent(system_prompt="s", tools=[], agent_type="coder")
     # max_depth=0 disables the cap -> never blocks on depth.
-    assert sub._depth_cap_exceeded() is False
+    assert sub._subagents.depth_cap_exceeded() is False
 
 
 # ─── settings timeout fallbacks wired in ─────────────────────────
@@ -256,7 +256,7 @@ def test_running_count_includes_curator_subagents(monkeypatch, tmp_path):
         # a background SHELL task has no owner_agent_id -> must NOT count
         sh = parent.task_manager.create_task("shell", "echo", owner_agent_id=None)
         parent.task_manager.update_task(sh.id, status="running")
-        n = parent._running_background_subagent_count()
+        n = parent._subagents.running_background_count()
         t1.cancel(); t2.cancel()
         return n
 

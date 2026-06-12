@@ -75,8 +75,6 @@ Date: {{date}}
 Platform: {{platform}}
 Shell: {{shell}}
 {{git_context}}
-{{claude_md}}
-{{memory}}
 {{skills}}
 {{agents}}
 {{deferred_tools}}

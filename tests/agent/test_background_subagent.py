@@ -11,7 +11,8 @@ import asyncio
 
 import pytest
 
-from nanocode.agent.engine import Agent, _auto_deny_confirm
+from nanocode.agent.engine import Agent
+from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.tools import tool_definitions, tasks_tool
 
 

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import asyncio
 
-from nanocode.agent.engine import Agent, SUBAGENT_MAX_TURNS_FALLBACK
+from nanocode.agent.engine import Agent
+from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import tool_definitions
 from nanocode.subagents import config
 

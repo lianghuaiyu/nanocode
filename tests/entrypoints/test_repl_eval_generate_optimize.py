@@ -1,4 +1,4 @@
-from nanocode.entrypoints.cli import handle_eval_command
+from nanocode.entrypoints.commands.builtin import handle_eval_command
 
 
 def test_handle_eval_command_does_not_handle_generate():

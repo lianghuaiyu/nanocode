@@ -32,7 +32,7 @@ from ..trust import is_trusted
 from .commands.types import CommandContext, Local, Prompt, Control
 from .commands.runner import dispatch, NOT_A_COMMAND
 from .host import RuntimeHost
-from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
+from .commands.builtin import build_registry
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
@@ -504,26 +504,17 @@ async def run_repl(agent: Agent, lease=None) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        # 注意：历史行为——主 REPL agent 的旧 `_output_buffer` 恒为 None（仅子 agent 的
-        # run_once 才置空列表），故此分支对主 agent 实为 dead，SIGINT 一律落到 else 的
-        # 「按两次退出」。P-1 移除 _output_buffer 后，用恒 False 占位以**逐字节保留**该行为，
-        # 不借机改成「Ctrl-C 中断处理中的 agent」（那是行为变更，超出 P-1 无语义变更约束）。
-        agent_capturing_output = False  # was: agent._output_buffer is not None (always None for main)
-        if agent._aborted is False and agent_capturing_output:
-            # Agent is processing
-            agent.abort()
-            print("\n  (interrupted)")
-            sigint_count = 0
-        else:
-            sigint_count += 1
-            if sigint_count >= 2:
-                print("\nBye!\n")
-                try:
-                    _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
-                except Exception:
-                    pass
-                sys.exit(0)
-            print("\n  Press Ctrl+C again to exit.")
+        # 历史行为：主 REPL 的 SIGINT 一律「按两次退出」（docs/16 C-1：原永假的 capturing 分支已删；
+        # turn 内的 Ctrl-C 由 _async_read_line/confirm 流程内恢复的 handler 处理）。
+        sigint_count += 1
+        if sigint_count >= 2:
+            print("\nBye!\n")
+            try:
+                _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
+            except Exception:
+                pass
+            sys.exit(0)
+        print("\n  Press Ctrl+C again to exit.")
 
     signal.signal(signal.SIGINT, handle_sigint)
     print_welcome()
@@ -600,7 +591,7 @@ async def run_repl(agent: Agent, lease=None) -> None:
             if skill and skill.user_invocable:
                 print_info(f"Invoking skill: {skill.name}")
                 try:
-                    if getattr(skill, "hooks", None):
+                    if skill.hooks:
                         agent._register_skill_hooks(skill)
                     if skill.context == "fork":
                         result = execute_skill(skill.name, cmd_args)

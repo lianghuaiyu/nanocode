@@ -73,8 +73,7 @@ from .core import AgentCore
 # ─── Agent ───────────────────────────────────────────────────
 
 # 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
-# SUBAGENT_MAX_TURNS_FALLBACK 随之迁入；此处 import 兼有 re-export 作用（back-compat）。
-from .subagent_manager import SubAgentManager, SUBAGENT_MAX_TURNS_FALLBACK  # noqa: E402,F401
+from .subagent_manager import SubAgentManager  # noqa: E402
 from . import agent_result  # noqa: E402 — 子 agent 结果信封纯函数（CAP-P1 STEP 1）
 from . import runtime_events  # noqa: E402 — 单一 RuntimeEvent 流（RUNTIME-P1）
 
@@ -85,8 +84,7 @@ from . import runtime_events  # noqa: E402 — 单一 RuntimeEvent 流（RUNTIME
 
 
 # docs/15 Phase 6：子 agent 构造 + 产物落盘搬迁到 runtime/spawn.py（host-driven SubAgentRunner）。
-# _auto_deny_confirm 定义在 spawn.py,此处 re-export（tests + build_sub_agent 依赖同一对象身份）。
-from ..runtime.spawn import SubAgentRunner, _auto_deny_confirm  # noqa: E402,F401
+from ..runtime.spawn import SubAgentRunner  # noqa: E402
 
 
 class Agent(PlanModeMixin):
@@ -412,7 +410,7 @@ class Agent(PlanModeMixin):
         与 fold 不符,codex-found）。**per-customType** 去重:只注入当前缺失的 kind,不被「另一 kind 在场」抑制。
         - fresh：都缺 → 各注入一次；resume：树里已渲染 → 跳过；compaction 后折出渲染 → 重注入缺失项。
         """
-        if self.is_sub_agent or self._session_mgr is None:
+        if self.is_sub_agent:                             # main agent 的 lease 由 chat() 先行保证
             return
         present = self._session_context_present_kinds()
         if present >= self._SESSION_CONTEXT_KINDS:        # 全部 kind 已在渲染上下文 → 无需注入
@@ -443,9 +441,7 @@ class Agent(PlanModeMixin):
         custom_message 的 customType（convert_to_llm 才丢弃）,故能精确判定「模型是否看得到该包」——
         无论 compaction 两区折叠 / firstKeptEntryId=None 全保留 等情形都对齐（codex-found 的 kept-region 不符）。
         """
-        mgr = self._session_mgr
-        if mgr is None:
-            return set()
+        mgr = self._session_mgr                           # lease 先行保证非 None（docs/16 C-1）
         try:
             from ..session import context as _ctx
             rich, _ = _ctx.fold(mgr.get_branch())
@@ -565,12 +561,6 @@ class Agent(PlanModeMixin):
             self._openai_messages = messages
         else:
             self._anthropic_messages = messages
-
-    def _replace_messages(self, messages: list) -> None:
-        self._load_messages(messages)
-
-    def _append_message(self, message) -> None:
-        self._active_messages().append(message)
 
     def _dump_messages(self) -> list:
         """dump：导出活动列表（持久化只读；含父读子 agent 列表）。"""
@@ -1052,26 +1042,7 @@ class Agent(PlanModeMixin):
             return None
         return max(0, self.max_turns - self.current_turns)
 
-    # ─── P4 concurrency / depth caps（策略已抽入 SubAgentManager，CAP-P1；以下为委托 shim）─────
-
-    def _running_background_subagent_count(self) -> int:
-        return self._subagents.running_background_count()
-
-    def _depth_cap_exceeded(self) -> bool:
-        return self._subagents.depth_cap_exceeded()
-
-    def _max_threads(self) -> int:
-        return self._subagents.max_threads()
-
-    def _background_subagent_cap_reached(self) -> bool:
-        return self._subagents.background_cap_reached()
-
-    @staticmethod
-    def _foreground_timeout(tool_timeout_ms, config: dict, fleet_cfg: dict):
-        return SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
-
-    def _bounded_sub_agent_max_turns(self, manifest_max_turns: int | None) -> int:
-        return self._subagents.bounded_max_turns(manifest_max_turns)
+    # ─── P4 concurrency / depth caps：策略在 SubAgentManager（self._subagents），调用方直连（docs/16 C-1）──
 
     def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None,
                          background=False, max_turns=None, model=None,
@@ -1109,7 +1080,7 @@ class Agent(PlanModeMixin):
         sk = get_skill_by_name(inp.get("skill_name", ""))
         if sk and sk.disable_model_invocation:
             return f'Skill "{inp.get("skill_name", "")}" cannot be invoked by the model (disable-model-invocation).'
-        if sk and getattr(sk, "hooks", None):
+        if sk and sk.hooks:
             self._register_skill_hooks(sk)
         result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""))
         if not result:
@@ -1123,7 +1094,7 @@ class Agent(PlanModeMixin):
                 return ("Error: fork-mode skills are not available to sub-agents "
                         "(sub-agents cannot spawn descendants).")
             # max_depth backstop（主 agent 仍受全局深度上限约束）。
-            if self._depth_cap_exceeded():
+            if self._subagents.depth_cap_exceeded():
                 return ("Error: max sub-agent depth reached; skill fork not spawned.")
             tools = (
                 [t for t in self.tools if t["name"] in result["allowed_tools"]]
@@ -1149,7 +1120,7 @@ class Agent(PlanModeMixin):
                     system_prompt=result["prompt"],
                     tools=tools,
                     agent_type="coder",
-                    max_turns=self._bounded_sub_agent_max_turns(None),
+                    max_turns=self._subagents.bounded_max_turns(None),
                     artifact_id=rec.id,
                 )
                 # 经 _await_subagent_run（与前台一致）而非裸 await run_once：

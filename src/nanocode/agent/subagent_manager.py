@@ -2,8 +2,8 @@
 
 P4 的 containment 政策（max_threads 后台并发上限、max_depth 纵深 backstop、前台超时回退、
 前台 turn 上限 clamp）从 Agent 抽到此处，作为 capability 边界化（doc12 Phase B / CAP-P1）的
-第一步。Agent 持有一个实例（`self._subagents`）并委托；旧的 `Agent._depth_cap_exceeded` 等
-方法保留为薄 shim，故调用方与既有测试（tests/agent/test_subagent_caps.py 等）逐字不变。
+第一步。Agent 持有一个实例（`self._subagents`），调用方直接 `host._subagents.*`
+（docs/16 C-1：原 `Agent._depth_cap_exceeded` 等委托 shim 已删）。
 
 spawn / run / artifact / result 机器仍在 Agent，后续增量迁入。本模块只持有对 agent 的反向
 引用（duck-typed），**不 import engine**（避免循环）；load_agents_config 在调用时 import。

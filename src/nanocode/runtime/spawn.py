@@ -27,6 +27,7 @@ from ..memory.maintenance import (
     build_eval_curator_message,
     parse_consolidation_plan,
 )
+from ..agent.subagent_manager import SubAgentManager
 from ..session import v2 as _session_v2
 from ..subagents import get_sub_agent_config
 
@@ -282,7 +283,7 @@ class SubAgentRunner:
         fleet_cfg = load_agents_config()
 
         # P4 max_depth backstop（所有 spawn 路径）。
-        if host._depth_cap_exceeded():
+        if host._subagents.depth_cap_exceeded():
             return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
                     f"cannot spawn a sub-agent at depth {host.depth + 1}.")
 
@@ -290,8 +291,8 @@ class SubAgentRunner:
         if inp.get("run_in_background"):
             if resume_id:
                 return "Error: run_in_background cannot be combined with resume."
-            max_threads = host._max_threads()
-            if max_threads > 0 and host._running_background_subagent_count() >= max_threads:
+            max_threads = host._subagents.max_threads()
+            if max_threads > 0 and host._subagents.running_background_count() >= max_threads:
                 return (f"Error: max concurrent sub-agents ({max_threads}) reached; try again later.")
             bg_cfg = get_sub_agent_config(agent_type)
             bg_timeout = tool_timeout_ms
@@ -325,8 +326,8 @@ class SubAgentRunner:
                 return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
                         f"model '{rec.model}' but its current effective model is '{current_eff_model}'. "
                         f"Cannot resume with a different model.")
-            eff_timeout = host._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
-            max_turns = host._bounded_sub_agent_max_turns(config.get("max_turns"))
+            eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
+            max_turns = host._subagents.bounded_max_turns(config.get("max_turns"))
             host._sink.sub_agent_start(rec.type, description)
             host.task_manager.update_subagent(resume_id, status="running")
             host._write_agent_spawn_artifacts(
@@ -376,8 +377,8 @@ class SubAgentRunner:
 
         # ── fresh path ──
         config = get_sub_agent_config(agent_type)
-        eff_timeout = host._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
-        max_turns = host._bounded_sub_agent_max_turns(config.get("max_turns"))
+        eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
+        max_turns = host._subagents.bounded_max_turns(config.get("max_turns"))
         eff_model = config.get("model") or host.model
         host._sink.sub_agent_start(agent_type, description)
         rec = host.task_manager.create_subagent(
@@ -463,7 +464,7 @@ class SubAgentRunner:
             config = get_sub_agent_config(agent_type)
             sub_agent = host._build_sub_agent(system_prompt=config["system_prompt"], tools=config["tools"],
                 agent_type=agent_type, background=True,
-                max_turns=host._bounded_sub_agent_max_turns(config.get("max_turns")),
+                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
                 model=config.get("model"), artifact_id=agent_id, agent_source=config.get("source"))
             kind, payload = await host._await_subagent_run(sub_agent, prompt, timeout_ms)
         except asyncio.CancelledError:
@@ -536,8 +537,8 @@ class SubAgentRunner:
         user_message = build_curator_user_message()
         if user_message.startswith("No memory files"):
             return "No memories to consolidate."
-        if host._background_subagent_cap_reached():
-            return (f"Error: max concurrent sub-agents ({host._max_threads()}) reached; "
+        if host._subagents.background_cap_reached():
+            return (f"Error: max concurrent sub-agents ({host._subagents.max_threads()}) reached; "
                     f"memory consolidation not started — try again later.")
 
         description = "memory consolidation"
@@ -581,7 +582,7 @@ class SubAgentRunner:
                 tools=config["tools"],
                 agent_type=host._MEMORY_CURATOR_TYPE,
                 background=True,
-                max_turns=host._bounded_sub_agent_max_turns(config.get("max_turns")),
+                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
                 artifact_id=agent_id,
             )
             if timeout_ms is not None:
@@ -654,8 +655,8 @@ class SubAgentRunner:
         user_message = build_eval_curator_message()
         if user_message.startswith("No memory files"):
             return "No memories to generate eval candidates from."
-        if host._background_subagent_cap_reached():
-            return (f"Error: max concurrent sub-agents ({host._max_threads()}) reached; "
+        if host._subagents.background_cap_reached():
+            return (f"Error: max concurrent sub-agents ({host._subagents.max_threads()}) reached; "
                     f"memory eval not started — try again later.")
         # eval 候选 provenance 的 source.session_id 必须指向真实存在的 session，
         # 否则 add_pending 校验会拒掉全部候选。REPL 命令不走 chat()，在此显式落盘。
@@ -699,7 +700,7 @@ class SubAgentRunner:
                 tools=config["tools"],
                 agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
                 background=True,
-                max_turns=host._bounded_sub_agent_max_turns(config.get("max_turns")),
+                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
                 artifact_id=agent_id,
             )
             if timeout_ms is not None:

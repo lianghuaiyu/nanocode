@@ -46,7 +46,7 @@ def test_dangerous_hook_command_blocked(tmp_path, monkeypatch):
     f = tmp_path / "z.txt"; f.write_text("hi")
     a = _agent()
     # 危险命令在 default 模式走 check_permission→confirm；无人值守等价拒绝（auto-deny）→ 阻断
-    from nanocode.agent.engine import _auto_deny_confirm
+    from nanocode.runtime.spawn import _auto_deny_confirm
     a.confirm_fn = _auto_deny_confirm
     a._active_hooks = [{"skill": "g", "event": "pre-tool-use", "matcher": ["*"],
                         "command": "rm -rf /tmp/whatever", "timeout_ms": 5000}]

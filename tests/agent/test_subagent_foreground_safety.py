@@ -2,7 +2,8 @@
 
 import asyncio
 
-from nanocode.agent.engine import Agent, SUBAGENT_MAX_TURNS_FALLBACK
+from nanocode.agent.engine import Agent
+from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import tool_definitions
 from nanocode.tools.agent import SCHEMA
 from nanocode.subagents import config
@@ -163,15 +164,15 @@ def test_max_turns_clamped_to_parent_remaining():
 
 def test_bounded_helper_no_parent_budget_uses_value():
     parent = _agent()
-    assert parent._bounded_sub_agent_max_turns(None) == SUBAGENT_MAX_TURNS_FALLBACK
-    assert parent._bounded_sub_agent_max_turns(12) == 12
+    assert parent._subagents.bounded_max_turns(None) == SUBAGENT_MAX_TURNS_FALLBACK
+    assert parent._subagents.bounded_max_turns(12) == 12
 
 
 def test_bounded_helper_clamps_to_parent():
     parent = _agent(max_turns=5)
     parent.current_turns = 2  # remaining 3
-    assert parent._bounded_sub_agent_max_turns(100) == 3
-    assert parent._bounded_sub_agent_max_turns(2) == 2
+    assert parent._subagents.bounded_max_turns(100) == 3
+    assert parent._subagents.bounded_max_turns(2) == 2
 
 
 def test_build_sub_agent_passes_max_turns_and_model():

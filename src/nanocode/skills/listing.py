@@ -41,9 +41,9 @@ def visible_model_skills(skills, activated):
     """过滤出模型可自动调用的清单：disable_model_invocation 排除；有 paths 且未激活则排除。"""
     out = []
     for s in skills:
-        if getattr(s, "disable_model_invocation", False):
+        if s.disable_model_invocation:
             continue
-        if getattr(s, "paths", None) and s.name not in activated:
+        if s.paths and s.name not in activated:
             continue
         out.append(s)
     return out
