@@ -65,8 +65,8 @@ def test_run_returns_turnresult_completed_with_tokens():
         a.total_input_tokens += 10
         a.total_output_tokens += 4
 
-    a.chat = fake_chat
     th = rt.adopt(a)
+    th.session.run_turn = fake_chat        # docs/16 #3c：turn 实现在 AgentSession.run_turn
     res = asyncio.run(th.run("hi"))
     assert isinstance(res, TurnResult)
     assert res.status == "completed"
@@ -75,15 +75,15 @@ def test_run_returns_turnresult_completed_with_tokens():
 
 
 def test_run_maps_aborted_to_cancelled_status():
-    """chat() 把取消吞成 _aborted=True 并正常返回——run() 必须在 await 后读 _aborted。"""
+    """run_turn 把取消吞成 _aborted=True 并正常返回——run() 必须在 await 后读 _aborted。"""
     rt = AgentRuntime()
     a = _agent()
 
     async def aborted_chat(prompt):
         a._aborted = True   # 模拟取消被吞
 
-    a.chat = aborted_chat
     th = rt.adopt(a)
+    th.session.run_turn = aborted_chat
     res = asyncio.run(th.run("x"))
     assert res.status == "cancelled"   # 不是 completed
 
@@ -108,8 +108,8 @@ def test_capture_response_via_tee_preserves_display():
     async def fake_chat(prompt):
         a._emit_block("hello world")
 
-    a.chat = fake_chat
     th = rt.adopt(a, capture_response=True)
+    th.session.run_turn = fake_chat
     assert isinstance(a._sink, TeeSink)        # sink 被外挂为 tee
     res = asyncio.run(th.run("q"))
     assert res.final_response == "hello world"  # 捕获到
@@ -125,8 +125,8 @@ def test_capture_resets_between_turns():
     async def fake_chat(prompt):
         a._emit_block(next(seq))
 
-    a.chat = fake_chat
     th = rt.adopt(a, capture_response=True)
+    th.session.run_turn = fake_chat
     r1 = asyncio.run(th.run("a"))
     r2 = asyncio.run(th.run("b"))
     assert r1.final_response == "first"

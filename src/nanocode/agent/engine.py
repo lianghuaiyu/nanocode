@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 import uuid
@@ -18,29 +17,13 @@ from ..tools import (
     tool_definitions,
     execute_tool,
     PermissionEngine,
-    CONCURRENCY_SAFE_TOOLS,
-    get_active_tool_definitions,
     ToolDef,
-    PermissionMode,
-)
-from ..memory import (
-    start_memory_prefetch,
-    format_memories_for_injection,
-    MemoryPrefetch,
-)
-from ..memory.maintenance import (
-    build_curator_user_message,
-    parse_consolidation_plan,
-    apply_plan,
-    build_eval_curator_message,
 )
 from .sink import EventSink, TerminalSink, BufferSink
 from .events import (
     AssistantDelta,
     ToolBlocked,
     ToolCallAuthorized,
-    TurnAborted,
-    TurnCompleted,
 )
 from ..prompt import build_system_prompt
 from ..skills.discovery import (
@@ -49,21 +32,16 @@ from ..skills.discovery import (
     discover_skills,
     reset_skill_cache,
 )
-from ..subagents import get_sub_agent_config
 from ..mcp import McpManager
 from ..tasks.manager import TaskManager
 from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
 from ..session import v2 as _session_v2
-from ..tools import tasks_tool
 
 from .models import (
     _get_context_window,
     _model_supports_thinking,
     _model_supports_adaptive_thinking,
-    _get_max_output_tokens,
-    _to_openai_tools,
-    _with_retry,
 )
 from .compaction import persist_large_result
 from .plan_mode import PlanModeMixin
@@ -213,7 +191,10 @@ class Agent(PlanModeMixin):
         self._pre_plan_mode: str | None = None
         self._plan_file_path: str | None = None
         self._plan_approval_fn: Callable[[str], Awaitable[dict]] | None = None
-        self._context_cleared: bool = False  # Set when plan approval clears context
+        # turn-scoped context-break 信号（docs/16 #3c，取代 flat 时代的 _context_cleared）：
+        # plan clear-and-execute 经 agent_session.clear_for_plan_execution 置位，loop 经
+        # cfg.consume_context_break 消费；每 turn 开始复位，绝不跨 turn。
+        self._pending_context_break: bool = False
 
         # Thinking mode
         self._thinking_mode = self._resolve_thinking_mode()
@@ -248,11 +229,9 @@ class Agent(PlanModeMixin):
         self._active_hooks: list[dict] = []
         self._suppress_hooks: bool = False
 
-        # provider 消息列表（plain list）。docs/13 S5：树是会话事实源，这两个列表降为每轮
-        # 从 build_context 渲染的投影（live 请求源见 _build_request_messages）；MessageStore 抽象已删。
-        # 仅当前 provider 的列表会被填充（use_openai 决定）。
-        self._anthropic_messages: list = []
-        self._openai_messages: list = []
+        # provider 消息列表已退役（docs/16 #3c）：树是会话事实源，每个请求经
+        # AgentSession.project_request() 从 build_context 重渲染（request-local ProviderProjection），
+        # 不再持任何 durable provider-shaped 列表。
 
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -262,7 +241,6 @@ class Agent(PlanModeMixin):
         if self.use_openai:
             self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
-            self._openai_messages.append({"role": "system", "content": self._system_prompt})
         else:
             kwargs: dict[str, Any] = {}
             if api_key:
@@ -368,35 +346,9 @@ class Agent(PlanModeMixin):
     # ─── Main entry point ────────────────────────────────────
 
     async def chat(self, user_message: str) -> None:
-        # Lazily connect to MCP servers on first chat (main agent only)
-        if not self._mcp_initialized and not self.is_sub_agent:
-            self._mcp_initialized = True
-            try:
-                await self._mcp_manager.load_and_connect()
-                mcp_defs = self._mcp_manager.get_tool_definitions()
-                if mcp_defs:
-                    self.tools = self.tools + mcp_defs
-            except Exception as e:
-                self._sink.info(f"[mcp] Init failed: {e}")
-
-        self._aborted = False
-        self._ensure_session_lease()  # 确保持有会话写者租约（runtime 已注入则 no-op；headless/直接构造则自取）
-        await self.agent_session.inject_session_context()  # docs/15 Phase 3 cutover：项目指令/memory 作 session-context 包
-        coro = self._core.run_turn(self, user_message)
-        self._current_task = asyncio.current_task()
-        try:
-            await coro
-        except asyncio.CancelledError:
-            self._aborted = True
-        finally:
-            self._current_task = None
-        # docs/14 Milestone B：turn-end 累计遥测落树（trajectory 的 total_turns + 终态 step 从此派生）。
-        # docs/16 #2：经 emit→record_event 单写（typed TurnCompleted/TurnAborted → TURN_END entry）。
-        ev_cls = TurnAborted if self._aborted else TurnCompleted
-        self.emit(ev_cls(input_tokens=self.total_input_tokens,
-                         output_tokens=self.total_output_tokens, turns=self.current_turns))
-        if not self.is_sub_agent:
-            self.agent_session.auto_save()
+        """公开 turn 入口：委托 AgentSession.run_turn（turn shell，docs/16 #3c）。
+        取消吞成 _aborted=True 并正常返回的契约由 run_turn 保持。"""
+        await self.agent_session.run_turn(user_message)
 
     # ─── docs/15 Phase 3 / docs/16 #3b：session-context 注入（项目指令 + memory 静态段）已迁入
     # AgentSession.inject_session_context（turn shell 职责），chat() 经 agent_session 调用。
@@ -466,23 +418,10 @@ class Agent(PlanModeMixin):
     async def _compact_openai(self) -> "str | None":
         return await self._core._compact_openai(self)
 
-    # ─── Message-list ownership（docs/13 S5：plain list，MessageStore 抽象已删）──────
-    # _anthropic_messages / _openai_messages 是普通 list（每轮 build_context 投影 + 注入装饰）；
-    # 树是事实源。跨 agent：父读子经 _dump_messages、装入经 _load_messages（不直接赋子列表）。
-
-    def _active_messages(self) -> list:
-        return self._openai_messages if self.use_openai else self._anthropic_messages
-
-    def _load_messages(self, messages: list) -> None:
-        """装入活动列表（resume / move_to / 父恢复子 agent 单一入口）。"""
-        if self.use_openai:
-            self._openai_messages = messages
-        else:
-            self._anthropic_messages = messages
-
-    def _dump_messages(self) -> list:
-        """dump：导出活动列表（持久化只读；含父读子 agent 列表）。"""
-        return list(self._active_messages())
+    # ─── Message-list ownership：已退役（docs/16 #3c）─────────────────────────
+    # _anthropic_messages/_openai_messages/_active_messages/_load_messages/_dump_messages/
+    # _get_message_count 全部删除——树是唯一事实源，请求是 request-local 投影
+    # （AgentSession.project_request），任何"装载/导出 flat 列表"的 ownership 语义不复存在。
 
     # ─── Session ──────────────────────────────────────────────
     # docs/14 SessionLease：`restore_session` 已退役。resume 由 runtime 激活会话写者租约
@@ -530,7 +469,7 @@ class Agent(PlanModeMixin):
         重新进入——等价于以同一 config 全新构造一个 agent。修复 P2 review 的 plan-mode 跨会话泄漏。"""
         self.permission_mode = self._base_permission_mode
         self._pre_plan_mode = None
-        self._context_cleared = False
+        self._pending_context_break = False
         self._apply_permission_mode_prompt()    # 按 baseline mode 重算 _plan_file_path + _system_prompt（新 sid）
 
     def rebind_session(self, new_mgr, *, artifact_id: str = "main") -> None:
@@ -549,7 +488,6 @@ class Agent(PlanModeMixin):
         if new_sid == self.session_id:
             return
         old_sid = self.session_id
-        from ..session.render import ModelCtx, render
         built = new_mgr.build_context()         # 已由 _switch_via_rebind 校验过；纯内存 fold，无 I/O
         # ── FINALIZE 旧 session（均为低风险/guarded 操作）──
         old_mgr = self._session_mgr
@@ -580,17 +518,8 @@ class Agent(PlanModeMixin):
         self._aborted = False
         self._reset_working_sets()
         self._reset_session_mode()              # plan/permission 复位到 baseline（recompute _system_prompt，新 sid）
-        # 活动消息列表：从新 session 树（已校验的 built）render 装入（空 session → []，openai 含 system）
-        provider = "openai" if self.use_openai else "anthropic"
-        api = "openai-completions" if self.use_openai else "anthropic"
-        sysp = self._system_prompt if self.use_openai else None
-        self._load_messages(render(built.messages,
-                                   ModelCtx(provider=provider, api=api, model_id=self.model),
-                                   system_prompt=sysp)["messages"])
-        self._sink.info(f"Session → {new_sid} ({self._get_message_count()} messages).")
-
-    def _get_message_count(self) -> int:
-        return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
+        # 请求是 request-local 投影（每轮从新 session 树重渲染，docs/16 #3c）——无需装载 flat 列表。
+        self._sink.info(f"Session → {new_sid} ({len(built.messages)} messages).")
 
     # docs/16 #3b：_auto_save 迁入 AgentSession.auto_save（chat/rebind 经 agent_session 调用）。
 
@@ -631,12 +560,10 @@ class Agent(PlanModeMixin):
 
     def _persist_state(self) -> None:
         """Write v2 state (tasks + subagents) to disk —— DERIVED cache（非 resume 权威，docs/14 P7）。
-        canonical 树是会话事实源；这里只落 TaskManager/subagent 生命周期记录供 /resume 重载 + mark-lost。"""
+        canonical 树是会话事实源；这里只落 TaskManager/subagent 生命周期记录供 /resume 重载 + mark-lost。
+        无读者键 session_id/startTime 已删（docs/16 C-2 随 #3）。"""
         try:
-            state = self.task_manager.to_state()
-            state["session_id"] = self.session_id
-            state["startTime"] = self.session_start_time
-            _session_v2.write_state(self.session_id, state)
+            _session_v2.write_state(self.session_id, self.task_manager.to_state())
         except Exception as e:
             # docs/16 #2：silent pass 已清——derived cache 落盘失败必须可观测（不破坏 live turn）。
             self._sink.info(f"[state] v2 state persist failed: {e}")
@@ -689,7 +616,8 @@ class Agent(PlanModeMixin):
         stdout_path = str(d / "stdout.log"); stderr_path = str(d / "stderr.log")
         self.task_manager.update_task(rec.id, stdout_path=stdout_path, stderr_path=stderr_path)
         task = asyncio.create_task(run_shell_background_task(
-            self.task_manager, rec.id, command, stdout_path, stderr_path, timeout_ms))
+            self.task_manager, rec.id, command, stdout_path, stderr_path, timeout_ms,
+            session_id=self.session_id))
         task._nanocode_task_id = rec.id
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -766,7 +694,8 @@ class Agent(PlanModeMixin):
         # 权限通过后，用统一 planner 决定执行方式：任何沙盒档（auto/seatbelt）下 hook 都在
         # 原生 OS 沙盒内受限跑（写 workspace 受限、无网，宿主工具链在），无原生后端则 blocked；
         # off 档 hook 仍宿主跑（off=不沙盒）。hook 绝不进 microVM、绝不裸跑沙盒归类的命令。
-        hook_inp = {"command": cmd, "timeout": h["timeout_ms"], "stdin": json.dumps(event)}
+        hook_inp = {"command": cmd, "timeout": h["timeout_ms"], "stdin": json.dumps(event),
+                    "_session_id": self.session_id}
         kind, info = run_shell.plan_shell(hook_inp, context="hook")
         self._suppress_hooks = True
         try:

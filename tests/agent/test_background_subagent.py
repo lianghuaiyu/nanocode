@@ -35,11 +35,9 @@ def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):
             sub.run_once = run_once(sub)
         else:
             async def _ro(prompt: str) -> dict:
-                sub._anthropic_messages.append({"role": "user", "content": prompt})
-                sub._anthropic_messages.append({"role": "assistant", "content": text})
                 if sub._session_mgr is not None:          # 真实 run_once 会写 child 树——stub 对齐
-                    sub._core._record_messages(sub, {"role": "user", "content": prompt})
-                    sub._core._record_messages(sub, {"role": "assistant", "content": text})
+                    sub.agent_session.record_provider_messages({"role": "user", "content": prompt})
+                    sub.agent_session.record_provider_messages({"role": "assistant", "content": text})
                 return {"text": text, "tokens": tokens}
             sub.run_once = _ro
         return sub

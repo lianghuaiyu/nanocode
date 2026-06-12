@@ -1,5 +1,5 @@
 # tests/tools/test_sandbox_session_id.py
-"""Task 1: sandbox_shell 显式 session_id（_session_id）优先，env 回退。"""
+"""sandbox_shell 显式 session_id（_session_id）注入；env 回退已删（docs/16 C-2 随 #3）。"""
 
 from nanocode.tools import sandbox_shell as ss
 from nanocode.tools import sandbox_defaults as sd
@@ -15,9 +15,10 @@ def test_session_id_of_prefers_explicit(monkeypatch):
     assert ss._session_id_of({"_session_id": "EXPLICIT"}) == "EXPLICIT"
 
 
-def test_session_id_of_falls_back_to_env(monkeypatch):
+def test_session_id_of_no_env_fallback(monkeypatch):
+    # docs/16 C-2 随 #3：env 回退已删——缺显式注入即 "default"，绝不读进程环境。
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
-    assert ss._session_id_of({}) == "ENV"
+    assert ss._session_id_of({}) == "default"
 
 
 def test_session_id_of_default_when_no_env(monkeypatch):
@@ -31,9 +32,9 @@ def test_sandbox_name_for_uses_explicit(monkeypatch):
     assert ss._sandbox_name_for({"_session_id": "EXPLICIT"}) == "nanocode-sbx-EXPLICIT"
 
 
-def test_sandbox_name_for_falls_back_to_env(monkeypatch):
+def test_sandbox_name_for_no_env_fallback(monkeypatch):
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
-    assert ss._sandbox_name_for({}) == "nanocode-sbx-ENV"
+    assert ss._sandbox_name_for({}) == "nanocode-sbx-default"
 
 
 # ---- _trace_host_dir_for ----
@@ -46,11 +47,11 @@ def test_trace_host_dir_for_uses_explicit(monkeypatch, tmp_path):
     assert d.endswith("sandbox/tag1")
 
 
-def test_trace_host_dir_for_falls_back_to_env(monkeypatch, tmp_path):
+def test_trace_host_dir_for_no_env_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("NANOCODE_TRACE_DIR", str(tmp_path))
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
     d = ss._trace_host_dir_for({}, "tag1")
-    assert "ENV" in d
+    assert "ENV" not in d and "default" in d   # env 回退已删
 
 
 # ---- _merge_params 透传 _session_id ----

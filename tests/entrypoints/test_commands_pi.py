@@ -67,7 +67,7 @@ def test_thread_clone_creates_child_with_parent_session_and_switches():
     assert child_sid != "CLONESRC"
     ps = SessionManager.open(child_sid).parent_session()
     assert ps and ps["sessionId"] == "CLONESRC"          # parentSession 血缘
-    assert "q1" in str(a._anthropic_messages)            # path-to-root 复制过来
+    assert "q1" in str(a.agent_session.build_request_messages())            # path-to-root 复制过来
 
 
 # ─── /fork（in-file before-user：移 leaf，不新建 session）────────────────────────
@@ -82,7 +82,7 @@ def test_fork_no_arg_forks_before_last_user_in_file():
     assert isinstance(res, Local)                          # in-file，不发 Control
     assert a.session_id == "FORKSRC"                       # 同 session（不新建）
     assert a._session_mgr.get_leaf() == a1.id              # leaf 移到选中 user 消息之前（其 parent）
-    live = str(a._anthropic_messages)
+    live = str(a.agent_session.build_request_messages())
     assert "first q" in live and "first a" in live
     assert "second q" not in live                          # 选中 user 消息及其后不在上下文
 
@@ -98,7 +98,7 @@ def test_fork_at_entry_moves_leaf_excludes_selection(capsys):
     assert isinstance(res, Local)
     assert a._session_mgr.get_leaf() == a1.id
     assert "q2 SELECTED" in capsys.readouterr().out         # 选中文本回显供重编辑
-    assert "q2 SELECTED" not in str(a._anthropic_messages)
+    assert "q2 SELECTED" not in str(a.agent_session.build_request_messages())
 
 
 def test_fork_before_first_message_resets_to_root():
@@ -108,7 +108,7 @@ def test_fork_before_first_message_resets_to_root():
     assert isinstance(res, Local)
     assert a.session_id == "FORKFIRST"                        # in-file
     assert a._session_mgr.get_leaf() is None                  # fork before first → 复位到 root
-    assert a._anthropic_messages == []
+    assert a.agent_session.build_request_messages() == []
 
 
 # ─── /tree <entry> 导航 ──────────────────────────────────────────────────────
@@ -118,4 +118,4 @@ def test_tree_entry_navigates_moves_leaf(capsys):
     a._session_mgr.append_message(T.user_message("second"))
     asyncio.run(_tree(_ctx(a), u1.id[-8:]))               # /tree <entry> → move_to
     assert a._session_mgr.get_leaf() == u1.id
-    assert "first" in str(a._anthropic_messages) and "second" not in str(a._anthropic_messages)
+    assert "first" in str(a.agent_session.build_request_messages()) and "second" not in str(a.agent_session.build_request_messages())

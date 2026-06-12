@@ -146,13 +146,10 @@ def _resolve_msb() -> str | None:
     return None
 
 
-# ─── session_id 解析：显式 inp["_session_id"] 优先，回退 env ───
+# ─── session_id 解析：显式 inp["_session_id"]（调用方注入；env 回退已删，docs/16 C-2 随 #3）───
 def _session_id_of(p: dict) -> str:
-    """优先取显式注入的 _session_id，回退到进程环境（旧行为）。"""
-    sid = p.get("_session_id")
-    if sid:
-        return sid
-    return os.environ.get("NANOCODE_SESSION_ID", "default")
+    """取显式注入的 _session_id（router/后台 runner/hook 路径都显式注入；缺 → "default"）。"""
+    return p.get("_session_id") or "default"
 
 
 def _sandbox_name_for(p: dict) -> str:

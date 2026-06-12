@@ -1,13 +1,12 @@
 """docs/14 SessionLease：resume = runtime 激活会话写者租约（SessionLease.open with lock）+ 从
-canonical 树渲染上下文（cli._load_from_manager）。canonical `session.jsonl` 树是**唯一**权威——
-无 flat fallback、无 runtime 自动迁移（legacy 导入面已删，docs/16 C-3）；空树 → 空上下文。
+canonical 树按轮重渲染请求（agent_session.build_request_messages，docs/16 #3c：flat 装载已退役）。
+canonical `session.jsonl` 树是**唯一**权威——无 flat fallback、无 runtime 自动迁移；空树 → 空上下文。
 """
 
 from nanocode.agent.engine import Agent
 from nanocode.session import tree, capture
 from nanocode.session.manager import SessionManager
 from nanocode.session.lease import SessionLease
-from nanocode.entrypoints.cli import _load_from_manager
 
 LIVE = [
     {"role": "user", "content": "do it"},
@@ -48,8 +47,7 @@ def test_resume_loads_full_tree_into_active_list():
     _seed("p3sess", LIVE)
     b = _agent("p3sess"); b.model = "claude-x"
     b._session_mgr = SessionLease.open_or_create("p3sess").manager     # 激活写者租约
-    _load_from_manager(b)
-    assert _norm(b._anthropic_messages) == _norm(LIVE)
+    assert _norm(b.agent_session.build_request_messages()) == _norm(LIVE)
     assert sum(1 for e in SessionManager.open("p3sess").entries() if e.type == tree.MESSAGE) == 4
 
 
@@ -64,14 +62,13 @@ def test_resume_tree_is_sole_authority_ignores_stray_files():
     mgr.append_message(tree.user_message("only-tree")); mgr.close()
     b = _agent("p3auth"); b.model = "claude-x"
     b._session_mgr = SessionLease.open_or_create("p3auth").manager
-    _load_from_manager(b)
-    assert "only-tree" in str(b._anthropic_messages)
-    assert "do it" not in str(b._anthropic_messages)        # legacy flat 内容不出现
+    req = b.agent_session.build_request_messages()
+    assert "only-tree" in str(req)
+    assert "do it" not in str(req)                          # legacy flat 内容不出现
 
 
 def test_resume_empty_tree_yields_empty_context():
     SessionManager.create("p3empty").close()                 # header-only 空树
     b = _agent("p3empty"); b.model = "claude-x"
     b._session_mgr = SessionLease.open_or_create("p3empty").manager
-    _load_from_manager(b)
-    assert b._anthropic_messages == []                       # 空树 → 空上下文（不静默丢、不回退 flat）
+    assert b.agent_session.build_request_messages() == []   # 空树 → 空上下文（不静默丢、不回退 flat）

@@ -42,11 +42,150 @@ class AgentSession:
     def aborted(self) -> bool:
         return self.agent._aborted
 
-    # ── turn 编排 ────────────────────────────────────────────────────────────
+    # ── turn 编排（docs/16 #3c：turn shell = pi executeTurn）──────────────────
     async def run_turn(self, prompt: str) -> None:
-        """跑一个 turn：委托 AgentCore（其已含 begin_turn/user_message/模型循环/turn_end/取消语义）。
-        最终文本经 sink 呈现或 run_once 的 BufferSink 捕获；结构化结果由 RuntimeThread 的 TurnResult 承载。"""
-        await self.agent.chat(prompt)
+        """一个 turn 的完整外壳：MCP lazy init → lease prologue → session-context 注入 →
+        user 消息 emit → compaction 门 → AgentCore 纯 loop（state+cfg+emit）→ turn_end → auto_save。
+
+        取消语义（不可回归契约）：CancelledError 吞成 _aborted=True 并正常返回；
+        TurnResult 的 cancelled 状态由调用方 await 之后读 agent._aborted 映射。"""
+        import asyncio
+        a = self.agent
+        # MCP lazy init（主 agent 首 turn；工具表扩充须在 cfg 快照之前）
+        if not a._mcp_initialized and not a.is_sub_agent:
+            a._mcp_initialized = True
+            try:
+                await a._mcp_manager.load_and_connect()
+                mcp_defs = a._mcp_manager.get_tool_definitions()
+                if mcp_defs:
+                    a.tools = a.tools + mcp_defs
+            except Exception as e:
+                a._sink.info(f"[mcp] Init failed: {e}")
+
+        a._aborted = False
+        a._pending_context_break = False        # turn-scoped：上一 turn 的遗留信号绝不跨 turn
+        a._ensure_session_lease()               # lease prologue（runtime 已注入则 no-op）
+        await self.inject_session_context()     # 项目指令/memory 作 session-context 包
+        a.emit(_events.UserMessageAccepted(text=prompt))   # S1：user 消息先落树（请求从树渲染）
+        await self.check_and_compact()
+        memory_prefetch = self.start_memory_prefetch(prompt)
+
+        state = self.hydrate_state()
+        cfg = self._loop_config(memory_prefetch)
+        a._current_task = asyncio.current_task()
+        try:
+            await a._core.run_turn(state, cfg, a.emit, stream_fn=a._provider.stream)
+        except asyncio.CancelledError:
+            a._aborted = True
+        finally:
+            a._current_task = None
+        # turn-end 累计遥测落树（trajectory 的 total_turns + 终态 step 从此派生；record_event 单写）。
+        ev_cls = _events.TurnAborted if a._aborted else _events.TurnCompleted
+        a.emit(ev_cls(input_tokens=a.total_input_tokens,
+                      output_tokens=a.total_output_tokens, turns=a.current_turns))
+        if not a.is_sub_agent:
+            self.auto_save()
+
+    def _loop_config(self, memory_prefetch=None):
+        """绑定本 turn 的 AgentLoopConfig（docs/16 #3c）：scalars 快照 + 宿主能力闭包。
+        execute_tool 必须是 allowlist fail-closed 咽喉点入口（_execute_tool_call→router.dispatch）。"""
+        from .loop import AgentLoopConfig
+        a = self.agent
+
+        def note_api_call() -> None:
+            import time
+            a.last_api_call_time = time.time()
+
+        def add_usage(input_tokens: int, output_tokens: int) -> None:
+            a.total_input_tokens += input_tokens
+            a.total_output_tokens += output_tokens
+            a.last_input_token_count = input_tokens
+
+        def bump_turn() -> None:
+            a.current_turns += 1
+
+        def consume_context_break() -> bool:
+            if a._pending_context_break:
+                a._pending_context_break = False
+                return True
+            return False
+
+        def inject_turn_context() -> None:
+            self.inject_finished_tasks()
+            self.inject_skill_listing()
+
+        return AgentLoopConfig(
+            provider=("openai" if a.use_openai else "anthropic"),
+            model=a.model, thinking_mode=a._thinking_mode, tools=a.tools,
+            is_sub_agent=a.is_sub_agent, sink=a._sink,
+            rebuild_snapshot=self.project_request,
+            record_provider_messages=self.record_provider_messages,
+            execute_tool=a._execute_tool_call,
+            authorize=a._authorize_dispatch,
+            permission_check=a.permission.check,
+            persist_large_result=a._persist_large_result,
+            check_budget=a._check_budget,
+            bump_turn=bump_turn, note_api_call=note_api_call, add_usage=add_usage,
+            token_totals=lambda: (a.total_input_tokens, a.total_output_tokens),
+            is_aborted=lambda: a._aborted,
+            consume_context_break=consume_context_break,
+            inject_turn_context=inject_turn_context,
+            inject_skill_bodies=self.inject_pending_skill_bodies,
+            poll_memory=lambda: self.consume_memory_prefetch(memory_prefetch),
+        )
+
+    def record_provider_messages(self, provider_msg: dict, *, stop_reason: "str | None" = None,
+                                 usage: "dict | None" = None, latency_ms: "int | None" = None) -> None:
+        """message family 唯一树写入口（docs/16 #1）：capture-at-emit（#0 工厂）→ emit → record_event
+        （required=True，写失败 fail-loud——树是唯一权威，缺一条 = 下一轮上下文错误）。"""
+        a = self.agent
+        for ev in _events.events_from_provider_message(
+                provider_msg, provider=("openai" if a.use_openai else "anthropic"),
+                model=a.model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms):
+            a.emit(ev)
+
+    def project_request(self):
+        """每请求的 ProviderProjection：messages = 树渲染（build_request_messages），system 按 provider
+        分流（anthropic out-of-band、openai 已在 messages[0]）。读 **live** _system_prompt——plan-mode
+        的 turn 内 system 切换经下一次重渲染实时生效（取代旧 _openai_messages[0] flat 重写）。"""
+        from .state import ProviderProjection
+        a = self.agent
+        provider = "openai" if a.use_openai else "anthropic"
+        return ProviderProjection(provider=provider,
+                                  messages=self.build_request_messages(),
+                                  system=(None if a.use_openai else a._system_prompt))
+
+    # ── memory prefetch（docs/16 #3c：宿主侧 helper，loop 经 cfg 调用）──────────
+    def start_memory_prefetch(self, user_message: str):
+        """主 agent 每 turn 启动语义记忆预取（子 agent / 无 side-query 能力 → None）。"""
+        a = self.agent
+        if a.is_sub_agent:
+            return None
+        sq = a._build_side_query()
+        if not sq:
+            return None
+        from ..memory import start_memory_prefetch
+        return start_memory_prefetch(user_message, sq, a._already_surfaced_memories,
+                                     a._session_memory_bytes, backend=a._memory_backend)
+
+    def consume_memory_prefetch(self, prefetch) -> None:
+        """settle 后注入一次：树是唯一注入通道（写失败 → 不推进 dedup，下一轮 prefetch 重新浮现）；
+        召回/注入失败可观测（sink.info），不破坏 live turn（docs/16 #2 清 silent pass）。"""
+        a = self.agent
+        if not (prefetch and prefetch.settled and not prefetch.consumed):
+            return
+        prefetch.consumed = True
+        try:
+            memories = prefetch.task.result()
+            if memories:
+                from ..memory import format_memories_for_injection
+                injection_text = format_memories_for_injection(memories)
+                if a.emit(_events.ContextInjected(custom_type="memory", content=injection_text)):
+                    for m in memories:
+                        a._already_surfaced_memories.add(m.path)
+                        a._session_memory_bytes += len(m.content.encode())
+        except Exception as e:
+            a._sink.info(f"[memory] recall injection failed: {e}")
 
     async def compact(self, instructions: str | None = None) -> None:
         """压缩当前对话（docs/16 #3a：compaction owner 上移到 turn shell）。
@@ -350,20 +489,12 @@ class AgentSession:
     # ── /clear 与 derived-cache 落盘（docs/16 #3b 自 engine 迁入）────────────────
     def clear_history(self) -> None:
         """docs/14 SessionLease：/clear = 把 active leaf 复位到 root（in-file），而非清空对话事实。
-        历史保留在 canonical 树里（可经 /tree 回看 / 在旧分支继续）；后续 turn 从 root 起一条新分支。
-        复位本对话的 working set + 计数。flat else 分支已删（docs/16 C-2 随 #3）：缺 lease 即自取
-        （headless /clear-before-first-turn 也走树路径）。"""
+        历史保留在 canonical 树里（可经 /tree 回看 / 在旧分支继续）；后续 turn 从 root 起一条新分支
+        （每请求都从树重渲染，无需装载 flat 投影——flat 列表已退役，docs/16 #3c）。
+        复位本对话的 working set + 计数。"""
         a = self.agent
         a._ensure_session_lease()
         a._session_mgr.set_leaf(None)        # 回到 root：get_branch(None)==[] → 空上下文
-        from ..session.render import ModelCtx, render
-        provider = "openai" if a.use_openai else "anthropic"
-        api = "openai-completions" if a.use_openai else "anthropic"
-        sysp = a._system_prompt if a.use_openai else None
-        built = a._session_mgr.build_context()
-        a._load_messages(render(built.messages,
-                                ModelCtx(provider=provider, api=api, model_id=a.model),
-                                system_prompt=sysp)["messages"])
         a.total_input_tokens = 0
         a.total_output_tokens = 0
         a.last_input_token_count = 0
@@ -374,6 +505,19 @@ class AgentSession:
         from ..skills.discovery import reset_skill_cache
         reset_skill_cache()
         a._sink.info("Conversation cleared (leaf reset to root; history kept — /tree to revisit).")
+
+    def clear_for_plan_execution(self) -> None:
+        """plan clear-and-execute（docs/16 #3c，取代 flat 的 _clear_history_keep_system +
+        _context_cleared）：leaf 复位 root + 发 turn 内 context-break 信号——loop 在当前工具结果处
+        消费信号，把结果作为新分支首条 user 消息落树（plan 内容随之入新上下文）。
+
+        修复 latent bug：旧 flat clear 自 docs/13 S2 起从未生效（请求从树渲染，flat 清空被下一次
+        重渲染覆盖，历史原样回流）；leaf 复位才是树语义下真正的 clear。"""
+        a = self.agent
+        if a._session_mgr is not None:
+            a._session_mgr.set_leaf(None)
+        a.last_input_token_count = 0
+        a._pending_context_break = True
 
     def auto_save(self) -> None:
         """v2 state.json（TaskManager/subagent 派生 cache）按需落盘——canonical 树是 resume 权威。
@@ -387,8 +531,8 @@ class AgentSession:
     # ── in-file 导航（docs/14 P6）────────────────────────────────────────────
     def move_to(self, entry_id: "str | None", *, agent_id: str = "main") -> list:
         """把 active leaf 移到 canonical 树的 entry_id（in-file 导航 / checkout / fork-before）。
-        entry_id=None → 复位 root（空上下文）。从该 leaf 重建上下文并装入 live agent。fail-closed：
-        无写者租约 / entry 不存在 → ValueError。返回重建的消息列表。"""
+        entry_id=None → 复位 root（空上下文）。fail-closed：无写者租约 / entry 不存在 → ValueError。
+        返回从新 leaf 重渲染的消息列表（供调用方显示计数；请求路径每轮自行重渲染，无需装载）。"""
         from ..session.render import ModelCtx, render
         a = self.agent
         mgr = a._session_mgr
@@ -401,10 +545,8 @@ class AgentSession:
         provider = "openai" if a.use_openai else "anthropic"
         api = "openai-completions" if a.use_openai else "anthropic"
         sysp = a._system_prompt if a.use_openai else None
-        msgs = render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
+        return render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
                       system_prompt=sysp)["messages"]
-        a._load_messages(msgs)
-        return msgs
 
     # ── turn-end 一致性（§7.6）────────────────────────────────────────────────
     def verify_turn_consistency(self) -> list[str]:

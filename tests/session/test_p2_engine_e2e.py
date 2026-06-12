@@ -100,7 +100,7 @@ def test_subagent_writes_child_tree_not_parent_tree():
                                "taskId": "s1sub", "agentId": "s1sub"}
     a._session_mgr = SessionLease.open_or_create(
         a._tree_session_id, parent_session=a._child_parent_session).manager
-    a._core._record_messages(a, {"role": "user", "content": "x"})
+    a.agent_session.record_provider_messages({"role": "user", "content": "x"})
     assert session_file("PARENT.s1sub").exists()       # 写到 child session
     assert not session_file("PARENT").exists()          # 不碰父 session
     assert not session_file("s1sub").exists()           # 也不写自身 session_id（已解耦到 child）
@@ -132,6 +132,6 @@ def test_required_tree_record_reraises_on_write_failure(monkeypatch):
         raise OSError("disk full")
     monkeypatch.setattr(a._session_mgr, "append_message", boom)
     with pytest.raises(OSError):
-        a._core._record_messages(a, {"role": "user", "content": "hi"})   # 必写 → 重抛
+        a.agent_session.record_provider_messages({"role": "user", "content": "hi"})   # 必写 → 重抛
     monkeypatch.setattr(a._session_mgr, "append", boom)
     a.agent_session._tree_event(T.TURN_END, inputTokens=1)               # 注解型 → 不抛（observable）

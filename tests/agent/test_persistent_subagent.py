@@ -25,11 +25,9 @@ def _stub_run_once(agent, text="sub done", history=None):
     docs/14 SessionLease：真实 run_once 会把消息写进（child）树——stub 也落树（agent 有 child 租约时），
     使 resume 能从 child 树重载历史（docs/16 C-1：messages.json 副本已删，child 树是唯一历史）。"""
     async def _ro(prompt: str) -> dict:
-        agent._anthropic_messages.append({"role": "user", "content": prompt})
-        agent._anthropic_messages.append({"role": "assistant", "content": text})
         if agent._session_mgr is not None:
-            agent._core._record_messages(agent, {"role": "user", "content": prompt})
-            agent._core._record_messages(agent, {"role": "assistant", "content": text})
+            agent.agent_session.record_provider_messages({"role": "user", "content": prompt})
+            agent.agent_session.record_provider_messages({"role": "assistant", "content": text})
         if history is not None:
             history.append(prompt)
         return {"text": text, "tokens": {"input": 11, "output": 7}}
@@ -156,8 +154,6 @@ def test_resume_reloads_history_and_appends(monkeypatch):
             # 不再装进 flat 列表——从 child 树分支量历史。
             reloaded["history_len_before_run"] = sum(
                 1 for e in sub._session_mgr.get_branch() if e.type == _T.MESSAGE)
-            sub._anthropic_messages.append({"role": "user", "content": prompt})
-            sub._anthropic_messages.append({"role": "assistant", "content": "second"})
             return {"text": "second", "tokens": {"input": 3, "output": 2}}
 
         sub.run_once = _ro

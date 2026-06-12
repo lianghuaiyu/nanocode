@@ -1,17 +1,14 @@
-"""agent/core.py — AgentCore：模型循环 + 流式消费 + tool 调度 + 事件发射（docs/15 §6）。
+"""agent/core.py — AgentCore：纯模型循环（pi `Agent` 同位，docs/15 §6 / docs/16 #3c）。
 
-STEP C：把原 AnthropicBackendMixin._chat_anthropic / OpenAIBackendMixin._chat_openai 的循环体
-上移到这里,driven by 注入的 `host`（当前 = Agent，提供 collaborators）。逐字搬迁、行为不变,
-full suite 持续 exercise（等价性证明）。
+签名收敛：`run_turn(state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]`。
+loop **不触 Agent**：状态进（AgentState 快照 + cfg 注入的宿主能力）、事件出（emit 单出口，
+扇出 record_event(树)+UI）、工具经 cfg.execute_tool（allowlist fail-closed 咽喉点在 router）。
+每个请求经 cfg.rebuild_snapshot() 从 canonical 树重渲染（docs/13 硬不变量：turn 内绝不内存 push，
+plan-mode 的 system prompt 切换/上下文复位经重渲染实时生效）。
 
-§6 边界：AgentCore 自身**不**直接写 session、不 build system prompt、不发现 skills/subagents/MCP、
-不写 artifacts、不持 durable provider messages。docs/16 #1：message family 经 capture-at-emit
-（events_from_provider_message，#0 工厂）反转；docs/16 #2：遥测/UI/记忆注入也全部 typed 事件化
-——本模块对 session/UI 的全部触达收敛为 **host.emit(AgentEvent)** 单出口（扇出
-record_event(树) + UI 投影）。仍经 host 委托的只剩注入器（host._inject_*，#6 provider 化）、
-上下文构建（_build_request_messages）与工具派发/预算等 loop 配置（#3 收敛进 AgentLoopConfig）。
-
-provider-specific 的两条循环变体保留（adapter-driven）；不强行合一。
+turn shell（lease prologue / user 消息 emit / compaction 门 / turn_end / auto_save）在
+AgentSession.run_turn（#3）；本模块只剩两条 provider 循环变体（adapter-driven，不强行合一）
+与 summary compaction 的 LLM 调用。
 """
 
 from __future__ import annotations
@@ -20,117 +17,72 @@ import asyncio
 import json
 import time
 
-from ..memory import start_memory_prefetch, format_memories_for_injection
 from ..tools import CONCURRENCY_SAFE_TOOLS
 from .events import (
     AssistantDelta,
     BudgetExceeded,
-    ContextInjected,
     LlmRequestPrepared,
     ToolCallRequested,
     ToolResultObserved,
-    events_from_provider_message,
 )
-from .loop import group_openai_batches
+from .loop import AgentLoopConfig, group_openai_batches
 from .providers import StreamCallbacks
 
 
 class AgentCore:
-    """模型循环宿主。无状态（循环态都是 turn-local 局部变量或 host 上的字段）；按 host.use_openai 分派。"""
+    """模型循环。无状态（循环态都是 turn-local 局部变量）；按 cfg.provider 分派循环变体。"""
 
-    @staticmethod
-    def _record_messages(host, provider_msg: dict, *, stop_reason: "str | None" = None,
-                         usage: "dict | None" = None, latency_ms: "int | None" = None) -> None:
-        """message family 唯一树写者（docs/16 #1）：capture-at-emit（#0 工厂，与原 _tree_record 内联
-        capture 树级等价）→ host.emit → record_event（required=True，写失败 fail-loud——树是唯一权威，
-        无 flat 兜底，缺一条 = 下一轮上下文错误）。"""
-        for ev in events_from_provider_message(
-                provider_msg, provider=("openai" if host.use_openai else "anthropic"),
-                model=host.model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms):
-            host.emit(ev)
+    async def run_turn(self, state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]:
+        if cfg.provider == "openai":
+            return await self.run_openai_turn(state, cfg, emit, stream_fn=stream_fn)
+        return await self.run_anthropic_turn(state, cfg, emit, stream_fn=stream_fn)
 
-    async def run_turn(self, host, user_message: str) -> None:
-        if host.use_openai:
-            await self.run_openai_turn(host, user_message)
-        else:
-            await self.run_anthropic_turn(host, user_message)
-
-    # ─── Anthropic turn（移植自 _chat_anthropic，self→host）────────────────────
-    async def run_anthropic_turn(self, host, user_message: str) -> None:
-        host._anthropic_messages.append({"role": "user", "content": user_message})
-        self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
-        await host.agent_session.check_and_compact()
-
-        memory_prefetch = None
-        if not host.is_sub_agent:
-            sq = host._build_side_query()
-            if sq:
-                memory_prefetch = start_memory_prefetch(
-                    user_message, sq,
-                    host._already_surfaced_memories, host._session_memory_bytes,
-                    backend=host._memory_backend,
-                )
-
+    # ─── Anthropic turn ──────────────────────────────────────────────────────
+    async def run_anthropic_turn(self, state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]:
+        messages: list = []
         while True:
-            if host._aborted:
+            if cfg.is_aborted():
                 break
 
-            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
-                memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup，
-                        # 下一轮 prefetch 重新浮现（不静默丢记忆）。
-                        injection_text = format_memories_for_injection(memories)
-                        if host.emit(ContextInjected(custom_type="memory", content=injection_text)):
-                            for m in memories:
-                                host._already_surfaced_memories.add(m.path)
-                                host._session_memory_bytes += len(m.content.encode())
-                except Exception as e:
-                    # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
-                    host._sink.info(f"[memory] recall injection failed: {e}")
+            cfg.poll_memory()
+            cfg.inject_turn_context()
 
-            host.agent_session.inject_finished_tasks()
-            host.agent_session.inject_skill_listing()
-
-            if not host.is_sub_agent:
-                host._sink.spinner_start()
+            if not cfg.is_sub_agent:
+                cfg.sink.spinner_start()
 
             early_executions: dict[str, asyncio.Task] = {}
             early_started: dict[str, float] = {}
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    if host.permission.check(block["name"], block["input"]).action == "allow":
+                    if cfg.permission_check(block["name"], block["input"]).action == "allow":
                         early_started[block["id"]] = time.time()
-                        task = asyncio.create_task(host._execute_tool_call(block["name"], block["input"]))
+                        task = asyncio.create_task(cfg.execute_tool(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
-            host._anthropic_messages = host.agent_session.build_request_messages()
-            host.emit(LlmRequestPrepared(
-                model=host.model, message_count=len(host._anthropic_messages),
-                messages_chars=len(json.dumps(host._anthropic_messages, default=str))))
+            proj = cfg.rebuild_snapshot()
+            messages = proj.messages
+            emit(LlmRequestPrepared(
+                model=cfg.model, message_count=len(messages),
+                messages_chars=len(json.dumps(messages, default=str))))
             _t_req = time.time()
             cb = StreamCallbacks(
-                spinner_stop=host._sink.spinner_stop,
-                text_block=host._emit_block,
-                thinking_block=lambda t: host.emit(AssistantDelta(thinking=t)),
+                spinner_stop=cfg.sink.spinner_stop,
+                text_block=lambda t: emit(AssistantDelta(text=t)),
+                thinking_block=lambda t: emit(AssistantDelta(thinking=t)),
                 tool_block=_on_tool_block,
-                retry=host._sink.retry,
+                retry=cfg.sink.retry,
             )
-            response = await host._provider.stream(
-                model=host.model, system=host._system_prompt, tools=host.tools,
-                messages=host._anthropic_messages, thinking_mode=host._thinking_mode, callbacks=cb)
+            response = await stream_fn(
+                model=cfg.model, system=proj.system, tools=cfg.tools,
+                messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
             _latency_ms = int((time.time() - _t_req) * 1000)
 
-            if not host.is_sub_agent:
-                host._sink.spinner_stop()
+            if not cfg.is_sub_agent:
+                cfg.sink.spinner_stop()
 
-            host.last_api_call_time = time.time()
-            host.total_input_tokens += response.usage.input_tokens
-            host.total_output_tokens += response.usage.output_tokens
-            host.last_input_token_count = response.usage.input_tokens
+            cfg.note_api_call()
+            cfg.add_usage(response.usage.input_tokens, response.usage.output_tokens)
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
@@ -138,61 +90,58 @@ class AgentCore:
                 "role": "assistant",
                 "content": [self.block_to_dict(b) for b in response.content],
             }
-            host._anthropic_messages.append(assistant_msg)
-            self._record_messages(host, assistant_msg, stop_reason=getattr(response, "stop_reason", None),
-                                  usage={"inputTokens": response.usage.input_tokens,
-                                         "outputTokens": response.usage.output_tokens},
-                                  latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
-            # docs/16 #2：旧的 _dispatch_event("assistant_message") 双发已删——AssistantMessageCompleted
-            # 由上面 _record_messages 的 emit 单发承载（UI 投影 no-op：流式已逐 block 渲染）。
+            cfg.record_provider_messages(
+                assistant_msg, stop_reason=getattr(response, "stop_reason", None),
+                usage={"inputTokens": response.usage.input_tokens,
+                       "outputTokens": response.usage.output_tokens},
+                latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
 
             if not tool_uses:
-                if not host.is_sub_agent:
-                    host._sink.cost(host.total_input_tokens, host.total_output_tokens)
+                if not cfg.is_sub_agent:
+                    cfg.sink.cost(*cfg.token_totals())
                 break
 
-            host.current_turns += 1
-            budget = host._check_budget()
+            cfg.bump_turn()
+            budget = cfg.check_budget()
             if budget["exceeded"]:
-                host._sink.info(f"Budget exceeded: {budget['reason']}")
-                host.emit(BudgetExceeded(reason=budget["reason"]))
+                cfg.sink.info(f"Budget exceeded: {budget['reason']}")
+                emit(BudgetExceeded(reason=budget["reason"]))
                 break
 
             tool_results: list[dict] = []
             context_break = False
             for tu in tool_uses:
-                if context_break or host._aborted:
+                if context_break or cfg.is_aborted():
                     break
                 inp = dict(tu.input) if hasattr(tu.input, "items") else tu.input
-                host.emit(ToolCallRequested(tool=tu.name, input=inp, tool_use_id=tu.id))
+                emit(ToolCallRequested(tool=tu.name, input=inp, tool_use_id=tu.id))
 
                 early_task = early_executions.get(tu.id)
                 if early_task:
                     raw = await early_task
-                    res = host._persist_large_result(tu.name, raw)
+                    res = cfg.persist_large_result(tu.name, raw)
                     _lat = int((time.time() - early_started.get(tu.id, time.time())) * 1000)
-                    host.emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
+                    emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
                                          "toolName": tu.name, "toolLatencyMs": _lat})
                     continue
 
-                allowed, denial = await host._authorize_dispatch(tu.name, inp)
+                allowed, denial = await cfg.authorize(tu.name, inp)
                 if not allowed:
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": denial,
                                          "toolName": tu.name, "is_error": True})
                     continue
 
                 _t_tool = time.time()
-                raw = await host._execute_tool_call(tu.name, inp)
-                res = host._persist_large_result(tu.name, raw)
+                raw = await cfg.execute_tool(tu.name, inp)
+                res = cfg.persist_large_result(tu.name, raw)
                 _lat = int((time.time() - _t_tool) * 1000)
-                host.emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
+                emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
 
-                if host._context_cleared:
-                    host._context_cleared = False
-                    cb_msg = {"role": "user", "content": res}
-                    host._anthropic_messages.append(cb_msg)
-                    self._record_messages(host, cb_msg)
+                if cfg.consume_context_break():
+                    # plan clear-and-execute：leaf 已复位 root——结果作为新分支首条 user 消息落树，
+                    # 不能作 toolResult（其 toolCall 已不在新分支上，render 会按 inverse-orphan 清掉）。
+                    cfg.record_provider_messages({"role": "user", "content": res})
                     context_break = True
                     break
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
@@ -200,104 +149,73 @@ class AgentCore:
 
             if not context_break and tool_results:
                 tr_msg = {"role": "user", "content": tool_results}
-                host._anthropic_messages.append(tr_msg)
-                self._record_messages(host, tr_msg)       # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
-            host._context_cleared = False
+                cfg.record_provider_messages(tr_msg)   # §7.6①：tool result 必须落树（否则 toolCall 孤儿）
             if not context_break:
-                host.agent_session.inject_pending_skill_bodies()
+                cfg.inject_skill_bodies()
+        return messages
 
-    # ─── OpenAI turn（移植自 _chat_openai，self→host）──────────────────────────
-    async def run_openai_turn(self, host, user_message: str) -> None:
-        host._openai_messages.append({"role": "user", "content": user_message})
-        self._record_messages(host, {"role": "user", "content": user_message})  # S1: message-end → tree（必写）
-        await host.agent_session.check_and_compact()
-
-        memory_prefetch = None
-        if not host.is_sub_agent:
-            sq = host._build_side_query()
-            if sq:
-                memory_prefetch = start_memory_prefetch(
-                    user_message, sq,
-                    host._already_surfaced_memories, host._session_memory_bytes,
-                    backend=host._memory_backend,
-                )
-
+    # ─── OpenAI turn ─────────────────────────────────────────────────────────
+    async def run_openai_turn(self, state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]:
+        messages: list = []
         while True:
-            if host._aborted:
+            if cfg.is_aborted():
                 break
 
-            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
-                memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup。
-                        injection_text = format_memories_for_injection(memories)
-                        if host.emit(ContextInjected(custom_type="memory", content=injection_text)):
-                            for m in memories:
-                                host._already_surfaced_memories.add(m.path)
-                                host._session_memory_bytes += len(m.content.encode())
-                except Exception as e:
-                    # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
-                    host._sink.info(f"[memory] recall injection failed: {e}")
+            cfg.poll_memory()
+            cfg.inject_turn_context()
 
-            host.agent_session.inject_finished_tasks()
-            host.agent_session.inject_skill_listing()
+            if not cfg.is_sub_agent:
+                cfg.sink.spinner_start()
 
-            if not host.is_sub_agent:
-                host._sink.spinner_start()
-
-            host._openai_messages = host.agent_session.build_request_messages()
-            host.emit(LlmRequestPrepared(
-                model=host.model, message_count=len(host._openai_messages),
-                messages_chars=len(json.dumps(host._openai_messages, default=str))))
+            proj = cfg.rebuild_snapshot()
+            messages = proj.messages
+            emit(LlmRequestPrepared(
+                model=cfg.model, message_count=len(messages),
+                messages_chars=len(json.dumps(messages, default=str))))
             _t_req = time.time()
-            cb = StreamCallbacks(spinner_stop=host._sink.spinner_stop,
-                                 text_block=host._emit_block, retry=host._sink.retry)
-            response = await host._provider.stream(
-                model=host.model, system=None, tools=host.tools,
-                messages=host._openai_messages, thinking_mode=host._thinking_mode, callbacks=cb)
+            cb = StreamCallbacks(spinner_stop=cfg.sink.spinner_stop,
+                                 text_block=lambda t: emit(AssistantDelta(text=t)),
+                                 retry=cfg.sink.retry)
+            response = await stream_fn(
+                model=cfg.model, system=None, tools=cfg.tools,
+                messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
             _latency_ms = int((time.time() - _t_req) * 1000)
 
-            if not host.is_sub_agent:
-                host._sink.spinner_stop()
+            if not cfg.is_sub_agent:
+                cfg.sink.spinner_stop()
 
-            host.last_api_call_time = time.time()
-
+            cfg.note_api_call()
             if response.get("usage"):
-                host.total_input_tokens += response["usage"]["prompt_tokens"]
-                host.total_output_tokens += response["usage"]["completion_tokens"]
-                host.last_input_token_count = response["usage"]["prompt_tokens"]
+                cfg.add_usage(response["usage"]["prompt_tokens"],
+                              response["usage"]["completion_tokens"])
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
 
-            host._openai_messages.append(message)
-            self._record_messages(host, message, stop_reason=choice.get("finish_reason"),
-                                  usage={"inputTokens": _u.get("prompt_tokens", 0),
-                                         "outputTokens": _u.get("completion_tokens", 0)}
-                                  if (_u := (response.get("usage") or {})) else None,
-                                  latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
-            # docs/16 #2：旧的 _dispatch_event("assistant_message") 双发已删——AssistantMessageCompleted
-            # 由上面 _record_messages 的 emit 单发承载（UI 投影 no-op：流式已逐 block 渲染）。
+            cfg.record_provider_messages(
+                message, stop_reason=choice.get("finish_reason"),
+                usage={"inputTokens": _u.get("prompt_tokens", 0),
+                       "outputTokens": _u.get("completion_tokens", 0)}
+                if (_u := (response.get("usage") or {})) else None,
+                latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                if not host.is_sub_agent:
-                    host._sink.cost(host.total_input_tokens, host.total_output_tokens)
+                if not cfg.is_sub_agent:
+                    cfg.sink.cost(*cfg.token_totals())
                 break
 
-            host.current_turns += 1
-            budget = host._check_budget()
+            cfg.bump_turn()
+            budget = cfg.check_budget()
             if budget["exceeded"]:
-                host._sink.info(f"Budget exceeded: {budget['reason']}")
-                host.emit(BudgetExceeded(reason=budget["reason"]))
+                cfg.sink.info(f"Budget exceeded: {budget['reason']}")
+                emit(BudgetExceeded(reason=budget["reason"]))
                 break
 
             # Phase 1: Parse & permission-check (serial)
             oai_checked: list[dict] = []
             for tc in tool_calls:
-                if host._aborted:
+                if cfg.is_aborted():
                     break
                 if tc.get("type") != "function":
                     continue
@@ -307,9 +225,9 @@ class AgentCore:
                 except Exception:
                     inp = {}
 
-                host.emit(ToolCallRequested(tool=fn_name, input=inp, tool_use_id=tc["id"]))
+                emit(ToolCallRequested(tool=fn_name, input=inp, tool_use_id=tc["id"]))
 
-                allowed, denial = await host._authorize_dispatch(fn_name, inp)
+                allowed, denial = await cfg.authorize(fn_name, inp)
                 if not allowed:
                     oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": denial})
                     continue
@@ -320,58 +238,50 @@ class AgentCore:
 
             oai_context_break = False
             for batch in oai_batches:
-                if oai_context_break or host._aborted:
+                if oai_context_break or cfg.is_aborted():
                     break
 
                 if batch["concurrent"]:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, int]:
                         _t0 = time.time()
-                        raw = await host._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                        res = host._persist_large_result(ct_item["fn"], raw)
+                        raw = await cfg.execute_tool(ct_item["fn"], ct_item["inp"])
+                        res = cfg.persist_large_result(ct_item["fn"], raw)
                         _lat = int((time.time() - _t0) * 1000)
-                        host.emit(ToolResultObserved(tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"],
-                                                     chars=len(res), result=res))
+                        emit(ToolResultObserved(tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"],
+                                                chars=len(res), result=res))
                         return ct_item, res, _lat
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                     for ct_item, res, _lat in results:
                         tmsg = {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res}
-                        host._openai_messages.append(tmsg)
-                        self._record_messages(host, tmsg, latency_ms=_lat)       # §7.6①
+                        cfg.record_provider_messages(tmsg, latency_ms=_lat)       # §7.6①
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
                             dmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]}
-                            host._openai_messages.append(dmsg)
-                            self._record_messages(host, dmsg)       # §7.6①：denied 也是 toolResult,必须落树
+                            cfg.record_provider_messages(dmsg)   # §7.6①：denied 也是 toolResult,必须落树
                             continue
                         _t_tool = time.time()
-                        raw = await host._execute_tool_call(ct["fn"], ct["inp"])
-                        res = host._persist_large_result(ct["fn"], raw)
+                        raw = await cfg.execute_tool(ct["fn"], ct["inp"])
+                        res = cfg.persist_large_result(ct["fn"], raw)
                         _lat = int((time.time() - _t_tool) * 1000)
-                        host.emit(ToolResultObserved(tool=ct["fn"], tool_use_id=ct["tc"]["id"],
-                                                     chars=len(res), result=res))
+                        emit(ToolResultObserved(tool=ct["fn"], tool_use_id=ct["tc"]["id"],
+                                                chars=len(res), result=res))
 
-                        if host._context_cleared:
-                            host._context_cleared = False
-                            cbmsg = {"role": "user", "content": res}
-                            host._openai_messages.append(cbmsg)
-                            self._record_messages(host, cbmsg)
+                        if cfg.consume_context_break():
+                            cfg.record_provider_messages({"role": "user", "content": res})
                             oai_context_break = True
                             break
                         rmsg = {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res}
-                        host._openai_messages.append(rmsg)
-                        self._record_messages(host, rmsg, latency_ms=_lat)       # §7.6①
-
-            host._context_cleared = False
+                        cfg.record_provider_messages(rmsg, latency_ms=_lat)       # §7.6①
             if not oai_context_break:
-                host.agent_session.inject_pending_skill_bodies()
+                cfg.inject_skill_bodies()
+        return messages
 
     # ─── Summary compaction（docs/16 #3a：summarizer 输入 = 树渲染，不再读/写 flat 列表）────
     #
-    # flat 重写（[summary, ack, last_user] 顶替列表）已删：自 docs/13 S2 起每个请求都从树
-    # 重新渲染（_build_request_messages 每轮覆盖 flat），重写从未进过请求——真正的 shrink 是
-    # AgentSession.compact 写的 COMPACTION entry（两区 fold）。本方法只产 summary 文本。
+    # host-driven（经 Agent._compact_* 委托调用，per-instance monkeypatch 锚）：summarizer 是
+    # 一次独立 LLM 调用、不在纯 loop 内；真正的 shrink 是 AgentSession.compact 写的 COMPACTION entry。
 
     async def _compact_anthropic(self, host) -> "str | None":
         messages = host.agent_session.hydrate_state().project().messages

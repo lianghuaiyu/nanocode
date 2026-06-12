@@ -174,8 +174,8 @@ def test_tree_entries_never_contain_reward_or_eval():
     a.agent_session._tree_event(T.TURN_END, inputTokens=1, outputTokens=2, turns=1,
                   reward=-1.0, eval_result={"final": "ok"})
     # 普通消息 entry
-    a._core._record_messages(a, {"role": "user", "content": "hi"})
-    a._core._record_messages(a, {"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+    a.agent_session.record_provider_messages({"role": "user", "content": "hi"})
+    a.agent_session.record_provider_messages({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
 
     entries = a._session_mgr.entries()
     assert entries, "expected tree entries"

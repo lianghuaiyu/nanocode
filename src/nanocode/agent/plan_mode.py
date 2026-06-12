@@ -1,4 +1,10 @@
-"""Plan Mode：只读规划模式的进入/退出、计划文件生成、计划提示词与审批流。"""
+"""Plan Mode：只读规划模式的进入/退出、计划文件生成、计划提示词与审批流。
+
+docs/16 #3c：flat shim 已删——system prompt 切换只改 `_system_prompt`（每个请求经
+AgentSession.project_request 从树重渲染，openai 的 system 由 render 注入 index 0，
+无需重写任何消息列表）；clear-and-execute 走 `agent_session.clear_for_plan_execution()`
+（leaf 复位 root + turn 内 context-break 信号——树语义下真正的 clear）。
+"""
 
 from __future__ import annotations
 
@@ -16,8 +22,6 @@ class PlanModeMixin:
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
             self._sink.info(f"Exited plan mode → {self.permission_mode} mode")
             return self.permission_mode
         else:
@@ -25,8 +29,6 @@ class PlanModeMixin:
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
             self._sink.info(f"Entered plan mode. Plan file: {self._plan_file_path}")
             return "plan"
 
@@ -66,8 +68,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
             self._sink.info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
 
@@ -105,12 +105,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
                 self._system_prompt = self._base_system_prompt
-                if self.use_openai and self._openai_messages:
-                    self._openai_messages[0]["content"] = self._system_prompt
 
                 if choice == "clear-and-execute":
-                    self._clear_history_keep_system()
-                    self._context_cleared = True
+                    self.agent_session.clear_for_plan_execution()
                     self._sink.info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
                     return (
                         f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
@@ -131,17 +128,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
             self._sink.info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"
-
-    def _clear_history_keep_system(self) -> None:
-        """Clear history but keep system prompt (used for clear-context plan approval)."""
-        self._anthropic_messages = []
-        self._openai_messages = []
-        if self.use_openai:
-            self._openai_messages.append({"role": "system", "content": self._system_prompt})
-        self.last_input_token_count = 0

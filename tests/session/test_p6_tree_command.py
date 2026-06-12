@@ -54,7 +54,7 @@ def test_checkout_moves_leaf_and_reloads_context(capsys):
     out = capsys.readouterr().out
     assert "Checked out" in out
     assert mgr.get_leaf() == u1.id
-    live = str(a._anthropic_messages)
+    live = str(a.agent_session.build_request_messages())
     assert "first" in live and "second" not in live   # 上下文回到 first 之处
 
 
@@ -68,7 +68,7 @@ def test_rewind_to_before_last_user(capsys):
     asyncio.run(_rewind(_ctx(a), ""))
     out = capsys.readouterr().out
     assert "Rewound" in out and "q2-oops" in out      # 打印旧文本供重输
-    live = str(a._anthropic_messages)
+    live = str(a.agent_session.build_request_messages())
     assert "q2-oops" not in live and "q1" in live      # 回到上一轮之前
 
 

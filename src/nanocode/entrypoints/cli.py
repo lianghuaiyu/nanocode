@@ -396,23 +396,6 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-def _load_from_manager(agent, built=None) -> None:
-    """把 canonical 树折叠出的上下文渲染进 agent 的 active 消息列表（docs/14 SessionLease 激活/恢复）。
-
-    built 缺省时现 build_context。空树 → 空 active 列表（OpenAI 仍含 system）。替代已退役的
-    restore_session：不再读 legacy flat 快照，树是唯一权威。"""
-    from ..session.render import ModelCtx, render
-    mgr = agent._session_mgr
-    if built is None:
-        built = mgr.build_context()
-    provider = "openai" if agent.use_openai else "anthropic"
-    api = "openai-completions" if agent.use_openai else "anthropic"
-    sysp = agent._system_prompt if agent.use_openai else None
-    agent._load_messages(render(built.messages,
-                                ModelCtx(provider=provider, api=api, model_id=agent.model),
-                                system_prompt=sysp)["messages"])
-
-
 async def run_repl(agent: Agent, lease=None) -> None:
     """Interactive REPL loop.
 
@@ -777,12 +760,11 @@ Examples:
         _lease.close()
         print_error(f"corrupt session tree for '{agent.session_id}': {e}")
         sys.exit(1)
-    agent._session_mgr = _lease.manager
-    _load_from_manager(agent, _built)                # 渲染初始上下文进 active 列表（空树 → 空）
+    agent._session_mgr = _lease.manager              # 请求按轮从树重渲染（docs/16 #3c），无需预装载
     if adopt_sid is not None:
         agent._reload_task_state(_session_v2.read_state(adopt_sid)
                                  if _session_v2.is_v2_session(adopt_sid) else None)
-        print_info(f"Session resumed: {adopt_sid} ({agent._get_message_count()} messages).")
+        print_info(f"Session resumed: {adopt_sid} ({len(_built.messages)} messages).")
 
     prompt = " ".join(args.prompt) if args.prompt else None
 

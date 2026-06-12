@@ -470,8 +470,7 @@ def test_merge_params_trace_default_false():
 
 
 def test_merge_params_trace_tag_persist(monkeypatch):
-    monkeypatch.setenv("NANOCODE_SESSION_ID", "ABC")
-    p = ss._merge_params({"command": "x", "trace": True, "persist": True})
+    p = ss._merge_params({"command": "x", "trace": True, "persist": True, "_session_id": "ABC"})
     assert p["trace"] is True
     assert p["trace_tag"] == "nanocode-sbx-ABC"
 
@@ -487,8 +486,7 @@ def test_merge_params_trace_tag_ephemeral(monkeypatch):
 def test_trace_flags_mount_and_env(monkeypatch):
     monkeypatch.setenv("NANOCODE_MSB_BIN", "msb")
     monkeypatch.setenv("NANOCODE_TRACE_DIR", "")  # 用默认
-    monkeypatch.setenv("NANOCODE_SESSION_ID", "ABC")
-    cmd = ss.build_msb_command({"command": "x", "trace": True, "deps": "none"})
+    cmd = ss.build_msb_command({"command": "x", "trace": True, "deps": "none", "_session_id": "ABC"})
     assert any(f":{ss.TRACE_MOUNT}:rw" in a for a in cmd)         # 挂了 /trace 卷
     assert "NANOCODE_TRACE=1" in cmd
     assert f"NANOCODE_TRACE_DIR={ss.TRACE_MOUNT}" in cmd
@@ -505,12 +503,11 @@ def test_no_trace_no_trace_flags(monkeypatch):
 def test_run_trace_creates_dir_and_marks_result(monkeypatch, tmp_path):
     monkeypatch.setenv("NANOCODE_MSB_BIN", "msb")
     monkeypatch.setenv("NANOCODE_TRACE_DIR", str(tmp_path))
-    monkeypatch.setenv("NANOCODE_SESSION_ID", "ABC")
     monkeypatch.setattr(ss, "_resolve_msb", lambda: "msb")
     def fake_run(args, **kw):
         return subprocess.CompletedProcess(args, 0, stdout="hi\n", stderr="")
     monkeypatch.setattr(ss.subprocess, "run", fake_run)
-    out = ss.run({"command": "echo hi", "trace": True, "deps": "none"})
+    out = ss.run({"command": "echo hi", "trace": True, "deps": "none", "_session_id": "ABC"})
     # 子目录被创建
     sandbox_root = tmp_path / "ABC" / "sandbox"
     assert sandbox_root.is_dir()
@@ -522,11 +519,10 @@ def test_run_trace_creates_dir_and_marks_result(monkeypatch, tmp_path):
 @pytest.mark.skipif(not _msb_available(), reason="msb not installed")
 def test_integration_trace_bridge_collects_child(monkeypatch, tmp_path):
     monkeypatch.setenv("NANOCODE_TRACE_DIR", str(tmp_path))
-    monkeypatch.setenv("NANOCODE_SESSION_ID", "itest")
-    # 沙箱内用 sh 模拟 agent 写一行 trace 到 /trace
+    # 沙箱内用 sh 模拟 agent 写一行 trace 到 /trace（_session_id 显式注入，env 回退已删）
     out = ss.run({
         "command": "echo '{\"seq\":0,\"type\":\"tool_call\",\"tool\":\"x\"}' >> /trace/child.jsonl && echo done",
-        "trace": True, "network": "none", "deps": "none",
+        "trace": True, "network": "none", "deps": "none", "_session_id": "itest",
     })
     assert "done" in out
     # 宿主子目录应出现 child.jsonl，内容完整

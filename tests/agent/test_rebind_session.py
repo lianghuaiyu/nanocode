@@ -28,7 +28,7 @@ def _working_set(a) -> dict:
         "_already_surfaced_memories": a._already_surfaced_memories,
         "_session_memory_bytes": a._session_memory_bytes,
         "_pre_plan_mode": a._pre_plan_mode,
-        "_context_cleared": a._context_cleared,
+        "_pending_context_break": a._pending_context_break,
         "permission_mode": a.permission_mode,
         "_plan_file_path": a._plan_file_path,
         "total_input_tokens": a.total_input_tokens,
@@ -47,7 +47,7 @@ def test_rebind_swaps_all_session_keyed_state():
     a._confirmed_paths.add("/secret"); a._sent_skill_names.add("foo")
     a._files_read.add("/x"); a._read_file_state["/x"] = 1.0
     a._already_surfaced_memories.add("m"); a._session_memory_bytes = 999
-    a._active_hooks.append({"k": 1}); a._pre_plan_mode = "default"; a._context_cleared = True
+    a._active_hooks.append({"k": 1}); a._pre_plan_mode = "default"; a._pending_context_break = True
     a.total_input_tokens = 100; a.total_output_tokens = 50
     a.last_input_token_count = 80; a.current_turns = 3
 
@@ -68,7 +68,7 @@ def test_rebind_swaps_all_session_keyed_state():
             continue
         assert not v, f"{k} not reset: {v!r}"
     # 消息从新树重载
-    live = str(a._anthropic_messages)
+    live = str(a.agent_session.build_request_messages())
     assert "new-conversation" in live and "old-conversation" not in live
     # 旧 session 树未被破坏（docs/14 Milestone B：Tracer/wire 已退役，不再断言旧 wire session_end）
     assert any(e.type == T.MESSAGE for e in SessionManager.open("OLD").entries())
@@ -147,4 +147,4 @@ def test_rebind_does_not_open_or_lock_trusts_injected_mgr(monkeypatch):
     monkeypatch.setattr(SM, "open", _no_open)
     a.rebind_session(new_mgr)                         # 不得触发 SM.open
     assert a.session_id == "TNEW" and a._session_mgr is new_mgr
-    assert "hello" in str(a._anthropic_messages)
+    assert "hello" in str(a.agent_session.build_request_messages())

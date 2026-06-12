@@ -32,7 +32,7 @@ def test_thread_new_switches_to_empty_session_preserving_old():
     assert new_t.agent is a                              # 同一 Agent，原地 rebind
     assert a.session_id != "OLD"                         # 切到新 mint 的 sid
     assert SessionManager.exists(a.session_id)           # 新空 session 已建
-    assert not a._anthropic_messages                     # 新 session 上下文为空
+    assert a.agent_session.build_request_messages() == []   # 新 session 上下文为空
     # registry：新 thread 在、旧 thread 注销
     assert rt.thread(new_t.thread_id) is new_t and rt.thread("OLD") is None
     # 旧 session 树保留（可 /resume 回去）
@@ -46,8 +46,8 @@ def test_thread_resume_reloads_target_and_rebinds_session():
     new_t = rt.thread_resume(host, "TGT")
     assert new_t is not None and host.current_thread is new_t
     assert a.session_id == "TGT"
-    assert "target-conversation" in str(a._anthropic_messages)
-    assert "current-q" not in str(a._anthropic_messages)
+    assert "target-conversation" in str(a.agent_session.build_request_messages())
+    assert "current-q" not in str(a.agent_session.build_request_messages())
     # docs/14 P2/P7：新 AgentSession 绑新 session（SessionContextBuilder 已退役，不再有 stale 缓存）
     assert host.current_thread.session.session_id == "TGT"
 

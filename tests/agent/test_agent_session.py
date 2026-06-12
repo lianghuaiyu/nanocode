@@ -21,17 +21,18 @@ def _agent(**kw):
     return Agent(api_key="test", session_id="p3sid", **kw)
 
 
-def test_run_turn_delegates_to_chat():
+def test_chat_delegates_to_run_turn():
+    # docs/16 #3c 方向反转：turn shell 在 AgentSession.run_turn，Agent.chat 是薄公开入口。
     a = _agent()
     seen = []
 
-    async def fake_chat(prompt):
+    async def fake_run_turn(prompt):
         seen.append(prompt)
 
-    a.chat = fake_chat
+    a.agent_session.run_turn = fake_run_turn
+    asyncio.run(a.chat("hello"))
+    assert seen == ["hello"]
     s = AgentSession(a)
-    asyncio.run(s.run_turn("hello"))
-    assert seen == ["hello"]            # run_turn 委托 chat，行为不变
     assert s.session_id == a.session_id
     assert s.aborted is a._aborted
 
@@ -44,7 +45,7 @@ def test_move_to_navigates_in_file_and_reloads():
     s = AgentSession(a)
     s.move_to(u1.id)                    # in-file 导航回 first
     assert mgr.get_leaf() == u1.id
-    assert "first" in str(a._anthropic_messages) and "second" not in str(a._anthropic_messages)
+    assert "first" in str(a.agent_session.build_request_messages()) and "second" not in str(a.agent_session.build_request_messages())
 
 
 def test_move_to_unknown_entry_fails_closed():

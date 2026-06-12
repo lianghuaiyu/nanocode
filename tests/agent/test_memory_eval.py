@@ -40,8 +40,6 @@ def _spy_build_with_stub(parent, *, text, captured=None, tokens=None):
         if captured is not None:
             captured["kw"] = kw
         async def _ro(prompt: str) -> dict:
-            sub._anthropic_messages.append({"role": "user", "content": prompt})
-            sub._anthropic_messages.append({"role": "assistant", "content": text})
             return {"text": text, "tokens": tokens}
         sub.run_once = _ro
         return sub

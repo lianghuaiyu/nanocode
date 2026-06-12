@@ -51,8 +51,6 @@ def _spy_build_with_stub(parent, *, run_once=None, text=None, tokens=None, captu
             sub.run_once = run_once(sub)
         else:
             async def _ro(prompt: str) -> dict:
-                sub._anthropic_messages.append({"role": "user", "content": prompt})
-                sub._anthropic_messages.append({"role": "assistant", "content": text})
                 return {"text": text, "tokens": tokens}
             sub.run_once = _ro
         return sub
