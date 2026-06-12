@@ -95,8 +95,8 @@ def test_fork_before_user_moves_leaf_in_file():
 
 
 def test_resume_lists_sessions(capsys):
-    from nanocode.session.store import save_session
-    save_session("rs1", {"metadata": {"id": "rs1"}, "anthropicMessages": [{"role": "user", "content": "x"}]})
+    from nanocode.session.manager import SessionManager
+    SessionManager.create("rs1").close()                  # canonical 树才进列表（docs/16 C-3）
     a = _agent("rs_cur")
     _seed(a, "rs_cur").append_message(T.user_message("hi"))
     asyncio.run(_resume(_ctx(a), ""))

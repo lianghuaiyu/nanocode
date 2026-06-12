@@ -437,10 +437,9 @@ def _child_session_ids() -> set:
 
 async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
     """/resume [<id>] —— 无参列出可恢复 session；带 id 返回 Control("resume") 交 runtime 原子切换
-    （AgentRuntime.thread_resume：rebind + 重建 thread；无 canonical 树则先 legacy 迁移，docs/14 P2）。"""
-    from ...paths import sessions_dir
-    from ...session.manager import SessionManager
-    from ...session.migration import inspect_session
+    （AgentRuntime.thread_resume：rebind + 重建 thread；canonical 树缺则拒绝，docs/16 C-3）。"""
+    from ...session import tree as _tree
+    from ...session.manager import SessionManager, _scan_headers
     target = args.strip()
     if target:
         # --fork：目标被占用时显式 clone 成新 session（绝不做第二个 writer，docs/14 §5.2）。
@@ -452,13 +451,8 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
             print_error("Usage: /resume <id> [--fork]")
             return Local()
         # handler 只做候选 resolve（exact > prefix）；真正切换由 runtime 经 Control 完成（docs/14 §3.4）。
-        known: set[str] = set()
-        if sessions_dir().exists():
-            for f in sessions_dir().glob("*.json"):
-                known.add(f.stem)
-            for e in sessions_dir().iterdir():
-                if e.is_dir():
-                    known.add(e.name)
+        # 候选只来自 canonical session.jsonl header（docs/16 C-3：legacy flat/v2 发现面已删）。
+        known = {sid for sid, _ps in _scan_headers()}
         cand = ([s for s in known if s == target]
                 or [s for s in known if s.startswith(target) and s not in _child_session_ids()])
         resolved = cand[0] if len(cand) == 1 else (target if SessionManager.exists(target) else None)
@@ -467,25 +461,18 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
                         f"`nanocode --resume {target}`.")
             return Local()
         return Control("resume", {"sessionId": resolved, "fork": fork})
-    d = sessions_dir()
-    ids: set[str] = set()
-    if d.exists():
-        for f in d.glob("*.json"):
-            ids.add(f.stem)
-        for e in d.iterdir():
-            if e.is_dir():
-                ids.add(e.name)
-    if not ids:
+    headers = _scan_headers()
+    if not headers:
         print("No sessions found.")
         return Local()
     # 默认隐藏 child session（有 parentSession header 回指）——它们经 /agents /agent 导航（docs/14 §5.2）。
-    child_ids = _child_session_ids()
-    top = sorted(s for s in ids if s not in child_ids or s == ctx.agent.session_id)
+    child_ids = {sid for sid, ps in headers if ps}
+    top = sorted(s for s, _ps in headers if s not in child_ids or s == ctx.agent.session_id)
     lines = ["Resumable sessions (/resume <id> to switch; child sessions hidden — see /agents):"]
     for s in top:
-        rep = inspect_session(s)
+        n = sum(1 for e in SessionManager.open(s).entries() if e.type == _tree.MESSAGE)
         mark = "  ← current" if s == ctx.agent.session_id else ""
-        lines.append(f"  {s}  tree={rep['tree']['message_entries']} legacy={rep['legacy']['messages']}{mark}")
+        lines.append(f"  {s}  messages={n}{mark}")
     print("\n".join(lines))
     return Local()
 

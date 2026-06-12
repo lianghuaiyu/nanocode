@@ -579,7 +579,7 @@ class Agent(PlanModeMixin):
     # ─── Session ──────────────────────────────────────────────
     # docs/14 SessionLease：`restore_session` 已退役。resume 由 runtime 激活会话写者租约
     # （SessionLease.open_or_create，cli._load_from_manager 渲染初始上下文）完成——canonical 树是
-    # 唯一权威，不再读 legacy flat 快照、不再 runtime 自动迁移（离线 `nanocode sessions migrate`）。
+    # 唯一权威，不再读 legacy flat 快照（legacy 导入面已删，docs/16 C-3）。
     # v2 state 的 TaskManager 重载/mark-lost 仍由 _reload_task_state 承担（被 rebind + cli 激活调用）。
 
     def _reload_task_state(self, state) -> None:
@@ -685,8 +685,8 @@ class Agent(PlanModeMixin):
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
-        # docs/14 P7：canonical session.jsonl 树是 resume 权威——不再写 legacy flat <sid>.json 快照
-        # （之前由 store.save_session 写，现冗余）。仍按需落 v2 state.json（TaskManager/subagent 派生 cache）。
+        # canonical session.jsonl 树是 resume 权威（legacy flat 快照及其 writer 已删，docs/16 C-1/C-3）。
+        # 仍按需落 v2 state.json（TaskManager/subagent 派生 cache）。
         # v2 state: persist when session has forked subagents, background tasks, or is already v2
         # （含 list_tasks：仅有后台 shell 任务、无 subagent 的 session 也要落 state，否则 /resume
         #  回来时丢任务记录——docs/14 P2 review）。
@@ -1159,14 +1159,14 @@ class Agent(PlanModeMixin):
             except asyncio.CancelledError:
                 self.task_manager.update_subagent(rec.id, status="cancelled")
                 if sub_agent is not None:
-                    self._persist_agent_messages(rec.id, sub_agent)
+                    self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
                 self._sink.sub_agent_end("skill-fork", skill_name)
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 self.task_manager.update_subagent(rec.id, status="failed")
                 if sub_agent is not None:
-                    self._persist_agent_messages(rec.id, sub_agent)
+                    self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
                 self._sink.sub_agent_end("skill-fork", skill_name)
                 return f"Skill fork error: {e}"
@@ -1174,13 +1174,13 @@ class Agent(PlanModeMixin):
             if kind == "timeout":
                 # 无超时设定 → 'timeout' 表示运行被取消/aborted：落 cancelled 并向上传播取消。
                 self.task_manager.update_subagent(rec.id, status="cancelled")
-                self._persist_agent_messages(rec.id, sub_agent)
+                self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
                 self._sink.sub_agent_end("skill-fork", skill_name)
                 raise asyncio.CancelledError()
             if kind == "error":
                 self.task_manager.update_subagent(rec.id, status="failed")
-                self._persist_agent_messages(rec.id, sub_agent)
+                self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
                 self._sink.sub_agent_end("skill-fork", skill_name)
                 return f"Skill fork error: {payload}"
@@ -1189,7 +1189,7 @@ class Agent(PlanModeMixin):
             self.total_input_tokens += sub_result["tokens"]["input"]
             self.total_output_tokens += sub_result["tokens"]["output"]
             self.task_manager.update_subagent(rec.id, status="completed")
-            self._persist_agent_messages(rec.id, sub_agent)
+            self._close_child_session(rec.id, sub_agent)
             result_path = self._write_agent_result(rec.id, sub_result["text"] or "")
             self._finalize_agent_meta(rec.id, "completed")
             self._sink.sub_agent_end("skill-fork", skill_name)
@@ -1202,9 +1202,9 @@ class Agent(PlanModeMixin):
     def _current_provider(self) -> str:
         return self._spawn.current_provider(self)
 
-    def _persist_agent_messages(self, agent_id: str, sub_agent: "Agent") -> None:
-        """Persist sub-agent messages + close child 写锁（docs/15 Phase 6：实现在 runtime/spawn.py）。"""
-        return self._spawn.persist_agent_messages(self, agent_id, sub_agent)
+    def _close_child_session(self, agent_id: str, sub_agent: "Agent") -> None:
+        """Close 子 agent 的 child 写者租约（docs/15 Phase 6：实现在 runtime/spawn.py）。"""
+        return self._spawn.close_child_session(self, agent_id, sub_agent)
 
     def child_session_id(self, agent_id: str) -> str:
         """子 agent 的 child session id（docs/14 §6b）。父 sid 作前缀，保证跨父唯一。"""

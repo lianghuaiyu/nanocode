@@ -1,5 +1,5 @@
-"""Session v2：目录事件流存储（state + main/agent messages + task 目录）。
-与旧 flat JSON session 并存；engine 接线在后续阶段。"""
+"""Session v2 目录存储：derived state.json cache + per-agent artifacts（meta/prompt/result）+ task 目录。
+会话历史的唯一权威是 canonical session.jsonl 树（docs/14）；本模块不存任何 messages 副本（docs/16 C-1/C-3）。"""
 from __future__ import annotations
 
 import json
@@ -39,14 +39,6 @@ def read_state(session_id: str) -> dict | None:
     return _read_json(p, None) if p.exists() else None
 
 
-def write_main_messages(session_id: str, messages: list) -> None:
-    _write_json(session_root(session_id) / "main" / "messages.json", messages)
-
-
-def read_main_messages(session_id: str) -> list:
-    return _read_json(session_root(session_id) / "main" / "messages.json", [])
-
-
 def agent_dir(session_id: str, agent_id: str) -> Path:
     """每个 agent 的 artifact 主目录 = <session>/agents/<agent_id>/。
 
@@ -71,14 +63,6 @@ def agent_artifact_paths(session_id: str, agent_id: str) -> list[tuple[str, Path
     仍可能确保顶层 sessions/ 目录存在——与旧 tasks_tool 手拼路径的行为一致。调用方按 .exists() 过滤。"""
     base = session_root(session_id) / "agents" / agent_id
     return [(label, base / fname) for label, fname in AGENT_ARTIFACT_FILES]
-
-
-def write_agent_messages(session_id: str, agent_id: str, messages: list) -> None:
-    _write_json(agent_dir(session_id, agent_id) / "messages.json", messages)
-
-
-def read_agent_messages(session_id: str, agent_id: str) -> list:
-    return _read_json(agent_dir(session_id, agent_id) / "messages.json", [])
 
 
 def write_agent_meta(session_id: str, agent_id: str, meta: dict) -> None:

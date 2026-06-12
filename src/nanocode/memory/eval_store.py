@@ -112,7 +112,7 @@ def _candidate_id(question: str, answer: str) -> str:
 
 def _session_exists(session_id: str) -> bool:
     # docs/14 SessionLease：会话存在性以 canonical 树为准（v2 state.json 仍认，向后兼容 eval 溯源），
-    # 不再认 legacy flat <sid>.json（store.load_session 已离开运行时路径）。
+    # 不再认 legacy flat <sid>.json（flat 读写器已删，docs/16 C-3）。
     if not session_id:
         return False
     return v2.is_v2_session(session_id) or SessionManager.exists(session_id)

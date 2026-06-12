@@ -1,7 +1,7 @@
 """Task 5: persistent subagent 注册 + 持久化 + agent 工具重写。
 
 - fresh 路径：注册 SubAgentRecord（agent-001，type 归一，status running→completed），
-  messages 落 v2.read_agent_messages(sid, "agent-001")，token 累加到父。
+  messages 实时落 child canonical 树（{sid}.agent-001），token 累加到父。
 - resume 路径：reload 历史 + 追加新 prompt；unknown id 报错；provider mismatch 报错；
   model mismatch 报错；不新增记录。
 - run_in_background=True 返回未支持错误。
@@ -12,7 +12,6 @@ import asyncio
 import pytest
 
 from nanocode.agent.engine import Agent
-from nanocode.session import v2 as _session_v2
 
 
 def _agent(**kw):
@@ -24,7 +23,7 @@ def _stub_run_once(agent, text="sub done", history=None):
     """Stub run_once on a specific Agent instance: 写入 messages 历史 + 返回固定文本/token。
 
     docs/14 SessionLease：真实 run_once 会把消息写进（child）树——stub 也落树（agent 有 child 租约时），
-    使 resume 能从 child 树重载历史；v2 messages.json 仍由 _persist_agent_messages 落（向后兼容断言）。"""
+    使 resume 能从 child 树重载历史（docs/16 C-1：messages.json 副本已删，child 树是唯一历史）。"""
     async def _ro(prompt: str) -> dict:
         agent._anthropic_messages.append({"role": "user", "content": prompt})
         agent._anthropic_messages.append({"role": "assistant", "content": text})
@@ -82,8 +81,11 @@ def test_agent_tool_persists_messages_to_v2(monkeypatch):
     asyncio.run(parent._execute_agent_tool(
         {"type": "coder", "description": "d", "prompt": "p"}))
 
-    msgs = _session_v2.read_agent_messages("psid", "agent-001")
-    assert any(m.get("content") == "persisted body" for m in msgs)
+    from nanocode.session import tree as T
+    from nanocode.session.manager import SessionManager
+    child = SessionManager.open("psid.agent-001")
+    contents = str([e.data for e in child.entries() if e.type == T.MESSAGE])
+    assert "persisted body" in contents
 
 
 def test_agent_tool_token_accumulation(monkeypatch):
@@ -137,8 +139,10 @@ def test_resume_reloads_history_and_appends(monkeypatch):
     monkeypatch.setattr(parent, "_build_sub_agent", _spy_build)
     asyncio.run(parent._execute_agent_tool(
         {"type": "coder", "description": "d", "prompt": "first prompt"}))
-    first_msgs = _session_v2.read_agent_messages("psid", "agent-001")
-    assert len(first_msgs) >= 2
+    from nanocode.session import tree as T
+    from nanocode.session.manager import SessionManager
+    first_n = sum(1 for e in SessionManager.open("psid.agent-001").entries() if e.type == T.MESSAGE)
+    assert first_n >= 2
 
     # resume：reload 历史，追加新 prompt
     reloaded = {}

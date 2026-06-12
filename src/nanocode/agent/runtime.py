@@ -332,7 +332,7 @@ class AgentRuntime:
 
     def thread_resume(self, host, session_id: str) -> "RuntimeThread | None":
         """切到一个已存在的 session（/resume <id>）。docs/14 SessionLease：canonical 树是唯一权威——
-        树缺 → 返回 None（不再 runtime 自动迁移；legacy 迁移是离线 `nanocode sessions migrate`）。
+        树缺 → 返回 None（canonical 树是唯一权威；legacy 导入面已删，docs/16 C-3）。
         目标被占用 → `_switch_via_rebind` 抛 SessionBusyError（调用方提示 `--fork`）。"""
         from ..session.manager import SessionManager
         if not SessionManager.exists(session_id):

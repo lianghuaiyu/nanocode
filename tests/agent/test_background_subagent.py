@@ -3,7 +3,7 @@
 - Task 1：_build_sub_agent(background=True) → auto-deny confirm_fn + 隔离空 confirmed_paths；
   background=False（默认）维持共享父 confirm_fn + _confirmed_paths 同一引用。
 - Task 2：_spawn_background_subagent 立即返回 task_id；detached 协程完成后填
-  task/subagent 终态 + result_summary + result.md + messages 持久化 + token 累加 + 回注。
+  task/subagent 终态 + result_summary + result.md + child 树持久化 + token 累加 + 回注。
 - Task 3：failed（run_once 抛异常）/ cancelled（task_stop）/ timeout（timeout_ms）三态。
 """
 
@@ -12,7 +12,6 @@ import asyncio
 import pytest
 
 from nanocode.agent.engine import Agent, _auto_deny_confirm
-from nanocode.session import v2 as _session_v2
 from nanocode.tools import tool_definitions, tasks_tool
 
 
@@ -37,6 +36,9 @@ def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):
             async def _ro(prompt: str) -> dict:
                 sub._anthropic_messages.append({"role": "user", "content": prompt})
                 sub._anthropic_messages.append({"role": "assistant", "content": text})
+                if sub._session_mgr is not None:          # 真实 run_once 会写 child 树——stub 对齐
+                    sub._tree_record({"role": "user", "content": prompt})
+                    sub._tree_record({"role": "assistant", "content": text})
                 return {"text": text, "tokens": tokens}
             sub.run_once = _ro
         return sub
@@ -166,7 +168,7 @@ def test_background_sets_result_path_and_last_result_path():
     assert sub.last_result_path and sub.last_result_path.endswith("result.md")
 
 
-def test_background_persists_messages_to_v2():
+def test_background_persists_messages_to_child_tree():
     parent = _agent()
     _spy_build_with_stub(parent, text="persisted bg body")
 
@@ -177,8 +179,11 @@ def test_background_persists_messages_to_v2():
         await _wait_task_terminal(parent, "task-001")
 
     asyncio.run(scenario())
-    msgs = _session_v2.read_agent_messages("bgsid", "agent-001")
-    assert any(m.get("content") == "persisted bg body" for m in msgs)
+    from nanocode.session import tree as T
+    from nanocode.session.manager import SessionManager
+    child = SessionManager.open("bgsid.agent-001")
+    contents = str([e.data for e in child.entries() if e.type == T.MESSAGE])
+    assert "persisted bg body" in contents
 
 
 def test_background_token_accumulation():

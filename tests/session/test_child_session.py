@@ -41,7 +41,7 @@ def test_subagent_writes_child_session_live_with_lineage():
     sub = _sub_with_child(parent, "agent-001", spawn_leaf)
     sub._tree_record({"role": "user", "content": "sub prompt"})                       # 实时写 child 树
     sub._tree_record({"role": "assistant", "content": [{"type": "text", "text": "sub done"}]})
-    parent._persist_agent_messages("agent-001", sub)                                  # close child mgr
+    parent._close_child_session("agent-001", sub)                                  # close child mgr
     child_sid = parent.child_session_id("agent-001")
     assert SessionManager.exists(child_sid)
     child = SessionManager.open(child_sid)
@@ -62,10 +62,10 @@ def test_subagent_child_tree_accumulates_across_runs():
     parent._session_mgr = SessionManager.create("PARENT2")
     sub1 = _sub_with_child(parent, "a1", None)
     sub1._tree_record({"role": "user", "content": "one"})
-    parent._persist_agent_messages("a1", sub1)
+    parent._close_child_session("a1", sub1)
     sub2 = _sub_with_child(parent, "a1", None)
     sub2._tree_record({"role": "user", "content": "two"})
-    parent._persist_agent_messages("a1", sub2)
+    parent._close_child_session("a1", sub2)
     child = SessionManager.open(parent.child_session_id("a1"))
     assert sum(1 for e in child.entries() if e.type == T.SESSION_START) == 1          # 单 header
     msgs = [e.data["message"]["content"] for e in child.entries() if e.type == T.MESSAGE]
@@ -79,7 +79,7 @@ def test_empty_subagent_leaves_headeronly_child_session():
     parent = _agent("EP")
     parent._session_mgr = SessionManager.create("EP")
     sub = _sub_with_child(parent, "a-empty", None)
-    parent._persist_agent_messages("a-empty", sub)
+    parent._close_child_session("a-empty", sub)
     child_sid = parent.child_session_id("a-empty")
     assert SessionManager.exists(child_sid)                          # 租约在 spawn 时建了 header
     child = SessionManager.open(child_sid)

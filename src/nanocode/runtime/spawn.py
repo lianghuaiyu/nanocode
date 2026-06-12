@@ -103,13 +103,9 @@ class SubAgentRunner:
             pass
 
     # ─── 产物 / 结果落盘（parent-keyed artifacts）──────────────────────────────
-    def persist_agent_messages(self, host, agent_id: str, sub_agent) -> None:
-        """持久化子 agent messages（parent-keyed artifacts,back-compat）+ close child 写锁。"""
-        try:
-            msgs = sub_agent._dump_messages()
-            _session_v2.write_agent_messages(host.session_id, agent_id, msgs)
-        except Exception:
-            pass
+    def close_child_session(self, host, agent_id: str, sub_agent) -> None:
+        """子 agent 运行结束：close child 写者租约。历史唯一权威是 child canonical 树
+        （resume 经 child tree 重载），不再落 messages.json 副本（docs/16 C-1）。"""
         try:
             if sub_agent._session_mgr is not None:
                 sub_agent._session_mgr.close()
@@ -348,21 +344,21 @@ class SubAgentRunner:
             except asyncio.CancelledError:
                 host.task_manager.update_subagent(resume_id, status="cancelled")
                 if sub_agent is not None:
-                    host._persist_agent_messages(resume_id, sub_agent)
+                    host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(resume_id, "cancelled")
                 host._sink.sub_agent_end(rec.type, description)
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 host.task_manager.update_subagent(resume_id, status="failed")
                 if sub_agent is not None:
-                    host._persist_agent_messages(resume_id, sub_agent)
+                    host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(resume_id, "failed")
                 host._sink.sub_agent_end(rec.type, description)
                 return f"Sub-agent error: {e}"
             if kind != "ok":
                 if kind == "error":
                     host.task_manager.update_subagent(resume_id, status="failed")
-                host._persist_agent_messages(resume_id, sub_agent)
+                host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(
                     resume_id, "timed_out" if kind == "timeout" else "failed")
                 host._sink.sub_agent_end(rec.type, description)
@@ -372,7 +368,7 @@ class SubAgentRunner:
             host.total_input_tokens += result["tokens"]["input"]
             host.total_output_tokens += result["tokens"]["output"]
             host.task_manager.update_subagent(resume_id, status="completed")
-            host._persist_agent_messages(resume_id, sub_agent)
+            host._close_child_session(resume_id, sub_agent)
             result_path = host._write_agent_result(resume_id, result["text"] or "")
             host._finalize_agent_meta(resume_id, "completed")
             host._sink.sub_agent_end(rec.type, description)
@@ -402,21 +398,21 @@ class SubAgentRunner:
         except asyncio.CancelledError:
             host.task_manager.update_subagent(rec.id, status="cancelled")
             if sub_agent is not None:
-                host._persist_agent_messages(rec.id, sub_agent)
+                host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(rec.id, "cancelled")
             host._sink.sub_agent_end(agent_type, description)
             raise
         except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
             host.task_manager.update_subagent(rec.id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(rec.id, sub_agent)
+                host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(rec.id, "failed")
             host._sink.sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
         if kind != "ok":
             if kind == "error":
                 host.task_manager.update_subagent(rec.id, status="failed")
-            host._persist_agent_messages(rec.id, sub_agent)
+            host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(
                 rec.id, "timed_out" if kind == "timeout" else "failed")
             host._sink.sub_agent_end(agent_type, description)
@@ -426,7 +422,7 @@ class SubAgentRunner:
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         host.task_manager.update_subagent(rec.id, status="completed")
-        host._persist_agent_messages(rec.id, sub_agent)
+        host._close_child_session(rec.id, sub_agent)
         result_path = host._write_agent_result(rec.id, result["text"] or "")
         host._finalize_agent_meta(rec.id, "completed")
         host._sink.sub_agent_end(agent_type, description)
@@ -475,7 +471,7 @@ class SubAgentRunner:
                                           result_summary="(cancelled by task_stop)")
             host.task_manager.update_subagent(agent_id, status="cancelled")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
             host._sink.sub_agent_end(agent_type, description)
             raise
@@ -484,7 +480,7 @@ class SubAgentRunner:
                                           result_summary=f"(sub-agent error: {e})")
             host.task_manager.update_subagent(agent_id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
             host._sink.sub_agent_end(agent_type, description)
             return
@@ -496,7 +492,7 @@ class SubAgentRunner:
                                           result_summary=f"(timed out after {timeout_ms}ms)")
             host.task_manager.update_subagent(agent_id, status="failed", last_result_path=rp)
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
             host._sink.sub_agent_end(agent_type, description)
             return
@@ -507,7 +503,7 @@ class SubAgentRunner:
                                           result_summary=f"(sub-agent error: {payload})")
             host.task_manager.update_subagent(agent_id, status="failed", last_result_path=rp)
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
             host._sink.sub_agent_end(agent_type, description)
             return
@@ -522,7 +518,7 @@ class SubAgentRunner:
         host.task_manager.update_task(task_id, status="completed", result_path=result_path,
                                       result_summary=agent_result["summary"])
         host.task_manager.update_subagent(agent_id, status="completed", last_result_path=agent_result_path)
-        host._persist_agent_messages(agent_id, sub_agent)
+        host._close_child_session(agent_id, sub_agent)
         host._finalize_agent_meta(agent_id, "completed")
         host._sink.sub_agent_end(agent_type, description)
 
@@ -599,7 +595,7 @@ class SubAgentRunner:
                 result_summary="(cancelled by task_stop)")
             host.task_manager.update_subagent(agent_id, status="cancelled")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
             host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
             raise
@@ -609,7 +605,7 @@ class SubAgentRunner:
                 result_summary=f"(timed out after {timeout_ms}ms)")
             host.task_manager.update_subagent(agent_id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
             host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
             return
@@ -619,7 +615,7 @@ class SubAgentRunner:
                 result_summary=f"(curator error: {e})")
             host.task_manager.update_subagent(agent_id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
             host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
             return
@@ -631,7 +627,7 @@ class SubAgentRunner:
         result_path = host._write_subagent_result(task_id, text)
         host._write_agent_result(agent_id, text)
         host.task_manager.update_subagent(agent_id, status="completed")
-        host._persist_agent_messages(agent_id, sub_agent)
+        host._close_child_session(agent_id, sub_agent)
         host._finalize_agent_meta(agent_id, "completed")
 
         # 确定性 parse+apply（宿主 Python，可回滚）。坏 JSON 不让 task failed，标 completed。
@@ -717,7 +713,7 @@ class SubAgentRunner:
                 result_summary="(cancelled by task_stop)")
             host.task_manager.update_subagent(agent_id, status="cancelled")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
             host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
             raise
@@ -727,7 +723,7 @@ class SubAgentRunner:
                 result_summary=f"(timed out after {timeout_ms}ms)")
             host.task_manager.update_subagent(agent_id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
             host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
             return
@@ -737,7 +733,7 @@ class SubAgentRunner:
                 result_summary=f"(eval curator error: {e})")
             host.task_manager.update_subagent(agent_id, status="failed")
             if sub_agent is not None:
-                host._persist_agent_messages(agent_id, sub_agent)
+                host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
             host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
             return
@@ -748,7 +744,7 @@ class SubAgentRunner:
         result_path = host._write_subagent_result(task_id, text)
         host._write_agent_result(agent_id, text)
         host.task_manager.update_subagent(agent_id, status="completed")
-        host._persist_agent_messages(agent_id, sub_agent)
+        host._close_child_session(agent_id, sub_agent)
         host._finalize_agent_meta(agent_id, "completed")
 
         # 确定性后处理：解析候选并逐条 add_pending（坏 JSON / 缺 candidates → 0）。

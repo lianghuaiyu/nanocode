@@ -11,16 +11,8 @@ def test_agent_dir_path_shape():
     assert d.name == "agent-001"
     assert d.parent.name == "agents"
     assert d.parent.parent.name == "sA"
-    # 与 messages.json 同一目录（一条代码路径）。
+    # meta/prompt/result 同一目录（一条代码路径）。
     assert v2.session_root("sA") / "agents" / "agent-001" == d
-
-
-def test_messages_use_agent_dir_roundtrip():
-    v2.write_agent_messages("sB", "agent-001", [{"role": "user", "content": "x"}])
-    # 物理上落在 agent_dir 下
-    p = v2.agent_dir("sB", "agent-001") / "messages.json"
-    assert p.exists()
-    assert v2.read_agent_messages("sB", "agent-001")[0]["content"] == "x"
 
 
 def test_write_and_read_agent_meta():

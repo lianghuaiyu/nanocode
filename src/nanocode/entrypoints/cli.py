@@ -26,7 +26,6 @@ from ..trajectory import (
     trajectory_level as _trajectory_level,
 )
 from .trajectory_cmd import run as _run_trajectory_cmd
-from .sessions_cmd import run as _run_sessions_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
@@ -36,7 +35,7 @@ from .host import RuntimeHost
 from .commands.builtin import build_registry, handle_eval_command, _fmt_eval_row  # 后两者 re-export（CMD-P0）
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
-_SUBCOMMANDS = {"trajectory": _run_trajectory_cmd, "sessions": _run_sessions_cmd}
+_SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
 
 
 # REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
@@ -464,7 +463,7 @@ async def run_repl(agent: Agent, lease=None) -> None:
             from ..session.tree import SessionBusyError
             try:
                 if host.runtime.thread_resume(host, sid) is None:
-                    print_error(f"cannot resume '{sid}' (no canonical tree; legacy migration failed).")
+                    print_error(f"cannot resume '{sid}' (no canonical tree).")
             except SessionBusyError:
                 print_error(f"session '{sid}' is busy (another writer holds it). "
                             f"Use `/resume {sid} --fork` to fork it into a new session.")
@@ -724,20 +723,12 @@ Examples:
 
     # Resolve resume BEFORE constructing Agent (so we adopt the session_id).
     # docs/14 SessionLease：--resume = 恢复最近的 canonical session（latest header）；无则保持新建。
-    # 不再读 legacy flat 快照——canonical 树是唯一 resume 权威（迁移走离线 `nanocode sessions migrate`）。
+    # canonical 树是唯一 resume 权威（docs/16 C-3：legacy flat/v2 发现面已删，latest 必有树）。
     adopt_sid = None
     if args.resume:
-        from ..session.manager import SessionManager
         adopt_sid = get_latest_session_id()
         if adopt_sid is None:
             print_info("No previous sessions found.")
-        elif not SessionManager.exists(adopt_sid):
-            # get_latest_session_id 也会返回 legacy <sid>.json / v2 state.json 的 sid（无 canonical 树）。
-            # 若对它 open_or_create 会**新建空树**、把旧历史静默丢弃（review high：data loss）。改为拒绝
-            # 续此 sid、回退新建一个全新 session（绝不 clobber 旧 id），并提示离线迁移。
-            print_info(f"Latest session '{adopt_sid}' has no canonical tree (legacy/v2). "
-                       f"Run `nanocode sessions migrate {adopt_sid}` to import it; starting a fresh session.")
-            adopt_sid = None
 
     # Long-term memory backend (CLI > env > auto). auto silently degrades to
     # markdown when no embeddings endpoint is configured; explicit --memory-backend

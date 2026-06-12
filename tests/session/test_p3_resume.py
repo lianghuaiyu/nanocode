@@ -53,10 +53,13 @@ def test_resume_loads_full_tree_into_active_list():
     assert sum(1 for e in SessionManager.open("p3sess").entries() if e.type == tree.MESSAGE) == 4
 
 
-def test_resume_tree_is_sole_authority_ignores_legacy_flat():
-    # 树是唯一权威：即便磁盘上有 legacy flat 快照，resume 也只看树（绝不读 flat）。
-    from nanocode.session.store import save_session
-    save_session("p3auth", {"metadata": {"id": "p3auth"}, "anthropicMessages": list(LIVE)})
+def test_resume_tree_is_sole_authority_ignores_stray_files():
+    # 树是唯一权威：即便 sessions 目录里有杂散的同名 .json 文件，resume 也只看树（docs/16 C-3：
+    # flat 读写器已删，此处直接落一个杂散文件钉住"绝不读 flat"性质）。
+    import json
+    from nanocode.paths import sessions_dir
+    (sessions_dir() / "p3auth.json").write_text(
+        json.dumps({"metadata": {"id": "p3auth"}, "anthropicMessages": list(LIVE)}, default=str))
     mgr = SessionManager.create("p3auth")
     mgr.append_message(tree.user_message("only-tree")); mgr.close()
     b = _agent("p3auth"); b.model = "claude-x"
