@@ -270,11 +270,9 @@ def test_blank_line_is_ignored(monkeypatch):
     assert not any(c[0] == "run_turn" for c in calls)
 
 
-@pytest.mark.parametrize("flag", ["1", "0"])
-def test_via_runtime_escape_hatch_both_drive_turn(monkeypatch, flag):
-    """docs/14 P1：NANOCODE_REPL_VIA_RUNTIME on(默认)/off 两条 _drive_turn 分支都驱动一个 turn。
-    on → host.current_thread.run → session.run_turn；off → session.run_turn 直驱。均落到录制 session。"""
-    monkeypatch.setenv("NANOCODE_REPL_VIA_RUNTIME", flag)
+def test_repl_turn_driven_via_runtime_thread(monkeypatch):
+    """docs/15 Phase 7：普通 turn 一律经 RuntimeThread.run（逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删,
+    runtime 是唯一 turn 路径）。落到录制 session 的 run_turn。"""
     calls = _run_script(monkeypatch, ["hello world"])
     assert ("run_turn", "hello world") in calls
 

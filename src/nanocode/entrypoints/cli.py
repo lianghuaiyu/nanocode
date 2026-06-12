@@ -431,16 +431,11 @@ async def run_repl(agent: Agent, lease=None) -> None:
     _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
     _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY)
 
-    # CMD-P2.5：普通 chat / skill turn 经 RuntimeThread.run 驱动（取 host 的 current_thread）。
-    # NANOCODE_REPL_VIA_RUNTIME=0 可回退到直接 session.run_turn（cancel/approval 回归时的逃生阀）。
-    _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
+    # CMD-P2.5 / docs/15 Phase 7：普通 chat / skill turn **一律**经 RuntimeThread.run 驱动
+    # （取 host 的 current_thread）。逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删——runtime 是唯一 turn 路径。
 
     async def _drive_turn(prompt: str) -> None:
-        t = _host.current_thread
-        if _via_runtime:
-            await t.run(prompt)
-        else:
-            await t.session.run_turn(prompt)
+        await _host.current_thread.run(prompt)
 
     async def _apply_control(host: RuntimeHost, ctrl: Control) -> None:
         """消费 lifecycle Control（docs/14 P2）：先过 host.can_switch() fail-closed 闸，再交
@@ -817,15 +812,11 @@ Examples:
             pass
 
     if prompt:
-        # One-shot mode —— CMD-P2.5：headless 路径同样经 RuntimeThread.run，不绕过 runtime。
-        # NANOCODE_REPL_VIA_RUNTIME=0 回退到直接 agent.chat（与 REPL 同一逃生阀）。
-        _via_runtime = os.environ.get("NANOCODE_REPL_VIA_RUNTIME", "1") != "0"
+        # One-shot mode —— docs/15 Phase 7：headless 路径同样**仅**经 RuntimeThread.run,不绕过 runtime
+        # （逃生阀已删）。
 
         async def _one_shot() -> None:
-            if _via_runtime:
-                await AgentRuntime().adopt(agent, lease=_lease).run(prompt)
-            else:
-                await agent.chat(prompt)
+            await AgentRuntime().adopt(agent, lease=_lease).run(prompt)
 
         try:
             asyncio.run(_one_shot())
