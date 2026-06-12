@@ -173,6 +173,12 @@ class Agent(PlanModeMixin):
         # fire-and-forget——订阅者异常绝不影响 turn。
         self._event_subscribers: list = []
 
+        # docs/16 #6（STEP E）：per-turn 上下文状态。_turn_context_plan = 本 turn 的 volatile packs
+        # （date/git…，request-local 置尾、不入树）；_context_ledger = 本 turn 全量记账（/context）。
+        # 都由 AgentSession.run_turn 每 turn 重置。
+        self._turn_context_plan = None
+        self._context_ledger = None
+
         # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
         self.task_manager = task_manager if task_manager is not None else TaskManager()
         self._background_tasks: set[asyncio.Task] = set()

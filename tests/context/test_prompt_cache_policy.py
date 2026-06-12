@@ -37,6 +37,7 @@ def test_survives_compaction_classification():
     assert not survives_compaction(ContextPack(id="t", kind="git", content="x", lifecycle="turn"))
     assert not survives_compaction(ContextPack(id="u", kind="skill", content="x", lifecycle="until_compact"))
     assert not survives_compaction(ContextPack(id="p", kind="nested", content="x", lifecycle="path_triggered"))
+    assert not survives_compaction(ContextPack(id="o", kind="skill_body", content="x", lifecycle="one_shot"))
 
 
 def test_pack_injected_as_separate_custom_message_not_mutating_user():

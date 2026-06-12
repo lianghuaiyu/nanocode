@@ -71,10 +71,10 @@ If you can say it in one sentence, don't use three. Prefer short, direct sentenc
 
 # Environment
 Working directory: {{cwd}}
-Date: {{date}}
 Platform: {{platform}}
 Shell: {{shell}}
-{{git_context}}
+
+(Date and git state are volatile and provided per-turn in a trailing context block, not here.)
 {{skills}}
 {{agents}}
 {{deferred_tools}}

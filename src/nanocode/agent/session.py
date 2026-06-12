@@ -65,7 +65,10 @@ class AgentSession:
         a._aborted = False
         a._pending_context_break = False        # turn-scoped：上一 turn 的遗留信号绝不跨 turn
         a._ensure_session_lease()               # lease prologue（runtime 已注入则 no-op）
+        from ..context import ContextLedger
+        a._context_ledger = ContextLedger()     # per-turn 全量记账（/context 可见性，docs/16 #6）
         await self.inject_session_context()     # 项目指令/memory 作 session-context 包
+        a._turn_context_plan = await self._collect_turn_volatile()   # date/git 等 per-turn volatile
         a.emit(_events.UserMessageAccepted(text=prompt))   # S1：user 消息先落树（请求从树渲染）
         await self.check_and_compact()
         memory_prefetch = self.start_memory_prefetch(prompt)
@@ -145,15 +148,60 @@ class AgentSession:
             a.emit(ev)
 
     def project_request(self):
-        """每请求的 ProviderProjection：messages = 树渲染（build_request_messages），system 按 provider
-        分流（anthropic out-of-band、openai 已在 messages[0]）。读 **live** _system_prompt——plan-mode
-        的 turn 内 system 切换经下一次重渲染实时生效（取代旧 _openai_messages[0] flat 重写）。"""
+        """每请求的 ProviderProjection：messages = 树渲染 + **volatile tail**（docs/16 #6），system 按
+        provider 分流（anthropic out-of-band、openai 已在 messages[0]）。读 **live** _system_prompt——
+        plan-mode 的 turn 内 system 切换经下一次重渲染实时生效。
+
+        volatile tail：persist=none 的 per-turn packs（date/git…）以 render-time 装饰追加在请求**尾部**
+        ——不入树（树存干净原文）、置尾不破坏 prompt-cache 稳定前缀；每 turn 收集一次
+        （_collect_turn_volatile），turn 内各迭代复用（git subprocess per-turn 缓存）。"""
         from .state import ProviderProjection
         a = self.agent
         provider = "openai" if a.use_openai else "anthropic"
         return ProviderProjection(provider=provider,
-                                  messages=self.build_request_messages(),
+                                  messages=self.build_request_messages(extra_neutral=self._volatile_tail()),
                                   system=(None if a.use_openai else a._system_prompt))
+
+    def _volatile_tail(self) -> "list[dict] | None":
+        """本 turn 的 volatile packs → 一条中立 user 消息（render 会与相邻 user 合并，保持 provider
+        交替约束）。无 plan / 无 persist=none pack → None。"""
+        plan = getattr(self.agent, "_turn_context_plan", None)
+        if plan is None:
+            return None
+        vols = [p for p in plan.packs if p.persist_policy == "none"]
+        if not vols:
+            return None
+        body = "\n\n".join(p.as_text() for p in vols)
+        return [_tree.user_message(
+            "<system-reminder>\nPer-turn context (refreshed every turn; supersedes any earlier "
+            "snapshot in this conversation):\n" + body + "\n</system-reminder>")]
+
+    async def _collect_turn_volatile(self):
+        """每 turn 一次的 volatile 上下文收集（docs/16 #6：date/git 移出 system prompt 的承接路径）。
+
+        collect 纯（产 packs 不写树）；ledger 并入本 turn 全量账本。仅主 agent（子 agent 的
+        system prompt 来自 manifest，从未含 date/git——保持不变）。失败可观测、不破坏 turn。"""
+        a = self.agent
+        if a.is_sub_agent:
+            return None
+        import os
+        from ..context import BudgetPolicy, ContextRequest, ContextRuntime
+        from ..context.providers import EnvProvider, GitSnapshotProvider
+        req = ContextRequest(cwd=os.getcwd(), is_sub_agent=False,
+                             include_env=True, include_git=True,
+                             include_project_instructions=False, include_memory=False,
+                             include_skills=False, include_agents=False,
+                             include_deferred_tools=False)
+        try:
+            plan = await ContextRuntime(providers=[EnvProvider(), GitSnapshotProvider()],
+                                        budget=BudgetPolicy.for_window(a.effective_window)).collect(req)
+        except Exception as e:
+            a._sink.info(f"[context] per-turn volatile collect failed: {e}")
+            return None
+        led = getattr(a, "_context_ledger", None)
+        if led is not None:
+            led.entries.extend(plan.ledger.entries)
+        return plan
 
     # ── memory prefetch（docs/16 #3c：宿主侧 helper，loop 经 cfg 调用）──────────
     def start_memory_prefetch(self, user_message: str):
@@ -178,12 +226,14 @@ class AgentSession:
         try:
             memories = prefetch.task.result()
             if memories:
-                from ..memory import format_memories_for_injection
-                injection_text = format_memories_for_injection(memories)
-                if a.emit(_events.ContextInjected(custom_type="memory", content=injection_text)):
-                    for m in memories:
-                        a._already_surfaced_memories.add(m.path)
-                        a._session_memory_bytes += len(m.content.encode())
+                from ..context.providers import MemoryRecallProvider
+                provider = MemoryRecallProvider(a, memories)
+                pack = provider.collect()
+                if pack is not None:
+                    ok = a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+                    if ok:
+                        provider.commit()      # 写成功才推进 dedup（_already_surfaced + 字节预算）
+                    self._ledger_note(pack, ok)
         except Exception as e:
             a._sink.info(f"[memory] recall injection failed: {e}")
 
@@ -373,7 +423,7 @@ class AgentSession:
             return False
 
     # ── 请求构建（docs/13 S2；#3b 自 engine 迁入）────────────────────────────────
-    def build_request_messages(self) -> list:
+    def build_request_messages(self, extra_neutral: "list[dict] | None" = None) -> list:
         """从 canonical 树渲染本轮请求（`render(build_context())`）。
 
         树是会话**唯一**事实源（含 message-end 写入的消息 + 注入的 custom_message）；render 据当前
@@ -388,7 +438,10 @@ class AgentSession:
         api = "openai-completions" if a.use_openai else "anthropic"
         sysp = a._system_prompt if a.use_openai else None
         built = a._session_mgr.build_context()
-        return render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
+        messages = list(built.messages)
+        if extra_neutral:
+            messages.extend(extra_neutral)     # volatile tail（request-local 装饰，不入树，docs/16 #6）
+        return render(messages, ModelCtx(provider=provider, api=api, model_id=a.model),
                       system_prompt=sysp)["messages"]
 
     # ── turn-boundary 注入器（docs/16 #3b 自 engine 迁入；树是唯一注入通道）───────
@@ -423,7 +476,10 @@ class AgentSession:
             return
         for pack in plan.packs:
             if pack.kind not in present:                  # per-customType：只注入缺失的 kind
-                a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+                ok = a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+                self._ledger_note(pack, ok)
+            else:
+                self._ledger_note(pack, True, reason="already rendered in context (skip re-inject)")
 
     def _session_context_present_kinds(self) -> set[str]:
         """当前 branch **经 context.fold 实际渲染**的 session-context customType 集合。
@@ -439,52 +495,61 @@ class AgentSession:
         return {m.get("customType") for m in rich
                 if m.get("role") == "custom" and m.get("customType") in self._SESSION_CONTEXT_KINDS}
 
-    def _skill_listing_budget(self) -> int:
-        return max(2000, int(self.agent.effective_window * 0.04))
+    def _ledger_note(self, pack, included: bool, reason: str = "") -> None:
+        """把一次注入记进本 turn 的全量账本（/context 可见性，docs/16 #6）。无账本（turn 外直调）→ no-op。"""
+        led = getattr(self.agent, "_context_ledger", None)
+        if led is not None:
+            led.add(pack, included=included,
+                    reason=reason or ("injected" if included else "tree write failed; will retry"))
 
     def inject_skill_listing(self) -> None:
-        """skill 清单 → ContextInjected 事件 → custom_message entry。
-        dedup（_sent_skill_names）**只在树写成功后**推进——失败则下一轮重试，不静默丢清单。"""
+        """skill 清单（docs/16 #6 provider 化：SkillListingProvider，lifecycle=until_compact）。
+        dedup（_sent_skill_names）**只在树写成功后** commit——失败则下一轮重试，不静默丢清单。"""
         a = self.agent
         if a.is_sub_agent:
             return
-        from ..skills.listing import skill_listing_delta
-        text, new_names = skill_listing_delta(
-            a._sent_skill_names, a._activated_path_skills, self._skill_listing_budget()
-        )
-        if text and a.emit(_events.ContextInjected(custom_type="skill_listing", content=text)):
-            a._sent_skill_names.update(new_names)
+        from ..context.providers import SkillListingProvider
+        provider = SkillListingProvider(a)
+        pack = provider.collect()
+        if pack is None:
+            return
+        ok = a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+        if ok:
+            provider.commit()
+        self._ledger_note(pack, ok)
 
     def inject_pending_skill_bodies(self) -> None:
-        """skill body → ContextInjected 事件 → custom_message entry。
+        """skill body（docs/16 #6 provider 化：skill_body_pack，lifecycle=one_shot）。
         树写失败的 body 留在队列、下一轮重试（不静默丢指令）。"""
         a = self.agent
-        from ..skills.listing import render_skill_body_message
+        from ..context.providers import skill_body_pack
         remaining: list = []
         for name, body in a._pending_skill_bodies:
-            msg = render_skill_body_message(name, body)
-            if not a.emit(_events.ContextInjected(custom_type="skill_body", content=msg.get("content", ""))):
+            pack = skill_body_pack(name, body)
+            ok = a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+            if not ok:
                 remaining.append((name, body))
+            self._ledger_note(pack, ok, reason=("injected" if ok else "tree write failed; requeued"))
         a._pending_skill_bodies = remaining
 
     def inject_finished_tasks(self) -> None:
-        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder>，写 custom_message entry
-        挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这优先于 docs/14 §6b 的
-        "pin 到 spawn 分支"）。spawn 血缘记在 task.spawn_entry_id（state.json 持久）供审计。
-        树写失败 → 不标 injected、下一轮重试，不静默丢提醒。"""
+        """终态后台任务提醒（docs/16 #6 provider 化：FinishedTasksProvider，lifecycle=turn）。
+        custom_message 挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这优先于
+        docs/14 §6b 的"pin 到 spawn 分支"）；spawn 血缘记在 task.spawn_entry_id 供审计。
+        树写失败 → 不 commit（不标 injected）、下一轮重试，不静默丢提醒。"""
         a = self.agent
         if a.is_sub_agent:
             return   # 子 agent 与父共享 TaskManager；finished-task 回注是**父**（user-facing loop）的职责，
                      # 否则子会"偷走"并标 injected 父/兄弟的后台完成提醒，使父永不浮现（review high）。
-        from ..tasks.inject import collect_pending_injections, render_task_reminder
-        pending = collect_pending_injections(a.task_manager)
-        if not pending:
+        from ..context.providers import FinishedTasksProvider
+        provider = FinishedTasksProvider(a)
+        pack = provider.collect()
+        if pack is None:
             return
-        text = "\n\n".join(render_task_reminder(t) for t in pending)
-        if not a.emit(_events.ContextInjected(custom_type="finished_tasks", content=text)):
-            return
-        for t in pending:
-            a.task_manager.update_task(t.id, injected=True)
+        ok = a.emit(_events.ContextInjected(custom_type=pack.kind, content=pack.content))
+        if ok:
+            provider.commit()
+        self._ledger_note(pack, ok)
 
     # ── /clear 与 derived-cache 落盘（docs/16 #3b 自 engine 迁入）────────────────
     def clear_history(self) -> None:

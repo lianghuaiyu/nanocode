@@ -198,3 +198,106 @@ def default_providers() -> list:
         DeferredToolsProvider(),
         RepoMapProvider(),
     ]
+
+
+# ─── turn-loop providers（docs/16 #6：四个手写注入器 provider 化）──────────────
+#
+# 与上面的 async provider 不同,这些在**模型循环边界内**运行（每次请求前 / 工具后）,同步、无 I/O，
+# 由 AgentSession 直接调用而非经 ContextRuntime（不参与预算 eviction——注入语义是"有则必注"，
+# 真正的体积控制在各源内部,如 skill_listing_delta 的 char 预算）。共同契约：
+# - collect() 纯：只读 agent 状态、产 pack，绝不写树/推进 dedup；
+# - commit() 在 AgentSession **写树成功后**调用——dedup/injected 标记只在此推进
+#   （docs/14 P3 review #7：写失败不得静默丢注入 + 不得误推进 dedup）。
+
+class SkillListingProvider:
+    """skill 渐进披露清单（lifecycle=until_compact：清单 entry 被压缩折叠丢弃后,
+    AgentSession.compact 复位 _sent_skill_names → 下轮重新播报）。"""
+
+    id = "skill_listing"
+
+    def __init__(self, agent) -> None:
+        self.agent = agent
+        self._new_names: set = set()
+
+    def collect(self) -> "ContextPack | None":
+        from ..skills.listing import skill_listing_delta
+        a = self.agent
+        budget_chars = max(2000, int(a.effective_window * 0.04))
+        text, new_names = skill_listing_delta(a._sent_skill_names, a._activated_path_skills, budget_chars)
+        if not text:
+            return None
+        self._new_names = new_names
+        return ContextPack(id="skill_listing", kind="skill_listing", content=text,
+                           lifecycle="until_compact", cache_policy="append_only",
+                           persist_policy="custom_message", priority=35,
+                           provenance={"source": "SkillListingProvider",
+                                       "new_skills": sorted(new_names)})
+
+    def commit(self) -> None:
+        self.agent._sent_skill_names.update(self._new_names)
+
+
+class FinishedTasksProvider:
+    """终态且未注入的后台任务提醒（lifecycle=turn）。commit 把任务标 injected。"""
+
+    id = "finished_tasks"
+
+    def __init__(self, agent) -> None:
+        self.agent = agent
+        self._pending: list = []
+
+    def collect(self) -> "ContextPack | None":
+        from ..tasks.inject import collect_pending_injections, render_task_reminder
+        a = self.agent
+        pending = collect_pending_injections(a.task_manager)
+        if not pending:
+            return None
+        self._pending = pending
+        text = "\n\n".join(render_task_reminder(t) for t in pending)
+        return ContextPack(id="finished_tasks", kind="finished_tasks", content=text,
+                           lifecycle="turn", cache_policy="append_only",
+                           persist_policy="custom_message", priority=38,
+                           provenance={"source": "FinishedTasksProvider",
+                                       "task_ids": [t.id for t in pending]})
+
+    def commit(self) -> None:
+        for t in self._pending:
+            self.agent.task_manager.update_task(t.id, injected=True)
+
+
+class MemoryRecallProvider:
+    """settled 记忆预取的注入（lifecycle=turn）。commit 推进 _already_surfaced + 字节预算。"""
+
+    id = "memory"
+
+    def __init__(self, agent, memories: list) -> None:
+        self.agent = agent
+        self.memories = memories
+
+    def collect(self) -> "ContextPack | None":
+        if not self.memories:
+            return None
+        from ..memory import format_memories_for_injection
+        text = format_memories_for_injection(self.memories)
+        return ContextPack(id="memory", kind="memory", content=text,
+                           lifecycle="turn", cache_policy="append_only",
+                           persist_policy="custom_message", priority=45,
+                           provenance={"source": "MemoryRecallProvider",
+                                       "paths": [m.path for m in self.memories]})
+
+    def commit(self) -> None:
+        a = self.agent
+        for m in self.memories:
+            a._already_surfaced_memories.add(m.path)
+            a._session_memory_bytes += len(m.content.encode())
+
+
+def skill_body_pack(name: str, body: str) -> ContextPack:
+    """skill body → pack（lifecycle=one_shot：指令注入一次,失败由调用方 requeue——无 dedup 状态,
+    故无 provider 类/commit）。"""
+    from ..skills.listing import render_skill_body_message
+    msg = render_skill_body_message(name, body)
+    return ContextPack(id=f"skill_body:{name}", kind="skill_body", content=msg.get("content", ""),
+                       lifecycle="one_shot", cache_policy="append_only",
+                       persist_policy="custom_message", priority=80,
+                       provenance={"source": "skill_body_pack", "skill": name})

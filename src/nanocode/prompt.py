@@ -139,14 +139,16 @@ def get_git_context() -> str:
 
 
 def build_system_prompt() -> str:
-    """Build the full system prompt from system_prompt.md + dynamic context."""
-    from datetime import date
-    today = date.today().isoformat()
+    """Build the full system prompt from system_prompt.md + dynamic context.
+
+    docs/16 #6（STEP E）：date / git 已移出——它们是 volatile 事实，烤进 system prompt 会在
+    过午夜 / commit 后变 stale（live bug），现由 per-turn ContextRuntime collect
+    （EnvProvider/GitSnapshotProvider）作 volatile tail 注入请求尾部。本函数只留
+    会话内稳定的来源（cwd/platform/shell + skills/agents/deferred 公告）。"""
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
-    git_context = get_git_context()
     # docs/15 Phase 3 cutover（§8.3）：项目指令 + memory 不在 system prompt——由会话开始的
-    # session-context custom_message 注入（Agent._inject_session_context；docs/16 C-1 删恒空占位符）。
+    # session-context custom_message 注入（AgentSession.inject_session_context）。
     skills_section = SKILL_PROMPT_GUIDANCE
     agent_section = build_agent_descriptions()
 
@@ -158,10 +160,8 @@ def build_system_prompt() -> str:
 
     replacements = {
         "{{cwd}}": str(Path.cwd()),
-        "{{date}}": today,
         "{{platform}}": plat,
         "{{shell}}": shell,
-        "{{git_context}}": git_context,
         "{{skills}}": skills_section,
         "{{agents}}": agent_section,
         "{{deferred_tools}}": deferred_section,

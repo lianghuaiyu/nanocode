@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 CACHE_POLICIES = ("stable_prefix", "append_only", "volatile_tail")
 PERSIST_POLICIES = ("none", "custom_message", "message", "derived_only")
-LIFECYCLES = ("session", "turn", "until_compact", "path_triggered", "manual")
+LIFECYCLES = ("session", "turn", "until_compact", "path_triggered", "one_shot", "manual")
 
 
 def breaks_stable_prefix(packs: "list[ContextPack]") -> bool:
@@ -37,12 +37,12 @@ def survives_compaction(pack: "ContextPack") -> bool:
     规则：
     - session 生命周期 → 存活（整会话不变，如稳定 system / root 项目指令重载）。
     - persist_policy 是 message / custom_message 且 lifecycle 是 until_compact → 不存活（定义上到压缩为止）。
-    - turn / manual → 不存活（单轮或一次性）。
+    - turn / one_shot / manual → 不存活（单轮或一次性）。
     - path_triggered → 不存活（需路径再次触发重新注入）。
     其余按 lifecycle 保守判定。
     """
     if pack.lifecycle == "session":
         return True
-    if pack.lifecycle in ("turn", "until_compact", "path_triggered", "manual"):
+    if pack.lifecycle in ("turn", "until_compact", "path_triggered", "one_shot", "manual"):
         return False
     return False

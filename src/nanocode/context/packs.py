@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-Lifecycle = Literal["session", "turn", "until_compact", "path_triggered", "manual"]
+Lifecycle = Literal["session", "turn", "until_compact", "path_triggered", "one_shot", "manual"]
 CachePolicy = Literal["stable_prefix", "append_only", "volatile_tail"]
 PersistPolicy = Literal["none", "custom_message", "message", "derived_only"]
 
