@@ -376,15 +376,19 @@ class AgentRuntime:
             raise
         return new_thread
 
-    def thread_new(self, host) -> RuntimeThread:
-        """新建空 canonical session 并切入（/new）。session_id 与主 agent 同格式（8 hex）；
-        re-mint 直到不与磁盘上已有 session 撞——否则 rebind 会 open 到陌生 session 而非建空的
-        （违反 /new "新 session context 为空"，docs/14 P2 review）。"""
+    @staticmethod
+    def _mint_session_id() -> str:
+        """铸造未占用的新 session id（8 hex，与主 agent 同格式）。re-mint 直到不与磁盘上已有
+        session 撞——否则 rebind 会 open 到陌生 session 而非建空的（docs/14 P2 review）。"""
         from ..session.manager import SessionManager
         sid = uuid.uuid4().hex[:8]
         while SessionManager.exists(sid):
             sid = uuid.uuid4().hex[:8]
-        return self._switch_via_rebind(host, sid)
+        return sid
+
+    def thread_new(self, host) -> RuntimeThread:
+        """新建空**顶层** canonical session 并切入（/new；语义表：不带 parentSession）。"""
+        return self._switch_via_rebind(host, self._mint_session_id())
 
     def thread_resume(self, host, session_id: str) -> "RuntimeThread | None":
         """切到一个已存在的 session（/resume <id>）。docs/14 SessionLease：canonical 树是唯一权威——
@@ -416,12 +420,10 @@ class AgentRuntime:
         # 选中消息之前无可复制内容（parent=None，或 pre-3a 树里 parent 是 session_start header）
         # → 新建**空** session，但血缘照记（不可复用裸 thread_new：会丢 parentSession）。
         if cut is None or all(e.type == _tree.SESSION_START for e in src.get_branch(cut)):
-            sid = uuid.uuid4().hex[:8]
-            while SessionManager.exists(sid):
-                sid = uuid.uuid4().hex[:8]
             return self._switch_via_rebind(
-                host, sid, parent_session={"sessionId": source_sid, "entryId": cut,
-                                           "forkedBeforeEntryId": user_entry_id})
+                host, self._mint_session_id(),
+                parent_session={"sessionId": source_sid, "entryId": cut,
+                                "forkedBeforeEntryId": user_entry_id})
         try:
             child = src.clone(cut, parent_session_extra={"forkedBeforeEntryId": user_entry_id})
         except Exception:

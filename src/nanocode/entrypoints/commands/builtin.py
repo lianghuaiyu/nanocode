@@ -317,21 +317,17 @@ async def _checkout(ctx: CommandContext, args: str) -> Local:
 
 async def _rewind(ctx: CommandContext, args: str) -> Local:
     """/rewind —— 回到最近一条 user 消息之前（撤销上一轮；后续输入在 in-file 新分支重开，docs/13 P6）。"""
-    from ...session import tree as T
     from ...session.manager import SessionManager
     sid = ctx.agent.session_id
     if not SessionManager.exists(sid):
         print("No canonical session tree yet for this session.")
         return Local()
-    target = None
-    for e in SessionManager.open(sid).get_branch():  # root-first；取最后一条 user 消息
-        if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
-            target = e
+    target = _last_user_message(SessionManager.open(sid))
     if target is None:
         print("No user message to rewind to.")
         return Local()
     try:
-        ctx.session.move_to(target.parentId)         # parentId=None（首条消息）→ 复位到 root（空上下文），与 /fork 一致
+        ctx.session.move_to(target.parentId)         # parentId=None（首条消息）→ 复位到 root（空上下文）
         content = (target.data.get("message") or {}).get("content")
         print(f"Rewound to before your last message (in-file branch). Re-enter it if you like:\n  {content}")
     except ValueError as e:
@@ -362,13 +358,27 @@ def _resolve_entry(mgr, target: str):
 #   /clone     复制当前 active branch 到当前 leaf → 新 session，编辑器为空
 #   /new       新顶层 session（不带 parentSession）
 
+def _is_user_message(e) -> bool:
+    """entry 是否为 user MESSAGE（fork 目标 / rewind 锚点 / 候选清单共用的唯一谓词）。"""
+    from ...session import tree as T
+    return e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user"
+
+
+def _last_user_message(mgr):
+    """branch 上最近一条 user MESSAGE entry（无则 None）。/fork 无参与 /rewind 共用。"""
+    sel = None
+    for e in mgr.get_branch():                     # root-first → 末个命中即最近
+        if _is_user_message(e):
+            sel = e
+    return sel
+
+
 def _user_message_candidates(mgr, limit: int = 10) -> str:
     """fork 候选清单（pi getUserMessagesForForking 的文本等价）：branch 上的 user MESSAGE，
     近期在前，id 尾缀 + 预览——选择器没有 TUI 时，把候选集打印出来让用户挑。"""
-    from ...session import tree as T
     rows = []
     for e in reversed(mgr.get_branch()):
-        if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
+        if _is_user_message(e):
             text = _user_message_text(e.data.get("message")).strip().replace("\n", " ")
             if len(text) > 60:
                 text = text[:57] + "..."
@@ -392,7 +402,6 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     """/fork [entry] —— pi 语义：选择一条历史 user 消息，**新建 session** 复制到该消息**之前**，
     并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。无参 = 最近一条 user 消息。
     原 session 保留（header 记 parentSession 血缘）。同 session 内的 leaf 移动用 /tree <entry>。"""
-    from ...session import tree as T
     mgr = ctx.agent._session_mgr
     if mgr is None:
         print_info("No active session for this agent.")
@@ -405,11 +414,8 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
             return Local()
         sel = next((e for e in mgr.entries() if e.id == resolved), None)
     else:
-        sel = None
-        for e in mgr.get_branch():                 # root-first；取最近一条 user 消息
-            if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
-                sel = e
-    if sel is None or sel.type != T.MESSAGE or (sel.data.get("message") or {}).get("role") != "user":
+        sel = _last_user_message(mgr)              # 无参 = 最近一条 user 消息
+    if sel is None or not _is_user_message(sel):
         # pi 双层收窄的 UX 层：候选集只有 user 消息——选错/无效时把候选打印出来让用户挑
         # （runtime.thread_fork 仍独立 fail-closed 校验，不依赖这里）。
         print_error("Fork target must be a user message. Candidates (/fork <id>):\n"

@@ -4,7 +4,7 @@ import asyncio
 
 from nanocode.agent import AgentSession
 from nanocode.agent.engine import Agent
-from nanocode.entrypoints.commands.builtin import _checkout, _fork, _resume, _rewind, _tree
+from nanocode.entrypoints.commands.builtin import _checkout, _resume, _rewind, _tree
 from nanocode.entrypoints.commands.types import CommandContext
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
@@ -79,20 +79,8 @@ def test_checkout_bad_id_fails_closed(capsys):
     assert "not found" in capsys.readouterr().out
 
 
-def test_fork_emits_control_and_leaves_source_untouched():
-    # pi /fork：handler 发 Control（新 session 由 runtime thread_fork 完成）；源 session 的
-    # leaf/内容原样保留（同 session 内移 leaf 是 /tree <entry> 的职责）。
-    from nanocode.entrypoints.commands.types import Control
-    a = _agent("fk1")
-    mgr = _seed(a, "fk1")
-    mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
-                       api="anthropic", model="claude-x", stop_reason="stop"))
-    u = mgr.append_message(T.user_message("q"))           # 无参 /fork → 选中此条
-    res = asyncio.run(_fork(_ctx(a), ""))
-    assert isinstance(res, Control) and res.payload["kind"] == "fork"
-    assert res.payload["userEntryId"] == u.id and res.payload["prefill"] == "q"
-    assert a.session_id == "fk1"                          # 不切换（runtime 才切换）
-    assert a._session_mgr.get_leaf() == u.id              # 源 leaf 未动
+# /fork handler 的 Control payload / prefill / 源不动 钉点在 tests/entrypoints/test_commands_pi.py
+# （test_fork_no_arg_returns_control_with_last_user_and_prefill 等）——此处不再重复。
 
 
 def test_resume_lists_sessions(capsys):

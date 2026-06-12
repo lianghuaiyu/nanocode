@@ -659,7 +659,7 @@ class AgentSession:
 
     # ── in-file 导航（docs/14 P6）────────────────────────────────────────────
     def move_to(self, entry_id: "str | None", *, agent_id: str = "main") -> list:
-        """把 active leaf 移到 canonical 树的 entry_id（in-file 导航 / checkout / fork-before）。
+        """把 active leaf 移到 canonical 树的 entry_id（in-file 导航：/tree <entry> /checkout /rewind）。
         entry_id=None → 复位 root（空上下文）。fail-closed：无写者租约 / entry 不存在 → ValueError。
         返回从新 leaf 重渲染的消息列表（供调用方显示计数；请求路径每轮自行重渲染，无需装载）。"""
         from ..session.render import ModelCtx, render
