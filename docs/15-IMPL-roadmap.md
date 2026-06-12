@@ -30,19 +30,28 @@ Phase 1 另有自身 characterization 测试(test_providers.py + 全套 e2e via 
 context/{packs,ledger,cache_policy,budgets,providers,runtime}.py · agents/{profile,registry,permissions,result}.py ·
 capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py · tools/read_file.py(caps)。
 
-### 各 Phase 完成度
+### 各 Phase 完成度 —— **全部 0–8 已落地（acceptance 达成）**
 - Phase 0/1/2/8 ✅ 完成。
-- Phase 3 ✅ abstraction + /context + **cutover 完成**(项目指令/memory 移出 system prompt → session-context
-  custom_message,resume-dedup + compaction-survival;三条验收全过)。注:git/skills/agents/deferred 仍留 system
-  (scoped 到 doc 点名的"项目指令+memory")。
-- Phase 4 🟡 read_file caps 完成;**剩余 tree-sitter repo map**（需加依赖 tree-sitter + grammars）。
-- Phase 5 🟡 typed profile/registry/permission + capabilities(PermissionContext/taxonomy) 完成;
-  **剩余 engine._execute_tool_call 改经 CapabilityRouter 派发**。
-- Phase 6 ✅ ResultEnvelope + **spawn 搬迁完成**：SubAgentRunner(build/写盘/run 原语/finalizers/
-  execute_agent_tool/后台 spawn·run/**memory curator spawns**)全在 runtime/spawn.py。engine.py **2195→1439**。
-  runner 内跨调走 host._X 保 monkeypatch seam。**注**：_execute_skill_tool fork 留在 engine —— 它是 skill-tool
-  handler(skill 域),宜归 capabilities/skills.py(Phase 5 域),非 runtime/spawn(已记)。
-- Phase 7 ⬜ 未开始: CLI as runtime client。
+- Phase 3 ✅ ContextRuntime abstraction + /context + cutover(项目指令/memory 移出 system→session-context,
+  resume-dedup + compaction-survival)。
+- Phase 4 ✅ read_file budget caps + **词法 RepoIndex + RepoMapProvider**(§9.2,/context 展示)。
+  残留增强:tree-sitter 精度升级(同 RepoIndex 接口可替换;词法 fallback 已可用)。
+- Phase 5 ✅ typed profile/registry/permission-derivation + capabilities(PermissionContext/taxonomy)+
+  **CapabilityRouter.dispatch 单一工具咽喉点**(engine._execute_tool_call 委托;agent/skill 经 host 路由,
+  消除 tools↔agent 循环 import)。残留增强:PermissionEngine→PermissionContext 内部替换(非 acceptance)。
+- Phase 6 ✅ ResultEnvelope + SubAgentRunner(build/写盘/run 原语/finalizers/execute_agent_tool/后台 spawn·run/
+  memory curator spawns)全在 runtime/spawn.py。**engine.py 2195→1385**。残留:_execute_skill_tool fork
+  归 capabilities/skills.py(skill 域,非 spawn)。
+- Phase 7 ✅ runtime 单一 turn 路径(删 NANOCODE_REPL_VIA_RUNTIME 逃生阀)+ **RuntimeThread.events()
+  in-process 订阅**(RecordingSink,SDK/协议消费者)。命令走 Control/runtime API;approvals 带身份。
+
+### 残留增强(均超出 doc acceptance,非核心交付;按需后续)
+1. repo map tree-sitter 精度(词法 fallback 已可用,同接口替换)。
+2. PermissionEngine 改吃 PermissionContext(capabilities 层已备;当前 PermissionEngine(self) 仍是单一咽喉点)。
+3. _execute_skill_tool fork → capabilities/skills.py(skill 域归位)。
+4. CLI 显示路径改吃 RuntimeThread.events()(当前 events() 已暴露给 SDK;CLI 仍用 TeeSink 显示,二者并存)。
+5. 全套用 codex 交叉验证 + simplify pass。
+
 
 ### 继续指南（剩余 = 把旧 engine.py 代码迁入新架构;每步小颗粒 + 测试 + 提交,保持全绿）
 **性质转变**: 已完成的是「建新架构」(additive,干净);剩余是「迁旧码入新家」(destructive,改 model-visible
