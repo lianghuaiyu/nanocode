@@ -300,7 +300,9 @@ def test_memory_consolidate_respects_max_threads(monkeypatch, tmp_path):
     """Curators counted toward max_threads but never checked it (counted-but-not-capped).
     A consolidate spawn must be refused when the cap is already reached."""
     _set_agents_settings(monkeypatch, tmp_path, {"max_threads": 1})
-    monkeypatch.setattr("nanocode.agent.engine.build_curator_user_message",
+    # docs/15 Phase 6：memory curator spawn 已搬到 runtime/spawn.py,build_curator_user_message
+    # 在该模块被调用 → monkeypatch 目标随之迁移。
+    monkeypatch.setattr("nanocode.runtime.spawn.build_curator_user_message",
                         lambda: "memory: some content to consolidate", raising=False)
 
     async def scenario():
