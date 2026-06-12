@@ -123,6 +123,8 @@ class RepoIndex:
         self.root = Path(root)
         self._tags: dict[str, list[SymbolTag]] = {}     # rel_path → defs
         self._mtime: dict[str, float] = {}              # rel_path → mtime（cache key）
+        self._tree_cache: dict = {}                     # (rel, lois, mtime) → 渲染文本
+        self._tree_context_cache: dict = {}             # rel → (mtime, PyTreeContext | None)
 
     def update(self, files) -> None:
         """索引给定文件（rel 或 abs path 皆可）。mtime 未变则跳过（cache）。"""
@@ -177,11 +179,12 @@ class RepoIndex:
 
     def render_map(self, tags: list, *, budget_tokens: int = 1024) -> str:
         """aider get_ranked_tags_map_uncached 等价：对 ranked tags 数量**二分搜索**拟合
-        token 预算（误差 <15% 提前停）。选择按 rank 序，显示按文件名分组（aider to_tree
-        先 sorted 再分组——选择与显示解耦）。"""
+        token 预算（误差 <15% 提前停）。选择按 rank 序，显示交给 to_tree（其内部 sorted
+        ——选择与显示解耦）。"""
         from ..context.packs import estimate_tokens
         if not tags:
             return ""
+        self._tree_cache = {}                             # aider：每次 uncached build 重置
         lower, upper = 0, len(tags)
         best, best_tokens = None, 0
         middle = min(max(budget_tokens // 25, 1), len(tags))
@@ -200,30 +203,66 @@ class RepoIndex:
             middle = (lower + upper) // 2
         return best or ""
 
-    @staticmethod
-    def _to_tree(tags: list) -> str:
-        """选中的 tags → 文本（aider to_tree 的轻量版：按文件分组，def 显示签名行；
-        裸文件 tuple 只列文件名）。"""
-        by_file: dict[str, list] = {}
-        bare: list[str] = []
-        order: list[str] = []
-        for t in tags:
-            if isinstance(t, tuple):                  # 裸文件兜底
-                if t[0] not in by_file and t[0] not in bare:
-                    bare.append(t[0])
-                continue
-            if t.rel_path not in by_file:
-                by_file[t.rel_path] = []
-                order.append(t.rel_path)
-            by_file[t.rel_path].append(t)
-        lines: list[str] = ["# Repo map"]
-        for rel in sorted(order):                     # 显示按文件名排序（aider sorted(tags)）
-            lines.append(f"\n{rel}:")
-            for d in sorted(by_file[rel], key=lambda d: d.line):
-                lines.append(f"  {d.line:>4}: {d.text or d.name}")
-        for rel in sorted(b for b in bare if b not in by_file):
-            lines.append(f"\n{rel}")
-        return "\n".join(lines)
+    def _to_tree(self, tags: list) -> str:
+        """aider to_tree 逐字对照：sorted(tags)+dummy 冲洗,def 文件经 TreeContext 渲染骨架,
+        裸文件 tuple 只列文件名（无冒号）;末尾全行截断 100 字符。"""
+        if not tags:
+            return ""
+
+        def _key(t):                                      # Tag 是 namedtuple,混排裸 tuple 可比
+            if isinstance(t, tuple):
+                return (t[0], 0, -1, "")
+            return (t.rel_path, 1, t.line, t.name)
+
+        cur_fname, cur_abs, lois = None, None, None
+        output = ""
+        dummy = (None,)                                   # 尾部冲洗用
+        for tag in sorted(tags, key=_key) + [dummy]:
+            this_rel = tag[0] if isinstance(tag, tuple) else tag.rel_path
+            if this_rel != cur_fname:
+                if lois is not None:
+                    output += "\n" + cur_fname + ":\n" + self._render_tree(cur_abs, cur_fname, lois)
+                    lois = None
+                elif cur_fname:
+                    output += "\n" + cur_fname + "\n"
+                if not isinstance(tag, tuple):
+                    lois = []
+                    cur_abs = tag.abs_path
+                cur_fname = this_rel
+            if lois is not None and not isinstance(tag, tuple):
+                lois.append(tag.line)
+        # 截断超长行（minified js 之类）——aider 同款收尾
+        output = "\n".join(line[:100] for line in output.splitlines()) + "\n"
+        return "# Repo map\n" + output
+
+    def _render_tree(self, abs_path: str, rel: str, lois: list[int]) -> str:
+        """一个文件的骨架渲染（aider render_tree 等价）：Python → PyTreeContext（父 scope
+        头行 + ⋮ 缺口）；其余/解析失败 → render_plain（仅 LOI 行同款格式）。
+        (rel, lois, mtime) 级缓存——二分搜索期间同前缀不重渲。"""
+        from .treectx import PyTreeContext, render_plain
+        try:
+            mtime = Path(abs_path).stat().st_mtime
+        except OSError:
+            return ""
+        key = (rel, tuple(sorted(lois)), mtime)
+        if key in self._tree_cache:
+            return self._tree_cache[key]
+        cached = self._tree_context_cache.get(rel)
+        if cached is None or cached[0] != mtime:
+            ctx = None
+            try:
+                code = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+                if language_for_path(rel) == "python":
+                    ctx = PyTreeContext(code)
+            except (OSError, SyntaxError, ValueError, RecursionError):
+                code = ""
+            cached = (mtime, ctx, code)
+            self._tree_context_cache[rel] = cached
+        _mt, ctx, code = cached
+        lois0 = [ln - 1 for ln in lois if ln > 0]         # SymbolTag.line 1-indexed → 0-indexed
+        res = ctx.render(lois0) if ctx is not None else render_plain(code, lois0)
+        self._tree_cache[key] = res
+        return res
 
     def _rel(self, ap: Path) -> str:
         try:
