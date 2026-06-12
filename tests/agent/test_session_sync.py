@@ -61,8 +61,10 @@ def test_hydrate_state_rebuilds_request_from_tree():
     built = a._session_mgr.build_context()
     direct = render(built.messages, ANTH, system_prompt=None)["messages"]
     assert state.project().messages == direct
-    assert [m["role"] for m in built.messages] == ["user", "assistant"]
-    # 干净 turn → 一致
+    # docs/15 Phase 3 cutover：真实 turn 在末尾,前面是 session-context 包(proj + memory 指引,折成 user)。
+    assert [m["role"] for m in built.messages[-2:]] == ["user", "assistant"]
+    assert all(m["role"] == "user" for m in built.messages[:-2])
+    # 干净 turn → 一致（注入是 leaf-affecting custom_message,leaf/orphan 不变量保持）
     assert sess.verify_turn_consistency() == []
 
 
@@ -80,7 +82,9 @@ def test_hydrate_tool_turn_rebuilds_and_consistent():
     asyncio.run(a.chat("list"))
     sess = AgentSession(a)
     built = a._session_mgr.build_context()
-    assert [m["role"] for m in built.messages] == ["user", "assistant", "toolResult", "assistant"]
+    # docs/15 Phase 3 cutover：真实 round 在末尾,前面是 session-context 包。
+    assert [m["role"] for m in built.messages[-4:]] == ["user", "assistant", "toolResult", "assistant"]
+    assert all(m["role"] == "user" for m in built.messages[:-4])
     # tool turn 后无孤儿、leaf 正确
     assert sess.verify_turn_consistency() == []
     # state.project() 仍等于直接 render

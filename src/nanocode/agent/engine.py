@@ -379,6 +379,7 @@ class Agent(PlanModeMixin):
 
         self._aborted = False
         self._ensure_session_lease()  # 确保持有会话写者租约（runtime 已注入则 no-op；headless/直接构造则自取）
+        await self._inject_session_context()  # docs/15 Phase 3 cutover：项目指令/memory 作 session-context 包
         coro = self._core.run_turn(self, user_message)
         self._current_task = asyncio.current_task()
         try:
@@ -393,6 +394,61 @@ class Agent(PlanModeMixin):
                          finalStatus="cancelled" if self._aborted else "completed")
         if not self.is_sub_agent:
             self._auto_save()
+
+    # ─── docs/15 Phase 3 cutover：session-context 注入（项目指令 + memory 静态段）─────────
+    _SESSION_CONTEXT_KINDS = frozenset({"project_instructions", "memory_static"})
+
+    async def _inject_session_context(self) -> None:
+        """把项目指令 + memory 静态段作为 session-context custom_message 注入 canonical 树（§8.3）。
+
+        取代旧的「烤进 system prompt」：稳定 system 前缀利于 cache,内容作 messages/custom_message。
+        仅主 agent（子 agent 各有自己的 system prompt,不应注入项目指令）。
+
+        幂等 + resume 安全 + compaction 存活,统一由「当前 branch 的有效(post-compaction)区间是否已有
+        session-context 包」判定（_session_context_present）：
+        - fresh：无 → 注入；
+        - resume：树里已有(未被压缩) → 跳过(不重复)；
+        - compaction 后：旧包被折叠出有效区间 → 视为缺失 → 重注入一次(survival matrix)。
+        """
+        if self.is_sub_agent or self._session_mgr is None:
+            return
+        if self._session_context_present():
+            return
+        from ..context import BudgetPolicy, ContextRequest, ContextRuntime
+        req = ContextRequest(
+            cwd=os.getcwd(), is_sub_agent=False,
+            include_project_instructions=True, include_memory=True,
+            include_env=False, include_git=False, include_skills=False,
+            include_agents=False, include_deferred_tools=False,
+        )
+        try:
+            plan = await ContextRuntime(budget=BudgetPolicy.for_window(self.effective_window)).collect(req)
+        except Exception as e:
+            try:
+                self._sink.info(f"[context] session-context collect failed: {e}")
+            except Exception:
+                pass
+            return
+        for pack in plan.packs:
+            self._tree_custom_message(pack.kind, pack.content)
+
+    def _session_context_present(self) -> bool:
+        """当前 branch 的有效(post-compaction kept)区间是否已含 session-context custom_message。"""
+        mgr = self._session_mgr
+        if mgr is None:
+            return False
+        try:
+            branch = mgr.get_branch()
+        except Exception:
+            return True  # 树不可重建时保守跳过注入（避免在坏树上叠写）
+        comp_idx = -1
+        for i, e in enumerate(branch):
+            if e.type == _tree.COMPACTION:
+                comp_idx = i
+        kept = branch[comp_idx + 1:] if comp_idx >= 0 else branch
+        return any(e.type == _tree.CUSTOM_MESSAGE
+                   and e.data.get("customType") in self._SESSION_CONTEXT_KINDS
+                   for e in kept)
 
     # ─── Sub-agent entry point ────────────────────────────────
 

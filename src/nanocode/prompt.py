@@ -146,8 +146,12 @@ def build_system_prompt() -> str:
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
     git_context = get_git_context()
-    claude_md = load_project_instructions()
-    memory_section = build_memory_prompt_section()
+    # docs/15 Phase 3 cutover（§8.3）：项目指令 + memory 静态段**不再**烤进 system prompt
+    # （它们是可变项目/用户上下文,应作 messages/custom_message,而非可变 system 文本）。
+    # 改由会话开始的 session-context custom_message 注入（Agent._inject_session_context）：
+    # 稳定 system 前缀利于 prompt cache,且经 ContextLedger/`/context` 可审计、按 survival matrix 处理。
+    claude_md = ""
+    memory_section = ""
     skills_section = SKILL_PROMPT_GUIDANCE
     agent_section = build_agent_descriptions()
 
