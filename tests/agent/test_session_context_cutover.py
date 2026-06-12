@@ -72,17 +72,40 @@ def test_subagent_does_not_get_session_context():
     assert _proj_entries(a._session_mgr) == []               # 子 agent 不注入项目指令
 
 
-def test_session_context_present_handles_compaction_survival():
+def test_present_kinds_uses_fold_rendered_folded_out_reinjects():
     a = _agent("cut4")
     mgr = SessionLease.open_or_create("cut4").manager
     a._session_mgr = mgr
     mgr.append(T.CUSTOM_MESSAGE, {"customType": "project_instructions", "content": "X", "display": False})
     u = mgr.append_message(T.user_message("u1"))
-    assert a._session_context_present() is True               # 无 compaction：proj 在 kept 区 → 跳过重注入
+    assert a._session_context_present_kinds() == {"project_instructions"}     # 无 compaction:渲染中
+    # compaction firstKept=u1 → project_instructions(在 u1 之前)被折出渲染 → 视为缺失 → 会重注入(survival)
     mgr.append_compaction(summary="s", first_kept_entry_id=u.id)
     mgr.append_message(T.user_message("u2"))
-    # proj 在 compaction 之前 → 被折出有效区间 → 视为缺失 → 下一轮会重注入（survival matrix）
-    assert a._session_context_present() is False
+    assert a._session_context_present_kinds() == set()
+
+
+def test_present_kinds_keeps_pre_compaction_kept_region_no_double_inject():
+    # codex-found：custom 在 compaction 的 kept 前区(firstKeptEntryId=None=全保留)→ fold 仍渲染 → 不重复注入。
+    a = _agent("cut4b")
+    mgr = SessionLease.open_or_create("cut4b").manager
+    a._session_mgr = mgr
+    mgr.append(T.CUSTOM_MESSAGE, {"customType": "project_instructions", "content": "X", "display": False})
+    mgr.append_message(T.user_message("u1"))
+    mgr.append_compaction(summary="s", first_kept_entry_id=None)              # None → fold 保留全部前区
+    mgr.append_message(T.user_message("u2"))
+    assert "project_instructions" in a._session_context_present_kinds()       # 仍渲染 → 不 double-inject
+
+
+def test_per_customtype_dedup_not_suppressed_by_other_kind():
+    # codex-found：仅 memory_static 在场时,project_instructions 不应被「另一 kind 在场」抑制(per-kind)。
+    a = _agent("cut4c")
+    mgr = SessionLease.open_or_create("cut4c").manager
+    a._session_mgr = mgr
+    mgr.append(T.CUSTOM_MESSAGE, {"customType": "memory_static", "content": "M", "display": False})
+    present = a._session_context_present_kinds()
+    assert present == {"memory_static"}
+    assert "project_instructions" not in present                             # → 仍会被注入
 
 
 def test_injected_pack_does_not_mutate_user_message():

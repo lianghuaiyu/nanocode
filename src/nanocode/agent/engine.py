@@ -407,15 +407,15 @@ class Agent(PlanModeMixin):
         取代旧的「烤进 system prompt」：稳定 system 前缀利于 cache,内容作 messages/custom_message。
         仅主 agent（子 agent 各有自己的 system prompt,不应注入项目指令）。
 
-        幂等 + resume 安全 + compaction 存活,统一由「当前 branch 的有效(post-compaction)区间是否已有
-        session-context 包」判定（_session_context_present）：
-        - fresh：无 → 注入；
-        - resume：树里已有(未被压缩) → 跳过(不重复)；
-        - compaction 后：旧包被折叠出有效区间 → 视为缺失 → 重注入一次(survival matrix)。
+        幂等 + resume 安全 + compaction 存活,统一由「**经 fold 实际渲染**的 session-context 包」判定
+        （_session_context_present_kinds 直接用 context.fold,与发给模型的上下文一致——避免手算 kept-region
+        与 fold 不符,codex-found）。**per-customType** 去重:只注入当前缺失的 kind,不被「另一 kind 在场」抑制。
+        - fresh：都缺 → 各注入一次；resume：树里已渲染 → 跳过；compaction 后折出渲染 → 重注入缺失项。
         """
         if self.is_sub_agent or self._session_mgr is None:
             return
-        if self._session_context_present():
+        present = self._session_context_present_kinds()
+        if present >= self._SESSION_CONTEXT_KINDS:        # 全部 kind 已在渲染上下文 → 无需注入
             return
         from ..context import BudgetPolicy, ContextRequest, ContextRuntime
         req = ContextRequest(
@@ -433,25 +433,26 @@ class Agent(PlanModeMixin):
                 pass
             return
         for pack in plan.packs:
-            self._tree_custom_message(pack.kind, pack.content)
+            if pack.kind not in present:                  # per-customType：只注入缺失的 kind
+                self._tree_custom_message(pack.kind, pack.content)
 
-    def _session_context_present(self) -> bool:
-        """当前 branch 的有效(post-compaction kept)区间是否已含 session-context custom_message。"""
+    def _session_context_present_kinds(self) -> set[str]:
+        """当前 branch **经 context.fold 实际渲染**的 session-context customType 集合。
+
+        用 fold（而非手算 post-compaction 区间）确保与真正发给模型的上下文一致：fold 的 rich 输出保留
+        custom_message 的 customType（convert_to_llm 才丢弃）,故能精确判定「模型是否看得到该包」——
+        无论 compaction 两区折叠 / firstKeptEntryId=None 全保留 等情形都对齐（codex-found 的 kept-region 不符）。
+        """
         mgr = self._session_mgr
         if mgr is None:
-            return False
+            return set()
         try:
-            branch = mgr.get_branch()
+            from ..session import context as _ctx
+            rich, _ = _ctx.fold(mgr.get_branch())
         except Exception:
-            return True  # 树不可重建时保守跳过注入（避免在坏树上叠写）
-        comp_idx = -1
-        for i, e in enumerate(branch):
-            if e.type == _tree.COMPACTION:
-                comp_idx = i
-        kept = branch[comp_idx + 1:] if comp_idx >= 0 else branch
-        return any(e.type == _tree.CUSTOM_MESSAGE
-                   and e.data.get("customType") in self._SESSION_CONTEXT_KINDS
-                   for e in kept)
+            return set(self._SESSION_CONTEXT_KINDS)       # 树不可重建 → 保守视为全在(不重复注入)
+        return {m.get("customType") for m in rich
+                if m.get("role") == "custom" and m.get("customType") in self._SESSION_CONTEXT_KINDS}
 
     # ─── Sub-agent entry point ────────────────────────────────
 
