@@ -90,10 +90,10 @@ def test_runtime_provider_error_is_recorded_not_fatal():
     assert "provider error" in plan.ledger.render_summary()
 
 
-def test_default_providers_cover_the_ten_dynamic_sources():
+def test_default_providers_cover_the_dynamic_sources():
     ids = {p.id for p in default_providers()}
     assert ids == {"project_instructions", "memory_static", "skills",
-                   "agents", "env", "git", "deferred_tools"}
+                   "agents", "env", "git", "deferred_tools", "repo_map"}
 
 
 def test_project_instructions_pack_survives_compaction():

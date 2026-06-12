@@ -12,5 +12,9 @@ agent profile 自动注入。
 """
 
 from .symbols import SymbolTag, SUPPORTED_LANGUAGES, language_for_path
+from .index import RepoIndex, RepoQuery, RankedFile, extract_symbols
 
-__all__ = ["SymbolTag", "SUPPORTED_LANGUAGES", "language_for_path"]
+__all__ = [
+    "SymbolTag", "SUPPORTED_LANGUAGES", "language_for_path",
+    "RepoIndex", "RepoQuery", "RankedFile", "extract_symbols",
+]

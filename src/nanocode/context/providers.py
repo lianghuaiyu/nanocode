@@ -156,6 +156,36 @@ class DeferredToolsProvider:
                            priority=45, provenance={"source": "DeferredToolsProvider"})
 
 
+class RepoMapProvider:
+    """Aider-style repo map 作 ContextProvider（§9.2）：按 RepoQuery 个性化 + 预算封顶,never 整文件。
+
+    已读/已改/提及文件优先;若都空则有界扫 repo(首回合也给结构)。词法 fallback(无 tree-sitter)。
+    profile 关 codeintel(include_repo_map=False) → 跳过。lifecycle=turn,不入树(persist=none)。
+    """
+
+    id = "repo_map"
+    enable_attr = "include_repo_map"
+
+    async def collect(self, request):
+        import os
+        from ..codeintel.index import RepoIndex, RepoQuery
+        idx = RepoIndex(request.cwd or os.getcwd())
+        touched = list(request.files_read) + list(request.files_modified) + list(request.mentioned_files)
+        if touched:
+            idx.update(touched)
+        else:
+            idx.scan_repo()
+        ranked = idx.rank(RepoQuery(
+            files_read=request.files_read, files_modified=request.files_modified,
+            mentioned_files=request.mentioned_files, mentioned_identifiers=request.mentioned_identifiers))
+        if not ranked:
+            return None
+        text = idx.render(ranked, budget_tokens=request.repo_map_budget_tokens)
+        return ContextPack(id="repo_map", kind="repo_map", content=text, lifecycle="turn",
+                           cache_policy="volatile_tail", persist_policy="none", priority=30,
+                           provenance={"source": "RepoMapProvider"})
+
+
 def default_providers() -> list:
     """build_system_prompt 今天烤进的 10 个动态来源,逐个 provider 化（顺序 = 优先级高→低组装）。"""
     return [
@@ -166,4 +196,5 @@ def default_providers() -> list:
         EnvProvider(),
         GitSnapshotProvider(),
         DeferredToolsProvider(),
+        RepoMapProvider(),
     ]

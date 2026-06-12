@@ -94,7 +94,8 @@ async def _context(ctx: CommandContext, args: str) -> Local:
     from ...context import BudgetPolicy, ContextRequest, ContextRuntime
     a = ctx.agent
     budget = BudgetPolicy.for_window(getattr(a, "effective_window", 200000))
-    req = ContextRequest(cwd=os.getcwd(), is_sub_agent=getattr(a, "is_sub_agent", False))
+    req = ContextRequest(cwd=os.getcwd(), is_sub_agent=getattr(a, "is_sub_agent", False),
+                         include_repo_map=True)
     plan = await ContextRuntime(budget=budget).collect(req)
     print_info(plan.ledger.render_summary())
     return Local()
