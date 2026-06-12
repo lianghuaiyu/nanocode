@@ -32,7 +32,9 @@ capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py
 
 ### 各 Phase 完成度
 - Phase 0/1/2/8 ✅ 完成。
-- Phase 3 🟡 abstraction + /context 完成;**剩余 cutover**（见下「继续指南」）。
+- Phase 3 ✅ abstraction + /context + **cutover 完成**(项目指令/memory 移出 system prompt → session-context
+  custom_message,resume-dedup + compaction-survival;三条验收全过)。注:git/skills/agents/deferred 仍留 system
+  (scoped 到 doc 点名的"项目指令+memory")。
 - Phase 4 🟡 read_file caps 完成;**剩余 tree-sitter repo map**（需加依赖 tree-sitter + grammars）。
 - Phase 5 🟡 typed profile/registry/permission + capabilities(PermissionContext/taxonomy) 完成;
   **剩余 engine._execute_tool_call 改经 CapabilityRouter 派发**。
