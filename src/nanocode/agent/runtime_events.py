@@ -115,12 +115,32 @@ def project(event: RuntimeEvent, sink) -> None:
     # 其余 durable type 无 UI 投影 → no-op。
 
 
-def dispatch_event(event: RuntimeEvent, sink) -> None:
-    """fan-out 一条 RuntimeEvent：UI projection（durable 持久化已迁出本流——见 Agent._tree_event/
-    _tree_record 落 canonical 树；wire/Tracer 已退役）。
+def project_agent_event(event, sink) -> None:
+    """typed AgentEvent → EventSink UI 投影（docs/16 #2：`Agent.emit` 单扇出的 ui 腿）。
 
-    sink 由调用方在**调用时**提供（Agent 传 live self._sink，避免缓存过期——adopt() 可能把 _sink
-    包成 TeeSink）。Agent._dispatch_event 与 EventDispatcher 共用本函数。
+    有 UI 的只有三种：AssistantDelta（流式 text/thinking 逐 block）、ToolCallRequested、
+    ToolResultObserved（执行点即时观测）。其余事件的持久化等价物由 record_event 落 canonical 树，
+    UI 一律 no-op——尤其 AssistantMessageCompleted 整段**不**重复渲染（流式已逐 block 画过，
+    与 project() 对 RuntimeEvent 'assistant_message' 的 no-op 同义）。
+    """
+    k = getattr(event, "kind", None)
+    if k == "assistant_delta":
+        if event.text:
+            sink.assistant_markdown(event.text)
+        if event.thinking:
+            sink.thinking(event.thinking)
+    elif k == "tool_call_requested":
+        sink.tool_call(event.tool, event.input)
+    elif k == "tool_result_observed":
+        sink.tool_result(event.tool, event.result)
+
+
+def dispatch_event(event: RuntimeEvent, sink) -> None:
+    """fan-out 一条 RuntimeEvent：UI projection（durable 持久化已迁出本流——typed AgentEvent 经
+    `Agent.emit` → record_event 落 canonical 树；wire/Tracer 已退役）。
+
+    docs/16 #2 后 live 路径已全部 typed（emit + project_agent_event）；本函数与 EventDispatcher /
+    DURABLE_TYPES 等 string-channel 残留按 C-2 随 #4（events push 化）一并处置。
     """
     project(event, sink)
 

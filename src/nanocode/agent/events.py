@@ -1,8 +1,9 @@
 """agent/events.py — typed AgentEvent union（docs/15 §6）。
 
-`AgentCore.run_turn(state, request) -> AsyncIterator[AgentEvent]` 发出这些事件；`AgentSession`
-把它们转成 canonical session entries / telemetry entries / UI 投影——取代旧的**双发**
-（`_dispatch_event` 的 RuntimeEvent + `_tree_event` / `_tree_record` / `_tree_custom_message`）。
+AgentCore / engine 经 **单一出口 `Agent.emit(event)`** 发出这些事件（docs/16 #2），扇出
+`[AgentSession.record_event（canonical 树）, runtime_events.project_agent_event（UI 投影）]`
+——旧的**双发**（`_dispatch_event` 的 RuntimeEvent + `_tree_event` / `_tree_record` /
+`_tree_custom_message` 各自直调）已被取代。
 
 与 `runtime_events.DURABLE_EVENT_FIELDS` 的 **additive 契约**对齐（trajectory 从 canonical 树派生，
 docs/14 B2）：事件字段只增不改名/不删。每个事件携带把它落成 session entry 所需的全部中立事实
@@ -71,11 +72,12 @@ class ToolCallRequested:
 
 @dataclass(frozen=True)
 class ToolCallAuthorized:
-    """权限决策结果（落 PERMISSION_DECISION 遥测 entry）。action ∈ allow|confirm|deny。"""
+    """权限决策结果（落 PERMISSION_DECISION 遥测 entry）。action ∈ allow|confirm|deny。
+    tool_use_id 可空（_authorize_dispatch 的决策点只见 (name, input)；树 entry 历来不含它）。"""
 
     tool: str
-    tool_use_id: str
     action: str
+    tool_use_id: str = ""
     message: str | None = None
     kind: str = "tool_call_authorized"
 
@@ -95,11 +97,34 @@ class ToolResultCompleted:
 
 @dataclass(frozen=True)
 class ToolBlocked:
-    """call-time allowlist fail-closed 拦截（落 TOOL_BLOCKED 遥测 entry）。"""
+    """call-time allowlist fail-closed 拦截（落 TOOL_BLOCKED 遥测 entry；agentType/artifactId
+    由 record_event 从 agent 身份补齐——事件本身只携带拦截事实）。"""
 
     tool: str
     reason: str
     kind: str = "tool_blocked"
+
+
+@dataclass(frozen=True)
+class ToolResultObserved:
+    """工具执行完成的**即时观测**（逐工具、执行点实时发出；**仅 UI 投影**）。
+
+    durable 等价物是批量 toolResult 消息在收口点拆出的 ToolResultCompleted——观测在执行点、
+    树写在批量消息收口点，两个时刻本就不同（docs/16 #1 锁定的 inline 顺序），故是两个事件。"""
+
+    tool: str
+    tool_use_id: str
+    chars: int
+    result: str
+    kind: str = "tool_result_observed"
+
+
+@dataclass(frozen=True)
+class BudgetExceeded:
+    """成本/turn 预算触顶，模型循环终止（落 BUDGET_EXCEEDED 遥测 entry）。"""
+
+    reason: str
+    kind: str = "budget_exceeded"
 
 
 @dataclass(frozen=True)
@@ -158,7 +183,9 @@ AgentEvent = Union[
     ToolCallRequested,
     ToolCallAuthorized,
     ToolResultCompleted,
+    ToolResultObserved,
     ToolBlocked,
+    BudgetExceeded,
     CompactionRequested,
     ContextInjected,
     TurnCompleted,
@@ -168,7 +195,8 @@ AgentEvent = Union[
 
 ALL_AGENT_EVENTS: tuple[type, ...] = (
     UserMessageAccepted, LlmRequestPrepared, AssistantDelta, AssistantMessageCompleted,
-    ToolCallRequested, ToolCallAuthorized, ToolResultCompleted, ToolBlocked,
+    ToolCallRequested, ToolCallAuthorized, ToolResultCompleted, ToolResultObserved,
+    ToolBlocked, BudgetExceeded,
     CompactionRequested, ContextInjected, TurnCompleted, TurnAborted, ErrorRaised,
 )
 
@@ -183,7 +211,9 @@ DURABLE_ENTRY_FOR_EVENT: dict[str, str | None] = {
     "tool_call_requested": None,
     "tool_call_authorized": "permission_decision",
     "tool_result_completed": "message",
+    "tool_result_observed": None,
     "tool_blocked": "tool_blocked",
+    "budget_exceeded": "budget_exceeded",
     "compaction_requested": "compaction",
     "context_injected": "custom_message",
     "turn_completed": "turn_end",

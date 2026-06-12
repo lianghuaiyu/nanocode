@@ -130,21 +130,34 @@ def test_project_durable_only_types_are_noop_for_ui():
     assert sk.calls == []  # durable-only type 无 UI 投影
 
 
-# ─── Agent._dispatch_event live 接线（只投影到 sink；无 tracer）────────────────
+# ─── Agent.emit live 接线（docs/16 #2：typed AgentEvent 单出口，UI 腿投影到 sink）─────
 
-def test_agent_dispatch_event_tool_call_projects():
+def test_agent_emit_tool_call_requested_projects():
     from nanocode.agent.engine import Agent
+    from nanocode.agent.events import ToolCallRequested
     a = Agent(api_key="test", session_id="rtevt1", permission_mode="bypassPermissions")
     sk = _RecSink()
     a._sink = sk
-    a._dispatch_event("tool_call", tool="run_shell", input={"command": "ls"}, tool_use_id="tu1")
+    a.emit(ToolCallRequested(tool="run_shell", input={"command": "ls"}, tool_use_id="tu1"))
     assert sk.calls == [("tool_call", "run_shell", {"command": "ls"})]
 
 
-def test_agent_dispatch_event_tool_result_projects():
+def test_agent_emit_tool_result_observed_projects():
     from nanocode.agent.engine import Agent
+    from nanocode.agent.events import ToolResultObserved
     a = Agent(api_key="test", session_id="rtevt2", permission_mode="bypassPermissions")
     sk = _RecSink()
     a._sink = sk
-    a._dispatch_event("tool_result", tool="read_file", tool_use_id="x", chars=3, result="abc")
+    a.emit(ToolResultObserved(tool="read_file", tool_use_id="x", chars=3, result="abc"))
     assert sk.calls == [("tool_result", "read_file", "abc")]
+
+
+def test_agent_emit_assistant_delta_projects_text_and_thinking():
+    from nanocode.agent.engine import Agent
+    from nanocode.agent.events import AssistantDelta
+    a = Agent(api_key="test", session_id="rtevt3", permission_mode="bypassPermissions")
+    sk = _RecSink()
+    a._sink = sk
+    a.emit(AssistantDelta(text="hello "))
+    a.emit(AssistantDelta(thinking="hmm"))
+    assert sk.calls == [("assistant_markdown", "hello "), ("thinking", "hmm")]

@@ -3,7 +3,7 @@
 把 dispatch 从「依赖 Agent god-class」改为「依赖一个显式协议」——这是解开
 core/_execute_tool_call 锁链（docs/16 #1/#3）与 AgentProfile spawn cutover（#9）的结构前提。
 
-诚实地宽（~18 成员）：真实工具派发确实需要 allowlist 判定、hooks、后台 spawn、task 面板与
+诚实地宽（~17 成员）：真实工具派发确实需要 allowlist 判定、hooks、后台 spawn、task 面板与
 plan/skill/agent 路由——这是工具派发的真实依赖面，不是意外耦合。Agent 结构性满足本协议
 （runtime_checkable 结构检查由 tests/tools/test_spec.py 锚定）；任何替代宿主只需实现同一面。
 """
@@ -20,16 +20,14 @@ class ToolHost(Protocol):
     # ── 身份 / 状态 ──
     session_id: str
     is_sub_agent: bool
-    agent_type: Any
-    artifact_id: Any
     task_manager: Any
     _background_tasks: Any
     _suppress_hooks: Any
     _active_hooks: Any
 
-    # ── allowlist 咽喉点 + 遥测 ──
+    # ── allowlist 咽喉点 + 遥测（emit：typed AgentEvent 单出口，docs/16 #2）──
     def _tool_blocked_by_allowlist(self, name: str) -> bool: ...
-    def _tree_event(self, entry_type: str, **data) -> None: ...
+    def emit(self, event) -> bool: ...
 
     # ── 派发目标 ──
     async def _spawn_background_shell(self, command: str, timeout_ms) -> str: ...

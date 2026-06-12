@@ -5,10 +5,11 @@ STEP C：把原 AnthropicBackendMixin._chat_anthropic / OpenAIBackendMixin._chat
 full suite 持续 exercise（等价性证明）。
 
 §6 边界：AgentCore 自身**不**直接写 session、不 build system prompt、不发现 skills/subagents/MCP、
-不写 artifacts、不持 durable provider messages。docs/16 #1（STEP D-1）：**message family 的树写入
-已反转**——capture-at-emit（events_from_provider_message，#0 工厂）→ host.agent_session.record_event
-（required=True 唯一树写者）。遥测/注入/上下文仍经 host 委托（host._tree_event / host._inject_* /
-host._build_request_messages / host._execute_tool_call），由 STEP D-2/E（docs/16 #2/#6）继续反转。
+不写 artifacts、不持 durable provider messages。docs/16 #1：message family 经 capture-at-emit
+（events_from_provider_message，#0 工厂）反转；docs/16 #2：遥测/UI/记忆注入也全部 typed 事件化
+——本模块对 session/UI 的全部触达收敛为 **host.emit(AgentEvent)** 单出口（扇出
+record_event(树) + UI 投影）。仍经 host 委托的只剩注入器（host._inject_*，#6 provider 化）、
+上下文构建（_build_request_messages）与工具派发/预算等 loop 配置（#3 收敛进 AgentLoopConfig）。
 
 provider-specific 的两条循环变体保留（adapter-driven）；不强行合一。
 """
@@ -20,9 +21,16 @@ import json
 import time
 
 from ..memory import start_memory_prefetch, format_memories_for_injection
-from ..session import tree as _tree
 from ..tools import CONCURRENCY_SAFE_TOOLS
-from .events import events_from_provider_message
+from .events import (
+    AssistantDelta,
+    BudgetExceeded,
+    ContextInjected,
+    LlmRequestPrepared,
+    ToolCallRequested,
+    ToolResultObserved,
+    events_from_provider_message,
+)
 from .loop import group_openai_batches
 from .providers import StreamCallbacks
 
@@ -34,12 +42,12 @@ class AgentCore:
     def _record_messages(host, provider_msg: dict, *, stop_reason: "str | None" = None,
                          usage: "dict | None" = None, latency_ms: "int | None" = None) -> None:
         """message family 唯一树写者（docs/16 #1）：capture-at-emit（#0 工厂，与原 _tree_record 内联
-        capture 树级等价）→ AgentSession.record_event（required=True，写失败 fail-loud——树是唯一权威，
+        capture 树级等价）→ host.emit → record_event（required=True，写失败 fail-loud——树是唯一权威，
         无 flat 兜底，缺一条 = 下一轮上下文错误）。"""
         for ev in events_from_provider_message(
                 provider_msg, provider=("openai" if host.use_openai else "anthropic"),
                 model=host.model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms):
-            host.agent_session.record_event(ev)
+            host.emit(ev)
 
     async def run_turn(self, host, user_message: str) -> None:
         if host.use_openai:
@@ -75,12 +83,13 @@ class AgentCore:
                         # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup，
                         # 下一轮 prefetch 重新浮现（不静默丢记忆）。
                         injection_text = format_memories_for_injection(memories)
-                        if host._tree_custom_message("memory", injection_text):
+                        if host.emit(ContextInjected(custom_type="memory", content=injection_text)):
                             for m in memories:
                                 host._already_surfaced_memories.add(m.path)
                                 host._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass
+                except Exception as e:
+                    # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
+                    host._sink.info(f"[memory] recall injection failed: {e}")
 
             host._inject_finished_tasks()
             host._inject_skill_listing()
@@ -99,14 +108,14 @@ class AgentCore:
                         early_executions[block["id"]] = task
 
             host._anthropic_messages = host._build_request_messages()
-            host._tree_event(_tree.LLM_REQUEST, model=host.model,
-                             messageCount=len(host._anthropic_messages),
-                             messagesChars=len(json.dumps(host._anthropic_messages, default=str)))
+            host.emit(LlmRequestPrepared(
+                model=host.model, message_count=len(host._anthropic_messages),
+                messages_chars=len(json.dumps(host._anthropic_messages, default=str))))
             _t_req = time.time()
             cb = StreamCallbacks(
                 spinner_stop=host._sink.spinner_stop,
                 text_block=host._emit_block,
-                thinking_block=lambda t: host._dispatch_event("assistant_thinking", text=t),
+                thinking_block=lambda t: host.emit(AssistantDelta(thinking=t)),
                 tool_block=_on_tool_block,
                 retry=host._sink.retry,
             )
@@ -134,16 +143,8 @@ class AgentCore:
                                   usage={"inputTokens": response.usage.input_tokens,
                                          "outputTokens": response.usage.output_tokens},
                                   latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
-            host._dispatch_event(
-                "assistant_message",
-                text="".join(b.text for b in response.content if b.type == "text"),
-                thinking=getattr(response, "_nanocode_thinking", ""),
-                tool_uses=[
-                    {"id": b.id, "name": b.name,
-                     "input": dict(b.input) if hasattr(b.input, "items") else b.input}
-                    for b in response.content if b.type == "tool_use"
-                ],
-            )
+            # docs/16 #2：旧的 _dispatch_event("assistant_message") 双发已删——AssistantMessageCompleted
+            # 由上面 _record_messages 的 emit 单发承载（UI 投影 no-op：流式已逐 block 渲染）。
 
             if not tool_uses:
                 if not host.is_sub_agent:
@@ -154,7 +155,7 @@ class AgentCore:
             budget = host._check_budget()
             if budget["exceeded"]:
                 host._sink.info(f"Budget exceeded: {budget['reason']}")
-                host._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
+                host.emit(BudgetExceeded(reason=budget["reason"]))
                 break
 
             tool_results: list[dict] = []
@@ -163,14 +164,14 @@ class AgentCore:
                 if context_break or host._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, "items") else tu.input
-                host._dispatch_event("tool_call", tool=tu.name, input=inp, tool_use_id=tu.id)
+                host.emit(ToolCallRequested(tool=tu.name, input=inp, tool_use_id=tu.id))
 
                 early_task = early_executions.get(tu.id)
                 if early_task:
                     raw = await early_task
                     res = host._persist_large_result(tu.name, raw)
                     _lat = int((time.time() - early_started.get(tu.id, time.time())) * 1000)
-                    host._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
+                    host.emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
                                          "toolName": tu.name, "toolLatencyMs": _lat})
                     continue
@@ -185,7 +186,7 @@ class AgentCore:
                 raw = await host._execute_tool_call(tu.name, inp)
                 res = host._persist_large_result(tu.name, raw)
                 _lat = int((time.time() - _t_tool) * 1000)
-                host._dispatch_event("tool_result", tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res)
+                host.emit(ToolResultObserved(tool=tu.name, tool_use_id=tu.id, chars=len(res), result=res))
 
                 if host._context_cleared:
                     host._context_cleared = False
@@ -232,12 +233,13 @@ class AgentCore:
                     if memories:
                         # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup。
                         injection_text = format_memories_for_injection(memories)
-                        if host._tree_custom_message("memory", injection_text):
+                        if host.emit(ContextInjected(custom_type="memory", content=injection_text)):
                             for m in memories:
                                 host._already_surfaced_memories.add(m.path)
                                 host._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass
+                except Exception as e:
+                    # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
+                    host._sink.info(f"[memory] recall injection failed: {e}")
 
             host._inject_finished_tasks()
             host._inject_skill_listing()
@@ -246,9 +248,9 @@ class AgentCore:
                 host._sink.spinner_start()
 
             host._openai_messages = host._build_request_messages()
-            host._tree_event(_tree.LLM_REQUEST, model=host.model,
-                             messageCount=len(host._openai_messages),
-                             messagesChars=len(json.dumps(host._openai_messages, default=str)))
+            host.emit(LlmRequestPrepared(
+                model=host.model, message_count=len(host._openai_messages),
+                messages_chars=len(json.dumps(host._openai_messages, default=str))))
             _t_req = time.time()
             cb = StreamCallbacks(spinner_stop=host._sink.spinner_stop,
                                  text_block=host._emit_block, retry=host._sink.retry)
@@ -276,19 +278,8 @@ class AgentCore:
                                          "outputTokens": _u.get("completion_tokens", 0)}
                                   if (_u := (response.get("usage") or {})) else None,
                                   latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
-
-            _tcs = message.get("tool_calls") or []
-            host._dispatch_event(
-                "assistant_message",
-                text=message.get("content") or "",
-                thinking="",
-                tool_uses=[
-                    {"id": tc.get("id"),
-                     "name": (tc.get("function") or {}).get("name"),
-                     "input": (tc.get("function") or {}).get("arguments")}
-                    for tc in _tcs
-                ],
-            )
+            # docs/16 #2：旧的 _dispatch_event("assistant_message") 双发已删——AssistantMessageCompleted
+            # 由上面 _record_messages 的 emit 单发承载（UI 投影 no-op：流式已逐 block 渲染）。
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
@@ -300,7 +291,7 @@ class AgentCore:
             budget = host._check_budget()
             if budget["exceeded"]:
                 host._sink.info(f"Budget exceeded: {budget['reason']}")
-                host._tree_event(_tree.BUDGET_EXCEEDED, reason=budget["reason"])
+                host.emit(BudgetExceeded(reason=budget["reason"]))
                 break
 
             # Phase 1: Parse & permission-check (serial)
@@ -316,7 +307,7 @@ class AgentCore:
                 except Exception:
                     inp = {}
 
-                host._dispatch_event("tool_call", tool=fn_name, input=inp, tool_use_id=tc["id"])
+                host.emit(ToolCallRequested(tool=fn_name, input=inp, tool_use_id=tc["id"]))
 
                 allowed, denial = await host._authorize_dispatch(fn_name, inp)
                 if not allowed:
@@ -338,7 +329,8 @@ class AgentCore:
                         raw = await host._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = host._persist_large_result(ct_item["fn"], raw)
                         _lat = int((time.time() - _t0) * 1000)
-                        host._dispatch_event("tool_result", tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"], chars=len(res), result=res)
+                        host.emit(ToolResultObserved(tool=ct_item["fn"], tool_use_id=ct_item["tc"]["id"],
+                                                     chars=len(res), result=res))
                         return ct_item, res, _lat
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
@@ -357,7 +349,8 @@ class AgentCore:
                         raw = await host._execute_tool_call(ct["fn"], ct["inp"])
                         res = host._persist_large_result(ct["fn"], raw)
                         _lat = int((time.time() - _t_tool) * 1000)
-                        host._dispatch_event("tool_result", tool=ct["fn"], tool_use_id=ct["tc"]["id"], chars=len(res), result=res)
+                        host.emit(ToolResultObserved(tool=ct["fn"], tool_use_id=ct["tc"]["id"],
+                                                     chars=len(res), result=res))
 
                         if host._context_cleared:
                             host._context_cleared = False

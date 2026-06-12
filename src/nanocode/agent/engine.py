@@ -35,6 +35,14 @@ from ..memory.maintenance import (
     build_eval_curator_message,
 )
 from .sink import EventSink, TerminalSink, BufferSink
+from .events import (
+    AssistantDelta,
+    ContextInjected,
+    ToolBlocked,
+    ToolCallAuthorized,
+    TurnAborted,
+    TurnCompleted,
+)
 from ..prompt import build_system_prompt
 from ..skills.listing import (
     skill_listing_delta,
@@ -53,7 +61,6 @@ from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
 from ..tasks.inject import render_task_reminder, collect_pending_injections
 from ..session import v2 as _session_v2
-from ..session import tree as _tree
 from ..tools import tasks_tool
 
 from .models import (
@@ -389,10 +396,11 @@ class Agent(PlanModeMixin):
             self._aborted = True
         finally:
             self._current_task = None
-        # docs/14 Milestone B：把 turn-end 累计遥测落进树（trajectory 的 total_turns + 终态 step 从此派生）。
-        self._tree_event(_tree.TURN_END, inputTokens=self.total_input_tokens,
-                         outputTokens=self.total_output_tokens, turns=self.current_turns,
-                         finalStatus="cancelled" if self._aborted else "completed")
+        # docs/14 Milestone B：turn-end 累计遥测落树（trajectory 的 total_turns + 终态 step 从此派生）。
+        # docs/16 #2：经 emit→record_event 单写（typed TurnCompleted/TurnAborted → TURN_END entry）。
+        ev_cls = TurnAborted if self._aborted else TurnCompleted
+        self.emit(ev_cls(input_tokens=self.total_input_tokens,
+                         output_tokens=self.total_output_tokens, turns=self.current_turns))
         if not self.is_sub_agent:
             self._auto_save()
 
@@ -432,7 +440,7 @@ class Agent(PlanModeMixin):
             return
         for pack in plan.packs:
             if pack.kind not in present:                  # per-customType：只注入缺失的 kind
-                self._tree_custom_message(pack.kind, pack.content)
+                self.emit(ContextInjected(custom_type=pack.kind, content=pack.content))
 
     def _session_context_present_kinds(self) -> set[str]:
         """当前 branch **经 context.fold 实际渲染**的 session-context customType 集合。
@@ -485,7 +493,7 @@ class Agent(PlanModeMixin):
         return sub_agent._captured_text()
 
     def _emit_block(self, text: str) -> None:
-        self._dispatch_event("assistant_block", text=text)
+        self.emit(AssistantDelta(text=text))
 
     # ─── REPL commands ────────────────────────────────────────
 
@@ -707,6 +715,15 @@ class Agent(PlanModeMixin):
             self._agent_session_obj = AgentSession(self)
         return self._agent_session_obj
 
+    def emit(self, event) -> bool:
+        """docs/16 #2：**单一事件出口**——一条 typed AgentEvent 扇出
+        `[agent_session.record_event（canonical 树）, project_agent_event（UI 投影）]`
+        （push 订阅者/recorder 在 #4 挂上同一扇出）。树先于 UI：required 写失败 fail-loud 时
+        不画半截 UI。返回 record_event 的写入结果（ContextInjected 调用方据此推进 dedup）。"""
+        written = self.agent_session.record_event(event)
+        runtime_events.project_agent_event(event, self._sink)
+        return written
+
     def _tree_record(self, provider_msg: dict, *, stop_reason: "str | None" = None,
                      usage: "dict | None" = None, latency_ms: "int | None" = None,
                      required: bool = False) -> None:
@@ -742,16 +759,17 @@ class Agent(PlanModeMixin):
 
     def _tree_event(self, entry_type: str, **data) -> None:
         """docs/14 Milestone B：把一条派生遥测写成**注解型**树 entry（不在 FOLD_TYPES、不推进 leaf、
-        对 LLM 不可见），供 trajectory 从树派生（取代原只进 wire 的 tracer.emit）。全 guarded：绝不破坏
-        live turn。**防御性剔除 reward/eval_result**——派生标签绝不进事实源（docs/10 三层边界：
-        tree=facts / metrics·evals=labels-never-in-tree；取代原 Tracer.emit 的同名剥除）。"""
+        对 LLM 不可见），供 trajectory 从树派生。docs/16 #2 后唯一调用方 = AgentSession.record_event
+        （emit 单出口的树腿；#3 将随 _tree_* 族整体迁入 AgentSession）。失败**可观测**（sink.info，
+        不静默）但不破坏 live turn——遥测是注解、非 message family。**防御性剔除 reward/eval_result**
+        ——派生标签绝不进事实源（docs/10 三层边界：tree=facts / metrics·evals=labels-never-in-tree）。"""
         data.pop("reward", None)
         data.pop("eval_result", None)
         try:
             if self._session_mgr is not None:
                 self._session_mgr.append(entry_type, data)
-        except Exception:
-            pass
+        except Exception as e:
+            self._sink.info(f"[tree] telemetry append failed ({entry_type}): {e}")
 
     def _build_request_messages(self) -> list:
         """docs/13 cutover S2 + docs/14 SessionLease：从 canonical 树渲染本轮请求（`render(build_context())`）。
@@ -780,8 +798,9 @@ class Agent(PlanModeMixin):
             state["session_id"] = self.session_id
             state["startTime"] = self.session_start_time
             _session_v2.write_state(self.session_id, state)
-        except Exception:
-            pass
+        except Exception as e:
+            # docs/16 #2：silent pass 已清——derived cache 落盘失败必须可观测（不破坏 live turn）。
+            self._sink.info(f"[state] v2 state persist failed: {e}")
 
     # ─── Autocompact ──────────────────────────────────────────
 
@@ -813,15 +832,16 @@ class Agent(PlanModeMixin):
         if summary:
             try:
                 # docs/14 SessionLease：_session_mgr 由 lease 注入/_ensure 自取（compaction 发生在 turn
-                # 活动期，mgr 必在）。缺则 guarded 跳过（observable via except），不再 lazy create。
+                # 活动期，mgr 必在）。缺则跳过；append 失败可观测（sink.info，docs/16 #2 清 silent pass）
+                # ——丢 compaction entry 意味着树渲染不收缩，必须浮现。
                 if self._session_mgr is not None:
                     self._session_mgr.append_compaction(
                         summary=summary, tokens_before=tokens_before,
                         first_kept_entry_id=first_kept, kind="auto",
                         message_count_before=before_count,
                         message_count_after=self._get_message_count())
-            except Exception:
-                pass
+            except Exception as e:
+                self._sink.info(f"[tree] compaction entry append failed: {e}")
         self._sink.info("Conversation compacted.")
         self._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
@@ -833,8 +853,10 @@ class Agent(PlanModeMixin):
     def _tree_custom_message(self, custom_type: str, content, *, parent_id: "str | None" = None) -> bool:
         """docs/13 P5 / docs/14 §4.5+full-P6b：把一次注入作为 custom_message entry 写进 canonical 树
         （主 agent=自身树，子 agent=child 树；按 _session_mgr 而非 is_sub_agent gate）。parent_id 显式给定
-        时挂到指定 entry（background pin-to-spawn-branch 用）。返回是否真正写入——调用方据此推进 dedup /
-        flat 兜底（docs/14 P3 review #7：写失败不得静默丢注入 + 不得误推进 dedup）。"""
+        时挂到指定 entry（background pin-to-spawn-branch 预留）。docs/16 #2 后唯一调用方 =
+        AgentSession.record_event（ContextInjected 的树腿）。返回是否真正写入——emit 调用方据此推进
+        dedup（docs/14 P3 review #7：写失败不得静默丢注入 + 不得误推进 dedup）；写失败**可观测**
+        （sink.info，不静默）。"""
         if self._session_mgr is None:
             return False
         try:
@@ -843,18 +865,19 @@ class Agent(PlanModeMixin):
                                      {"customType": custom_type, "content": content, "display": False},
                                      parent_id=parent_id)
             return True
-        except Exception:
+        except Exception as e:
+            self._sink.info(f"[tree] custom_message append failed ({custom_type}): {e}")
             return False
 
     def _inject_skill_listing(self) -> None:
-        """skill 清单 → custom_message entry（树是唯一注入通道，docs/16 #1：flat 注入已删）。
+        """skill 清单 → ContextInjected 事件 → custom_message entry（树是唯一注入通道，docs/16 #1/#2）。
         dedup（_sent_skill_names）**只在树写成功后**推进——失败则下一轮重试，不静默丢清单。"""
         if self.is_sub_agent:
             return
         text, new_names = skill_listing_delta(
             self._sent_skill_names, self._activated_path_skills, self._skill_listing_budget()
         )
-        if text and self._tree_custom_message("skill_listing", text):
+        if text and self.emit(ContextInjected(custom_type="skill_listing", content=text)):
             self._sent_skill_names.update(new_names)
 
     def _on_file_touched(self, name: str, inp: dict) -> None:
@@ -883,12 +906,12 @@ class Agent(PlanModeMixin):
                 self._activated_path_skills.add(s.name)
 
     def _inject_pending_skill_bodies(self) -> None:
-        """skill body → custom_message entry（树是唯一注入通道，docs/16 #1：flat 注入已删）。
+        """skill body → ContextInjected 事件 → custom_message entry（树是唯一注入通道，docs/16 #1/#2）。
         树写失败的 body 留在队列、下一轮重试（不静默丢指令）。"""
         remaining: list = []
         for name, body in self._pending_skill_bodies:
             msg = render_skill_body_message(name, body)
-            if not self._tree_custom_message("skill_body", msg.get("content", "")):
+            if not self.emit(ContextInjected(custom_type="skill_body", content=msg.get("content", ""))):
                 remaining.append((name, body))
         self._pending_skill_bodies = remaining
 
@@ -924,7 +947,7 @@ class Agent(PlanModeMixin):
         if not pending:
             return
         text = "\n\n".join(render_task_reminder(t) for t in pending)
-        if not self._tree_custom_message("finished_tasks", text):
+        if not self.emit(ContextInjected(custom_type="finished_tasks", content=text)):
             return
         for t in pending:
             self.task_manager.update_task(t.id, injected=True)
@@ -979,8 +1002,7 @@ class Agent(PlanModeMixin):
         # P4 安全基石：skill hook 会以 run_shell 身份跑命令。若本（子）agent 的有效集
         # 不含 run_shell，则它不得借 skill hook 旁路获得 shell——按 allowlist fail-closed。
         if self._tool_blocked_by_allowlist("run_shell"):
-            self._tree_event(_tree.TOOL_BLOCKED, tool="run_shell", reason="hook_not_in_allowlist",
-                             agentType=self.agent_type, artifactId=self.artifact_id)
+            self.emit(ToolBlocked(tool="run_shell", reason="hook_not_in_allowlist"))
             return False, (f"hook command blocked: run_shell is not permitted for this sub-agent "
                            f"({h['skill']} {h['event']})")
         perm = check_permission("run_shell", {"command": cmd}, self.permission_mode)
@@ -1196,12 +1218,6 @@ class Agent(PlanModeMixin):
     def _render_agent_result_envelope(self, result: dict, raw_text: str) -> str:
         return agent_result.render_agent_result_envelope(result, raw_text)
 
-    def _dispatch_event(self, _type: str, **fields) -> None:
-        """单流发射：UI → projection（读 live self._sink）。durable 持久化已迁出本流——派生遥测经
-        _tree_event/_tree_record 落 canonical 树（Milestone B），wire/Tracer 已退役。"""
-        runtime_events.dispatch_event(
-            runtime_events.RuntimeEvent(_type, fields), self._sink)
-
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
         """把子 agent 已花费的 token 折叠进父（成功/超时/错误都折；实现在 runtime/spawn.py）。"""
         return self._spawn.fold_subagent_tokens(self, sub_agent)
@@ -1289,7 +1305,7 @@ class Agent(PlanModeMixin):
         拒绝消息 "Error: tool '…' is not permitted" 与 prompt-then-block 行为不变）。
         """
         d = self.permission.check(name, inp)
-        self._tree_event(_tree.PERMISSION_DECISION, tool=name, action=d.action, message=d.message)
+        self.emit(ToolCallAuthorized(tool=name, action=d.action, message=d.message))
         if d.action == "deny":
             self._sink.info(f"Denied: {d.message}")
             return False, f"Action denied: {d.message}"

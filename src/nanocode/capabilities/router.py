@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from enum import Enum
 
-from ..session import tree as _tree
 from ..tools.permissions import (
     ALWAYS_ALLOWED_META, AGENT_META_TOOL, allowlist_blocks,
 )
@@ -77,8 +76,8 @@ class CapabilityRouter:
     async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
         # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
         if host._tool_blocked_by_allowlist(name):
-            host._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",
-                             agentType=host.agent_type, artifactId=host.artifact_id)
+            from ..agent.events import ToolBlocked   # lazy：避免 capabilities↔agent 包级 import 环
+            host.emit(ToolBlocked(tool=name, reason="not_in_allowlist"))
             return f"Error: tool '{name}' is not permitted for this sub-agent."
         if name == "run_shell" and inp.get("run_in_background"):
             tid = await host._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))

@@ -75,7 +75,8 @@ class AgentSession:
         消息族（user/assistant/toolResult）的 event.message 已是**中立 Message**——直接 append_message
         （不经 capture；capture 是 provider→中立 的逆向,中立再 capture 会丢 toolCall 块）。required=True
         写失败 fail-loud（删 flat 后必须,§7.6）。遥测族走 _tree_event（注解型,不推进 leaf）；context_injected
-        走 _tree_custom_message。AssistantDelta/ToolCallRequested/ErrorRaised 无树等价物。
+        走 _tree_custom_message。AssistantDelta/ToolCallRequested/ToolResultObserved/ErrorRaised
+        无树等价物（仅 UI / 无持久化）。
         """
         a = self.agent
         k = getattr(event, "kind", None)
@@ -104,12 +105,16 @@ class AgentSession:
             a._tree_event(_tree.TOOL_BLOCKED, tool=event.tool, reason=event.reason,
                           agentType=a.agent_type, artifactId=a.artifact_id)
             return True
+        if k == "budget_exceeded":
+            a._tree_event(_tree.BUDGET_EXCEEDED, reason=event.reason)
+            return True
         if k in ("turn_completed", "turn_aborted"):
             a._tree_event(_tree.TURN_END, inputTokens=event.input_tokens,
                           outputTokens=event.output_tokens, turns=event.turns,
                           finalStatus="cancelled" if k == "turn_aborted" else "completed")
             return True
-        # assistant_delta / tool_call_requested / error_raised / compaction_requested → 无直接树等价物
+        # assistant_delta / tool_call_requested / tool_result_observed / error_raised /
+        # compaction_requested → 无直接树等价物
         return False
 
     def _append_neutral(self, neutral_msg: dict, *, required: bool) -> None:

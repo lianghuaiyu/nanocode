@@ -29,10 +29,10 @@ def _noop(*_a, **_k) -> None:  # 默认 callback：无表现层时全 no-op
 class StreamCallbacks:
     """流式期间的 UI 副作用注入点（fire-and-forget，绝不影响控制流）。
 
-    与旧 `_call_*_stream` 内联的 `self._sink.*` / `self._emit_block` / `self._dispatch_event` 一一对应：
+    与旧 `_call_*_stream` 内联的 UI 副作用一一对应（docs/16 #2 后由 host.emit 的 typed 事件承载）：
     - spinner_stop：首个 text/thinking block 收尾前停 spinner；
-    - text_block：完整 text block（UI markdown，= self._emit_block）；
-    - thinking_block：完整 thinking block（= dispatch assistant_thinking）；
+    - text_block：完整 text block（UI markdown，= host._emit_block → AssistantDelta(text)）；
+    - thinking_block：完整 thinking block（= emit AssistantDelta(thinking)）；
     - tool_block：tool_use block 收尾（流式早执行触发，= on_tool_block_complete）；
     - retry：重试通知（= self._sink.retry），None 则不通知。
     """
