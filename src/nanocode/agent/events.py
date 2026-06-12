@@ -17,9 +17,13 @@ from typing import Any, Union
 
 @dataclass(frozen=True)
 class UserMessageAccepted:
-    """用户输入被接受（在模型请求前；AgentSession 据此 append_message required=True）。"""
+    """用户输入被接受（在模型请求前；AgentSession 据此 append_message required=True）。
+
+    message（additive，docs/16 #0）：已 capture 的中立 user Message；非 None 时 record_event 直接
+    append（保留 block content/timestamp 语义），None 时退回 text 重建（纯文本场景等价）。"""
 
     text: str
+    message: dict | None = None
     kind: str = "user_message_accepted"
 
 
@@ -186,3 +190,65 @@ DURABLE_ENTRY_FOR_EVENT: dict[str, str | None] = {
     "turn_aborted": "turn_end",
     "error_raised": None,
 }
+
+
+# ─── capture-at-emit（docs/16 #0）───────────────────────────────────────────
+#
+# STEP D 的唯一致命陷阱拆雷：AgentCore 持有的 message 是 **provider-shaped**（anthropic block
+# dicts / openai message dicts），而 AgentSession.record_event._append_neutral 假设 event.message
+# 已是**中立 Message**（绕过 capture——中立再 capture 会丢 toolCall 块）。因此转换必须发生在
+# **emit 时**（AgentCore 知道 provider 形状）。本工厂与 engine._tree_record 的内联 capture 路径
+# **逐字节等价**（同一 neutral_stop_reason 映射、同一 capture_anthropic/capture_openai），由
+# tests/agent/test_capture_at_emit.py 的树级 parity 测试锚定。
+
+def events_from_provider_message(
+    provider_msg: dict,
+    *,
+    provider: str,
+    model: str,
+    stop_reason: "str | None" = None,
+    usage: "dict | None" = None,
+    latency_ms: "int | None" = None,
+) -> list["AgentEvent"]:
+    """一条 provider-shaped 消息 → 0+ 条 message-family AgentEvent（capture-at-emit）。
+
+    入参语义与 `engine._tree_record` 一致：`stop_reason` 是 provider **原生**值（此处映射成
+    中立值再交 capture）；`usage`/`latency_ms` 透传。产出事件的 `.message` 即中立 Message，
+    可直接 `record_event`（required=True append）。
+
+    条数语义沿袭 capture：anthropic 的 tool_result-user 批量消息拆成 N 条 ToolResultCompleted；
+    openai 的 system 消息产 0 条；assistant 恒 1 条。
+    """
+    import json as _json
+
+    from ..session import capture as _capture
+
+    neutral_sr = _capture.neutral_stop_reason(provider, stop_reason)
+    cap = _capture.capture_openai if provider == "openai" else _capture.capture_anthropic
+    out: list[AgentEvent] = []
+    for m in cap(provider_msg, model=model, stop_reason=neutral_sr,
+                 usage=usage, latency_ms=latency_ms):
+        role = m.get("role")
+        if role == "user":
+            c = m.get("content")
+            out.append(UserMessageAccepted(text=c if isinstance(c, str) else "", message=m))
+        elif role == "assistant":
+            blocks = m.get("content") or []
+            text = "".join(b.get("text", "") for b in blocks
+                           if isinstance(b, dict) and b.get("type") == "text")
+            thinking = "".join(b.get("thinking", "") for b in blocks
+                               if isinstance(b, dict) and b.get("type") == "thinking")
+            tool_uses = [{"id": b.get("id"), "name": b.get("name"), "input": b.get("arguments")}
+                         for b in blocks if isinstance(b, dict) and b.get("type") == "toolCall"]
+            out.append(AssistantMessageCompleted(
+                message=m, text=text, thinking=thinking, tool_uses=tool_uses,
+                stop_reason=m.get("stopReason"), usage=m.get("usage"),
+                latency_ms=m.get("latencyMs")))
+        elif role == "toolResult":
+            c = m.get("content")
+            content = c if isinstance(c, str) else _json.dumps(c, ensure_ascii=False, default=str)
+            out.append(ToolResultCompleted(
+                message=m, tool=m.get("toolName", ""), tool_use_id=m.get("toolCallId", ""),
+                content=content, is_error=bool(m.get("isError", False)),
+                latency_ms=m.get("latencyMs")))
+    return out

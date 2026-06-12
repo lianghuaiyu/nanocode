@@ -80,7 +80,9 @@ class AgentSession:
         a = self.agent
         k = getattr(event, "kind", None)
         if k == "user_message_accepted":
-            self._append_neutral(_tree.user_message(event.text), required=True)
+            # docs/16 #0：优先用已 capture 的中立 message（保留 block content）；缺则按 text 重建。
+            neutral = getattr(event, "message", None) or _tree.user_message(event.text)
+            self._append_neutral(neutral, required=True)
             return True
         if k == "assistant_message_completed":
             self._append_neutral(event.message, required=True)
