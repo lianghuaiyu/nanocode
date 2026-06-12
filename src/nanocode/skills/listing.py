@@ -65,4 +65,3 @@ def skill_listing_delta(sent_names: set[str],
 
 def render_skill_body_message(name: str, body: str) -> dict:
     return {"role": "user", "content": f"<command-name>{name}</command-name>\n\n{body}"}
-
