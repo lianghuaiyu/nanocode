@@ -421,11 +421,11 @@ class Agent(PlanModeMixin):
     # docs/16 #3a：compaction 流程（阈值门 + entry 写入）归 AgentSession（turn shell / compaction
     # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（实现在 AgentCore，
     # summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走 agent_session.compact()。
-    async def _compact_anthropic(self) -> "str | None":
-        return await self._core._compact_anthropic(self)
+    async def _compact_anthropic(self, messages: "list | None") -> "str | None":
+        return await self._core._compact_anthropic(self, messages)
 
-    async def _compact_openai(self) -> "str | None":
-        return await self._core._compact_openai(self)
+    async def _compact_openai(self, messages: "list | None") -> "str | None":
+        return await self._core._compact_openai(self, messages)
 
     # ─── Message-list ownership：已退役（docs/16 #3c）─────────────────────────
     # _anthropic_messages/_openai_messages/_active_messages/_load_messages/_dump_messages/

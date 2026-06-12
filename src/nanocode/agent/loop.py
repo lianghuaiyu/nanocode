@@ -49,6 +49,7 @@ class AgentLoopConfig:
     token_totals: Callable[[], tuple]
     # ── 控制流信号 ──
     is_aborted: Callable[[], bool]
+    compact: Callable[[], Awaitable[None]]            # overflow 恢复（docs/16 #10）：压缩后重试一次
     consume_context_break: Callable[[], bool]         # plan clear-and-execute 的 turn 内信号
     # ── turn-boundary 注入 ──
     inject_turn_context: Callable[[], None]           # finished_tasks + skill_listing

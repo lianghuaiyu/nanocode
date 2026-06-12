@@ -26,7 +26,7 @@ from .events import (
     ToolResultObserved,
 )
 from .loop import AgentLoopConfig, group_openai_batches
-from .providers import StreamCallbacks
+from .providers import StreamCallbacks, is_context_overflow_error
 
 
 class AgentCore:
@@ -40,6 +40,7 @@ class AgentCore:
     # ─── Anthropic turn ──────────────────────────────────────────────────────
     async def run_anthropic_turn(self, state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]:
         messages: list = []
+        overflow_retried = False        # docs/16 #10：每 turn 至多一次 overflow→compact→重试
         while True:
             if cfg.is_aborted():
                 break
@@ -73,9 +74,22 @@ class AgentCore:
                 tool_block=_on_tool_block,
                 retry=cfg.sink.retry,
             )
-            response = await stream_fn(
-                model=cfg.model, system=proj.system, tools=cfg.tools,
-                messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
+            try:
+                response = await stream_fn(
+                    model=cfg.model, system=proj.system, tools=cfg.tools,
+                    messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
+            except Exception as e:
+                # docs/16 #10：provider 上下文溢出不再是死 turn——压缩后重试一次
+                # （abort 门控：被取消的 turn 不做恢复；重试后仍溢出 → 如实上抛）。
+                if (not overflow_retried and not cfg.is_aborted()
+                        and is_context_overflow_error(e)):
+                    overflow_retried = True
+                    if not cfg.is_sub_agent:
+                        cfg.sink.spinner_stop()
+                    cfg.sink.info("Provider context overflow — compacting and retrying once...")
+                    await cfg.compact()
+                    continue
+                raise
             _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not cfg.is_sub_agent:
@@ -157,6 +171,7 @@ class AgentCore:
     # ─── OpenAI turn ─────────────────────────────────────────────────────────
     async def run_openai_turn(self, state, cfg: AgentLoopConfig, emit, *, stream_fn) -> list[dict]:
         messages: list = []
+        overflow_retried = False        # docs/16 #10：每 turn 至多一次 overflow→compact→重试
         while True:
             if cfg.is_aborted():
                 break
@@ -176,9 +191,20 @@ class AgentCore:
             cb = StreamCallbacks(spinner_stop=cfg.sink.spinner_stop,
                                  text_block=lambda t: emit(AssistantDelta(text=t)),
                                  retry=cfg.sink.retry)
-            response = await stream_fn(
-                model=cfg.model, system=None, tools=cfg.tools,
-                messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
+            try:
+                response = await stream_fn(
+                    model=cfg.model, system=None, tools=cfg.tools,
+                    messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
+            except Exception as e:
+                if (not overflow_retried and not cfg.is_aborted()
+                        and is_context_overflow_error(e)):
+                    overflow_retried = True
+                    if not cfg.is_sub_agent:
+                        cfg.sink.spinner_stop()
+                    cfg.sink.info("Provider context overflow — compacting and retrying once...")
+                    await cfg.compact()
+                    continue
+                raise
             _latency_ms = int((time.time() - _t_req) * 1000)
 
             if not cfg.is_sub_agent:
@@ -278,38 +304,54 @@ class AgentCore:
                 cfg.inject_skill_bodies()
         return messages
 
-    # ─── Summary compaction（docs/16 #3a：summarizer 输入 = 树渲染，不再读/写 flat 列表）────
+    # ─── Summary compaction（docs/16 #3a/#10）─────────────────────────────────
     #
     # host-driven（经 Agent._compact_* 委托调用，per-instance monkeypatch 锚）：summarizer 是
     # 一次独立 LLM 调用、不在纯 loop 内；真正的 shrink 是 AgentSession.compact 写的 COMPACTION entry。
+    # docs/16 #10：summarizer 只吃 **prefix 投影**（kept-suffix 由 AgentSession 的 keepRecentTokens
+    # cut-point 排除）——summary 与 fold 保留区绝不双计同一段内容。
 
-    async def _compact_anthropic(self, host) -> "str | None":
-        messages = host.agent_session.hydrate_state().project().messages
-        if len(messages) < 4:
+    _SUMMARIZE_PROMPT = ("Summarize the conversation so far in a concise paragraph, "
+                         "preserving key decisions, file paths, and context needed to continue the work.")
+
+    @staticmethod
+    def _with_summary_request(messages: list, prompt_text: str) -> list:
+        """把 summarize 指令接到 prefix 末尾。prefix 末条若是 user（render 保证列表内交替，
+        但 prefix 截断可停在 user 上），把指令并入该条（anthropic 不接受连续 user）。"""
+        msgs = list(messages)
+        if msgs and msgs[-1].get("role") == "user":
+            last = dict(msgs[-1])
+            c = last.get("content")
+            if isinstance(c, list):
+                last["content"] = list(c) + [{"type": "text", "text": "\n\n" + prompt_text}]
+            else:
+                last["content"] = (c or "") + "\n\n" + prompt_text
+            msgs[-1] = last
+        else:
+            msgs.append({"role": "user", "content": prompt_text})
+        return msgs
+
+    async def _compact_anthropic(self, host, messages: "list | None") -> "str | None":
+        if messages is None or len(messages) < 3:
             return None
         summary_resp = await host._anthropic_client.messages.create(
             model=host.model,
             max_tokens=2048,
             system="You are a conversation summarizer. Be concise but preserve important details.",
-            messages=[
-                *messages[:-1],
-                {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
-            ],
+            messages=self._with_summary_request(messages, self._SUMMARIZE_PROMPT),
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
         host.last_input_token_count = 0
         return summary_text
 
-    async def _compact_openai(self, host) -> "str | None":
-        messages = host.agent_session.hydrate_state().project().messages
-        if len(messages) < 5:
+    async def _compact_openai(self, host, messages: "list | None") -> "str | None":
+        if messages is None or len(messages) < 4:     # 含 render 注入的 system[0]
             return None
         summary_resp = await host._openai_client.chat.completions.create(
             model=host.model,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *messages[1:-1],
-                {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
+                *self._with_summary_request(messages[1:], self._SUMMARIZE_PROMPT),
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "No summary available."

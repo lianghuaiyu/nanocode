@@ -5,7 +5,7 @@ from nanocode.session import tree
 from nanocode.session.manager import SessionManager
 
 
-async def _fake_summary():
+async def _fake_summary(_messages=None):
     return "THE SUMMARY"
 
 
@@ -67,35 +67,65 @@ def test_last_user_message_id_picks_last_user_not_leaf():
     assert m.last_user_message_id() == last_user.id                  # cut point 指向 last-user
 
 
-def test_engine_compaction_auto_cut_point_is_last_user_when_leaf(monkeypatch):
-    # auto-compact 触发于刚记完 user 消息（leaf == 该 user）→ firstKeptEntryId = 该 user（保留它）。
+def test_compaction_cut_point_keeps_recent_user_within_budget(monkeypatch):
+    # docs/16 #10 keepRecentTokens：firstKept = 预算内最近的 user MESSAGE 边界；
+    # summarizer 只吃 prefix（kept suffix 绝不进 summary——两区 fold 不双计）。
     import asyncio
     a = Agent(api_key="test", session_id="s4auto", permission_mode="bypassPermissions")
     a.model = "claude-x"
     mgr = SessionManager.create("s4auto")
     a._session_mgr = mgr
-    mgr.append_message(tree.user_message("old"))
-    mgr.append_message(tree.assistant_message([tree.text_block("a1")], provider="anthropic",
+    mgr.append_message(tree.user_message("old question " * 50))
+    mgr.append_message(tree.assistant_message([tree.text_block("a1 " * 50)], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
-    last_user = mgr.append_message(tree.user_message("recent question"))   # leaf == this user
-    monkeypatch.setattr(a, "_compact_anthropic", _fake_summary)
+    last_user = mgr.append_message(tree.user_message("recent"))
+    seen = {}
+
+    async def _fake(messages=None):
+        seen["messages"] = messages
+        return "S"
+
+    monkeypatch.setattr(a, "_compact_anthropic", _fake)
+    monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 5)   # 预算只容末条 user
     asyncio.run(a.agent_session.compact())
     comp = [e for e in mgr.entries() if e.type == tree.COMPACTION]
     assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] == last_user.id
+    assert "old question" in str(seen["messages"])      # prefix 进 summarizer
+    assert "recent" not in str(seen["messages"])        # kept suffix 不进 summarizer
 
 
-def test_engine_compaction_manual_cut_point_none_when_leaf_is_assistant(monkeypatch):
-    # manual /compact 在 turn 间（leaf = assistant）→ firstKeptEntryId = None（旧消息全被 summary 顶替，
-    # 与 backend 行为一致：末条非 user 时 summary 后不留旧消息，docs/14 P3 review #5）。
+def test_compaction_cut_point_none_when_no_user_boundary_fits(monkeypatch):
+    # 末条 user 自身已超预算 → 无可保的 user 边界 → firstKept=None（旧消息全由 summary 顶替）。
     import asyncio
     a = Agent(api_key="test", session_id="s4man", permission_mode="bypassPermissions")
     a.model = "claude-x"
     mgr = SessionManager.create("s4man")
     a._session_mgr = mgr
-    mgr.append_message(tree.user_message("recent question"))
+    mgr.append_message(tree.user_message("recent question " * 100))
     mgr.append_message(tree.assistant_message([tree.text_block("ans")], provider="anthropic",
-                       api="anthropic", model="claude-x", stop_reason="stop"))   # leaf = assistant
+                       api="anthropic", model="claude-x", stop_reason="stop"))
     monkeypatch.setattr(a, "_compact_anthropic", _fake_summary)
+    monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 1)
     asyncio.run(a.agent_session.compact())
     comp = [e for e in mgr.entries() if e.type == tree.COMPACTION]
     assert len(comp) == 1 and comp[0].data["firstKeptEntryId"] is None
+
+
+def test_compaction_skipped_when_everything_fits_keep_budget(monkeypatch):
+    # 整个对话都在 keep 预算内 → prefix 为空 → summarizer 拿 None → 不写 compaction entry
+    # （无可压缩内容时绝不写空 summary 顶替历史）。
+    import asyncio
+    a = Agent(api_key="test", session_id="s4fit", permission_mode="bypassPermissions")
+    a.model = "claude-x"
+    mgr = SessionManager.create("s4fit")
+    a._session_mgr = mgr
+    mgr.append_message(tree.user_message("q"))
+    mgr.append_message(tree.assistant_message([tree.text_block("a")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+
+    async def _fake(messages=None):
+        return None if not messages else "S"
+
+    monkeypatch.setattr(a, "_compact_anthropic", _fake)
+    asyncio.run(a.agent_session.compact())          # 默认预算远大于内容
+    assert [e for e in mgr.entries() if e.type == tree.COMPACTION] == []

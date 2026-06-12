@@ -131,6 +131,7 @@ class AgentSession:
             bump_turn=bump_turn, note_api_call=note_api_call, add_usage=add_usage,
             token_totals=lambda: (a.total_input_tokens, a.total_output_tokens),
             is_aborted=lambda: a._aborted,
+            compact=self.compact,
             consume_context_break=consume_context_break,
             inject_turn_context=inject_turn_context,
             inject_skill_bodies=self.inject_pending_skill_bodies,
@@ -238,23 +239,27 @@ class AgentSession:
             a._sink.info(f"[memory] recall injection failed: {e}")
 
     async def compact(self, instructions: str | None = None) -> None:
-        """压缩当前对话（docs/16 #3a：compaction owner 上移到 turn shell）。
+        """压缩当前对话（docs/16 #3a/#10：compaction owner = turn shell）。
 
-        summarizer 输入吃**树渲染**（hydrate_state().project()，与发给模型的上下文一致）——
-        不再读 flat 列表；产出经 `CompactionRequested→record_event` 写 COMPACTION entry
-        （两区 fold 的唯一 shrink 通道）。firstKept 语义保持 docs/14 §4.4 bug#1：
-        cut = last_user id 仅当它 == live leaf（auto-compact 刚记完 user 消息时），否则 None。
-        instructions 预留（自定义摘要指令）。"""
+        keepRecentTokens（#10）：kept-suffix 起点 = 预算内最近的 **user MESSAGE** entry
+        （_compaction_cut_point）；summarizer 只吃 **prefix 投影**（cut 之前的 fold→render）——
+        cut-point 与 summarizer kept-suffix 同一来源，summary 与 fold 保留区绝不双计。
+        产出经 `CompactionRequested→record_event` 写 COMPACTION entry（两区 fold 的唯一
+        shrink 通道）。instructions 预留（自定义摘要指令）。"""
         a = self.agent
         mgr = a._session_mgr
+        if mgr is None:
+            a._sink.info("Nothing to compact (no active session tree).")
+            return
         tokens_before = a.last_input_token_count
-        before_count = len(mgr.build_context().messages) if mgr is not None else None
-        first_kept = None
-        if mgr is not None:
-            leaf = mgr.get_leaf()
-            last_u = mgr.last_user_message_id()
-            first_kept = last_u if last_u == leaf else None
-        summary = await (a._compact_openai() if a.use_openai else a._compact_anthropic())
+        before_count = len(mgr.build_context().messages)
+        branch = mgr.get_branch()
+        first_kept = self._compaction_cut_point(branch)
+        cut_idx = (next((i for i, e in enumerate(branch) if e.id == first_kept), len(branch))
+                   if first_kept is not None else len(branch))
+        prefix_messages = self._project_branch_prefix(branch[:cut_idx])
+        summary = await (a._compact_openai(prefix_messages) if a.use_openai
+                         else a._compact_anthropic(prefix_messages))
         if summary:
             self.record_event(_events.CompactionRequested(
                 reason="context_window", tokens_before=tokens_before, summary=summary,
@@ -266,11 +271,62 @@ class AgentSession:
         a._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
     async def check_and_compact(self) -> None:
-        """auto-compact 阈值门（原 engine._check_and_compact，turn shell 职责）。"""
+        """auto-compact 阈值门（turn shell 职责）。abort 门控（docs/16 #10）：被取消的 turn
+        不触发压缩——abort 后的 token 计数/分支状态不值得花一次 summarizer 调用。"""
         a = self.agent
+        if a._aborted:
+            return
         if a.last_input_token_count > a.effective_window * 0.85:
             a._sink.info("Context window filling up, compacting conversation...")
             await self.compact()
+
+    def keep_recent_tokens(self) -> int:
+        """compaction 保留的近期 suffix 预算（pi keepRecentTokens 的有用子集）：
+        有效窗口的 10%，下限 4000 token。"""
+        return max(4000, int(self.agent.effective_window * 0.10))
+
+    def _compaction_cut_point(self, branch) -> "str | None":
+        """kept-suffix 起点：从分支尾部按 token 估计累计，选**预算内最近的 user MESSAGE** entry。
+
+        必须是 user 消息边界——assistant/toolResult 开头的悬挂 suffix 会被 render 的
+        inverse-orphan 清洗掉（信息丢失）或形成断链。无预算内的 user 边界 → None
+        （旧消息全部由 summary 顶替）。"""
+        from ..context.packs import estimate_tokens
+        budget = self.keep_recent_tokens()
+        total = 0
+        cut = None
+        for e in reversed(branch):
+            if e.type == _tree.MESSAGE:
+                content = (e.data.get("message") or {}).get("content", "")
+            elif e.type == _tree.CUSTOM_MESSAGE:
+                content = e.data.get("content", "")
+            else:
+                continue
+            total += estimate_tokens(content if isinstance(content, (str, list)) else str(content))
+            if total > budget:
+                break
+            if (e.type == _tree.MESSAGE
+                    and (e.data.get("message") or {}).get("role") == "user"):
+                cut = e.id
+        return cut
+
+    def _project_branch_prefix(self, prefix_entries) -> "list | None":
+        """branch 前缀 → provider-shaped 消息（summarizer 输入）。与请求渲染同一管线
+        （fold→convert_to_llm→render），summarizer 看到的 = 模型曾看到的前缀。空前缀 → None。"""
+        if not prefix_entries:
+            return None
+        a = self.agent
+        from ..session import context as _ctx
+        from ..session.render import ModelCtx, render
+        rich, _ = _ctx.fold(list(prefix_entries))
+        neutral = _ctx.convert_to_llm(rich)
+        if not neutral:
+            return None
+        provider = "openai" if a.use_openai else "anthropic"
+        api = "openai-completions" if a.use_openai else "anthropic"
+        sysp = a._system_prompt if a.use_openai else None
+        return render(neutral, ModelCtx(provider=provider, api=api, model_id=a.model),
+                      system_prompt=sysp)["messages"]
 
     def _predicted_post_compaction_count(self, summary: str, first_kept: "str | None") -> "int | None":
         """预测 compaction entry 落树后的 neutral 消息数（entry 是 append-only，写后不可补字段，

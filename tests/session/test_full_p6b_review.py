@@ -25,7 +25,7 @@ def test_subagent_compaction_writes_to_its_child_tree(monkeypatch):
     sub._session_mgr = SessionManager.create(sub._tree_session_id, parent_session=sub._child_parent_session)
     sub._session_mgr.append_message(T.user_message("u"))      # leaf == last user
 
-    async def fake():
+    async def fake(_messages=None):
         return "SUB-SUMMARY"
 
     monkeypatch.setattr(sub, "_compact_anthropic", fake)

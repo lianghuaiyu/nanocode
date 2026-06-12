@@ -21,6 +21,22 @@ from ..tools import get_active_tool_definitions
 from .models import _get_max_output_tokens, _to_openai_tools, _with_retry
 
 
+def is_context_overflow_error(e: BaseException) -> bool:
+    """provider 上下文溢出判定（docs/16 #10：overflow 恢复的触发器）。
+
+    保守的字符串匹配（provider SDK 异常类型/版本各异，但溢出文案稳定）：
+    anthropic 'prompt is too long' / 'input length and `max_tokens` exceed'；
+    openai 'context_length_exceeded'（code）/ 'maximum context length'（message）。
+    """
+    text = str(e).lower()
+    return any(m in text for m in (
+        "prompt is too long",
+        "input length and `max_tokens` exceed",
+        "context_length_exceeded",
+        "maximum context length",
+    ))
+
+
 def _noop(*_a, **_k) -> None:  # 默认 callback：无表现层时全 no-op
     return None
 
