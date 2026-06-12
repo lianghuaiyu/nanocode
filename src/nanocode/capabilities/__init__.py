@@ -13,6 +13,7 @@
 from .permissions import PermissionContext, decide
 from .router import (
     Capability,
+    CapabilityRouter,
     classify_capability,
     is_always_allowed_meta,
     router_allowlist_blocks,
@@ -22,6 +23,7 @@ __all__ = [
     "PermissionContext",
     "decide",
     "Capability",
+    "CapabilityRouter",
     "classify_capability",
     "is_always_allowed_meta",
     "router_allowlist_blocks",

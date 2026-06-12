@@ -200,6 +200,9 @@ class Agent(PlanModeMixin):
         self._subagents = SubAgentManager(self)
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
         self._spawn = SubAgentRunner()
+        # docs/15 Phase 5：工具派发单一入口（allowlist 咽喉点 + meta/agent/skill/real 路由 + hooks）。
+        from ..capabilities import CapabilityRouter
+        self._router = CapabilityRouter()
         # docs/14 §6b（additive child-session）：spawn 时记下父 leaf，finalize 镜像 child session 时
         # 作 parentSession.entryId（pin 到 spawn 分支）。agent_id → 父 spawn leaf。
         self._subagent_spawn_leaf: dict = {}
@@ -955,68 +958,11 @@ class Agent(PlanModeMixin):
         return self.permission.allowlist_blocks(name)
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
-        # P4 call-time allowlist enforcement（安全基石）：在任何真实工具派发（含
-        # run_shell 后台分支）之前 fail-closed。仅约束 REAL 工具——子 agent 合法持有的
-        # meta 工具（task_*/memory/plan_mode/skill；agent 永远被剥）不在约束内。
-        # 这是覆盖前台 + 后台 run_shell 的单一咽喉点：run_shell 后台分支在下方先于 meta
-        # 拦截返回，若不在此处先判，read-only agent 仍能借 run_in_background 跑 run_shell。
-        if self._tool_blocked_by_allowlist(name):
-            self._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",
-                             agentType=self.agent_type, artifactId=self.artifact_id)
-            return f"Error: tool '{name}' is not permitted for this sub-agent."
-        if name == "run_shell" and inp.get("run_in_background"):
-            tid = await self._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
-            return (f"Started background shell task {tid}. It will report completion later. "
-                    f"Use task_output with task_id={tid} to inspect progress.")
-        if name == "task_list":
-            return tasks_tool.list_tasks_text(self.task_manager, inp.get("status"), inp.get("kind"))
-        if name == "task_output":
-            return tasks_tool.task_output_text(self.task_manager, inp.get("task_id", ""),
-                                               int(inp.get("tail_bytes") or 8000))
-        if name == "task_stop":
-            # 子 agent 共享父 TaskManager：限制其只能 stop 自己持有协程的 task，
-            # 不得把父/兄弟的 task 标 cancelled（orphan-cancel 仅主 agent 可用）。
-            return await tasks_tool.task_stop(
-                self.task_manager, self._background_tasks, inp.get("task_id", ""),
-                allow_orphan_cancel=not self.is_sub_agent)
-        if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
-            return await self._recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
-        if name == "memory" and inp.get("action") == "consolidate":
-            # 记忆巩固会 spawn 一个 curator（孙 agent）并批量改写宿主记忆文件——属
-            # 宿主/会话级操作，子 agent 不得触发（否则绕过 agent 后备 + depth/threads）。
-            if self.is_sub_agent:
-                return ("Error: memory consolidation is a host/session operation and "
-                        "is not available to sub-agents.")
-            return await self._spawn_memory_consolidate()
-        if name in ("enter_plan_mode", "exit_plan_mode"):
-            # Plan mode 是主 agent / REPL 流程，会改写 self.permission_mode。子 agent
-            # 若能 exit_plan_mode 就能把自己从 plan 放宽到 default——自我提权。禁用之。
-            if self.is_sub_agent:
-                return "Error: plan-mode tools are not available to sub-agents."
-            return await self._execute_plan_mode_tool(name)
-        if name == "agent":
-            return await self._execute_agent_tool(inp)
-        if name == "skill":
-            return await self._execute_skill_tool(inp)
-        # 真实工具(mcp/execute_tool)——受 hooks 约束(meta 工具上面已返回)
-        # session_id 单一注入点：sandbox/run_shell 走显式 _session_id（去全局竞态），保留 env 回退
-        if name in ("run_shell", "sandbox_shell") and "_session_id" not in inp:
-            inp = {**inp, "_session_id": self.session_id}
-        if self._suppress_hooks or not self._active_hooks:
-            return await self._run_real_tool(name, inp)
-        for h in self._matching_hooks("pre-tool-use", name):
-            ok, msg = await self._run_hook(h, name, inp, None)
-            if not ok:
-                return f"[blocked by skill hook {h['skill']} (pre-tool-use)] {msg}"
-        result = await self._run_real_tool(name, inp)
-        warnings = []
-        for h in self._matching_hooks("post-tool-use", name):
-            ok, msg = await self._run_hook(h, name, inp, result)
-            if not ok:
-                warnings.append(f"[skill hook {h['skill']} (post-tool-use) warning] {msg}")
-        if warnings:
-            result = result + "\n\n" + "\n".join(warnings)
-        return result
+        """工具派发 callgate（实现搬迁到 capabilities.CapabilityRouter.dispatch；以下为薄委托）。
+
+        allowlist fail-closed 咽喉点 + meta/agent/skill/real 路由 + hooks 都在 router；engine 保此入口供
+        backend loop（host._execute_tool_call）+ 早执行 + tests 调用。"""
+        return await self._router.dispatch(self, name, inp)
 
     async def _run_real_tool(self, name: str, inp: dict) -> str:
         if self._mcp_manager.is_mcp_tool(name):

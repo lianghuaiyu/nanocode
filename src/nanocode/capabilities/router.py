@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+from ..session import tree as _tree
 from ..tools.permissions import (
     ALWAYS_ALLOWED_META, AGENT_META_TOOL, allowlist_blocks,
 )
@@ -61,3 +62,67 @@ def router_allowlist_blocks(name: str, allowed_tool_names: "set[str] | frozenset
     - 其余（含 memory/skill/run_shell/真实工具/MCP）→ 不在有效集内即拦截。
     """
     return allowlist_blocks(name, allowed_tool_names)
+
+
+class CapabilityRouter:
+    """工具派发的单一入口（docs/15 §5）：allowlist fail-closed 咽喉点 + meta/agent/skill/real 路由 + hooks。
+
+    host-driven（host=Agent 提供 collaborators）。从 engine._execute_tool_call 逐字搬迁,行为不变。
+    'agent'/'skill' 经 host 方法路由（**不 import engine**）——结构上消除 execute.py 注释提到的
+    tools↔agent 循环 import。allowlist 判定（host._tool_blocked_by_allowlist）仍是第一道、覆盖前台 +
+    后台 run_shell 的单一 fail-closed 咽喉点（§5 风险#3）。
+    """
+
+    async def dispatch(self, host, name: str, inp: dict) -> str:
+        # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
+        if host._tool_blocked_by_allowlist(name):
+            host._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",
+                             agentType=host.agent_type, artifactId=host.artifact_id)
+            return f"Error: tool '{name}' is not permitted for this sub-agent."
+        if name == "run_shell" and inp.get("run_in_background"):
+            tid = await host._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
+            return (f"Started background shell task {tid}. It will report completion later. "
+                    f"Use task_output with task_id={tid} to inspect progress.")
+        from ..tools import tasks_tool
+        if name == "task_list":
+            return tasks_tool.list_tasks_text(host.task_manager, inp.get("status"), inp.get("kind"))
+        if name == "task_output":
+            return tasks_tool.task_output_text(host.task_manager, inp.get("task_id", ""),
+                                               int(inp.get("tail_bytes") or 8000))
+        if name == "task_stop":
+            return await tasks_tool.task_stop(
+                host.task_manager, host._background_tasks, inp.get("task_id", ""),
+                allow_orphan_cancel=not host.is_sub_agent)
+        if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
+            return await host._recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
+        if name == "memory" and inp.get("action") == "consolidate":
+            if host.is_sub_agent:
+                return ("Error: memory consolidation is a host/session operation and "
+                        "is not available to sub-agents.")
+            return await host._spawn_memory_consolidate()
+        if name in ("enter_plan_mode", "exit_plan_mode"):
+            if host.is_sub_agent:
+                return "Error: plan-mode tools are not available to sub-agents."
+            return await host._execute_plan_mode_tool(name)
+        if name == "agent":
+            return await host._execute_agent_tool(inp)
+        if name == "skill":
+            return await host._execute_skill_tool(inp)
+        # 真实工具(mcp/execute_tool)——受 hooks 约束(meta 工具上面已返回)。
+        if name in ("run_shell", "sandbox_shell") and "_session_id" not in inp:
+            inp = {**inp, "_session_id": host.session_id}
+        if host._suppress_hooks or not host._active_hooks:
+            return await host._run_real_tool(name, inp)
+        for h in host._matching_hooks("pre-tool-use", name):
+            ok, msg = await host._run_hook(h, name, inp, None)
+            if not ok:
+                return f"[blocked by skill hook {h['skill']} (pre-tool-use)] {msg}"
+        result = await host._run_real_tool(name, inp)
+        warnings = []
+        for h in host._matching_hooks("post-tool-use", name):
+            ok, msg = await host._run_hook(h, name, inp, result)
+            if not ok:
+                warnings.append(f"[skill hook {h['skill']} (post-tool-use) warning] {msg}")
+        if warnings:
+            result = result + "\n\n" + "\n".join(warnings)
+        return result
