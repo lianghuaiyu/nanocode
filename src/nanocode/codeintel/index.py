@@ -1,12 +1,16 @@
 """codeintel/index.py — RepoIndex：Aider-style 代码库结构感知（docs/15 §9）。
 
-抽取：Python 走 **stdlib AST**（pyast.py：defs 带签名 + refs；语法错回退词法）；其余语言词法
-defs-only。tree-sitter 装上后可在同一接口背后替换（SymbolTag schema 已统一）。
+发现：root 即 git toplevel 走 `git ls-files`（吃 .gitignore）,否则 rglob;全量清单 _all_files。
+抽取：Python 走 **stdlib AST**（pyast.py：defs 带签名 + refs;语法错回退词法）;其余语言
+tree-sitter（可选 extra `codeintel`,vendored *-tags.scm,ts.py）→ 词法回退;
+defs-without-refs → Pygments 回填（aider get_tags_raw 同款）。
 
-排名（对照 aider repomap 语义）：personal 文件（已读/已改/chat）是**排名种子、不是输出**——
-它们的全文已在上下文里，渲染它们是浪费；map 的价值是顺着引用边把「还没读但相关」的文件拉进来。
-单跳引用加权（personal 的 refs → 命中 def 的其他文件加分），mentioned_idents 同时匹配 def 名
-与路径成分（aider 的 path-component 技巧）。不做 PageRank（GitHub 级，docs/16 §5 推迟）。
+排名（graph.py,aider get_ranked_tags 复刻）：personal 文件（已读/已改/chat）是**排名种子、
+不是输出**——全文已在上下文,map 的价值是顺引用边把「还没读但相关」的文件拉进来;
+个性化 PageRank + rank 分发到 (文件, 符号)。
+
+渲染：to_tree（aider 同构）——TreeContext 骨架（Python=treectx.py 复刻;其余语言装了
+grep-ast 走真 TreeContext,否则 render_plain）+ 裸文件名,二分搜索拟合 token 预算。
 
 repo map 不是工具,而是经 RepoMapProvider 注入的 ContextProvider（§9.2）：按任务/已读文件/提及符号
 个性化 + 预算封顶。
@@ -57,7 +61,9 @@ class RepoQuery:
 
 
 def extract_symbols(rel_path: str, abs_path: str, text: str) -> list[SymbolTag]:
-    """抽取一个文件的 symbols：Python → AST defs+refs（语法错回退词法）；其余语言词法 defs。"""
+    """抽取一个文件的 symbols。优先级：Python → stdlib AST（限定名+签名,语法错回退词法）；
+    其余语言 → tree-sitter（可选 extra,装了即 aider 同款精度）→ 词法回退。
+    defs-without-refs → Pygments 回填（aider get_tags_raw 同层同款）。"""
     lang = language_for_path(rel_path)
     if lang is None:
         return []
@@ -67,6 +73,14 @@ def extract_symbols(rel_path: str, abs_path: str, text: str) -> list[SymbolTag]:
             return extract_python_symbols(rel_path, abs_path, text)
         except (SyntaxError, ValueError, RecursionError):
             pass                                   # 语法错/病态文件 → 词法回退（aider 同款降级）
+        return _extract_lexical(rel_path, abs_path, text, lang)
+    from .ts import extract_ts_symbols
+    tags = extract_ts_symbols(rel_path, abs_path, text, lang)
+    if tags is not None:                           # tree-sitter 路径（空列表也算成功——aider 语义）
+        kinds = {t.kind for t in tags}
+        if "def" in kinds and "ref" not in kinds:
+            tags = tags + _pygments_refs(rel_path, abs_path, text, lang)
+        return tags
     return _extract_lexical(rel_path, abs_path, text, lang)
 
 
@@ -295,7 +309,10 @@ class RepoIndex:
             try:
                 code = Path(abs_path).read_text(encoding="utf-8", errors="replace")
                 if language_for_path(rel) == "python":
-                    ctx = PyTreeContext(code)
+                    ctx = PyTreeContext(code)      # stdlib,始终可用
+                else:
+                    from .ts import tree_context
+                    ctx = tree_context(rel, code)  # grep-ast 装了 → 真 TreeContext;否则 None
             except (OSError, SyntaxError, ValueError, RecursionError):
                 code = ""
             cached = (mtime, ctx, code)

@@ -23,7 +23,10 @@ def test_extract_symbols_python(tmp_path):
     assert foo.line == 3
 
 
-def test_extract_symbols_js_ts(tmp_path):
+def test_extract_symbols_js_ts_lexical_fallback(tmp_path, monkeypatch):
+    # 显式钉词法回退路径（extra 未装时的行为）；tree-sitter 路径见 test_ts.py。
+    import nanocode.codeintel.ts as ts_mod
+    monkeypatch.setattr(ts_mod, "ts_available", lambda: False)
     p = _write(tmp_path, "m.ts", "export function run() {}\nclass Svc {}\nexport const make = () => {}\ninterface I {}\ntype T = string\n")
     names = {t.name for t in extract_symbols("m.ts", str(p), p.read_text())}
     assert {"run", "Svc", "make", "I", "T"} <= names

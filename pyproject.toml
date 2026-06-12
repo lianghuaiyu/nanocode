@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 simplemem = ["lancedb>=0.4.0", "pyarrow>=12.0.0", "numpy>=1.24.0", "dateparser>=1.1.0", "rank-bm25>=0.2.2"]
+codeintel = ["grep-ast>=0.8", "tree-sitter-language-pack>=0.13,<1.0"]
 
 [project.scripts]
 nanocode = "nanocode.entrypoints.cli:main"
@@ -28,7 +29,7 @@ where = ["src"]
 include = ["nanocode*"]
 
 [tool.setuptools.package-data]
-nanocode = ["system_prompt.md"]
+nanocode = ["system_prompt.md", "codeintel/queries/*.scm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
