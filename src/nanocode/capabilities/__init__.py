@@ -5,11 +5,13 @@
                   + decide()。
   router.py       CapabilityRouter dispatch taxonomy（meta/agent/skill/plan/real 分类 + 单一 allowlist
                   咽喉点判定）。
+  host.py         ToolHost typed port（dispatch 的宿主依赖面,docs/16 #5）。
 
 迁移策略：先落地 **PermissionContext + 分类 taxonomy**（additive,可测）;engine._execute_tool_call
 改为经 router 派发（消除 tools↔agent 循环 import、保单一 allowlist 咽喉点）是后续 cutover 步骤。
 """
 
+from .host import ToolHost
 from .permissions import PermissionContext, decide
 from .router import (
     Capability,
@@ -20,6 +22,7 @@ from .router import (
 )
 
 __all__ = [
+    "ToolHost",
     "PermissionContext",
     "decide",
     "Capability",

@@ -17,6 +17,7 @@ from ..session import tree as _tree
 from ..tools.permissions import (
     ALWAYS_ALLOWED_META, AGENT_META_TOOL, allowlist_blocks,
 )
+from .host import ToolHost
 
 
 class Capability(str, Enum):
@@ -67,13 +68,13 @@ def router_allowlist_blocks(name: str, allowed_tool_names: "set[str] | frozenset
 class CapabilityRouter:
     """工具派发的单一入口（docs/15 §5）：allowlist fail-closed 咽喉点 + meta/agent/skill/real 路由 + hooks。
 
-    host-driven（host=Agent 提供 collaborators）。从 engine._execute_tool_call 逐字搬迁,行为不变。
+    host-driven（host: ToolHost——typed port,docs/16 #5；Agent 结构性满足）。从 engine._execute_tool_call 逐字搬迁,行为不变。
     'agent'/'skill' 经 host 方法路由（**不 import engine**）——结构上消除 execute.py 注释提到的
     tools↔agent 循环 import。allowlist 判定（host._tool_blocked_by_allowlist）仍是第一道、覆盖前台 +
     后台 run_shell 的单一 fail-closed 咽喉点（§5 风险#3）。
     """
 
-    async def dispatch(self, host, name: str, inp: dict) -> str:
+    async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
         # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
         if host._tool_blocked_by_allowlist(name):
             host._tree_event(_tree.TOOL_BLOCKED, tool=name, reason="not_in_allowlist",

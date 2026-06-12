@@ -8,17 +8,12 @@ import os
 from pathlib import Path
 
 from . import registry
+from . import run_shell, sandbox_shell
 from .shared import _truncate_result
-from . import read_file, write_file, edit_file, list_files, grep_search, run_shell, sandbox_shell, web_fetch, memory_tool
+from .spec import TOOLS
 
-_HANDLERS = {
-    "read_file": read_file.run, "write_file": write_file.run,
-    "edit_file": edit_file.run, "list_files": list_files.run,
-    "grep_search": grep_search.run, "run_shell": run_shell.run,
-    "sandbox_shell": sandbox_shell.run,
-    "web_fetch": web_fetch.run,
-    "memory": memory_tool.run,
-}
+# docs/16 #5：handler 表从 spec.TOOLS 派生（单一真相源；host-routed 工具 run=None 不在表内）。
+_HANDLERS = {name: s.run for name, s in TOOLS.items() if s.run is not None}
 
 
 _SANDBOX_FAIL_HINT = (
