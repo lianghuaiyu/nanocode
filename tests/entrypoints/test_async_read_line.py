@@ -139,3 +139,26 @@ def test_sigint_handler_restored_after_read():
         signal.signal(signal.SIGINT, prev)
 
 
+
+
+def test_async_read_line_default_prefills_editor():
+    """docs/16 pi /fork：default= 预填编辑器——直接回车则原样发回，也可先编辑。"""
+    async def scenario():
+        with create_pipe_input() as pipe:
+            pipe.send_text("\n")                              # 直接接受预填内容
+            return await cli._async_read_line(input=pipe, output=DummyOutput(),
+                                              default="forked prompt")
+
+    out = asyncio.run(scenario())
+    assert out == "forked prompt"
+
+
+def test_async_read_line_default_is_editable():
+    async def scenario():
+        with create_pipe_input() as pipe:
+            pipe.send_text(" edited\n")                       # 在预填文本（光标在尾）后追加
+            return await cli._async_read_line(input=pipe, output=DummyOutput(),
+                                              default="forked prompt")
+
+    out = asyncio.run(scenario())
+    assert out == "forked prompt edited"

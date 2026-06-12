@@ -79,19 +79,20 @@ def test_checkout_bad_id_fails_closed(capsys):
     assert "not found" in capsys.readouterr().out
 
 
-def test_fork_before_user_moves_leaf_in_file():
-    # docs/14 SessionLease：/fork 是 in-file before-user fork——把 active leaf 移到选中 user 消息之前
-    # （其 parent），同 session（不新建）、返回 Local；选中文本回显供重编辑。
-    from nanocode.entrypoints.commands.types import Local
+def test_fork_emits_control_and_leaves_source_untouched():
+    # pi /fork：handler 发 Control（新 session 由 runtime thread_fork 完成）；源 session 的
+    # leaf/内容原样保留（同 session 内移 leaf 是 /tree <entry> 的职责）。
+    from nanocode.entrypoints.commands.types import Control
     a = _agent("fk1")
     mgr = _seed(a, "fk1")
-    a1 = mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
-                            api="anthropic", model="claude-x", stop_reason="stop"))
-    mgr.append_message(T.user_message("q"))               # 无参 /fork → fork before this
+    mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+    u = mgr.append_message(T.user_message("q"))           # 无参 /fork → 选中此条
     res = asyncio.run(_fork(_ctx(a), ""))
-    assert isinstance(res, Local)                         # in-file，不发 Control
-    assert a.session_id == "fk1"                          # 不切换/不新建
-    assert a._session_mgr.get_leaf() == a1.id             # leaf 移到选中 user 消息之前（其 parent）
+    assert isinstance(res, Control) and res.payload["kind"] == "fork"
+    assert res.payload["userEntryId"] == u.id and res.payload["prefill"] == "q"
+    assert a.session_id == "fk1"                          # 不切换（runtime 才切换）
+    assert a._session_mgr.get_leaf() == u.id              # 源 leaf 未动
 
 
 def test_resume_lists_sessions(capsys):

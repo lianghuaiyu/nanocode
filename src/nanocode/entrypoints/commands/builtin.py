@@ -356,10 +356,20 @@ def _resolve_entry(mgr, target: str):
     return None, f"ambiguous/unknown id '{target}' ({len(matches)} matches)"
 
 
-async def _fork(ctx: CommandContext, args: str) -> "Local":
-    """/fork [entry] —— in-file fork：把 active leaf 移到某条 user 消息**之前**（其 parent），在原分支旁
-    开一条新 in-file 分支；选中文本回显供重新编辑/发送。无参 = 最近一条 user 消息（≈ /rewind）。
-    docs/14 SessionLease：/fork 是 in-file（移 leaf，不新建 session）；跨文件复制到新 session 用 /clone。"""
+def _user_message_text(msg: dict) -> str:
+    """中立 user Message 的纯文本（prefill 用）：str 直通；block 列表拼接 text 字段。"""
+    c = (msg or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
+    """/fork [entry] —— pi 语义：选择一条历史 user 消息，**新建 session** 复制到该消息**之前**，
+    并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。无参 = 最近一条 user 消息。
+    原 session 保留（header 记 parentSession 血缘）。同 session 内的 leaf 移动用 /tree <entry>。"""
     from ...session import tree as T
     mgr = ctx.agent._session_mgr
     if mgr is None:
@@ -380,32 +390,26 @@ async def _fork(ctx: CommandContext, args: str) -> "Local":
     if sel is None or sel.type != T.MESSAGE or (sel.data.get("message") or {}).get("role") != "user":
         print_error("No user message to fork before (pass a user-message entry id; see /tree).")
         return Local()
-    try:
-        ctx.session.move_to(sel.parentId)          # in-file 移 leaf 到选中 user 消息之前（parent；None→root）
-    except ValueError as e:
-        print_error(str(e))
-        return Local()
-    content = (sel.data.get("message") or {}).get("content")
-    print_info(f"Forked before that message (in-file branch). Re-enter to send:\n  {content}")
-    return Local()
+    return Control("replace_thread", {
+        "kind": "fork", "sourceSid": ctx.agent.session_id, "userEntryId": sel.id,
+        "prefill": _user_message_text(sel.data.get("message")),
+    })
 
 
 async def _clone(ctx: CommandContext, args: str) -> "Control | Local":
-    """/clone [entry] —— 跨文件复制当前 branch（或指定 entry 的 path-to-root）到新 session 并切入
-    （docs/14 P4 / §5.5；header 记 parentSession 血缘，原 session 保留）。运行时经 Control → thread_clone。"""
+    """/clone —— pi 语义：**新建 session**，复制当前 active branch 到**当前 leaf** 并切入；
+    编辑器为空（docs/14 P4 / §5.5；header 记 parentSession 血缘，原 session 保留）。
+    无参数——要在某条 user 消息之前分叉用 /fork，同 session 内移动 leaf 用 /tree <entry>。"""
     from ...session.manager import SessionManager
+    if args.strip():
+        print_error("/clone takes no arguments (it copies the current branch to the current leaf). "
+                    "Use /fork [entry] to branch before a user message.")
+        return Local()
     sid = ctx.agent.session_id
     if not SessionManager.exists(sid):
         print_info("No canonical session tree yet for this session.")
         return Local()
-    target = args.strip() or None
-    if target:
-        resolved, err = _resolve_entry(SessionManager.open(sid), target)
-        if resolved is None:
-            print_error(err)
-            return Local()
-        target = resolved
-    return Control("replace_thread", {"kind": "clone", "sourceSid": sid, "entryId": target})
+    return Control("replace_thread", {"kind": "clone", "sourceSid": sid})
 
 
 async def _name(ctx: CommandContext, args: str) -> Local:
@@ -538,8 +542,8 @@ _BUILTINS = [
     ("/checkout", _checkout, "prefix", "Move the active leaf to a tree entry (in-file navigation)", "<entry_id>"),
     ("/rewind", _rewind, "exact", "Rewind to before your last message (in-file branch)", ""),
     ("/new", _new, "exact", "Start a new empty session and switch to it", ""),
-    ("/clone", _clone, "exact_or_prefix", "Clone this branch (optionally at an entry) into a new session and switch", "[entry_id]"),
-    ("/fork", _fork, "exact_or_prefix", "Fork before a user message into a new session (Pi before-user fork)", "[entry_id]"),
+    ("/clone", _clone, "exact_or_prefix", "New session: copy the current branch up to the current leaf and switch (editor empty)", ""),
+    ("/fork", _fork, "exact_or_prefix", "New session: copy up to BEFORE a user message and put that prompt back in the editor", "[entry_id]"),
     ("/name", _name, "exact_or_prefix", "Show or set this session's name (/name <text> | --clear)", "[text]"),
     ("/resume", _resume, "exact_or_prefix", "List resumable sessions, or /resume <id> to switch mid-REPL", "[id]"),
     ("/help", _help, "exact", "List REPL commands", ""),

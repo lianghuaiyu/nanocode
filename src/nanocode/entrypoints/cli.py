@@ -200,7 +200,8 @@ def _get_session(*, input=None, output=None, persistent=True) -> PromptSession:
     return _session
 
 
-async def _async_read_line(prompt="", *, input=None, output=None, persistent=True) -> object:
+async def _async_read_line(prompt="", *, input=None, output=None, persistent=True,
+                           default="") -> object:
     """Read one line with full line editing + history via prompt_toolkit,
     cooperating with the asyncio loop (background tasks stay live).
     Ctrl-D -> EOF sentinel; Ctrl-C -> CANCEL sentinel.
@@ -221,9 +222,9 @@ async def _async_read_line(prompt="", *, input=None, output=None, persistent=Tru
         session = _get_session(input=input, output=output, persistent=persistent)
         pre_run = _make_prime_buffer(session)
         if input is not None or output is not None:
-            return await session.prompt_async(prompt, pre_run=pre_run)
+            return await session.prompt_async(prompt, pre_run=pre_run, default=default)
         with patch_stdout():
-            return await session.prompt_async(prompt, pre_run=pre_run)
+            return await session.prompt_async(prompt, pre_run=pre_run, default=default)
     except EOFError:
         return EOF
     except KeyboardInterrupt:
@@ -418,6 +419,9 @@ async def run_repl(agent: Agent, lease=None) -> None:
     async def _drive_turn(prompt: str) -> None:
         await _host.current_thread.run(prompt)
 
+    # pi /fork 语义：选中的历史 prompt 放回编辑器（下一次主读取的 default 文本，one-shot）。
+    _pending_prefill = {"text": ""}
+
     async def _apply_control(host: RuntimeHost, ctrl: Control) -> None:
         """消费 lifecycle Control（docs/14 P2）：先过 host.can_switch() fail-closed 闸，再交
         runtime-owned replacement（thread_new / thread_resume → rebind_session）。handler 只发信号，
@@ -430,8 +434,16 @@ async def run_repl(agent: Agent, lease=None) -> None:
         if action == "replace_thread" and payload.get("kind") == "new":
             host.runtime.thread_new(host)          # rebind 已 sink.info "Session → ..."
         elif action == "replace_thread" and payload.get("kind") == "clone":
-            if host.runtime.thread_clone(host, payload.get("sourceSid"), payload.get("entryId")) is None:
+            # pi /clone：复制当前 active branch 到当前 leaf → 新 session；编辑器为空。
+            if host.runtime.thread_clone(host, payload.get("sourceSid")) is None:
                 print_error("clone failed (no canonical tree / nothing to clone).")
+        elif action == "replace_thread" and payload.get("kind") == "fork":
+            # pi /fork：复制到选中 user 消息**之前** → 新 session；该 prompt 放回编辑器。
+            if host.runtime.thread_fork(host, payload.get("sourceSid"),
+                                        payload.get("userEntryId")) is None:
+                print_error("fork failed (no canonical tree / unknown entry).")
+            else:
+                _pending_prefill["text"] = payload.get("prefill") or ""
         elif action == "resume":
             sid = payload.get("sessionId")
             if sid == host.current_thread.thread_id:
@@ -503,7 +515,8 @@ async def run_repl(agent: Agent, lease=None) -> None:
 
     cancel_count = 0
     while True:
-        line = await _async_read_line(ANSI("\n\x1b[1;32m> \x1b[0m"))
+        _prefill, _pending_prefill["text"] = _pending_prefill["text"], ""
+        line = await _async_read_line(ANSI("\n\x1b[1;32m> \x1b[0m"), default=_prefill)
         # SIGINT handler is restored inside _async_read_line (covers this read and
         # the transient confirm/plan prompts too), so Ctrl-C during agent.chat
         # always reaches handle_sigint.

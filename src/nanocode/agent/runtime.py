@@ -387,6 +387,28 @@ class AgentRuntime:
             return None
         return self._switch_via_rebind(host, session_id)
 
+    def thread_fork(self, host, source_sid: str, user_entry_id: str) -> "RuntimeThread | None":
+        """pi /fork：复制 source 到选中 user 消息**之前**（其 parent 的 path-to-root）的新 session
+        并切入；选中 prompt 由调用方预填编辑器。选中首条消息（parent=None）→ 新空 session。
+        源无树 / entry 不存在 / 复制失败 → None。"""
+        from ..session.manager import SessionManager
+        if not SessionManager.exists(source_sid):
+            return None
+        src = SessionManager.open(source_sid)
+        sel = next((e for e in src.entries() if e.id == user_entry_id), None)
+        if sel is None:
+            return None
+        cut = sel.parentId
+        # 选中消息之前无可复制内容（parent=None，或 pre-3a 树里 parent 是 session_start header）
+        # → 全新空 session（clone 复制空前缀无意义且会拒绝）。
+        if cut is None or all(e.type == "session_start" for e in src.get_branch(cut)):
+            return self.thread_new(host)
+        try:
+            child = src.clone(cut)
+        except Exception:
+            return None
+        return self._switch_via_rebind(host, child.session_id)
+
     def thread_clone(self, host, source_sid: str, entry_id: "str | None" = None) -> "RuntimeThread | None":
         """跨文件 clone（/clone [entry]）：复制 source 的 path-to-root 到新 session（header 记
         parentSession 血缘）并切入。源无 canonical 树 / clone 失败 → None。

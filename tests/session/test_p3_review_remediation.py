@@ -39,20 +39,27 @@ def test_clone_pre3a_tree_no_double_session_start():
     assert msgs[1].data["message"]["role"] == "assistant"
 
 
-def test_fork_pre3a_first_message_in_file_resets_to_empty():
-    # docs/14 SessionLease：/fork 是 in-file（移 leaf，不新建 session）。pre-3a 盘上树（首消息 parentId
-    # 指向 session_start）下 /fork before 首消息 → move_to(其 parent=session_start，folded→空) → 空上下文。
+def test_fork_pre3a_first_message_yields_empty_new_session():
+    # pi /fork + pre-3a 盘上树（首消息 parentId 指向 session_start）：fork before 首消息 →
+    # 前缀只剩 session_start（剥掉后无可复制）→ runtime 落到全新空 session。
     import asyncio
+    from nanocode.agent import AgentRuntime, RuntimeThread
     from nanocode.entrypoints.commands.builtin import _fork
-    from nanocode.entrypoints.commands.types import CommandContext, Local
+    from nanocode.entrypoints.commands.types import CommandContext, Control
+    from nanocode.entrypoints.host import RuntimeHost
     mgr, start_id, u1 = _seed_pre3a_tree("pre3a_fork")
     a = _agent("pre3a_fork")
     a._session_mgr = mgr
     ctx = CommandContext(agent=a, session=AgentSession(a), out=a._sink)
     res = asyncio.run(_fork(ctx, u1.id[-8:]))
-    assert isinstance(res, Local)
-    assert a.session_id == "pre3a_fork"                      # in-file：同 session（不新建）
-    assert a._session_mgr.build_context().messages == []     # fork 到空（其前无内容）
+    assert isinstance(res, Control) and res.payload["kind"] == "fork"
+    rt = AgentRuntime()
+    t = rt.register(RuntimeThread(rt, a, AgentSession(a)))
+    host = RuntimeHost(rt, t, registry=None)
+    new_t = rt.thread_fork(host, "pre3a_fork", res.payload["userEntryId"])
+    assert new_t is not None
+    assert a.session_id != "pre3a_fork"                      # 新 session
+    assert a.agent_session.build_request_messages() == []    # 其前无内容 → 空上下文
 
 
 # docs/14 SessionLease：删除「空树回退 legacy」与「树仅 custom_message 回退 flat」两个用例——
