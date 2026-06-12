@@ -85,11 +85,11 @@ def test_inject_finished_tasks_writes_custom_message_and_dedups():
     a._session_mgr = SessionManager.create("bgsh_inj")
     t = a.task_manager.create_task("shell", "echo hi")
     a.task_manager.update_task(t.id, status="completed", exit_code=0, result_summary="hi")
-    a._inject_finished_tasks()
+    a.agent_session.inject_finished_tasks()
     (cm,) = _ftask_custom_msgs(a)
     assert "<system-reminder>" in cm and t.id in cm
     assert a.task_manager.get_task(t.id).injected is True
-    a._inject_finished_tasks()                                  # dedup：不再注入
+    a.agent_session.inject_finished_tasks()                                  # dedup：不再注入
     assert len(_ftask_custom_msgs(a)) == 1
 
 
@@ -97,7 +97,7 @@ def test_inject_finished_tasks_skips_running():
     from nanocode.session.manager import SessionManager
     a = _agent(); a.task_manager.create_task("shell", "still going")
     a._session_mgr = SessionManager.create("bgsh_run")
-    a._inject_finished_tasks()
+    a.agent_session.inject_finished_tasks()
     assert _ftask_custom_msgs(a) == []
 
 
@@ -107,7 +107,7 @@ def test_inject_finished_tasks_tree_write_failure_retries(monkeypatch):
     a = _agent(); t = a.task_manager.create_task("shell", "x")
     a.task_manager.update_task(t.id, status="completed")
     a._session_mgr = SessionManager.create("bgsh_fail")
-    monkeypatch.setattr(a, "_tree_custom_message", lambda *args, **kw: False)
-    a._inject_finished_tasks()
+    monkeypatch.setattr(a.agent_session, "_tree_custom_message", lambda *args, **kw: False)
+    a.agent_session.inject_finished_tasks()
     assert a.task_manager.get_task(t.id).injected is False      # 未推进 dedup → 重试
 

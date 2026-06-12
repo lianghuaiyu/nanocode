@@ -34,6 +34,6 @@ def test_auto_save_no_longer_writes_legacy_flat_snapshot():
     a = Agent(api_key="test", session_id="NOFLAT", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.create("NOFLAT")
     a._session_mgr.append_message(T.user_message("hi"))
-    a._auto_save()
+    a.agent_session.auto_save()
     assert not (sessions_dir() / "NOFLAT.json").exists()    # 不再写 legacy flat 快照
     assert SessionManager.exists("NOFLAT")                  # canonical 树是权威

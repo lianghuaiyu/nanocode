@@ -28,8 +28,8 @@ def _stub_run_once(agent, text="sub done", history=None):
         agent._anthropic_messages.append({"role": "user", "content": prompt})
         agent._anthropic_messages.append({"role": "assistant", "content": text})
         if agent._session_mgr is not None:
-            agent._tree_record({"role": "user", "content": prompt})
-            agent._tree_record({"role": "assistant", "content": text})
+            agent._core._record_messages(agent, {"role": "user", "content": prompt})
+            agent._core._record_messages(agent, {"role": "assistant", "content": text})
         if history is not None:
             history.append(prompt)
         return {"text": text, "tokens": {"input": 11, "output": 7}}

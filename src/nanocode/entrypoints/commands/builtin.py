@@ -74,7 +74,7 @@ def handle_eval_command(rest: str) -> str:
 # ─── handlers（镜像 cli.run_repl 的分支体）────────────────────────────────────
 
 async def _clear(ctx: CommandContext, args: str) -> Local:
-    ctx.agent.clear_history()
+    ctx.agent.agent_session.clear_history()
     return Local()
 
 

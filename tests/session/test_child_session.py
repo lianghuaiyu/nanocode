@@ -39,8 +39,8 @@ def test_subagent_writes_child_session_live_with_lineage():
     parent._session_mgr = SessionManager.create("PARENT")
     spawn_leaf = parent._session_mgr.append_message(T.user_message("do task")).id
     sub = _sub_with_child(parent, "agent-001", spawn_leaf)
-    sub._tree_record({"role": "user", "content": "sub prompt"})                       # 实时写 child 树
-    sub._tree_record({"role": "assistant", "content": [{"type": "text", "text": "sub done"}]})
+    sub._core._record_messages(sub, {"role": "user", "content": "sub prompt"})                       # 实时写 child 树
+    sub._core._record_messages(sub, {"role": "assistant", "content": [{"type": "text", "text": "sub done"}]})
     parent._close_child_session("agent-001", sub)                                  # close child mgr
     child_sid = parent.child_session_id("agent-001")
     assert SessionManager.exists(child_sid)
@@ -61,10 +61,10 @@ def test_subagent_child_tree_accumulates_across_runs():
     parent = _agent("PARENT2")
     parent._session_mgr = SessionManager.create("PARENT2")
     sub1 = _sub_with_child(parent, "a1", None)
-    sub1._tree_record({"role": "user", "content": "one"})
+    sub1._core._record_messages(sub1, {"role": "user", "content": "one"})
     parent._close_child_session("a1", sub1)
     sub2 = _sub_with_child(parent, "a1", None)
-    sub2._tree_record({"role": "user", "content": "two"})
+    sub2._core._record_messages(sub2, {"role": "user", "content": "two"})
     parent._close_child_session("a1", sub2)
     child = SessionManager.open(parent.child_session_id("a1"))
     assert sum(1 for e in child.entries() if e.type == T.SESSION_START) == 1          # 单 header
@@ -74,7 +74,7 @@ def test_subagent_child_tree_accumulates_across_runs():
 
 def test_empty_subagent_leaves_headeronly_child_session():
     # docs/14 SessionLease：spawn 即给子 agent 注入一把 child 写者租约（open_or_create 建 child 树 header）。
-    # 子从未 _tree_record（空/取消运行）→ child 树仅 header、无 MESSAGE。/resume 隐藏 child（有 parentSession），
+    # 子从未写消息（空/取消运行）→ child 树仅 header、无 MESSAGE。/resume 隐藏 child（有 parentSession），
     # 不污染顶层 resume 列表；children() 仍可发现这棵（空）child——与「child 是从 spawn 起的真实 session」一致。
     parent = _agent("EP")
     parent._session_mgr = SessionManager.create("EP")

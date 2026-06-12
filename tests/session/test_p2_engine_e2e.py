@@ -90,7 +90,7 @@ def test_message_end_tool_turn_records_full_round():
 
 
 def test_subagent_writes_child_tree_not_parent_tree():
-    # docs/14 full-P6b + SessionLease：子 agent _tree_record 写自己的 child session（注入的 child 租约），
+    # docs/14 full-P6b + SessionLease：子 agent 的消息写自己的 child session（注入的 child 租约），
     # 不碰父 session。spawn 给子 agent 注入一把 child 写者租约（locked child mgr）。
     from nanocode.session.lease import SessionLease
     a = _agent("s1sub")
@@ -100,7 +100,7 @@ def test_subagent_writes_child_tree_not_parent_tree():
                                "taskId": "s1sub", "agentId": "s1sub"}
     a._session_mgr = SessionLease.open_or_create(
         a._tree_session_id, parent_session=a._child_parent_session).manager
-    a._tree_record({"role": "user", "content": "x"})
+    a._core._record_messages(a, {"role": "user", "content": "x"})
     assert session_file("PARENT.s1sub").exists()       # 写到 child session
     assert not session_file("PARENT").exists()          # 不碰父 session
     assert not session_file("s1sub").exists()           # 也不写自身 session_id（已解耦到 child）
@@ -114,15 +114,17 @@ def test_s2_request_built_from_tree_not_flat_list():
     a._session_mgr = mgr
     mgr.append_message(T.user_message("FROM-TREE"))
     a._anthropic_messages = [{"role": "user", "content": "FROM-FLAT-STALE"}]
-    req = a._build_request_messages()
+    req = a.agent_session.build_request_messages()
     joined = str(req)
     assert "FROM-TREE" in joined and "FROM-FLAT" not in joined
 
 
 def test_required_tree_record_reraises_on_write_failure(monkeypatch):
-    # review medium：user 消息是 required 写——树是唯一权威、本轮请求从树渲染，写失败若被吞掉会向模型
-    # 发缺失上下文。required=True 时 _tree_record 须重抛（fail loudly）；默认 best-effort 仍吞掉。
+    # review medium → docs/16 #1：message family 是 required 写——树是唯一权威、本轮请求从树渲染，
+    # 写失败若被吞掉会向模型发缺失上下文 → record_event 必须重抛（fail loudly）。
+    # 注解型遥测（_tree_event）保持 guarded：失败 observable（sink.info）、不抛。
     import pytest
+    from nanocode.session import tree as T
     from nanocode.session.lease import SessionLease
     a = _agent("reqw")
     a._session_mgr = SessionLease.open_or_create("reqw").manager
@@ -130,5 +132,6 @@ def test_required_tree_record_reraises_on_write_failure(monkeypatch):
         raise OSError("disk full")
     monkeypatch.setattr(a._session_mgr, "append_message", boom)
     with pytest.raises(OSError):
-        a._tree_record({"role": "user", "content": "hi"}, required=True)   # 必写 → 重抛
-    a._tree_record({"role": "assistant", "content": "x"})                  # 默认 best-effort → 不抛
+        a._core._record_messages(a, {"role": "user", "content": "hi"})   # 必写 → 重抛
+    monkeypatch.setattr(a._session_mgr, "append", boom)
+    a.agent_session._tree_event(T.TURN_END, inputTokens=1)               # 注解型 → 不抛（observable）

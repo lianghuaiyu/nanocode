@@ -205,7 +205,7 @@ def test_finished_task_injected_with_summary():
     from nanocode.session import tree as _T
     from nanocode.session.manager import SessionManager as _SM
     parent._session_mgr = parent._session_mgr or _SM.create("memcon_inj")
-    parent._inject_finished_tasks()
+    parent.agent_session.inject_finished_tasks()
     content = next(e.data["content"] for e in parent._session_mgr.entries()
                    if e.type == _T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks")
     assert "<system-reminder>" in content

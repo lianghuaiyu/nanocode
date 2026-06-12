@@ -78,11 +78,11 @@ def test_present_kinds_uses_fold_rendered_folded_out_reinjects():
     a._session_mgr = mgr
     mgr.append(T.CUSTOM_MESSAGE, {"customType": "project_instructions", "content": "X", "display": False})
     u = mgr.append_message(T.user_message("u1"))
-    assert a._session_context_present_kinds() == {"project_instructions"}     # 无 compaction:渲染中
+    assert a.agent_session._session_context_present_kinds() == {"project_instructions"}     # 无 compaction:渲染中
     # compaction firstKept=u1 → project_instructions(在 u1 之前)被折出渲染 → 视为缺失 → 会重注入(survival)
     mgr.append_compaction(summary="s", first_kept_entry_id=u.id)
     mgr.append_message(T.user_message("u2"))
-    assert a._session_context_present_kinds() == set()
+    assert a.agent_session._session_context_present_kinds() == set()
 
 
 def test_present_kinds_keeps_pre_compaction_kept_region_no_double_inject():
@@ -94,7 +94,7 @@ def test_present_kinds_keeps_pre_compaction_kept_region_no_double_inject():
     mgr.append_message(T.user_message("u1"))
     mgr.append_compaction(summary="s", first_kept_entry_id=None)              # None → fold 保留全部前区
     mgr.append_message(T.user_message("u2"))
-    assert "project_instructions" in a._session_context_present_kinds()       # 仍渲染 → 不 double-inject
+    assert "project_instructions" in a.agent_session._session_context_present_kinds()       # 仍渲染 → 不 double-inject
 
 
 def test_per_customtype_dedup_not_suppressed_by_other_kind():
@@ -103,7 +103,7 @@ def test_per_customtype_dedup_not_suppressed_by_other_kind():
     mgr = SessionLease.open_or_create("cut4c").manager
     a._session_mgr = mgr
     mgr.append(T.CUSTOM_MESSAGE, {"customType": "memory_static", "content": "M", "display": False})
-    present = a._session_context_present_kinds()
+    present = a.agent_session._session_context_present_kinds()
     assert present == {"memory_static"}
     assert "project_instructions" not in present                             # → 仍会被注入
 

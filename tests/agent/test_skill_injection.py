@@ -22,11 +22,11 @@ def test_inject_listing_then_silent(tmp_path, monkeypatch):
     discovery.reset_skill_cache()
     a = _agent()
     a._session_mgr = SessionManager.create("ski_listing")
-    a._inject_skill_listing()
+    a.agent_session.inject_skill_listing()
     cms = _custom_msgs(a._session_mgr, "skill_listing")
     assert len(cms) == 1 and "<system-reminder>" in cms[0] and "k1" in cms[0]
     # 第二次无新增 → 不再注入（dedup 已推进）
-    a._inject_skill_listing()
+    a.agent_session.inject_skill_listing()
     assert len(_custom_msgs(a._session_mgr, "skill_listing")) == 1
 
 
@@ -34,7 +34,7 @@ def test_inject_listing_skipped_for_subagent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = Agent(api_key="test", is_sub_agent=True)
     a._session_mgr = SessionManager.create("ski_sub")
-    a._inject_skill_listing()
+    a.agent_session.inject_skill_listing()
     assert _custom_msgs(a._session_mgr) == []          # 子 agent → no-op
 
 
@@ -51,7 +51,7 @@ def test_skill_tool_returns_stub_and_queues_body(tmp_path, monkeypatch):
     assert "Do the thing" not in res                              # body 不在 tool_result
     assert a._pending_skill_bodies and a._pending_skill_bodies[0][0] == "commitx"
     a._session_mgr = SessionManager.create("ski_body")
-    a._inject_pending_skill_bodies()
+    a.agent_session.inject_pending_skill_bodies()
     (body,) = _custom_msgs(a._session_mgr, "skill_body")
     assert "<command-name>commitx</command-name>" in body
     assert "Do the thing now" in body                            # $ARGUMENTS 已替换
@@ -63,7 +63,7 @@ def test_clear_history_resets_skill_state(tmp_path, monkeypatch):
     a = _agent()
     a._sent_skill_names.add("x")
     a._pending_skill_bodies.append(("x", "b"))
-    a.clear_history()
+    a.agent_session.clear_history()
     assert a._sent_skill_names == set() and a._pending_skill_bodies == []
 
 
@@ -75,11 +75,11 @@ def test_paths_skill_activated_by_touch(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
     a = _agent()
     a._session_mgr = SessionManager.create("ski_paths")
-    a._inject_skill_listing()
+    a.agent_session.inject_skill_listing()
     assert "pyhelp" not in str(_custom_msgs(a._session_mgr))   # 未触碰 → 不在清单
     a._on_file_touched("read_file", {"file_path": "foo.py"})
     assert "pyhelp" in a._activated_path_skills
-    a._inject_skill_listing()
+    a.agent_session.inject_skill_listing()
     assert "pyhelp" in str(_custom_msgs(a._session_mgr))       # 触碰后 → 进清单
 
 
@@ -98,5 +98,5 @@ def test_clear_resets_activation(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = _agent()
     a._activated_path_skills.add("x")
-    a.clear_history()
+    a.agent_session.clear_history()
     assert a._activated_path_skills == set()

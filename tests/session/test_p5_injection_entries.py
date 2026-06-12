@@ -18,7 +18,7 @@ def test_tree_custom_message_folds_and_merges_into_user():
     mgr = SessionManager.create("p5a")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
-    a._tree_custom_message("skill_listing", "<system-reminder>SKILLS</system-reminder>")
+    a.agent_session._tree_custom_message("skill_listing", "<system-reminder>SKILLS</system-reminder>")
     assert any(e.type == T.CUSTOM_MESSAGE for e in mgr.entries())
     payload = render(mgr.build_context().messages, ANTH)["messages"]
     assert [m["role"] for m in payload] == ["user"]          # 注入并入同一条 user（合并相邻 user）
@@ -28,7 +28,7 @@ def test_tree_custom_message_folds_and_merges_into_user():
 
 def test_tree_custom_message_guarded_no_mgr():
     a = _agent("p5a2")          # 无 _session_mgr → 静默跳过、不抛
-    a._tree_custom_message("skill_listing", "X")
+    a.agent_session._tree_custom_message("skill_listing", "X")
     assert not SessionManager.exists("p5a2")
 
 
@@ -37,9 +37,9 @@ def test_inject_skill_listing_writes_custom_message(monkeypatch):
     mgr = SessionManager.create("p5a3")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
-    monkeypatch.setattr("nanocode.agent.engine.skill_listing_delta",
+    monkeypatch.setattr("nanocode.skills.listing.skill_listing_delta",
                         lambda sent, act, budget: ("LISTING-X", {"s1"}))
-    a._inject_skill_listing()                                      # tree-backed → 只写树 custom_message
+    a.agent_session.inject_skill_listing()                                      # tree-backed → 只写树 custom_message
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert len(cms) == 1 and "LISTING-X" in cms[0].data["content"]
 
@@ -50,7 +50,7 @@ def test_subagent_injection_writes_to_child_tree():
     a.is_sub_agent = True
     mgr = SessionManager.create("p5a4")    # 代表子的 child tree
     a._session_mgr = mgr
-    assert a._tree_custom_message("skill_listing", "X")
+    assert a.agent_session._tree_custom_message("skill_listing", "X")
     assert any(e.type == T.CUSTOM_MESSAGE for e in mgr.entries())
 
 
@@ -60,7 +60,7 @@ def test_injection_does_not_mutate_prior_user_message_entry():
     mgr = SessionManager.create("p5b")
     a._session_mgr = mgr
     u = mgr.append_message(T.user_message("original user text"))
-    a._tree_custom_message("skill_listing", "INJECTED-REMINDER")
+    a.agent_session._tree_custom_message("skill_listing", "INJECTED-REMINDER")
     user_entry = next(e for e in mgr.entries() if e.id == u.id)
     assert user_entry.data["message"]["content"] == "original user text"   # 原 user entry 未变
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
@@ -76,9 +76,9 @@ def test_inject_finished_tasks_tree_backed_writes_custom_message_not_flat(monkey
     mgr = SessionManager.create("p5c")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
-    monkeypatch.setattr("nanocode.agent.engine.collect_pending_injections",
+    monkeypatch.setattr("nanocode.tasks.inject.collect_pending_injections",
                         lambda tm: [type("FakeT", (), {"id": "t1"})()])
-    monkeypatch.setattr("nanocode.agent.engine.render_task_reminder", lambda t: "TASK-DONE")
-    a._inject_finished_tasks()
+    monkeypatch.setattr("nanocode.tasks.inject.render_task_reminder", lambda t: "TASK-DONE")
+    a.agent_session.inject_finished_tasks()
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert any("TASK-DONE" in e.data.get("content", "") for e in cms)

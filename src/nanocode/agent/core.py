@@ -91,8 +91,8 @@ class AgentCore:
                     # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
                     host._sink.info(f"[memory] recall injection failed: {e}")
 
-            host._inject_finished_tasks()
-            host._inject_skill_listing()
+            host.agent_session.inject_finished_tasks()
+            host.agent_session.inject_skill_listing()
 
             if not host.is_sub_agent:
                 host._sink.spinner_start()
@@ -107,7 +107,7 @@ class AgentCore:
                         task = asyncio.create_task(host._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
-            host._anthropic_messages = host._build_request_messages()
+            host._anthropic_messages = host.agent_session.build_request_messages()
             host.emit(LlmRequestPrepared(
                 model=host.model, message_count=len(host._anthropic_messages),
                 messages_chars=len(json.dumps(host._anthropic_messages, default=str))))
@@ -204,7 +204,7 @@ class AgentCore:
                 self._record_messages(host, tr_msg)       # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
             host._context_cleared = False
             if not context_break:
-                host._inject_pending_skill_bodies()
+                host.agent_session.inject_pending_skill_bodies()
 
     # ─── OpenAI turn（移植自 _chat_openai，self→host）──────────────────────────
     async def run_openai_turn(self, host, user_message: str) -> None:
@@ -241,13 +241,13 @@ class AgentCore:
                     # docs/16 #2：silent pass 已清——召回/注入失败必须可观测（仍不破坏 live turn）。
                     host._sink.info(f"[memory] recall injection failed: {e}")
 
-            host._inject_finished_tasks()
-            host._inject_skill_listing()
+            host.agent_session.inject_finished_tasks()
+            host.agent_session.inject_skill_listing()
 
             if not host.is_sub_agent:
                 host._sink.spinner_start()
 
-            host._openai_messages = host._build_request_messages()
+            host._openai_messages = host.agent_session.build_request_messages()
             host.emit(LlmRequestPrepared(
                 model=host.model, message_count=len(host._openai_messages),
                 messages_chars=len(json.dumps(host._openai_messages, default=str))))
@@ -365,7 +365,7 @@ class AgentCore:
 
             host._context_cleared = False
             if not oai_context_break:
-                host._inject_pending_skill_bodies()
+                host.agent_session.inject_pending_skill_bodies()
 
     # ─── Summary compaction（docs/16 #3a：summarizer 输入 = 树渲染，不再读/写 flat 列表）────
     #

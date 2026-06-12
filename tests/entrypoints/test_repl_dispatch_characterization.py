@@ -64,9 +64,10 @@ class _FakeAgent:
 
     @property
     def agent_session(self):
-        # docs/16 #3a：/compact 走 agent_session.compact()（compaction owner = turn shell）。
+        # docs/16 #3：/clear /compact 走 agent_session（turn shell 拥有 clear/compaction）。
         calls = self.calls
         class _S:
+            def clear_history(self): calls.append(("clear_history",))
             async def compact(self): calls.append(("compact",))
         return _S()
 

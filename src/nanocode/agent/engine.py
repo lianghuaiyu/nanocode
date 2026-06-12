@@ -37,17 +37,12 @@ from ..memory.maintenance import (
 from .sink import EventSink, TerminalSink, BufferSink
 from .events import (
     AssistantDelta,
-    ContextInjected,
     ToolBlocked,
     ToolCallAuthorized,
     TurnAborted,
     TurnCompleted,
 )
 from ..prompt import build_system_prompt
-from ..skills.listing import (
-    skill_listing_delta,
-    render_skill_body_message,
-)
 from ..skills.discovery import (
     register_nested_skill_dirs,
     path_activates_skill,
@@ -59,7 +54,6 @@ from ..mcp import McpManager
 from ..tasks.manager import TaskManager
 from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
-from ..tasks.inject import render_task_reminder, collect_pending_injections
 from ..session import v2 as _session_v2
 from ..tools import tasks_tool
 
@@ -387,7 +381,7 @@ class Agent(PlanModeMixin):
 
         self._aborted = False
         self._ensure_session_lease()  # 确保持有会话写者租约（runtime 已注入则 no-op；headless/直接构造则自取）
-        await self._inject_session_context()  # docs/15 Phase 3 cutover：项目指令/memory 作 session-context 包
+        await self.agent_session.inject_session_context()  # docs/15 Phase 3 cutover：项目指令/memory 作 session-context 包
         coro = self._core.run_turn(self, user_message)
         self._current_task = asyncio.current_task()
         try:
@@ -402,61 +396,10 @@ class Agent(PlanModeMixin):
         self.emit(ev_cls(input_tokens=self.total_input_tokens,
                          output_tokens=self.total_output_tokens, turns=self.current_turns))
         if not self.is_sub_agent:
-            self._auto_save()
+            self.agent_session.auto_save()
 
-    # ─── docs/15 Phase 3 cutover：session-context 注入（项目指令 + memory 静态段）─────────
-    _SESSION_CONTEXT_KINDS = frozenset({"project_instructions", "memory_static"})
-
-    async def _inject_session_context(self) -> None:
-        """把项目指令 + memory 静态段作为 session-context custom_message 注入 canonical 树（§8.3）。
-
-        取代旧的「烤进 system prompt」：稳定 system 前缀利于 cache,内容作 messages/custom_message。
-        仅主 agent（子 agent 各有自己的 system prompt,不应注入项目指令）。
-
-        幂等 + resume 安全 + compaction 存活,统一由「**经 fold 实际渲染**的 session-context 包」判定
-        （_session_context_present_kinds 直接用 context.fold,与发给模型的上下文一致——避免手算 kept-region
-        与 fold 不符,codex-found）。**per-customType** 去重:只注入当前缺失的 kind,不被「另一 kind 在场」抑制。
-        - fresh：都缺 → 各注入一次；resume：树里已渲染 → 跳过；compaction 后折出渲染 → 重注入缺失项。
-        """
-        if self.is_sub_agent:                             # main agent 的 lease 由 chat() 先行保证
-            return
-        present = self._session_context_present_kinds()
-        if present >= self._SESSION_CONTEXT_KINDS:        # 全部 kind 已在渲染上下文 → 无需注入
-            return
-        from ..context import BudgetPolicy, ContextRequest, ContextRuntime
-        req = ContextRequest(
-            cwd=os.getcwd(), is_sub_agent=False,
-            include_project_instructions=True, include_memory=True,
-            include_env=False, include_git=False, include_skills=False,
-            include_agents=False, include_deferred_tools=False,
-        )
-        try:
-            plan = await ContextRuntime(budget=BudgetPolicy.for_window(self.effective_window)).collect(req)
-        except Exception as e:
-            try:
-                self._sink.info(f"[context] session-context collect failed: {e}")
-            except Exception:
-                pass
-            return
-        for pack in plan.packs:
-            if pack.kind not in present:                  # per-customType：只注入缺失的 kind
-                self.emit(ContextInjected(custom_type=pack.kind, content=pack.content))
-
-    def _session_context_present_kinds(self) -> set[str]:
-        """当前 branch **经 context.fold 实际渲染**的 session-context customType 集合。
-
-        用 fold（而非手算 post-compaction 区间）确保与真正发给模型的上下文一致：fold 的 rich 输出保留
-        custom_message 的 customType（convert_to_llm 才丢弃）,故能精确判定「模型是否看得到该包」——
-        无论 compaction 两区折叠 / firstKeptEntryId=None 全保留 等情形都对齐（codex-found 的 kept-region 不符）。
-        """
-        mgr = self._session_mgr                           # lease 先行保证非 None（docs/16 C-1）
-        try:
-            from ..session import context as _ctx
-            rich, _ = _ctx.fold(mgr.get_branch())
-        except Exception:
-            return set(self._SESSION_CONTEXT_KINDS)       # 树不可重建 → 保守视为全在(不重复注入)
-        return {m.get("customType") for m in rich
-                if m.get("role") == "custom" and m.get("customType") in self._SESSION_CONTEXT_KINDS}
+    # ─── docs/15 Phase 3 / docs/16 #3b：session-context 注入（项目指令 + memory 静态段）已迁入
+    # AgentSession.inject_session_context（turn shell 职责），chat() 经 agent_session 调用。
 
     # ─── Sub-agent entry point ────────────────────────────────
 
@@ -496,38 +439,7 @@ class Agent(PlanModeMixin):
         self.emit(AssistantDelta(text=text))
 
     # ─── REPL commands ────────────────────────────────────────
-
-    def clear_history(self) -> None:
-        """docs/14 SessionLease：/clear = 把 active leaf 复位到 root（in-file），而非清空对话事实。
-        历史保留在 canonical 树里（可经 /tree 回看 / 在旧分支继续）；后续 turn 从 root 起一条新分支。
-        复位本对话的 working set + 计数，并从（现为空的）分支重渲染 active 列表。"""
-        if self._session_mgr is not None:
-            try:
-                self._session_mgr.set_leaf(None)        # 回到 root：get_branch(None)==[] → 空上下文
-            except Exception:
-                pass
-            from ..session.render import ModelCtx, render
-            provider = "openai" if self.use_openai else "anthropic"
-            api = "openai-completions" if self.use_openai else "anthropic"
-            sysp = self._system_prompt if self.use_openai else None
-            built = self._session_mgr.build_context()
-            self._load_messages(render(built.messages,
-                                       ModelCtx(provider=provider, api=api, model_id=self.model),
-                                       system_prompt=sysp)["messages"])
-        else:
-            self._anthropic_messages = []
-            self._openai_messages = []
-            if self.use_openai:
-                self._openai_messages.append({"role": "system", "content": self._system_prompt})
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.last_input_token_count = 0
-        self._sent_skill_names = set()
-        self._pending_skill_bodies = []
-        self._activated_path_skills = set()
-        self._active_hooks = []
-        reset_skill_cache()
-        self._sink.info("Conversation cleared (leaf reset to root; history kept — /tree to revisit).")
+    # docs/16 #3b：clear_history 迁入 AgentSession（/clear 经 agent_session.clear_history()）。
 
     def show_cost(self) -> None:
         total = self._get_current_cost_usd()
@@ -641,7 +553,7 @@ class Agent(PlanModeMixin):
         built = new_mgr.build_context()         # 已由 _switch_via_rebind 校验过；纯内存 fold，无 I/O
         # ── FINALIZE 旧 session（均为低风险/guarded 操作）──
         old_mgr = self._session_mgr
-        self._auto_save()                       # 旧 session 的 v2 state
+        self.agent_session.auto_save()          # 旧 session 的 v2 state
         if old_mgr is not None and old_mgr is not new_mgr:
             old_mgr.close()                     # 释放旧 session 写锁（旧 lease 的底层 mgr）
         try:
@@ -680,15 +592,7 @@ class Agent(PlanModeMixin):
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
-    def _auto_save(self) -> None:
-        # canonical session.jsonl 树是 resume 权威（legacy flat 快照及其 writer 已删，docs/16 C-1/C-3）。
-        # 仍按需落 v2 state.json（TaskManager/subagent 派生 cache）。
-        # v2 state: persist when session has forked subagents, background tasks, or is already v2
-        # （含 list_tasks：仅有后台 shell 任务、无 subagent 的 session 也要落 state，否则 /resume
-        #  回来时丢任务记录——docs/14 P2 review）。
-        if (_session_v2.is_v2_session(self.session_id) or self.task_manager.list_subagents()
-                or self.task_manager.list_tasks()):
-            self._persist_state()
+    # docs/16 #3b：_auto_save 迁入 AgentSession.auto_save（chat/rebind 经 agent_session 调用）。
 
     def _ensure_session_lease(self) -> None:
         """确保本 agent 持有一把会话写者租约（已加锁的 SessionManager）——在每个 turn 开始处调用。
@@ -722,71 +626,8 @@ class Agent(PlanModeMixin):
         runtime_events.project_agent_event(event, self._sink)
         return written
 
-    def _tree_record(self, provider_msg: dict, *, stop_reason: "str | None" = None,
-                     usage: "dict | None" = None, latency_ms: "int | None" = None,
-                     required: bool = False) -> None:
-        """docs/13 cutover S1 + docs/14 SessionLease：把一条 live provider 消息以**干净原文**写进
-        canonical session.jsonl 树（`_session_mgr` = runtime lease 注入 / turn 开始 _ensure 自取的
-        **已加锁** mgr）。message-end 调用；注入是 render-time 装饰、单独以 custom_message 入树。
-
-        默认 best-effort（失败只 emit observable `tree_record_failed`，不破坏 live turn）。但 `required=True`
-        的写（如 user 消息——本轮请求从树渲染、丢了它会向模型发缺失上下文，review medium）失败时**重抛**：
-        因树是唯一权威、无 flat 兜底，缺这条 = 这一轮上下文错误，应 fail loudly 而非静默发错请求。
-
-        stop_reason：assistant 消息记录 backend 的**真实** provider stop/finish reason（docs/14 §4.3
-        bug#2，忠实而非内容推断）；此处按 provider 映射成中立值再交 capture。"""
-        try:
-            from ..session import capture
-            if self._session_mgr is None:
-                raise RuntimeError("no writer lease for tree record (lease not injected/acquired)")
-            provider = "openai" if self.use_openai else "anthropic"
-            neutral_sr = capture.neutral_stop_reason(provider, stop_reason)
-            cap = capture.capture_openai if self.use_openai else capture.capture_anthropic
-            for neutral in cap(provider_msg, model=self.model, stop_reason=neutral_sr,
-                               usage=usage, latency_ms=latency_ms):
-                self._session_mgr.append_message(neutral)
-        except Exception as e:
-            # tree 写入默认 best-effort（§10#5 接受），但失败必须**可观测**——否则 tree-only resume 会
-            # 静默丢这条消息（docs/14 P3 review #3）。经 sink.info 记一条（wire/Tracer 已退役）。
-            try:
-                self._sink.info(f"[tree] record failed: {e}")
-            except Exception:
-                pass
-            if required:
-                raise          # required 写（user 消息）失败 → fail loudly（本轮请求会缺这条上下文）
-
-    def _tree_event(self, entry_type: str, **data) -> None:
-        """docs/14 Milestone B：把一条派生遥测写成**注解型**树 entry（不在 FOLD_TYPES、不推进 leaf、
-        对 LLM 不可见），供 trajectory 从树派生。docs/16 #2 后唯一调用方 = AgentSession.record_event
-        （emit 单出口的树腿；#3 将随 _tree_* 族整体迁入 AgentSession）。失败**可观测**（sink.info，
-        不静默）但不破坏 live turn——遥测是注解、非 message family。**防御性剔除 reward/eval_result**
-        ——派生标签绝不进事实源（docs/10 三层边界：tree=facts / metrics·evals=labels-never-in-tree）。"""
-        data.pop("reward", None)
-        data.pop("eval_result", None)
-        try:
-            if self._session_mgr is not None:
-                self._session_mgr.append(entry_type, data)
-        except Exception as e:
-            self._sink.info(f"[tree] telemetry append failed ({entry_type}): {e}")
-
-    def _build_request_messages(self) -> list:
-        """docs/13 cutover S2 + docs/14 SessionLease：从 canonical 树渲染本轮请求（`render(build_context())`）。
-
-        树是会话**唯一**事实源（含 S1 message-end 写入的消息 + P5 注入的 custom_message）；render 据当前
-        provider 整形 + 合并相邻 user。**无 flat fallback**：缺 writer lease 即 fatal（_ensure_session_lease
-        已在 turn 开始保证 _session_mgr 存在；user 消息也已先于本调用 _tree_record 进树）。扁平列表 self.
-        _{provider}_messages 降为 turn-local 投影（每轮被本方法覆盖），不再是恢复/请求权威。
-        Anthropic system 走 out-of-band，OpenAI system 经 render 注入 index 0。"""
-        if self._session_mgr is None:
-            from ..session.tree import SessionTreeError
-            raise SessionTreeError("no writer lease: cannot build request messages without canonical tree")
-        from ..session.render import ModelCtx, render
-        provider = "openai" if self.use_openai else "anthropic"
-        api = "openai-completions" if self.use_openai else "anthropic"
-        sysp = self._system_prompt if self.use_openai else None
-        built = self._session_mgr.build_context()
-        return render(built.messages, ModelCtx(provider=provider, api=api, model_id=self.model),
-                      system_prompt=sysp)["messages"]
+    # docs/16 #3b：_tree_record/_tree_event/_tree_custom_message/_build_request_messages 已迁入
+    # AgentSession（record_event 的树腿 + build_request_messages）——engine 不再直接写树。
 
     def _persist_state(self) -> None:
         """Write v2 state (tasks + subagents) to disk —— DERIVED cache（非 resume 权威，docs/14 P7）。
@@ -806,39 +647,9 @@ class Agent(PlanModeMixin):
     # CompactionRequested→record_event 单写者。
 
     # ─── Skill progressive disclosure ─────────────────────────
-
-    def _skill_listing_budget(self) -> int:
-        return max(2000, int(self.effective_window * 0.04))
-
-    def _tree_custom_message(self, custom_type: str, content, *, parent_id: "str | None" = None) -> bool:
-        """docs/13 P5 / docs/14 §4.5+full-P6b：把一次注入作为 custom_message entry 写进 canonical 树
-        （主 agent=自身树，子 agent=child 树；按 _session_mgr 而非 is_sub_agent gate）。parent_id 显式给定
-        时挂到指定 entry（background pin-to-spawn-branch 预留）。docs/16 #2 后唯一调用方 =
-        AgentSession.record_event（ContextInjected 的树腿）。返回是否真正写入——emit 调用方据此推进
-        dedup（docs/14 P3 review #7：写失败不得静默丢注入 + 不得误推进 dedup）；写失败**可观测**
-        （sink.info，不静默）。"""
-        if self._session_mgr is None:
-            return False
-        try:
-            from ..session import tree as _tree
-            self._session_mgr.append(_tree.CUSTOM_MESSAGE,
-                                     {"customType": custom_type, "content": content, "display": False},
-                                     parent_id=parent_id)
-            return True
-        except Exception as e:
-            self._sink.info(f"[tree] custom_message append failed ({custom_type}): {e}")
-            return False
-
-    def _inject_skill_listing(self) -> None:
-        """skill 清单 → ContextInjected 事件 → custom_message entry（树是唯一注入通道，docs/16 #1/#2）。
-        dedup（_sent_skill_names）**只在树写成功后**推进——失败则下一轮重试，不静默丢清单。"""
-        if self.is_sub_agent:
-            return
-        text, new_names = skill_listing_delta(
-            self._sent_skill_names, self._activated_path_skills, self._skill_listing_budget()
-        )
-        if text and self.emit(ContextInjected(custom_type="skill_listing", content=text)):
-            self._sent_skill_names.update(new_names)
+    # docs/16 #3b：_skill_listing_budget/_tree_custom_message/_inject_skill_listing/
+    # _inject_pending_skill_bodies/_inject_finished_tasks 已迁入 AgentSession（注入器 = turn shell 职责，
+    # 树是唯一注入通道）；core loop 经 host.agent_session.inject_* 调用。
 
     def _on_file_touched(self, name: str, inp: dict) -> None:
         """成功 read/write/edit 后触发：宿主派生文件事实 + 嵌套发现 .nanocode/skills + paths 条件激活。
@@ -865,16 +676,6 @@ class Agent(PlanModeMixin):
             if s.paths and path_activates_skill(touched, s, cwd):
                 self._activated_path_skills.add(s.name)
 
-    def _inject_pending_skill_bodies(self) -> None:
-        """skill body → ContextInjected 事件 → custom_message entry（树是唯一注入通道，docs/16 #1/#2）。
-        树写失败的 body 留在队列、下一轮重试（不静默丢指令）。"""
-        remaining: list = []
-        for name, body in self._pending_skill_bodies:
-            msg = render_skill_body_message(name, body)
-            if not self.emit(ContextInjected(custom_type="skill_body", content=msg.get("content", ""))):
-                remaining.append((name, body))
-        self._pending_skill_bodies = remaining
-
     # ─── Large result persistence ─────────────────────────────────
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
@@ -893,24 +694,6 @@ class Agent(PlanModeMixin):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return rec.id
-
-    def _inject_finished_tasks(self) -> None:
-        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder>，写 custom_message entry
-        挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这优先于 docs/14 §6b 的
-        "pin 到 spawn 分支"：字面 parent_id=spawn_leaf 会造成 sibling 分支、既不可见又会 fork 掉用户
-        后续 turn）。spawn 血缘记在 task.spawn_entry_id（state.json 持久）供审计。树是唯一注入通道
-        （docs/16 #1：flat 兜底已删）；树写失败 → 不标 injected、下一轮重试，不静默丢提醒。"""
-        if self.is_sub_agent:
-            return   # 子 agent 与父共享 TaskManager；finished-task 回注是**父**（user-facing loop）的职责，
-                     # 否则子会"偷走"并标 injected 父/兄弟的后台完成提醒，使父永不浮现（review high）。
-        pending = collect_pending_injections(self.task_manager)
-        if not pending:
-            return
-        text = "\n\n".join(render_task_reminder(t) for t in pending)
-        if not self.emit(ContextInjected(custom_type="finished_tasks", content=text)):
-            return
-        for t in pending:
-            self.task_manager.update_task(t.id, injected=True)
 
     def _tool_blocked_by_allowlist(self, name: str) -> bool:
         """P4 call-time allowlist 判定——委托给 PermissionEngine（单一决策来源）。

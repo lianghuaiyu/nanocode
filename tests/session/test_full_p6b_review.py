@@ -42,16 +42,16 @@ def test_subagent_does_not_consume_parent_finished_tasks():
     sub = _agent("substeal", is_sub_agent=True)
     sub.task_manager = parent.task_manager                    # 与父共享 TaskManager
     sub._session_mgr = SessionManager.create("substeal.child")
-    sub._inject_finished_tasks()                              # 子 → no-op（不偷父的提醒）
+    sub.agent_session.inject_finished_tasks()                              # 子 → no-op（不偷父的提醒）
     assert parent.task_manager.get_task(rec.id).injected is False
 
 
 def test_skill_listing_dedup_not_advanced_on_tree_write_failure(monkeypatch):
     a = _agent("SLF")
     a._session_mgr = SessionManager.create("SLF")
-    monkeypatch.setattr("nanocode.agent.engine.skill_listing_delta", lambda s, act, b: ("LISTING", {"s1"}))
-    monkeypatch.setattr(a, "_tree_custom_message", lambda *args, **kw: False)   # 模拟树写失败
-    a._inject_skill_listing()
+    monkeypatch.setattr("nanocode.skills.listing.skill_listing_delta", lambda s, act, b: ("LISTING", {"s1"}))
+    monkeypatch.setattr(a.agent_session, "_tree_custom_message", lambda *args, **kw: False)   # 模拟树写失败
+    a.agent_session.inject_skill_listing()
     assert "s1" not in a._sent_skill_names                    # 不推进 dedup → 下轮重试
 
 

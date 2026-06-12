@@ -169,13 +169,13 @@ def test_tree_entries_never_contain_reward_or_eval():
     a = Agent(api_key="test", session_id="boundtree", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.create("boundtree")     # 持写锁（create 默认 lock=True）
     # 注解型遥测 entry：误传派生标签
-    a._tree_event(T.PERMISSION_DECISION, tool="run_shell", action="deny",
+    a.agent_session._tree_event(T.PERMISSION_DECISION, tool="run_shell", action="deny",
                   reward=0.5, eval_result={"signal": "should_be_stripped"})
-    a._tree_event(T.TURN_END, inputTokens=1, outputTokens=2, turns=1,
+    a.agent_session._tree_event(T.TURN_END, inputTokens=1, outputTokens=2, turns=1,
                   reward=-1.0, eval_result={"final": "ok"})
     # 普通消息 entry
-    a._tree_record({"role": "user", "content": "hi"})
-    a._tree_record({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+    a._core._record_messages(a, {"role": "user", "content": "hi"})
+    a._core._record_messages(a, {"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
 
     entries = a._session_mgr.entries()
     assert entries, "expected tree entries"

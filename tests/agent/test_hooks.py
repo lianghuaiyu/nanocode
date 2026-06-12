@@ -68,7 +68,7 @@ def test_clear_resets_hooks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = _agent()
     a._active_hooks = [{"skill": "g", "event": "pre-tool-use", "matcher": ["*"], "command": "true", "timeout_ms": 1}]
-    a.clear_history()
+    a.agent_session.clear_history()
     assert a._active_hooks == []
 
 

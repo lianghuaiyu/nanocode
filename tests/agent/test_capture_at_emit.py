@@ -77,20 +77,27 @@ OPENAI_CORPUS = [
 ]
 
 
-# ── 树级 parity：factory→record_event 与 _tree_record 写出的树相同 ────────────
+# ── 树级 parity：factory→record_event 与直接 capture→append 写出的树相同 ──────
+# （参照侧原是 engine._tree_record 的内联 capture；该方法已删（docs/16 #3b），
+#   此处在测试内重建同一参照路径，继续锚定 #0 工厂不漂移。）
 
 @pytest.mark.parametrize("use_openai,corpus", [(False, ANTHROPIC_CORPUS), (True, OPENAI_CORPUS)],
                          ids=["anthropic", "openai"])
 def test_tree_parity_with_inline_tree_record(use_openai, corpus):
+    from nanocode.session import capture
     provider = "openai" if use_openai else "anthropic"
     a1 = _agent(f"cap0a_{provider}", use_openai=use_openai)
     a1._session_mgr = SessionManager.create(f"cap0a_{provider}")
     a2 = _agent(f"cap0b_{provider}", use_openai=use_openai)
     a2._session_mgr = SessionManager.create(f"cap0b_{provider}")
 
+    cap = capture.capture_openai if use_openai else capture.capture_anthropic
     for msg, kw in corpus:
-        a1._tree_record(msg, required=True, **kw)                      # 现行内联 capture 路径
-        for ev in events_from_provider_message(                         # capture-at-emit 路径
+        neutral_sr = capture.neutral_stop_reason(provider, kw.get("stop_reason"))
+        for neutral in cap(msg, model=a1.model, stop_reason=neutral_sr,        # 参照：直接 capture 路径
+                           usage=kw.get("usage"), latency_ms=kw.get("latency_ms")):
+            a1._session_mgr.append_message(neutral)
+        for ev in events_from_provider_message(                                 # capture-at-emit 路径
                 msg, provider=provider, model=a2.model, **kw):
             assert AgentSession(a2).record_event(ev) is True
 

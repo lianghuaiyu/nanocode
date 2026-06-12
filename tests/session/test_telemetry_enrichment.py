@@ -73,7 +73,7 @@ def test_tree_event_strips_reward_and_eval_result():
     # 三层边界：派生标签绝不进事实源（_tree_event 防御性剥除，取代原 Tracer.emit 的同名剥除）。
     a = _agent("telbound")
     a._session_mgr = SessionManager.create("telbound")
-    a._tree_event(T.PERMISSION_DECISION, tool="run_shell", action="deny",
+    a.agent_session._tree_event(T.PERMISSION_DECISION, tool="run_shell", action="deny",
                   reward=-1.0, eval_result={"signal": "x"})
     pd = [e for e in a._session_mgr.entries() if e.type == T.PERMISSION_DECISION][0]
     assert "reward" not in pd.data and "eval_result" not in pd.data

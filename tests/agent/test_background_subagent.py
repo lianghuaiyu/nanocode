@@ -38,8 +38,8 @@ def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):
                 sub._anthropic_messages.append({"role": "user", "content": prompt})
                 sub._anthropic_messages.append({"role": "assistant", "content": text})
                 if sub._session_mgr is not None:          # 真实 run_once 会写 child 树——stub 对齐
-                    sub._tree_record({"role": "user", "content": prompt})
-                    sub._tree_record({"role": "assistant", "content": text})
+                    sub._core._record_messages(sub, {"role": "user", "content": prompt})
+                    sub._core._record_messages(sub, {"role": "assistant", "content": text})
                 return {"text": text, "tokens": tokens}
             sub.run_once = _ro
         return sub
@@ -218,7 +218,7 @@ def test_background_finished_task_injected_to_reminder():
     from nanocode.session import tree as _T
     from nanocode.session.manager import SessionManager as _SM
     parent._session_mgr = parent._session_mgr or _SM.create("bgsub_inj")
-    parent._inject_finished_tasks()
+    parent.agent_session.inject_finished_tasks()
     content = next(e.data["content"] for e in parent._session_mgr.entries()
                    if e.type == _T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks")
     assert "<system-reminder>" in content
