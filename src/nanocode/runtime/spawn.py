@@ -21,6 +21,7 @@ import asyncio
 import time
 
 from ..session import v2 as _session_v2
+from ..subagents import get_sub_agent_config
 
 
 async def _auto_deny_confirm(_command: str) -> bool:
@@ -255,3 +256,171 @@ class SubAgentRunner:
             except Exception:
                 pass
         return host._render_agent_result_envelope(agent_result, text)
+
+    # ─── agent 工具主入口（fresh / resume / background 分派,搬迁自 engine）─────────
+    async def execute_agent_tool(self, host, inp: dict) -> str:
+        """`agent` 工具的派发：类型归一 → depth backstop → background / resume / fresh 三路。
+        host-driven 搬迁自 engine._execute_agent_tool（行为逐字一致）。"""
+        agent_type = inp.get("type", "general")
+        from ..subagents.config import _discover_custom_agents, RESERVED_AGENT_TYPES
+        if agent_type in ("general", "coder"):
+            agent_type = "coder"
+        elif agent_type in ("explore", "plan"):
+            pass
+        elif agent_type in _discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
+            pass  # 已发现的自定义类型：保留
+        else:
+            agent_type = "coder"  # 真正未知（含保留名）→ general 语义
+        description = inp.get("description", "sub-agent task")
+        prompt = inp.get("prompt", "")
+        resume_id = inp.get("resume")
+        tool_timeout_ms = inp.get("timeout_ms")
+        from ..tools import load_agents_config
+        fleet_cfg = load_agents_config()
+
+        # P4 max_depth backstop（所有 spawn 路径）。
+        if host._depth_cap_exceeded():
+            return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
+                    f"cannot spawn a sub-agent at depth {host.depth + 1}.")
+
+        # ── run_in_background: detached subagent ──
+        if inp.get("run_in_background"):
+            if resume_id:
+                return "Error: run_in_background cannot be combined with resume."
+            max_threads = host._max_threads()
+            if max_threads > 0 and host._running_background_subagent_count() >= max_threads:
+                return (f"Error: max concurrent sub-agents ({max_threads}) reached; try again later.")
+            bg_cfg = get_sub_agent_config(agent_type)
+            bg_timeout = tool_timeout_ms
+            if bg_timeout is None:
+                bg_timeout = bg_cfg.get("timeout_ms")
+            if bg_timeout is None:
+                bg_timeout = fleet_cfg.get("background_timeout_ms")
+            task_id = await host._spawn_background_subagent(
+                agent_type=agent_type, description=description, prompt=prompt, timeout_ms=bg_timeout)
+            return (f"Started background sub-agent task {task_id}. It will report completion later. "
+                    f"Use task_output with task_id={task_id} to inspect progress.")
+
+        # ── resume path ──
+        if resume_id:
+            rec = host.task_manager.get_subagent(resume_id)
+            if not rec:
+                return f"Error: sub-agent '{resume_id}' not found (unknown id)."
+            if rec.type in RESERVED_AGENT_TYPES:
+                return (f"Error: sub-agent '{resume_id}' is a reserved internal agent "
+                        f"and cannot be resumed via the agent tool.")
+            if rec.status == "running":
+                return (f"Error: sub-agent '{resume_id}' is still running; cannot resume an in-flight "
+                        f"sub-agent. Wait for it to finish (use task_output to check progress).")
+            if rec.provider and rec.provider != host._current_provider():
+                return (f"Error: provider mismatch — sub-agent '{resume_id}' was created with "
+                        f"provider '{rec.provider}' but current provider is '{host._current_provider()}'. "
+                        f"Cannot resume across providers.")
+            config = get_sub_agent_config(rec.type)
+            current_eff_model = config.get("model") or host.model
+            if rec.model and rec.model != current_eff_model:
+                return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
+                        f"model '{rec.model}' but its current effective model is '{current_eff_model}'. "
+                        f"Cannot resume with a different model.")
+            eff_timeout = host._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
+            max_turns = host._bounded_sub_agent_max_turns(config.get("max_turns"))
+            host._sink.sub_agent_start(rec.type, description)
+            host.task_manager.update_subagent(resume_id, status="running")
+            host._write_agent_spawn_artifacts(
+                agent_id=resume_id, agent_type=rec.type, description=description,
+                prompt=prompt, model=rec.model or current_eff_model, background=False)
+            sub_agent = None
+            try:
+                sub_agent = host._build_sub_agent(
+                    system_prompt=config["system_prompt"], tools=config["tools"],
+                    agent_type=rec.type, max_turns=max_turns,
+                    model=rec.model or current_eff_model, artifact_id=resume_id,
+                    agent_source=config.get("source"))
+                kind, payload = await host._run_foreground_subagent(
+                    sub_agent, prompt, eff_timeout, resume_id)
+            except asyncio.CancelledError:
+                host.task_manager.update_subagent(resume_id, status="cancelled")
+                if sub_agent is not None:
+                    host._persist_agent_messages(resume_id, sub_agent)
+                host._finalize_agent_meta(resume_id, "cancelled")
+                host._sink.sub_agent_end(rec.type, description)
+                raise
+            except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
+                host.task_manager.update_subagent(resume_id, status="failed")
+                if sub_agent is not None:
+                    host._persist_agent_messages(resume_id, sub_agent)
+                host._finalize_agent_meta(resume_id, "failed")
+                host._sink.sub_agent_end(rec.type, description)
+                return f"Sub-agent error: {e}"
+            if kind != "ok":
+                if kind == "error":
+                    host.task_manager.update_subagent(resume_id, status="failed")
+                host._persist_agent_messages(resume_id, sub_agent)
+                host._finalize_agent_meta(
+                    resume_id, "timed_out" if kind == "timeout" else "failed")
+                host._sink.sub_agent_end(rec.type, description)
+                return host._finalize_foreground_terminal(
+                    sub_agent, resume_id, kind, payload, eff_timeout)
+            result = payload  # type: ignore[assignment]
+            host.total_input_tokens += result["tokens"]["input"]
+            host.total_output_tokens += result["tokens"]["output"]
+            host.task_manager.update_subagent(resume_id, status="completed")
+            host._persist_agent_messages(resume_id, sub_agent)
+            result_path = host._write_agent_result(resume_id, result["text"] or "")
+            host._finalize_agent_meta(resume_id, "completed")
+            host._sink.sub_agent_end(rec.type, description)
+            return host._finalize_foreground_result(sub_agent, result, result_path, resume_id)
+
+        # ── fresh path ──
+        config = get_sub_agent_config(agent_type)
+        eff_timeout = host._foreground_timeout(tool_timeout_ms, config, fleet_cfg)
+        max_turns = host._bounded_sub_agent_max_turns(config.get("max_turns"))
+        eff_model = config.get("model") or host.model
+        host._sink.sub_agent_start(agent_type, description)
+        rec = host.task_manager.create_subagent(
+            type=agent_type, description=description,
+            model=eff_model, provider=host._current_provider())
+        host.task_manager.update_subagent(rec.id, status="running")
+        host._write_agent_spawn_artifacts(
+            agent_id=rec.id, agent_type=agent_type, description=description,
+            prompt=prompt, model=eff_model, background=False)
+        sub_agent = None
+        try:
+            sub_agent = host._build_sub_agent(
+                system_prompt=config["system_prompt"], tools=config["tools"],
+                agent_type=agent_type, max_turns=max_turns, model=eff_model,
+                artifact_id=rec.id, agent_source=config.get("source"))
+            kind, payload = await host._run_foreground_subagent(
+                sub_agent, prompt, eff_timeout, rec.id)
+        except asyncio.CancelledError:
+            host.task_manager.update_subagent(rec.id, status="cancelled")
+            if sub_agent is not None:
+                host._persist_agent_messages(rec.id, sub_agent)
+            host._finalize_agent_meta(rec.id, "cancelled")
+            host._sink.sub_agent_end(agent_type, description)
+            raise
+        except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
+            host.task_manager.update_subagent(rec.id, status="failed")
+            if sub_agent is not None:
+                host._persist_agent_messages(rec.id, sub_agent)
+            host._finalize_agent_meta(rec.id, "failed")
+            host._sink.sub_agent_end(agent_type, description)
+            return f"Sub-agent error: {e}"
+        if kind != "ok":
+            if kind == "error":
+                host.task_manager.update_subagent(rec.id, status="failed")
+            host._persist_agent_messages(rec.id, sub_agent)
+            host._finalize_agent_meta(
+                rec.id, "timed_out" if kind == "timeout" else "failed")
+            host._sink.sub_agent_end(agent_type, description)
+            return host._finalize_foreground_terminal(
+                sub_agent, rec.id, kind, payload, eff_timeout)
+        result = payload  # type: ignore[assignment]
+        host.total_input_tokens += result["tokens"]["input"]
+        host.total_output_tokens += result["tokens"]["output"]
+        host.task_manager.update_subagent(rec.id, status="completed")
+        host._persist_agent_messages(rec.id, sub_agent)
+        result_path = host._write_agent_result(rec.id, result["text"] or "")
+        host._finalize_agent_meta(rec.id, "completed")
+        host._sink.sub_agent_end(agent_type, description)
+        return host._finalize_foreground_result(sub_agent, result, result_path, rec.id)
