@@ -42,13 +42,9 @@ def _parse_ts(ts) -> "datetime | None":
     if not isinstance(ts, str) or not ts:
         return None
     try:
-        return datetime.fromisoformat(ts)
+        return datetime.fromisoformat(ts)        # 3.11+ 原生接受 Z 后缀（树 ts 即此格式）
     except Exception:
-        # 兼容 ``Z`` 后缀的 legacy timestamp。
-        try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except Exception:
-            return None
+        return None
 
 
 def _delta_ms(a, b) -> "int | None":
@@ -207,7 +203,7 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
     # per_agent 桶键（""）与 step.agent_id（"main"）对不上，下游 per-agent join 错位（审阅 LOW）。
     by_agent: dict[str, list] = {}
     for ev in events:
-        aid = getattr(ev, "agent_id", "") or "main"
+        aid = ev.agent_id or "main"
         by_agent.setdefault(aid, []).append(ev)
 
     for aid, agent_events in by_agent.items():
@@ -216,7 +212,6 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
         ordered = sorted(agent_events, key=lambda e: (_as_int(getattr(e, "seq", 0)), getattr(e, "line_no", 0)))
 
         # llm_request 等待其后第一条 llm_response 配对延迟。
-        pending_llm_req_ts: "str | None" = None
         # tool_call 按 tool_use_id 配对 tool_result；无 id 时退化为 FIFO。
         # 值为 (tool, ts, command)——command 仅 run_shell 携带，供 tool_result 端的
         # tests_run 启发式判定（命令在 tool_call 上，结果在 tool_result 上）。
@@ -224,18 +219,13 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
         pending_tool_fifo: list = []   # (tool, ts, command) 当 tool_use_id 缺失
 
         for ev in ordered:
-            etype = getattr(ev, "type", "") or ""
-            data = getattr(ev, "data", None)
-            if not isinstance(data, dict):
-                data = {}
-            ts = getattr(ev, "ts", "") or ""
+            etype = ev.type or ""
+            data = ev.data if isinstance(ev.data, dict) else {}
+            ts = ev.ts or ""
 
             if etype == "turn_end":
                 total_turns += 1
                 ab["total_turns"] += 1
-
-            elif etype == "llm_request":
-                pending_llm_req_ts = ts
 
             elif etype == "llm_response":
                 in_tokens = _as_int(data.get("input_tokens"))
@@ -244,15 +234,12 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
                 total_output_tokens += out_tokens
                 ab["input_tokens"] += in_tokens
                 ab["output_tokens"] += out_tokens
-                # B2：优先树适配器在 llm_response 上直接给的毫秒级 latency_ms（树 ts 仅秒级、ts 差无用）；
-                # 缺则退回 llm_request→llm_response 的 ts 差（兼容旧 wire 派生流）。
+                # B2：树适配器在 llm_response 上直接给毫秒级 latency_ms（树 ts 仅秒级、ts 差无用；
+                # docs/16 C-1：旧 wire 派生流的 ts-diff 回退已删）。
                 d = _explicit_ms(data)
-                if d is None and pending_llm_req_ts is not None:
-                    d = _delta_ms(pending_llm_req_ts, ts)
                 if d is not None:
                     model_latencies.append(d)
                     ab["model_latency_ms_sum"] += d
-                pending_llm_req_ts = None
 
             elif etype == "tool_call":
                 total_tool_calls += 1
@@ -415,25 +402,16 @@ def _has_timeout_cancel_error(etype: str, data: dict) -> bool:
 
 
 def _count_high_risk(steps: "list | None") -> int:
-    """从派生 steps 数高风险动作数（risk_level == 'high'）。steps 缺/异形 → 0。
+    """从派生 steps 数高风险动作数（risk_level == 'high'）。steps 缺 → 0。
 
-    兼容两种形态：``Step`` dataclass（有 ``.risk_level``）或其 ``to_record()`` dict
-    （``metadata.risk_level``）。
+    steps 恒为 ``project.build_steps`` 的 ``Step`` dataclass 列表（docs/16 C-1：
+    旧 wire 派生流的 to_record() dict 双形态容忍已删）。
     """
     if not steps:
         return 0
     n = 0
     for s in steps:
-        try:
-            rl = getattr(s, "risk_level", None)
-            if rl is None and isinstance(s, dict):
-                meta = s.get("metadata")
-                if isinstance(meta, dict):
-                    rl = meta.get("risk_level")
-                if rl is None:
-                    rl = s.get("risk_level")
-            if isinstance(rl, str) and rl.lower() == "high":
-                n += 1
-        except Exception:
-            continue
+        rl = getattr(s, "risk_level", None)
+        if isinstance(rl, str) and rl.lower() == "high":
+            n += 1
     return n

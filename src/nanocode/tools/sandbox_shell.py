@@ -214,12 +214,6 @@ def _validate_command(p: dict) -> None:
         raise ValueError("command is required")
 
 
-def _trace_host_dir(trace_tag: str) -> str:
-    """宿主侧沙箱子轨迹目录的绝对路径（不创建，仅计算）。无参兼容版：session_id 取 env。"""
-    sid = os.environ.get("NANOCODE_SESSION_ID", "default")
-    return str(_trace_dir() / sid / "sandbox" / trace_tag)
-
-
 def _common_resource_flags(p: dict) -> list[str]:
     """内存/cpu/网络/卷/依赖 —— run 与 create 共用。"""
     args = ["--memory", f"{p['memory_mib']}M", "--cpus", str(p["cpus"])]
@@ -274,12 +268,6 @@ def build_exec_command(p: dict, msb: str, sandbox_name: str) -> list[str]:
     args += ["--timeout", f"{p['timeout_ms'] // 1000}s"]
     args += [sandbox_name, "--", "/bin/sh", "-c", _wrap_with_sentinel(p["command"])]
     return args
-
-
-def _sandbox_name() -> str:
-    """无参兼容版：session_id 取 env。"""
-    sid = os.environ.get("NANOCODE_SESSION_ID", "default")
-    return f"nanocode-sbx-{sid}"
 
 
 def build_msb_command(inp: dict, msb: str | None = None) -> list[str]:

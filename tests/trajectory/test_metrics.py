@@ -149,17 +149,6 @@ def test_model_latency_from_explicit_latency_ms():
     assert m["model_latency_ms"]["avg"] == 1500.0
 
 
-def test_model_latency_falls_back_to_ts_delta():
-    # 无显式 latency_ms 时退回 ts 差（兼容旧 wire 派生流）。
-    events = [
-        _ev("llm_request", seq=0, ts="2026-06-09T00:00:00+00:00"),
-        _ev("llm_response", seq=1, ts="2026-06-09T00:00:02+00:00", input_tokens=1, output_tokens=1),
-    ]
-    m = compute_metrics(events)
-    assert m["model_latency_ms"]["sum"] == 2000
-    assert m["model_latency_ms"]["count"] == 1
-
-
 def test_tool_latency_from_explicit_latency_ms_by_tool():
     events = [
         _ev("tool_call", seq=0, tool="read_file", input={"file_path": "/a"}, tool_use_id="t0"),
@@ -216,16 +205,6 @@ def test_high_risk_from_steps_dataclass():
         Step("traj", "s1", "step_main_2", None, None, "main", "tool_action", risk_level="high"),
     ]
     m = compute_metrics([], steps=steps)
-    assert m["high_risk_action_count"] == 2
-
-
-def test_high_risk_from_steps_records():
-    recs = [
-        {"metadata": {"risk_level": "high"}},
-        {"metadata": {"risk_level": "medium"}},
-        {"risk_level": "high"},
-    ]
-    m = compute_metrics([], steps=recs)
     assert m["high_risk_action_count"] == 2
 
 

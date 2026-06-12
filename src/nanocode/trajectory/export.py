@@ -153,7 +153,7 @@ def _derive_final_status(events: list) -> "str | None":
     """
     try:
         for ev in reversed(events):
-            etype = _str(getattr(ev, "type", ""))
+            etype = _str(ev.type)
             if etype not in ("session_end", "turn_end", "budget_exceeded"):
                 continue
             d = _ev_data(ev)
@@ -232,7 +232,7 @@ def _write_jsonl(path: Path, records) -> None:
 
 
 def _ev_data(ev) -> dict:
-    d = getattr(ev, "data", None)
+    d = ev.data
     return d if isinstance(d, dict) else {}
 
 

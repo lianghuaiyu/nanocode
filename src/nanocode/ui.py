@@ -45,11 +45,6 @@ def print_user_prompt() -> None:
     console.print("\n[bold green]>[/bold green] ", end="")
 
 
-def print_assistant_text(text: str) -> None:  # kept for compatibility (legacy raw path)
-    sys.stdout.write(text)
-    sys.stdout.flush()
-
-
 def render_assistant_markdown(text: str) -> None:
     # skip blank; render cyan ⏺ gutter in col 1 aligned with markdown body in col 2
     if not text.strip():

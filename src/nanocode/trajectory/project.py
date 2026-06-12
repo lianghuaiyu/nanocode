@@ -26,8 +26,7 @@ from . import schema
 from .schema import Step
 
 # Milestone B2：投影逻辑保留，仅换 source（wire → canonical 树适配器）。TrajEvent 与旧
-# SessionEvent 形状等价；下文类型注解沿用 ``SessionEvent`` 名以最小化 diff——别名指向 TrajEvent。
-SessionEvent = TrajEvent
+# TrajEvent 形状等价；下文类型注解沿用 ``TrajEvent`` 名以最小化 diff——别名指向 TrajEvent。
 
 # 风险启发（docs/10 risk_level）：中危工具（写盘 / 执行 shell）。
 _MEDIUM_RISK_TOOLS = frozenset({"write_file", "edit_file", "run_shell", "sandbox_shell"})
@@ -50,8 +49,8 @@ def project_session(session_id: str) -> list[Step]:
     return build_steps(tree_events(session_id))
 
 
-def build_steps(events: "list[SessionEvent]") -> list[Step]:
-    """把一段 merged SessionEvent 投影为 Step 列表（纯函数，绝不抛）。
+def build_steps(events: "list[TrajEvent]") -> list[Step]:
+    """把一段 merged TrajEvent 投影为 Step 列表（纯函数，绝不抛）。
 
     配对规则（docs/10 step model）：
     - tool_action：``tool_call`` 与同 agent_id / 同 tool_use_id 的 ``tool_result`` 配对。
@@ -79,9 +78,9 @@ def build_steps(events: "list[SessionEvent]") -> list[Step]:
         tool_results = _index_tool_results(events)
 
         # 待消费的 llm_request（按 agent_id 暂存，等其后的 assistant_message + llm_response）。
-        pending_llm: dict[str, SessionEvent] = {}
+        pending_llm: dict[str, TrajEvent] = {}
 
-        def _emit(step: Step, anchor: "SessionEvent | None", ev: SessionEvent) -> None:
+        def _emit(step: Step, anchor: "TrajEvent | None", ev: TrajEvent) -> None:
             step.branch_id = _safe_branch(ev)
             _link(step, last_step_by_branch, event_to_step, branch_first_parent, anchor)
             steps.append(step)
@@ -130,7 +129,7 @@ def build_steps(events: "list[SessionEvent]") -> list[Step]:
 # ── 配对/索引 helper ──────────────────────────────────────────
 
 
-def _index_tool_results(events: "list[SessionEvent]") -> dict:
+def _index_tool_results(events: "list[TrajEvent]") -> dict:
     """(agent_id, tool_use_id) -> 首个匹配的 tool_result 事件。"""
     out: dict = {}
     for ev in events:
@@ -146,7 +145,7 @@ def _index_tool_results(events: "list[SessionEvent]") -> dict:
     return out
 
 
-def _collect_denied_tools(events: "list[SessionEvent]") -> dict:
+def _collect_denied_tools(events: "list[TrajEvent]") -> dict:
     """agent_id -> {被 permission_decision deny 的 tool 名}。供 high-risk 启发。"""
     out: dict[str, set] = {}
     for ev in events:
@@ -162,7 +161,7 @@ def _collect_denied_tools(events: "list[SessionEvent]") -> dict:
     return out
 
 
-def _find_next_llm_response(events, idx: int, agent: str) -> "SessionEvent | None":
+def _find_next_llm_response(events, idx: int, agent: str) -> "TrajEvent | None":
     """从 idx 之后找同 agent 的下一个 llm_response（在遇到下一个 llm_request 前）。"""
     for j in range(idx + 1, len(events)):
         ev = events[j]
@@ -193,7 +192,7 @@ def _preceding_assistant_summary(events, idx: int, agent: str) -> str:
 
 
 def _make_tool_action(
-    call_ev: SessionEvent, result_ev: "SessionEvent | None", agent: str, *,
+    call_ev: TrajEvent, result_ev: "TrajEvent | None", agent: str, *,
     tool, obs: str, denied_tools: dict,
 ) -> Step:
     """tool_call (+ 配对 tool_result) -> tool_action step。"""
@@ -221,8 +220,8 @@ def _make_tool_action(
 
 
 def _make_llm_decision(
-    req_ev: "SessionEvent | None", asst_ev: SessionEvent,
-    resp_ev: "SessionEvent | None", agent: str, *, denied: bool,
+    req_ev: "TrajEvent | None", asst_ev: TrajEvent,
+    resp_ev: "TrajEvent | None", agent: str, *, denied: bool,
 ) -> Step:
     """llm_request -> assistant_message -> llm_response -> llm_decision step。
 
@@ -261,7 +260,7 @@ def _make_llm_decision(
     )
 
 
-def _make_final_from_assistant(asst_ev: SessionEvent, agent: str) -> Step:
+def _make_final_from_assistant(asst_ev: TrajEvent, agent: str) -> Step:
     """tool_uses 为空的 assistant_message -> 该 turn 收尾的 final step。
 
     episode = session（``episode_id = session_id``，docs/10），故**回合级**最终答复 ``done=False``——
@@ -286,7 +285,7 @@ def _make_final_from_assistant(asst_ev: SessionEvent, agent: str) -> Step:
     )
 
 
-def _make_final_terminal(ev: SessionEvent, agent: str, etype: str) -> Step:
+def _make_final_terminal(ev: TrajEvent, agent: str, etype: str) -> Step:
     """turn_end / session_end -> final step。
 
     - ``done`` 仅 ``session_end`` 为 True（episode=session 的唯一终止；turn_end 是回合边界，
@@ -317,7 +316,7 @@ def _make_final_terminal(ev: SessionEvent, agent: str, etype: str) -> Step:
 
 
 def _link(step: Step, last_step_by_branch: dict, event_to_step: dict,
-          branch_first_parent: dict, anchor_ev: "SessionEvent | None") -> None:
+          branch_first_parent: dict, anchor_ev: "TrajEvent | None") -> None:
     """把 step 接到 **(agent_id, branch_id)** 链：parent_step_id = 该分支链上一个 step_id；
     分支首 step 尽力接到 fork 点的 step（该分支首事件 parent_event_id 指向的事件所投影的 step），
     解析不到则 None。更新链尾，并把锚事件 id -> step_id 记入 event_to_step（供后续分支解析 fork）。
@@ -337,7 +336,7 @@ def _link(step: Step, last_step_by_branch: dict, event_to_step: dict,
         event_to_step[ev_id] = step.step_id
 
 
-def _collect_branch_fork_points(events: "list[SessionEvent]") -> dict:
+def _collect_branch_fork_points(events: "list[TrajEvent]") -> dict:
     """branch_id -> 该分支**首事件**的 parent_event_id（fork 点 event id）。
 
     main 分支首事件无 parent_event_id（不记）；fork 出的分支首事件由 Tracer.begin_branch
@@ -352,7 +351,7 @@ def _collect_branch_fork_points(events: "list[SessionEvent]") -> dict:
             if b in seen:
                 continue
             seen.add(b)
-            pev = getattr(ev, "parent_event_id", None)
+            pev = ev.parent_event_id
             if pev:
                 out[b] = _safe_str(pev)
         except Exception:
@@ -381,7 +380,7 @@ def _args_summary(d: dict) -> str:
     return ""
 
 
-def _result_summary(result_ev: "SessionEvent | None") -> str:
+def _result_summary(result_ev: "TrajEvent | None") -> str:
     """tool_result 摘要：full 级有 ``result`` 时截断；summary 级取 ``result_summary``/hash。"""
     if result_ev is None:
         return ""
@@ -395,7 +394,7 @@ def _result_summary(result_ev: "SessionEvent | None") -> str:
     return ""
 
 
-def _request_observation(req_ev: "SessionEvent | None") -> str:
+def _request_observation(req_ev: "TrajEvent | None") -> str:
     """llm_request 的 observation 摘要：message_count + messages_chars（summary 级）。"""
     if req_ev is None:
         return ""
@@ -448,7 +447,7 @@ def _looks_dangerous(call_data: dict) -> bool:
         return False
 
 
-def _explicit_latency(ev: "SessionEvent | None") -> "int | None":
+def _explicit_latency(ev: "TrajEvent | None") -> "int | None":
     """事件 data 里显式携带的 latency_ms（B2：树适配器把 per-call/per-tool 延迟直接放进 data）。
 
     优先于 ts 差——树 ts 是秒级，差值无用；适配器从 message.usage/latencyMs 取毫秒级真值。失败 None。
@@ -462,8 +461,8 @@ def _explicit_latency(ev: "SessionEvent | None") -> "int | None":
         return None
 
 
-def _pair_latency_ms(call_ev: "SessionEvent | None",
-                     result_ev: "SessionEvent | None") -> "int | None":
+def _pair_latency_ms(call_ev: "TrajEvent | None",
+                     result_ev: "TrajEvent | None") -> "int | None":
     """tool_call→tool_result 延迟：优先 result 事件的显式 latency_ms，否则退回 ts 差。"""
     if result_ev is None:
         return None
@@ -473,8 +472,8 @@ def _pair_latency_ms(call_ev: "SessionEvent | None",
     return _latency_ms(_ts(call_ev), _ts(result_ev))
 
 
-def _model_latency_ms(req_ev: "SessionEvent | None",
-                      resp_ev: "SessionEvent | None") -> "int | None":
+def _model_latency_ms(req_ev: "TrajEvent | None",
+                      resp_ev: "TrajEvent | None") -> "int | None":
     """llm_request→llm_response 延迟：优先 response 事件的显式 latency_ms，否则退回 ts 差
     （仅当 req/resp 都在时）。"""
     explicit = _explicit_latency(resp_ev)
@@ -514,51 +513,47 @@ def _parse_ts(ts: str):
         return None
 
 
-# ── SessionEvent 字段安全读取（兼容 legacy / 缺字段）──────────
+# ── TrajEvent 字段归一化（TrajEvent 恒为 dataclass，docs/16 C-1：getattr 双形态容忍已删；
+#    data 仍 isinstance 校验——它来自磁盘 JSONL，属输入校验而非兼容层）──────────
 
 
-def _data(ev: SessionEvent) -> dict:
-    d = getattr(ev, "data", None)
-    return d if isinstance(d, dict) else {}
+def _data(ev: TrajEvent) -> dict:
+    return ev.data if isinstance(ev.data, dict) else {}
 
 
-def _safe_type(ev: SessionEvent) -> str:
-    return _safe_str(getattr(ev, "type", ""))
+def _safe_type(ev: TrajEvent) -> str:
+    return _safe_str(ev.type)
 
 
-def _safe_agent(ev: SessionEvent) -> str:
-    a = getattr(ev, "agent_id", "")
-    return _safe_str(a) if a else "main"
+def _safe_agent(ev: TrajEvent) -> str:
+    return _safe_str(ev.agent_id) if ev.agent_id else "main"
 
 
-def _safe_branch(ev: SessionEvent) -> str:
-    b = getattr(ev, "branch_id", "")
-    return _safe_str(b) if b else "main"
+def _safe_branch(ev: TrajEvent) -> str:
+    return _safe_str(ev.branch_id) if ev.branch_id else "main"
 
 
-def _seq(ev: SessionEvent) -> int:
-    return _as_int(getattr(ev, "seq", 0))
+def _seq(ev: TrajEvent) -> int:
+    return _as_int(ev.seq)
 
 
-def _ts(ev: "SessionEvent | None") -> str:
+def _ts(ev: "TrajEvent | None") -> str:
     if ev is None:
         return ""
-    return _safe_str(getattr(ev, "ts", ""))
+    return _safe_str(ev.ts)
 
 
-def _turn(ev: SessionEvent) -> "str | None":
-    return getattr(ev, "turn_id", None)
+def _turn(ev: TrajEvent) -> "str | None":
+    return ev.turn_id
 
 
-def _episode_id(ev: SessionEvent) -> str:
-    return _safe_str(getattr(ev, "session_id", ""))
+def _episode_id(ev: TrajEvent) -> str:
+    return _safe_str(ev.session_id)
 
 
-def _traj_id(ev: SessionEvent) -> str:
-    """trajectory_id：优先取 wire envelope 注入的 ``trajectory_id``，否则 ``traj_<session_id>``。"""
-    tid = _data(ev).get("trajectory_id")
-    if tid:
-        return _safe_str(tid)
+def _traj_id(ev: TrajEvent) -> str:
+    """trajectory_id = ``traj_<session_id>``（docs/16 C-1：wire envelope 注入分支已删——树 entry
+    data 从不携带 trajectory_id）。"""
     sid = _episode_id(ev)
     return f"traj_{sid}" if sid else "traj_"
 

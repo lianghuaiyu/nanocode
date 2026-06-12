@@ -48,7 +48,6 @@ class TrajEvent:
     parent_event_id: "str | None" = None
     branch_id: str = "main"
     turn_id: "str | None" = None
-    legacy: bool = False
     line_no: int = 0
     data: dict = field(default_factory=dict)
 
@@ -365,8 +364,7 @@ def _first_user_text(mgr: "SessionManager") -> str:
 
 def list_tree_sessions() -> "list[dict]":
     """列出 ``sessions_dir()/*/session.jsonl`` 的**顶层**会话（排除带 parentSession 的子会话），
-    按 mtime 倒序。shape 兼容 trace.report.render_wire_session_list（session_id / start_ts /
-    first_user_msg / n_agents / n_events / mtime）。绝不抛。"""
+    按 mtime 倒序。shape：session_id / start_ts / first_user_msg / n_agents / n_events / mtime。绝不抛。"""
     root = sessions_dir()
     out: list[dict] = []
     if not root.is_dir():

@@ -72,7 +72,3 @@ def test_build_msb_command_persist_uses_explicit_session_id(monkeypatch):
     assert "nanocode-sbx-EXPLICIT" in cmd
 
 
-# ---- env 回退兼容（旧无参函数保留）----
-def test_legacy_sandbox_name_still_env(monkeypatch):
-    monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
-    assert ss._sandbox_name() == "nanocode-sbx-ENV"

@@ -27,9 +27,6 @@ from typing import Any
 from ._text import truncate
 from ._tree_events import TrajEvent
 
-# Milestone B2：投影逻辑保留，仅换 source（wire → canonical 树适配器）。SessionEvent 名沿用为
-# TrajEvent 的别名，最小化类型注解 diff。
-SessionEvent = TrajEvent
 
 # ─── 信号常量 ────────────────────────────────────────────────────────────────
 
@@ -72,10 +69,9 @@ _WRITE_TOOLS = frozenset({"write_file", "edit_file", "write", "edit", "create_fi
 
 # ─── 小工具：健壮取值 ────────────────────────────────────────────────────────
 
-def _data(ev: SessionEvent) -> dict:
-    """安全取 ``ev.data``（恒 dict）。"""
-    d = getattr(ev, "data", None)
-    return d if isinstance(d, dict) else {}
+def _data(ev: TrajEvent) -> dict:
+    """取 ``ev.data``（恒 dict；data 来自磁盘 JSONL，isinstance 是输入校验）。"""
+    return ev.data if isinstance(ev.data, dict) else {}
 
 
 def _result_text(d: dict) -> str:
@@ -168,7 +164,7 @@ def _step_anchor_seq(step_id: "str | None") -> "int | None":
         return None
 
 
-def _step_id_for(ev: SessionEvent, steps: "list | None") -> "str | None":
+def _step_id_for(ev: TrajEvent, steps: "list | None") -> "str | None":
     """把一条 event 关联到产生它的 step_id（若提供了 steps）。
 
     **按锚 seq 就近归属**（修审阅 HIGH 的 reward 误归属）：一个 turn 内所有事件共享同一
@@ -182,9 +178,9 @@ def _step_id_for(ev: SessionEvent, steps: "list | None") -> "str | None":
     if not steps:
         return None
     try:
-        agent_id = getattr(ev, "agent_id", "") or "main"
-        turn_id = getattr(ev, "turn_id", None)
-        ev_seq = _as_int(getattr(ev, "seq", None))
+        agent_id = ev.agent_id or "main"
+        turn_id = ev.turn_id
+        ev_seq = _as_int(ev.seq)
         best_id = None
         best_seq = None
         for s in steps:
@@ -214,7 +210,7 @@ def _step_id_for(ev: SessionEvent, steps: "list | None") -> "str | None":
 
 # ─── P4 API：online_evals ────────────────────────────────────────────────────
 
-def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "list[dict]":
+def online_evals(events: "list[TrajEvent]", steps: "list | None" = None) -> "list[dict]":
     """在线启发式评估：对每条出现的信号产出一条 eval 记录（plain dict）。
 
     一条记录形状：``{"step_id"|None, "turn_id"|None, "agent_id", "signal", "value", "detail"}``。
@@ -239,9 +235,9 @@ def online_evals(events: "list[SessionEvent]", steps: "list | None" = None) -> "
 
     for ev in events:
         try:
-            etype = getattr(ev, "type", "") or ""
-            agent_id = getattr(ev, "agent_id", "") or ""
-            turn_id = getattr(ev, "turn_id", None)
+            etype = ev.type or ""
+            agent_id = ev.agent_id or ""
+            turn_id = ev.turn_id
             d = _data(ev)
             sid = _step_id_for(ev, steps)
 
@@ -436,7 +432,7 @@ def _copy_step(step):
 
 # ─── P4 API：failure_attribution ────────────────────────────────────────────
 
-def failure_attribution(events: "list[SessionEvent]", evals: "list[dict]") -> "dict | None":
+def failure_attribution(events: "list[TrajEvent]", evals: "list[dict]") -> "dict | None":
     """尽力定位失败首因：返回首个失败 eval 关联的 step/tool/turn，干净则 None。
 
     返回形状（best-effort）：
