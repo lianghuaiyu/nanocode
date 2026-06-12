@@ -39,7 +39,6 @@ from ..prompt import build_system_prompt
 from ..skills.listing import (
     skill_listing_delta,
     render_skill_body_message,
-    append_to_last_user,
 )
 from ..skills.discovery import (
     register_nested_skill_dirs,
@@ -847,24 +846,16 @@ class Agent(PlanModeMixin):
         except Exception:
             return False
 
-    def _inject_skill_listing(self, messages: list) -> None:
+    def _inject_skill_listing(self) -> None:
+        """skill 清单 → custom_message entry（树是唯一注入通道，docs/16 #1：flat 注入已删）。
+        dedup（_sent_skill_names）**只在树写成功后**推进——失败则下一轮重试，不静默丢清单。"""
         if self.is_sub_agent:
             return
         text, new_names = skill_listing_delta(
             self._sent_skill_names, self._activated_path_skills, self._skill_listing_budget()
         )
-        if text:
-            # docs/14 §4.5：有树（主 agent 常态）→ 写 custom_message（请求由 _build_request_messages 从树
-            # 渲染）；无树 → flat 注入（此时 flat 是请求源）。dedup（_sent_skill_names）**只在注入真正生效后**
-            # 推进——有树但树写失败时，flat 兜底会被 _build_request_messages 丢弃，故不推进 dedup、下一轮重试，
-            # 不静默丢清单（review medium：原来无条件推进会永久丢失）。
-            if self._session_mgr is not None:
-                if self._tree_custom_message("skill_listing", text):
-                    self._sent_skill_names.update(new_names)
-                # 树写失败：不推进 dedup（下一轮重试树写）；不走 flat（会被树渲染丢弃）
-            else:
-                append_to_last_user(messages, text)        # 无树 → flat 即请求源，生效
-                self._sent_skill_names.update(new_names)
+        if text and self._tree_custom_message("skill_listing", text):
+            self._sent_skill_names.update(new_names)
 
     def _on_file_touched(self, name: str, inp: dict) -> None:
         """成功 read/write/edit 后触发：宿主派生文件事实 + 嵌套发现 .nanocode/skills + paths 条件激活。
@@ -891,14 +882,15 @@ class Agent(PlanModeMixin):
             if s.paths and path_activates_skill(touched, s, cwd):
                 self._activated_path_skills.add(s.name)
 
-    def _inject_pending_skill_bodies(self, messages: list) -> None:
-        # 有树（主 agent 或 full-P6b 子 agent）→ custom_message；无树 → flat 注入。
-        tree_backed = self._session_mgr is not None
+    def _inject_pending_skill_bodies(self) -> None:
+        """skill body → custom_message entry（树是唯一注入通道，docs/16 #1：flat 注入已删）。
+        树写失败的 body 留在队列、下一轮重试（不静默丢指令）。"""
+        remaining: list = []
         for name, body in self._pending_skill_bodies:
             msg = render_skill_body_message(name, body)
-            if not (tree_backed and self._tree_custom_message("skill_body", msg.get("content", ""))):
-                messages.append(msg)
-        self._pending_skill_bodies = []
+            if not self._tree_custom_message("skill_body", msg.get("content", "")):
+                remaining.append((name, body))
+        self._pending_skill_bodies = remaining
 
     # ─── Large result persistence ─────────────────────────────────
 
@@ -919,12 +911,12 @@ class Agent(PlanModeMixin):
         task.add_done_callback(self._background_tasks.discard)
         return rec.id
 
-    def _inject_finished_tasks(self, messages: list) -> None:
-        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder>。主 agent（有树）→
-        custom_message entry 挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这
-        优先于 docs/14 §6b 的"pin 到 spawn 分支"：字面 parent_id=spawn_leaf 会造成 sibling 分支、
-        既不可见又会 fork 掉用户后续 turn）。spawn 血缘记在 task.spawn_entry_id（state.json 持久）供审计。
-        无树（子 agent 早期）→ flat 追加到 last user message。dedup 经 task.injected 持久标记。"""
+    def _inject_finished_tasks(self) -> None:
+        """turn boundary 注入：终态且未注入的后台任务渲染成 <system-reminder>，写 custom_message entry
+        挂在 **live leaf**（必须在当前 branch 上，否则模型看不到完成提醒——这优先于 docs/14 §6b 的
+        "pin 到 spawn 分支"：字面 parent_id=spawn_leaf 会造成 sibling 分支、既不可见又会 fork 掉用户
+        后续 turn）。spawn 血缘记在 task.spawn_entry_id（state.json 持久）供审计。树是唯一注入通道
+        （docs/16 #1：flat 兜底已删）；树写失败 → 不标 injected、下一轮重试，不静默丢提醒。"""
         if self.is_sub_agent:
             return   # 子 agent 与父共享 TaskManager；finished-task 回注是**父**（user-facing loop）的职责，
                      # 否则子会"偷走"并标 injected 父/兄弟的后台完成提醒，使父永不浮现（review high）。
@@ -932,21 +924,8 @@ class Agent(PlanModeMixin):
         if not pending:
             return
         text = "\n\n".join(render_task_reminder(t) for t in pending)
-        wrote = (self._session_mgr is not None
-                 and self._tree_custom_message("finished_tasks", text))
-        if not wrote:                          # 无树 / 树写失败 → flat 兜底（追加到 last user message）
-            last = messages[-1] if messages else None
-            if last and last.get("role") == "user":
-                content = last.get("content", "")
-                if isinstance(content, str):
-                    last["content"] = content + "\n\n" + text
-                elif isinstance(content, list):
-                    content.append({"type": "text", "text": text})
-                else:
-                    messages.append({"role": "user", "content": text})
-            else:
-                messages.append({"role": "user", "content": text})
-        # 注入已落地（树或 flat）才标 injected——避免树写失败时 dedup 误推进、丢提醒（docs/14 P3 review #7）。
+        if not self._tree_custom_message("finished_tasks", text):
+            return
         for t in pending:
             self.task_manager.update_task(t.id, injected=True)
 

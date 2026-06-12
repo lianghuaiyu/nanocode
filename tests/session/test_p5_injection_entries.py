@@ -39,7 +39,7 @@ def test_inject_skill_listing_writes_custom_message(monkeypatch):
     mgr.append_message(T.user_message("hi"))
     monkeypatch.setattr("nanocode.agent.engine.skill_listing_delta",
                         lambda sent, act, budget: ("LISTING-X", {"s1"}))
-    a._inject_skill_listing([{"role": "user", "content": "hi"}])   # tree-backed → 只写树 custom_message
+    a._inject_skill_listing()                                      # tree-backed → 只写树 custom_message
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert len(cms) == 1 and "LISTING-X" in cms[0].data["content"]
 
@@ -79,8 +79,6 @@ def test_inject_finished_tasks_tree_backed_writes_custom_message_not_flat(monkey
     monkeypatch.setattr("nanocode.agent.engine.collect_pending_injections",
                         lambda tm: [type("FakeT", (), {"id": "t1"})()])
     monkeypatch.setattr("nanocode.agent.engine.render_task_reminder", lambda t: "TASK-DONE")
-    flat = [{"role": "user", "content": "hi"}]
-    a._inject_finished_tasks(flat)
-    assert flat[-1]["content"] == "hi"               # 主 agent 不改 flat list
+    a._inject_finished_tasks()
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert any("TASK-DONE" in e.data.get("content", "") for e in cms)

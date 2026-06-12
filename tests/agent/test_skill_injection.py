@@ -1,5 +1,12 @@
 import asyncio
 from nanocode.agent.engine import Agent
+from nanocode.session import tree as T
+from nanocode.session.manager import SessionManager
+
+
+def _custom_msgs(mgr, kind=None):
+    return [e.data.get("content", "") for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE
+            and (kind is None or e.data.get("customType") == kind)]
 
 
 def _agent():
@@ -14,21 +21,21 @@ def test_inject_listing_then_silent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     discovery.reset_skill_cache()
     a = _agent()
-    msgs = [{"role": "user", "content": "hi"}]
-    a._inject_skill_listing(msgs)
-    assert "<system-reminder>" in msgs[-1]["content"] and "k1" in msgs[-1]["content"]
-    # 第二次无新增 → 不再注入
-    before = [dict(m) for m in msgs]
-    a._inject_skill_listing(msgs)
-    assert msgs == before
+    a._session_mgr = SessionManager.create("ski_listing")
+    a._inject_skill_listing()
+    cms = _custom_msgs(a._session_mgr, "skill_listing")
+    assert len(cms) == 1 and "<system-reminder>" in cms[0] and "k1" in cms[0]
+    # 第二次无新增 → 不再注入（dedup 已推进）
+    a._inject_skill_listing()
+    assert len(_custom_msgs(a._session_mgr, "skill_listing")) == 1
 
 
 def test_inject_listing_skipped_for_subagent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = Agent(api_key="test", is_sub_agent=True)
-    msgs = [{"role": "user", "content": "hi"}]
-    a._inject_skill_listing(msgs)
-    assert msgs == [{"role": "user", "content": "hi"}]
+    a._session_mgr = SessionManager.create("ski_sub")
+    a._inject_skill_listing()
+    assert _custom_msgs(a._session_mgr) == []          # 子 agent → no-op
 
 
 def test_skill_tool_returns_stub_and_queues_body(tmp_path, monkeypatch):
@@ -43,10 +50,11 @@ def test_skill_tool_returns_stub_and_queues_body(tmp_path, monkeypatch):
     assert "loaded" in res.lower() and "commitx" in res        # tool_result 是 stub
     assert "Do the thing" not in res                              # body 不在 tool_result
     assert a._pending_skill_bodies and a._pending_skill_bodies[0][0] == "commitx"
-    msgs = []
-    a._inject_pending_skill_bodies(msgs)
-    assert "<command-name>commitx</command-name>" in msgs[0]["content"]
-    assert "Do the thing now" in msgs[0]["content"]              # $ARGUMENTS 已替换
+    a._session_mgr = SessionManager.create("ski_body")
+    a._inject_pending_skill_bodies()
+    (body,) = _custom_msgs(a._session_mgr, "skill_body")
+    assert "<command-name>commitx</command-name>" in body
+    assert "Do the thing now" in body                            # $ARGUMENTS 已替换
     assert a._pending_skill_bodies == []                          # 队列已清
 
 
@@ -66,14 +74,13 @@ def test_paths_skill_activated_by_touch(tmp_path, monkeypatch):
     (d / "SKILL.md").write_text("---\nname: pyhelp\ndescription: py\npaths:\n  - '*.py'\n---\nb")
     monkeypatch.chdir(tmp_path); discovery.reset_skill_cache()
     a = _agent()
-    msgs = [{"role": "user", "content": "hi"}]
-    a._inject_skill_listing(msgs)
-    assert "pyhelp" not in str(msgs[-1]["content"])          # 未触碰 → 不在清单
+    a._session_mgr = SessionManager.create("ski_paths")
+    a._inject_skill_listing()
+    assert "pyhelp" not in str(_custom_msgs(a._session_mgr))   # 未触碰 → 不在清单
     a._on_file_touched("read_file", {"file_path": "foo.py"})
     assert "pyhelp" in a._activated_path_skills
-    msgs2 = [{"role": "user", "content": "next"}]
-    a._inject_skill_listing(msgs2)
-    assert "pyhelp" in str(msgs2[-1]["content"])              # 触碰后 → 进清单
+    a._inject_skill_listing()
+    assert "pyhelp" in str(_custom_msgs(a._session_mgr))       # 触碰后 → 进清单
 
 
 def test_disable_model_invocation_rejected(tmp_path, monkeypatch):

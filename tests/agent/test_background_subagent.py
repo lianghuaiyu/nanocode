@@ -215,9 +215,12 @@ def test_background_finished_task_injected_to_reminder():
         await _wait_task_terminal(parent, "task-001")
 
     asyncio.run(scenario())
-    msgs = [{"role": "user", "content": "next turn"}]
-    parent._inject_finished_tasks(msgs)
-    content = msgs[-1]["content"]
+    from nanocode.session import tree as _T
+    from nanocode.session.manager import SessionManager as _SM
+    parent._session_mgr = parent._session_mgr or _SM.create("bgsub_inj")
+    parent._inject_finished_tasks()
+    content = next(e.data["content"] for e in parent._session_mgr.entries()
+                   if e.type == _T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks")
     assert "<system-reminder>" in content
     assert "task-001" in content
     assert "subagent" in content

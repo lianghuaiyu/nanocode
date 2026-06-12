@@ -66,16 +66,3 @@ def skill_listing_delta(sent_names: set[str],
 def render_skill_body_message(name: str, body: str) -> dict:
     return {"role": "user", "content": f"<command-name>{name}</command-name>\n\n{body}"}
 
-
-def append_to_last_user(messages: list, text: str) -> None:
-    last = messages[-1] if messages else None
-    if last and last.get("role") == "user":
-        content = last.get("content", "")
-        if isinstance(content, str):
-            last["content"] = (content or "") + "\n\n" + text
-        elif isinstance(content, list):
-            content.append({"type": "text", "text": text})
-        else:
-            messages.append({"role": "user", "content": text})
-    else:
-        messages.append({"role": "user", "content": text})

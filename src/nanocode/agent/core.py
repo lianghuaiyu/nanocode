@@ -72,25 +72,18 @@ class AgentCore:
                 try:
                     memories = memory_prefetch.task.result()
                     if memories:
+                        # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup，
+                        # 下一轮 prefetch 重新浮现（不静默丢记忆）。
                         injection_text = format_memories_for_injection(memories)
-                        if not host._tree_custom_message("memory", injection_text):
-                            last = host._anthropic_messages[-1] if host._anthropic_messages else None
-                            if last and last.get("role") == "user":
-                                content = last.get("content", "")
-                                if isinstance(content, str):
-                                    last["content"] = content + "\n\n" + injection_text
-                                elif isinstance(content, list):
-                                    content.append({"type": "text", "text": injection_text})
-                            else:
-                                host._anthropic_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            host._already_surfaced_memories.add(m.path)
-                            host._session_memory_bytes += len(m.content.encode())
+                        if host._tree_custom_message("memory", injection_text):
+                            for m in memories:
+                                host._already_surfaced_memories.add(m.path)
+                                host._session_memory_bytes += len(m.content.encode())
                 except Exception:
                     pass
 
-            host._inject_finished_tasks(host._anthropic_messages)
-            host._inject_skill_listing(host._anthropic_messages)
+            host._inject_finished_tasks()
+            host._inject_skill_listing()
 
             if not host.is_sub_agent:
                 host._sink.spinner_start()
@@ -210,7 +203,7 @@ class AgentCore:
                 self._record_messages(host, tr_msg)       # §7.6①：tool result 必须落树（否则 assistant tool_call 孤儿）
             host._context_cleared = False
             if not context_break:
-                host._inject_pending_skill_bodies(host._anthropic_messages)
+                host._inject_pending_skill_bodies()
 
     # ─── OpenAI turn（移植自 _chat_openai，self→host）──────────────────────────
     async def run_openai_turn(self, host, user_message: str) -> None:
@@ -237,21 +230,17 @@ class AgentCore:
                 try:
                     memories = memory_prefetch.task.result()
                     if memories:
+                        # 树是唯一注入通道（docs/16 #1：flat 兜底已删）；写失败 → 不推进 dedup。
                         injection_text = format_memories_for_injection(memories)
-                        if not host._tree_custom_message("memory", injection_text):
-                            last = host._openai_messages[-1] if host._openai_messages else None
-                            if last and last.get("role") == "user":
-                                last["content"] = (last.get("content") or "") + "\n\n" + injection_text
-                            else:
-                                host._openai_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            host._already_surfaced_memories.add(m.path)
-                            host._session_memory_bytes += len(m.content.encode())
+                        if host._tree_custom_message("memory", injection_text):
+                            for m in memories:
+                                host._already_surfaced_memories.add(m.path)
+                                host._session_memory_bytes += len(m.content.encode())
                 except Exception:
                     pass
 
-            host._inject_finished_tasks(host._openai_messages)
-            host._inject_skill_listing(host._openai_messages)
+            host._inject_finished_tasks()
+            host._inject_skill_listing()
 
             if not host.is_sub_agent:
                 host._sink.spinner_start()
@@ -383,7 +372,7 @@ class AgentCore:
 
             host._context_cleared = False
             if not oai_context_break:
-                host._inject_pending_skill_bodies(host._openai_messages)
+                host._inject_pending_skill_bodies()
 
     # ─── Summary compaction（移植自 mixin，host-driven）────────────────────────
     async def _compact_anthropic(self, host) -> "str | None":

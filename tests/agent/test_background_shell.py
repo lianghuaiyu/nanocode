@@ -73,41 +73,41 @@ def test_task_tools_default_mode_allow():
         assert perm["action"] == "allow"
 
 
-def test_inject_finished_tasks_appends_to_last_user():
+def _ftask_custom_msgs(a):
+    from nanocode.session import tree as T
+    return [e.data.get("content", "") for e in a._session_mgr.entries()
+            if e.type == T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks"]
+
+
+def test_inject_finished_tasks_writes_custom_message_and_dedups():
+    from nanocode.session.manager import SessionManager
     a = _agent()
+    a._session_mgr = SessionManager.create("bgsh_inj")
     t = a.task_manager.create_task("shell", "echo hi")
     a.task_manager.update_task(t.id, status="completed", exit_code=0, result_summary="hi")
-    msgs = [{"role": "user", "content": "do something"}]
-    a._inject_finished_tasks(msgs)
-    assert "<system-reminder>" in msgs[-1]["content"] and t.id in msgs[-1]["content"]
+    a._inject_finished_tasks()
+    (cm,) = _ftask_custom_msgs(a)
+    assert "<system-reminder>" in cm and t.id in cm
     assert a.task_manager.get_task(t.id).injected is True
-    before = [dict(m) for m in msgs]
-    a._inject_finished_tasks(msgs)
-    assert msgs == before
+    a._inject_finished_tasks()                                  # dedup：不再注入
+    assert len(_ftask_custom_msgs(a)) == 1
 
 
 def test_inject_finished_tasks_skips_running():
+    from nanocode.session.manager import SessionManager
     a = _agent(); a.task_manager.create_task("shell", "still going")
-    msgs = [{"role": "user", "content": "hi"}]
-    a._inject_finished_tasks(msgs)
-    assert msgs == [{"role": "user", "content": "hi"}]
+    a._session_mgr = SessionManager.create("bgsh_run")
+    a._inject_finished_tasks()
+    assert _ftask_custom_msgs(a) == []
 
 
-def test_inject_finished_tasks_new_user_when_last_not_user():
+def test_inject_finished_tasks_tree_write_failure_retries(monkeypatch):
+    # docs/16 #1：flat 兜底已删——树写失败 → 不标 injected，下一轮重试（不静默丢提醒）。
+    from nanocode.session.manager import SessionManager
     a = _agent(); t = a.task_manager.create_task("shell", "x")
     a.task_manager.update_task(t.id, status="completed")
-    msgs = [{"role": "assistant", "content": "ok"}]
-    a._inject_finished_tasks(msgs)
-    assert msgs[-1]["role"] == "user" and "<system-reminder>" in msgs[-1]["content"]
-
-
-def test_inject_finished_tasks_handles_list_content():
-    a = _agent(); t = a.task_manager.create_task("shell", "x")
-    a.task_manager.update_task(t.id, status="completed")
-    msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-    a._inject_finished_tasks(msgs)
-    last = msgs[-1]["content"]
-    assert isinstance(last, list) and any(
-        b.get("type") == "text" and "<system-reminder>" in b.get("text", "") for b in last)
-    assert a.task_manager.get_task(t.id).injected is True
+    a._session_mgr = SessionManager.create("bgsh_fail")
+    monkeypatch.setattr(a, "_tree_custom_message", lambda *args, **kw: False)
+    a._inject_finished_tasks()
+    assert a.task_manager.get_task(t.id).injected is False      # 未推进 dedup → 重试
 

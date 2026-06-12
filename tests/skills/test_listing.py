@@ -1,7 +1,7 @@
 from nanocode.skills.discovery import SkillDefinition
 from nanocode.skills.listing import (
     build_skill_listing, skill_listing_delta,
-    render_skill_body_message, append_to_last_user,
+    render_skill_body_message,
 )
 
 
@@ -42,29 +42,6 @@ def test_render_body_message_has_command_name():
     assert "<command-name>commit</command-name>" in m["content"]
     assert "do the commit" in m["content"]
 
-
-def test_append_to_last_user_str():
-    msgs = [{"role": "user", "content": "hi"}]
-    append_to_last_user(msgs, "EXTRA")
-    assert msgs[-1]["content"] == "hi\n\nEXTRA"
-
-
-def test_append_to_last_user_list_content():
-    msgs = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "r"}]}]
-    append_to_last_user(msgs, "EXTRA")
-    assert {"type": "text", "text": "EXTRA"} in msgs[-1]["content"]
-
-
-def test_append_to_last_user_non_user_appends_new():
-    msgs = [{"role": "assistant", "content": "a"}]
-    append_to_last_user(msgs, "EXTRA")
-    assert msgs[-1] == {"role": "user", "content": "EXTRA"}
-
-
-def test_append_to_last_user_empty():
-    msgs = []
-    append_to_last_user(msgs, "EXTRA")
-    assert msgs == [{"role": "user", "content": "EXTRA"}]
 
 
 def test_skill_listing_delta_diff(tmp_path, monkeypatch):
