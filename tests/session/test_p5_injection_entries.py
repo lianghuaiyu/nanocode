@@ -39,7 +39,7 @@ def test_inject_skill_listing_writes_custom_message(monkeypatch):
     mgr.append_message(T.user_message("hi"))
     monkeypatch.setattr("nanocode.agent.engine.skill_listing_delta",
                         lambda sent, act, budget: ("LISTING-X", {"s1"}))
-    a._inject_skill_listing([{"role": "user", "content": "hi"}])   # flat 注入仍发生 + 树 custom_message
+    a._inject_skill_listing([{"role": "user", "content": "hi"}])   # tree-backed → 只写树 custom_message
     cms = [e for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert len(cms) == 1 and "LISTING-X" in cms[0].data["content"]
 
