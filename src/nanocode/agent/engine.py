@@ -52,7 +52,6 @@ from .core import AgentCore
 
 # 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
 from .subagent_manager import SubAgentManager  # noqa: E402
-from . import agent_result  # noqa: E402 — 子 agent 结果信封纯函数（CAP-P1 STEP 1）
 from . import runtime_events  # noqa: E402 — typed AgentEvent UI 投影（docs/16 #2/#4）
 
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
@@ -896,14 +895,9 @@ class Agent(PlanModeMixin):
         return self._spawn.write_agent_result(self, agent_id, text)
 
     # ─── Structured AgentResult + bounded envelope ────────────────
-    # 纯函数（无 self / IO / 模型循环）已抽入 agent_result.py（CAP-P1 STEP 1）；以下为委托 shim。
-
-    def _build_agent_result(self, sub_agent: "Agent", text: str,
-                            tokens: dict, result_path: str | None) -> dict:
-        return agent_result.build_agent_result(sub_agent, text, tokens, result_path)
-
-    def _render_agent_result_envelope(self, result: dict, raw_text: str) -> str:
-        return agent_result.render_agent_result_envelope(result, raw_text)
+    # docs/16 #7b：spawn 终态/成功路径改走 typed agents.result.ResultEnvelope；
+    # engine 的 _build_agent_result/_render_agent_result_envelope 委托 shim 删除
+    # （纯函数本体在 agent_result.py，ResultEnvelope 复用之）。
 
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
         """把子 agent 已花费的 token 折叠进父（成功/超时/错误都折；实现在 runtime/spawn.py）。"""

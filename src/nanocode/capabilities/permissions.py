@@ -1,16 +1,16 @@
 """capabilities/permissions.py — 不可变 PermissionContext（docs/15 §5/§13#6）。
 
-PermissionEngine 今天持 live Agent back-ref（读 permission_mode / _plan_file_path /
-_allowed_tool_names）。本模块提供一个**不可变** PermissionContext,从 AgentProfile + runtime 配置
-构建,使权限决策不再耦合到 Agent god-class——PermissionEngine 已 duck-type 这三个属性,故
-`PermissionEngine(ctx)` 直接可用,无需改 PermissionEngine 本体（additive 解耦）。
+不可变 PermissionContext + 纯决策函数 decide()——权限裁决的单一基底（docs/16 #7b）。
+PermissionEngine（tools/permissions.py）持 live Agent back-ref，但其 check() 现在只做一件事：
+把 live 属性（permission_mode / _plan_file_path / _allowed_tool_names）快照成 PermissionContext
+再调 decide()。任何替代宿主（SDK / AppServer / profile 驱动的 spawn）直接构建 ctx 即可。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..tools.permissions import Decision, PermissionEngine
+from ..tools.permissions import Decision, allowlist_blocks, check_permission
 
 
 @dataclass(frozen=True)
@@ -51,5 +51,13 @@ class PermissionContext:
 
 
 def decide(ctx: PermissionContext, name: str, inp: dict) -> Decision:
-    """据不可变上下文做一次工具派发决策（policy action + allowlist 标记）。纯决策,无副作用。"""
-    return PermissionEngine(ctx).check(name, inp)
+    """据不可变上下文做一次工具派发决策（policy action + allowlist 标记）。纯决策,无副作用。
+
+    docs/16 #7b：这是权限决策的**基底**——PermissionEngine.check 也经此（live agent 属性
+    每次 check 快照成 PermissionContext 再裁决），决策逻辑单点化、不再依赖 Agent god-class。"""
+    policy = check_permission(name, inp, ctx.permission_mode, ctx._plan_file_path)
+    return Decision(
+        action=policy["action"],
+        message=policy.get("message", ""),
+        allowlist_blocked=allowlist_blocks(name, ctx._allowed_tool_names),
+    )

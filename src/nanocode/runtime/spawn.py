@@ -29,12 +29,44 @@ from ..memory.maintenance import (
 )
 from ..agent.subagent_manager import SubAgentManager
 from ..session import v2 as _session_v2
-from ..agents.registry import build_profile, effective_tools
+from ..agents.permissions import effective_child_tools
+from ..agents.result import ResultEnvelope
+from ..agents.profile import AgentProfile, IsolationPolicy, PermissionProfile
+from ..agents.registry import build_profile
 
 
 async def _auto_deny_confirm(_command: str) -> bool:
     """后台子 agent 的 confirm_fn：无 TTY 等价拒绝（auto-deny-but-continue）。"""
     return False
+
+
+def live_agent_profile(host) -> AgentProfile:
+    """live Agent 的 profile 视图（docs/16 #7b：child 派生的 parent 侧输入）。
+
+    只投影派生所需面：tools_allow = 父的 call-time allowlist（主 agent 恒 None）、
+    permission.mode = 父当前 mode（子不得高于父）、can_spawn = 非子 agent。"""
+    return AgentProfile(
+        name=host.agent_type or ("subagent" if host.is_sub_agent else "build"),
+        mode="subagent" if host.is_sub_agent else "primary",
+        model=host.model,
+        tools_allow=(set(host._allowed_tool_names) if host._allowed_tool_names is not None else None),
+        tools_deny=set(),
+        permission=PermissionProfile(mode=host.permission_mode),
+        isolation=IsolationPolicy(own_session=True, can_spawn=not host.is_sub_agent),
+    )
+
+
+def child_tools(host, profile: AgentProfile, *, background: bool = False) -> list:
+    """父+子 profile 派生的子 agent 有效 ToolDef 列表（docs/16 #7b：
+    derive_child_profile/effective_child_tools 上 live spawn 路径）。
+
+    语义：allow 交集（子绝不获得父没有的工具）、deny 并集、永剔 'agent'（子不 spawn 孙）。
+    主 agent 父（allow=None、deny=∅）下与 registry.effective_tools(profile) 逐字节等价——
+    typed 派生让「子不得超过父」对未来的非主 parent 也结构性成立。"""
+    from ..tools import tool_definitions
+    names = effective_child_tools(live_agent_profile(host), profile,
+                                  {t["name"] for t in tool_definitions}, background=background)
+    return [t for t in tool_definitions if t["name"] in names]
 
 
 class SubAgentRunner:
@@ -231,7 +263,8 @@ class SubAgentRunner:
     def finalize_foreground_terminal(self, host, sub_agent, record_id: str,
                                      kind: str, payload, timeout_ms: "int | None") -> str:
         """前台 timeout/error 终态共用：折叠 token + 落 partial result.md + 回传带宿主派生
-        files_modified 的最小信封（而非裸 '[timed out]' 字符串）。"""
+        files_modified 的最小信封（而非裸 '[timed out]' 字符串）。docs/16 #7b：typed
+        ResultEnvelope（render 保 ≤4KB 直通/截断+指针 bound 不变）。"""
         host._fold_subagent_tokens(sub_agent)
         partial = host._subagent_captured_text(sub_agent)
         reason = (f"[sub-agent timed out after {timeout_ms} ms]" if kind == "timeout"
@@ -242,24 +275,26 @@ class SubAgentRunner:
                 host.task_manager.update_subagent(record_id, last_result_path=result_path)
             except Exception:
                 pass
-        agent_result = host._build_agent_result(
-            sub_agent, partial or reason, {"input": 0, "output": 0}, result_path)
-        agent_result["summary"] = reason + (
+        envelope = ResultEnvelope.build(
+            sub_agent, partial or reason, {"input": 0, "output": 0}, result_path,
+            status=("timed_out" if kind == "timeout" else "failed"),
+            error=(None if kind == "timeout" else str(payload)))
+        envelope.summary = reason + (
             " — partial transcript persisted" if partial else "")
-        return host._render_agent_result_envelope(agent_result, "")
+        return envelope.render("")
 
     def finalize_foreground_result(self, host, sub_agent, result: dict,
                                    result_path: "str | None", record_id: "str | None") -> str:
-        """前台/skill-fork 成功路径共用：装配 AgentResult → 渲染有界信封 → 回填 last_result_path。"""
+        """前台/skill-fork 成功路径共用：装配 typed ResultEnvelope → 渲染有界信封（≤4KB 直通/
+        截断+指针）→ 回填 last_result_path。父 branch 只存信封 + child session id（§11.1）。"""
         text = result.get("text") or ""
-        agent_result = host._build_agent_result(
-            sub_agent, text, result.get("tokens") or {}, result_path)
+        envelope = ResultEnvelope.build(sub_agent, text, result.get("tokens") or {}, result_path)
         if record_id is not None and result_path:
             try:
                 host.task_manager.update_subagent(record_id, last_result_path=result_path)
             except Exception:
                 pass
-        return host._render_agent_result_envelope(agent_result, text)
+        return envelope.render(text)
 
     # ─── agent 工具主入口（fresh / resume / background 分派,搬迁自 engine）─────────
     async def execute_agent_tool(self, host, inp: dict) -> str:
@@ -335,7 +370,7 @@ class SubAgentRunner:
             sub_agent = None
             try:
                 sub_agent = host._build_sub_agent(
-                    system_prompt=profile.prompt, tools=effective_tools(profile),
+                    system_prompt=profile.prompt, tools=child_tools(host, profile),
                     agent_type=rec.type, max_turns=max_turns,
                     model=rec.model or current_eff_model, artifact_id=resume_id,
                     agent_source=profile.source)
@@ -390,7 +425,7 @@ class SubAgentRunner:
         sub_agent = None
         try:
             sub_agent = host._build_sub_agent(
-                system_prompt=profile.prompt, tools=effective_tools(profile),
+                system_prompt=profile.prompt, tools=child_tools(host, profile),
                 agent_type=agent_type, max_turns=max_turns, model=eff_model,
                 artifact_id=rec.id, agent_source=profile.source)
             kind, payload = await host._run_foreground_subagent(
@@ -461,7 +496,8 @@ class SubAgentRunner:
         sub_agent = None
         try:
             profile = build_profile(agent_type)
-            sub_agent = host._build_sub_agent(system_prompt=profile.prompt, tools=effective_tools(profile),
+            sub_agent = host._build_sub_agent(system_prompt=profile.prompt,
+                tools=child_tools(host, profile, background=True),
                 agent_type=agent_type, background=True,
                 max_turns=host._subagents.bounded_max_turns(profile.max_turns),
                 model=profile.model, artifact_id=agent_id, agent_source=profile.source)
@@ -514,9 +550,9 @@ class SubAgentRunner:
         text = result["text"] or ""
         result_path = host._write_subagent_result(task_id, text)
         agent_result_path = host._write_agent_result(agent_id, text)
-        agent_result = host._build_agent_result(sub_agent, text, result["tokens"], result_path)
+        envelope = ResultEnvelope.build(sub_agent, text, result["tokens"], result_path)
         host.task_manager.update_task(task_id, status="completed", result_path=result_path,
-                                      result_summary=agent_result["summary"])
+                                      result_summary=envelope.summary)
         host.task_manager.update_subagent(agent_id, status="completed", last_result_path=agent_result_path)
         host._close_child_session(agent_id, sub_agent)
         host._finalize_agent_meta(agent_id, "completed")
@@ -578,7 +614,7 @@ class SubAgentRunner:
             profile = build_profile(host._MEMORY_CURATOR_TYPE)
             sub_agent = host._build_sub_agent(
                 system_prompt=profile.prompt,
-                tools=effective_tools(profile),
+                tools=child_tools(host, profile, background=True),
                 agent_type=host._MEMORY_CURATOR_TYPE,
                 background=True,
                 max_turns=host._subagents.bounded_max_turns(profile.max_turns),
@@ -696,7 +732,7 @@ class SubAgentRunner:
             profile = build_profile(host._MEMORY_EVAL_CURATOR_TYPE)
             sub_agent = host._build_sub_agent(
                 system_prompt=profile.prompt,
-                tools=effective_tools(profile),
+                tools=child_tools(host, profile, background=True),
                 agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
                 background=True,
                 max_turns=host._subagents.bounded_max_turns(profile.max_turns),

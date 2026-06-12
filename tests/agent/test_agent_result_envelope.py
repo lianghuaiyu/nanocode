@@ -2,8 +2,8 @@
 
 覆盖：
 - _on_file_touched 把 read 记入 _files_read、write/edit 记入 _files_modified；
-- _build_agent_result 取子 agent 观测的文件事实 + 解析 summary/findings；
-- _render_agent_result_envelope：小文本直通；大文本截断 + result_path 指针；
+- build_agent_result 取子 agent 观测的文件事实 + 解析 summary/findings（docs/16 #7b：engine 委托 shim 已删，直测纯函数）；
+- render_agent_result_envelope：小文本直通；大文本截断 + result_path 指针；
   files_modified 出现在信封；findings cap；files cap + 溢出计数；
 - 前台 tool_result 是有界信封（含 summary + result_path），不是整段大 transcript。
 """
@@ -12,6 +12,7 @@ import asyncio
 import json
 
 from nanocode.agent.engine import Agent
+from nanocode.agent.agent_result import build_agent_result, render_agent_result_envelope
 from nanocode.session import v2 as _session_v2
 
 
@@ -53,7 +54,7 @@ def test_build_agent_result_uses_subagent_observed_files():
     sub._files_modified.add("/repo/wrote_one.py")
 
     text = "```agent-result\n{\"summary\": \"did it\", \"findings\": [\"f1\"]}\n```"
-    r = parent._build_agent_result(sub, text, {"input": 10, "output": 3}, "/s/result.md")
+    r = build_agent_result(sub, text, {"input": 10, "output": 3}, "/s/result.md")
 
     assert r["summary"] == "did it"
     assert r["findings"] == ["f1"]
@@ -70,7 +71,7 @@ def test_build_agent_result_does_not_trust_model_file_claims():
     sub = parent._build_sub_agent(system_prompt="s", tools=[], agent_type="coder")
     # model text claims to have touched files, but sub observed nothing
     text = "I modified /etc/passwd and read /secret. (lies)"
-    r = parent._build_agent_result(sub, text, {"input": 1, "output": 1}, None)
+    r = build_agent_result(sub, text, {"input": 1, "output": 1}, None)
     assert r["files_read"] == []
     assert r["files_modified"] == []
 
@@ -86,7 +87,7 @@ def test_envelope_small_text_passes_through():
         "tokens": {"input": 1, "output": 1}, "result_path": "/s/result.md",
     }
     raw = "A concise explore deliverable that fits."
-    env = parent._render_agent_result_envelope(result, raw)
+    env = render_agent_result_envelope(result, raw)
     assert "A concise explore deliverable that fits." in env
     assert "/s/result.md" in env
     assert "truncated" not in env
@@ -100,7 +101,7 @@ def test_envelope_large_text_truncates_with_pointer():
         "files_read": [], "files_modified": [],
         "tokens": {"input": 5, "output": 2}, "result_path": "/s/result.md",
     }
-    env = parent._render_agent_result_envelope(result, big)
+    env = render_agent_result_envelope(result, big)
     # raw transcript must NOT be dumped wholesale
     assert big not in env
     assert "B" * 5000 not in env
@@ -118,7 +119,7 @@ def test_envelope_includes_files_modified():
         "files_modified": ["/r/changed.py"],
         "tokens": {"input": 1, "output": 1}, "result_path": "/s/result.md",
     }
-    env = parent._render_agent_result_envelope(result, "small body")
+    env = render_agent_result_envelope(result, "small body")
     assert "Files modified:" in env
     assert "/r/changed.py" in env
     assert "Files read: 2" in env
@@ -133,7 +134,7 @@ def test_envelope_caps_findings_and_files_with_overflow():
         "files_modified": [f"/r/file-{i}.py" for i in range(25)],
         "tokens": {"input": 1, "output": 1}, "result_path": "/s/r.md",
     }
-    env = parent._render_agent_result_envelope(result, "small body")
+    env = render_agent_result_envelope(result, "small body")
     # findings capped at 10 + overflow line
     assert "finding-0" in env and "finding-9" in env
     assert "finding-10" not in env
@@ -151,7 +152,7 @@ def test_envelope_large_text_no_result_path_pointer():
         "files_read": [], "files_modified": [],
         "tokens": {"input": 0, "output": 0}, "result_path": None,
     }
-    env = parent._render_agent_result_envelope(result, big)
+    env = render_agent_result_envelope(result, big)
     assert big not in env
     assert "not persisted" in env
 

@@ -427,11 +427,15 @@ class PermissionEngine:
         return allowlist_blocks(name, self._agent._allowed_tool_names)
 
     def check(self, name: str, inp: dict) -> Decision:
-        """单一入口：返回 policy action + allowlist 标记（纯决策，无副作用）。"""
+        """单一入口：返回 policy action + allowlist 标记（纯决策，无副作用）。
+
+        docs/16 #7b：内部改走 capabilities.permissions 的不可变 PermissionContext + decide()
+        ——live 属性每次 check 快照成 ctx（mode/plan-file 随会话变化仍实时生效），裁决逻辑
+        单点在 decide（与 profile 驱动的 spawn / 未来 SDK 宿主共用同一基底）。"""
+        from ..capabilities.permissions import PermissionContext, decide  # lazy：避免包级 import 环
         a = self._agent
-        policy = check_permission(name, inp, a.permission_mode, a._plan_file_path)
-        return Decision(
-            action=policy["action"],
-            message=policy.get("message", ""),
-            allowlist_blocked=self.allowlist_blocks(name),
-        )
+        ctx = PermissionContext(
+            mode=a.permission_mode, plan_file_path=a._plan_file_path,
+            allowed_tool_names=(frozenset(a._allowed_tool_names)
+                                if a._allowed_tool_names is not None else None))
+        return decide(ctx, name, inp)
