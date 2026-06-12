@@ -109,13 +109,30 @@ def test_thread_fork_copies_prefix_into_new_session():
     assert a.session_id in children("FORKAT")
 
 
-def test_thread_fork_before_first_message_yields_empty_new_session():
+def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage():
     a, rt, t, host = _host("FORKFIRST")
     u1 = a._session_mgr.append_message(T.user_message("only q"))   # branch root（parentId=None）
     new_t = rt.thread_fork(host, "FORKFIRST", u1.id)
     assert new_t is not None
     assert a.session_id != "FORKFIRST"                       # 之前无内容 → 全新空 session
     assert a.agent_session.build_request_messages() == []
+    # review P1：空前缀路径**也**记 parentSession 血缘——children/parent 导航与审计依赖它。
+    from nanocode.session.manager import children
+    assert a.session_id in children("FORKFIRST")
+
+
+def test_thread_fork_rejects_non_user_entries_fail_closed():
+    # review P2：runtime facade 自己强制 user-message 校验（SDK/AppServer 可绕过 CLI handler 直调）。
+    a, rt, t, host = _host("FORKBAD")
+    mgr = a._session_mgr
+    mgr.append_message(T.user_message("q"))
+    a1 = mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
+                            api="anthropic", model="claude-x", stop_reason="stop"))
+    comp = mgr.append_compaction(summary="s", first_kept_entry_id=None)
+    assert rt.thread_fork(host, "FORKBAD", a1.id) is None      # assistant entry → 拒绝
+    assert rt.thread_fork(host, "FORKBAD", comp.id) is None    # compaction entry → 拒绝
+    assert rt.thread_fork(host, "FORKBAD", "no-such-entry") is None
+    assert a.session_id == "FORKBAD"                           # fail-closed：未切换
 
 
 def test_clone_rejects_arguments():

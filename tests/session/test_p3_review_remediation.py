@@ -60,6 +60,8 @@ def test_fork_pre3a_first_message_yields_empty_new_session():
     assert new_t is not None
     assert a.session_id != "pre3a_fork"                      # 新 session
     assert a.agent_session.build_request_messages() == []    # 其前无内容 → 空上下文
+    from nanocode.session.manager import children
+    assert a.session_id in children("pre3a_fork")            # 空前缀也记血缘（review P1）
 
 
 # docs/14 SessionLease：删除「空树回退 legacy」与「树仅 custom_message 回退 flat」两个用例——

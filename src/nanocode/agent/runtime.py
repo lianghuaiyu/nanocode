@@ -271,7 +271,9 @@ class AgentRuntime:
     """Codex 化 in-process facade：管 thread 生命周期。
 
     本步只对接已构造的 Agent（CLI 仍负责 Agent 构造/配置）；thread_start/resume 把它包成
-    RuntimeThread。协议 / server 留待后续；in-file /fork 由 AgentSession.move_to 承担（无 thread_fork）。
+    RuntimeThread。协议 / server 留待后续。pi 命令语义（ac3e78e）：in-file 导航 = /tree <entry>
+    （AgentSession.move_to）；/fork = thread_fork（跨文件、复制到选中 user 消息之前 + 编辑器预填）；
+    /clone = thread_clone（复制当前 branch 到当前 leaf）。
     """
 
     def __init__(self) -> None:
@@ -388,21 +390,32 @@ class AgentRuntime:
         return self._switch_via_rebind(host, session_id)
 
     def thread_fork(self, host, source_sid: str, user_entry_id: str) -> "RuntimeThread | None":
-        """pi /fork：复制 source 到选中 user 消息**之前**（其 parent 的 path-to-root）的新 session
-        并切入；选中 prompt 由调用方预填编辑器。选中首条消息（parent=None）→ 新空 session。
-        源无树 / entry 不存在 / 复制失败 → None。"""
+        """pi /fork：复制 source 到选中 **user 消息**之前（其 parent 的 path-to-root）的新 session
+        并切入；选中 prompt 由调用方预填编辑器。新 session header 一律记 parentSession 血缘
+        （含空前缀情形——children(source)/parent 导航与 trajectory 审计依赖它，review P1）。
+
+        fail-closed（review P2）：本方法是 runtime facade（SDK/AppServer 可直调），user-message
+        校验在此强制——非 user MESSAGE entry（assistant/toolResult/compaction…）→ None；
+        CLI handler 的同类校验只是更友好的 UX 提示。源无树 / entry 不存在 / 复制失败 → None。"""
+        from ..session import tree as _tree
         from ..session.manager import SessionManager
         if not SessionManager.exists(source_sid):
             return None
         src = SessionManager.open(source_sid)
         sel = next((e for e in src.entries() if e.id == user_entry_id), None)
-        if sel is None:
+        if (sel is None or sel.type != _tree.MESSAGE
+                or (sel.data.get("message") or {}).get("role") != "user"):
             return None
         cut = sel.parentId
         # 选中消息之前无可复制内容（parent=None，或 pre-3a 树里 parent 是 session_start header）
-        # → 全新空 session（clone 复制空前缀无意义且会拒绝）。
-        if cut is None or all(e.type == "session_start" for e in src.get_branch(cut)):
-            return self.thread_new(host)
+        # → 新建**空** session，但血缘照记（不可复用裸 thread_new：会丢 parentSession）。
+        if cut is None or all(e.type == _tree.SESSION_START for e in src.get_branch(cut)):
+            sid = uuid.uuid4().hex[:8]
+            while SessionManager.exists(sid):
+                sid = uuid.uuid4().hex[:8]
+            return self._switch_via_rebind(
+                host, sid, parent_session={"sessionId": source_sid, "entryId": cut,
+                                           "forkedBeforeEntryId": user_entry_id})
         try:
             child = src.clone(cut)
         except Exception:
@@ -410,12 +423,11 @@ class AgentRuntime:
         return self._switch_via_rebind(host, child.session_id)
 
     def thread_clone(self, host, source_sid: str, entry_id: "str | None" = None) -> "RuntimeThread | None":
-        """跨文件 clone（/clone [entry]）：复制 source 的 path-to-root 到新 session（header 记
-        parentSession 血缘）并切入。源无 canonical 树 / clone 失败 → None。
+        """跨文件 clone：复制 source 的 path-to-root（entry_id 缺省 = 当前 leaf）到新 session
+        （header 记 parentSession 血缘）并切入。源无 canonical 树 / clone 失败 → None。
 
-        docs/14 SessionLease：跨文件复制是 `/clone` 的唯一职责；in-file fork（移 leaf 到 user 消息之前）
-        改由 `/fork` 经 AgentSession.move_to 完成（不再有 runtime.thread_fork——已删，避免「fork = 新 session」
-        与「fork = in-file 分支」语义混淆）。"""
+        pi 命令语义（ac3e78e）：/clone 固定当前 leaf、无参；entry_id 参数保留给内部调用方
+        （/resume --fork 整 branch fork 等）。「在某条 user 消息之前分叉」是 thread_fork 的职责。"""
         from ..session.manager import SessionManager
         if not SessionManager.exists(source_sid):
             return None
