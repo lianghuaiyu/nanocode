@@ -241,9 +241,12 @@ class SessionManager:
         return None
 
     # ── fork / clone（docs/13 §7：in-file vs 跨文件） ───────────────────────────
-    def clone(self, from_entry_id: str | None = None, *, new_session_id: str | None = None) -> "SessionManager":
+    def clone(self, from_entry_id: str | None = None, *, new_session_id: str | None = None,
+              parent_session_extra: dict | None = None) -> "SessionManager":
         """跨文件 clone：新 session 复制本 session 从 from_entry 到 root 的 path-to-root
         （Pi repo.fork **会**复制史，评审 M6），header 记 parentSession 血缘。
+        parent_session_extra：附加进 parentSession 的额外血缘字段（如 fork 的
+        forkedBeforeEntryId——pi 语义下 fork/clone 的 header 形状保持一致）。
 
         鲁棒处理 pre-3a 与 post-3a 两种盘上树：剥掉 branch 里的 session_start（header，child 自有），
         并把任何指向被剥 session_start 的 parentId 重置为 None——使首条消息成为 child 干净的 branch
@@ -257,7 +260,8 @@ class SessionManager:
         child = SessionManager.create(
             new_session_id,
             cwd=self._cwd(),
-            parent_session={"sessionId": self.session_id, "entryId": leaf},
+            parent_session={"sessionId": self.session_id, "entryId": leaf,
+                            **(parent_session_extra or {})},
             lock=False,                 # bootstrap-then-handoff：child 由 runtime lease 重新加锁打开
         )
         for e in msgs:

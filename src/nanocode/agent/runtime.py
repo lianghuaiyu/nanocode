@@ -271,9 +271,15 @@ class AgentRuntime:
     """Codex 化 in-process facade：管 thread 生命周期。
 
     本步只对接已构造的 Agent（CLI 仍负责 Agent 构造/配置）；thread_start/resume 把它包成
-    RuntimeThread。协议 / server 留待后续。pi 命令语义（ac3e78e）：in-file 导航 = /tree <entry>
-    （AgentSession.move_to）；/fork = thread_fork（跨文件、复制到选中 user 消息之前 + 编辑器预填）；
-    /clone = thread_clone（复制当前 branch 到当前 leaf）。
+    RuntimeThread。协议 / server 留待后续。
+
+    会话导航语义表（pi 对齐，**唯一权威**——改任何一条须同步 commands/builtin.py 与 README）：
+
+        /tree      同文件移动 leaf（AgentSession.move_to），不新建 session
+        /fork      选 user message，复制其 parent 之前的路径到新 session（thread_fork，
+                   header 记 parentSession+forkedBeforeEntryId），prompt 回填编辑器
+        /clone     复制当前 leaf 所在 active branch 到新 session（thread_clone），编辑器为空
+        /new       新顶层 session（thread_new），不带 parentSession
     """
 
     def __init__(self) -> None:
@@ -417,7 +423,7 @@ class AgentRuntime:
                 host, sid, parent_session={"sessionId": source_sid, "entryId": cut,
                                            "forkedBeforeEntryId": user_entry_id})
         try:
-            child = src.clone(cut)
+            child = src.clone(cut, parent_session_extra={"forkedBeforeEntryId": user_entry_id})
         except Exception:
             return None
         return self._switch_via_rebind(host, child.session_id)

@@ -104,9 +104,12 @@ def test_thread_fork_copies_prefix_into_new_session():
     assert "q1" in live and "a1" in live                     # 选中消息之前的内容复制过来
     assert "q2 SELECTED" not in live                         # 选中消息及其后不复制
     assert SessionManager.exists("FORKAT")                   # 原 session 保留
-    # 血缘：新 session header 回指 source
+    # 血缘（pi：fork 两条路径 header 形状一致）：sessionId + entryId(=复制前缀 tip) + forkedBeforeEntryId
     from nanocode.session.manager import children
     assert a.session_id in children("FORKAT")
+    ps = SessionManager.open(a.session_id).parent_session()
+    assert ps["sessionId"] == "FORKAT"
+    assert ps["forkedBeforeEntryId"] == u2.id
 
 
 def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage():
@@ -116,9 +119,13 @@ def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage(
     assert new_t is not None
     assert a.session_id != "FORKFIRST"                       # 之前无内容 → 全新空 session
     assert a.agent_session.build_request_messages() == []
-    # review P1：空前缀路径**也**记 parentSession 血缘——children/parent 导航与审计依赖它。
+    # review P1：空前缀路径**也**记 parentSession 血缘——children/parent 导航与审计依赖它，
+    # 且 header 形状与非空前缀路径一致（pi：空前缀 fork 仍是 fork，不是 new）。
     from nanocode.session.manager import children
     assert a.session_id in children("FORKFIRST")
+    ps = SessionManager.open(a.session_id).parent_session()
+    assert ps["sessionId"] == "FORKFIRST"
+    assert ps["forkedBeforeEntryId"] == u1.id
 
 
 def test_thread_fork_rejects_non_user_entries_fail_closed():
@@ -151,3 +158,19 @@ def test_tree_entry_navigates_moves_leaf(capsys):
     asyncio.run(_tree(_ctx(a), u1.id[-8:]))               # /tree <entry> → move_to
     assert a._session_mgr.get_leaf() == u1.id
     assert "first" in str(a.agent_session.build_request_messages()) and "second" not in str(a.agent_session.build_request_messages())
+
+
+def test_fork_invalid_target_lists_user_message_candidates(capsys):
+    # pi 双层收窄的 UX 层：选错目标时打印 user 消息候选（getUserMessagesForForking 的文本等价）。
+    a, rt, t, host = _host("FORKCAND")
+    mgr = a._session_mgr
+    mgr.append_message(T.user_message("pick me one"))
+    a1 = mgr.append_message(T.assistant_message([T.text_block("nope")], provider="anthropic",
+                            api="anthropic", model="claude-x", stop_reason="stop"))
+    mgr.append_message(T.user_message("pick me two"))
+    res = asyncio.run(_fork(_ctx(a), a1.id[-8:]))             # 选了 assistant entry
+    assert isinstance(res, Local)
+    out = capsys.readouterr().out
+    assert "must be a user message" in out
+    assert "pick me one" in out and "pick me two" in out      # 候选清单（近期在前）
+    assert "nope" not in out                                  # 非 user 不进候选

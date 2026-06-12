@@ -356,6 +356,28 @@ def _resolve_entry(mgr, target: str):
     return None, f"ambiguous/unknown id '{target}' ({len(matches)} matches)"
 
 
+# ─── 会话导航命令族（pi 对齐语义表 = agent/runtime.py AgentRuntime docstring，唯一权威）──
+#   /tree      同文件移动 leaf，不新建 session
+#   /fork      选 user message，复制其 parent 之前的路径到新 session，prompt 回填编辑器
+#   /clone     复制当前 active branch 到当前 leaf → 新 session，编辑器为空
+#   /new       新顶层 session（不带 parentSession）
+
+def _user_message_candidates(mgr, limit: int = 10) -> str:
+    """fork 候选清单（pi getUserMessagesForForking 的文本等价）：branch 上的 user MESSAGE，
+    近期在前，id 尾缀 + 预览——选择器没有 TUI 时，把候选集打印出来让用户挑。"""
+    from ...session import tree as T
+    rows = []
+    for e in reversed(mgr.get_branch()):
+        if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
+            text = _user_message_text(e.data.get("message")).strip().replace("\n", " ")
+            if len(text) > 60:
+                text = text[:57] + "..."
+            rows.append(f"    …{e.id[-8:]}  {text}")
+            if len(rows) >= limit:
+                break
+    return "\n".join(rows) if rows else "    (no user messages on this branch)"
+
+
 def _user_message_text(msg: dict) -> str:
     """中立 user Message 的纯文本（prefill 用）：str 直通；block 列表拼接 text 字段。"""
     c = (msg or {}).get("content")
@@ -388,7 +410,10 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
             if e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user":
                 sel = e
     if sel is None or sel.type != T.MESSAGE or (sel.data.get("message") or {}).get("role") != "user":
-        print_error("No user message to fork before (pass a user-message entry id; see /tree).")
+        # pi 双层收窄的 UX 层：候选集只有 user 消息——选错/无效时把候选打印出来让用户挑
+        # （runtime.thread_fork 仍独立 fail-closed 校验，不依赖这里）。
+        print_error("Fork target must be a user message. Candidates (/fork <id>):\n"
+                    + _user_message_candidates(mgr))
         return Local()
     return Control("replace_thread", {
         "kind": "fork", "sourceSid": ctx.agent.session_id, "userEntryId": sel.id,
