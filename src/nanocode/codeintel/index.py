@@ -125,6 +125,8 @@ class RepoIndex:
         self._mtime: dict[str, float] = {}              # rel_path → mtime（cache key）
         self._tree_cache: dict = {}                     # (rel, lois, mtime) → 渲染文本
         self._tree_context_cache: dict = {}             # rel → (mtime, PyTreeContext | None)
+        self._all_files: list[str] = []                 # 发现的全量 rel（含非源码,裸文件尾巴用）
+        self.truncated = False                          # 语言文件超 max_files,索引被截断
 
     def update(self, files) -> None:
         """索引给定文件（rel 或 abs path 皆可）。mtime 未变则跳过（cache）。"""
@@ -146,17 +148,57 @@ class RepoIndex:
             self._mtime[rel] = mt
 
     def scan_repo(self, *, max_files: int = 2000) -> None:
-        """有界扫描 root 下的源文件（跳过 vendor/.git 等;cap 防超大仓库）。"""
+        """发现 + 有界索引。git 仓库（root 即 toplevel）走 `git ls-files`——吃 .gitignore、
+        无字母序截断偏置（aider 用 tracked files 的同款语义）；非 git 回退 rglob。
+        全量发现清单记 _all_files（裸文件尾巴/special 用）；语言文件超过 max_files
+        只截断**索引**并打 truncated 标（不静默），发现清单不截。"""
+        paths = self._git_files()
+        if paths is None:
+            paths = [p for p in sorted(self.root.rglob("*"))
+                     if p.is_file() and not any(part in _SKIP_DIRS for part in p.parts)]
+        self._all_files = []
+        self.truncated = False
         count = 0
-        for ap in sorted(self.root.rglob("*")):
-            if count >= max_files:
-                break
-            if any(part in _SKIP_DIRS for part in ap.parts):
+        for ap in paths:
+            self._all_files.append(self._rel(ap))
+            if language_for_path(ap.name) is None:
                 continue
-            if not ap.is_file() or language_for_path(ap.name) is None:
+            if count >= max_files:
+                self.truncated = True
                 continue
             self.update([ap])
             count += 1
+
+    def _git_files(self) -> "list[Path] | None":
+        """root 恰为 git toplevel 时返回 tracked files 的绝对路径；否则 None（回退 rglob）。
+        toplevel 校验防两类坑：root 在他人仓库内（ls-files 漏掉 root 自己的文件）、
+        临时目录未 track（空清单误判为空仓库）。"""
+        import subprocess
+        try:
+            top = subprocess.run(["git", "-C", str(self.root), "rev-parse", "--show-toplevel"],
+                                 capture_output=True, timeout=10)
+            if top.returncode != 0:
+                return None
+            if Path(top.stdout.decode().strip()).resolve() != self.root.resolve():
+                return None
+            r = subprocess.run(["git", "-C", str(self.root), "ls-files", "-z"],
+                               capture_output=True, timeout=15)
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
+        out: list[Path] = []
+        for rel in r.stdout.decode("utf-8", errors="replace").split("\0"):
+            if not rel or any(part in _SKIP_DIRS for part in Path(rel).parts):
+                continue
+            ap = self.root / rel
+            if ap.is_file():                            # index 里有、盘上已删 → 跳过
+                out.append(ap)
+        return out
+
+    def all_files(self) -> list[str]:
+        """scan_repo 发现的全量 rel path（含非源码文件）。"""
+        return list(self._all_files)
 
     def tags(self, file: str) -> list[SymbolTag]:
         return self._tags.get(self._rel(Path(file)), [])

@@ -45,6 +45,7 @@ class ContextRequest:
     mentioned_files: list[str] = field(default_factory=list)
     mentioned_identifiers: list[str] = field(default_factory=list)
     repo_map_budget_tokens: int = 1024
+    context_window_tokens: int = 0         # 模型上下文窗（repo map ×8 放大的封顶基准）
 
 
 @runtime_checkable
@@ -169,6 +170,7 @@ class RepoMapProvider:
     enable_attr = "include_repo_map"
 
     NO_FILES_BUDGET_MULTIPLIER = 8          # aider map_mul_no_files=8
+    CONTEXT_WINDOW_PADDING = 4096           # aider get_repo_map 的 padding
 
     async def collect(self, request):
         import os
@@ -182,14 +184,22 @@ class RepoMapProvider:
             mentioned_files=list(request.mentioned_files) + m_files,
             mentioned_identifiers=list(request.mentioned_identifiers) + m_idents)
         budget = request.repo_map_budget_tokens
-        if not (request.files_read or request.files_modified or query.mentioned_files):
-            budget *= self.NO_FILES_BUDGET_MULTIPLIER     # 无 personal 文件：×8 全局定向图
+        # aider get_repo_map:120-132 语义：无 chat（personal）文件即放大——mentions 不影响；
+        # 须知道上下文窗才放大，且按 window − padding 封顶。
+        if not (request.files_read or request.files_modified) and request.context_window_tokens:
+            target = min(budget * self.NO_FILES_BUDGET_MULTIPLIER,
+                         request.context_window_tokens - self.CONTEXT_WINDOW_PADDING)
+            if target > 0:
+                budget = target
         result = svc.repo_map(query, budget_tokens=budget)
         if not result.text:
             return None
+        prov = {"source": "RepoMapProvider", "files": result.files}
+        if result.truncated:
+            prov["index_truncated"] = True              # 覆盖不全不静默（/context 可见）
         return ContextPack(id="repo_map", kind="repo_map", content=result.text, lifecycle="turn",
                            cache_policy="volatile_tail", persist_policy="none", priority=30,
-                           provenance={"source": "RepoMapProvider", "files": result.files})
+                           provenance=prov)
 
 
 def default_providers() -> list:

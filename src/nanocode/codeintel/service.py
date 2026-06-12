@@ -28,6 +28,7 @@ class RepoMapResult:
     text: str
     files: list[str] = field(default_factory=list)   # 渲染中实际出现的文件（rel path，排名序）
     token_estimate: int = 0
+    truncated: bool = False                          # 索引被 max_files 截断（覆盖不全,不静默）
 
 
 class CodeIntelService:
@@ -51,11 +52,27 @@ class CodeIntelService:
     # ── 查询面 ───────────────────────────────────────────────────────────────
     def repo_map(self, query: "RepoQuery | None" = None, *, budget_tokens: int = 1024) -> RepoMapResult:
         """个性化 + 预算化的 repo map（aider 算法：personal 作 PageRank 种子、不渲染；
-        rank 分发到 (文件, 符号)；二分拟合预算——见 graph.py / index.render_map）。"""
+        rank 分发到 (文件, 符号)；二分拟合预算——见 graph.py / index.render_map）。
+
+        组装与 aider get_ranked_tags(_map_uncached) 同构：图排名 tags 之后接**全量发现
+        文件**的裸文件尾巴（含 README 等非源码——预算大时可见），special 文件前置过滤
+        因尾巴已含全部文件而为 no-op（aider 源码同款行为，保真保留）。"""
         from ..context.packs import estimate_tokens
+        from .special import filter_important_files
         q = query or RepoQuery()
         self._ensure_indexed(q.chat_files + q.files_read + q.files_modified + q.mentioned_files)
         tags = self._index.ranked_tags(q)
+        personal = {self._index._rel(Path(f))
+                    for f in (q.chat_files + q.files_read + q.files_modified)}
+        included = {(t[0] if isinstance(t, tuple) else t.rel_path) for t in tags}
+        # aider get_ranked_tags 尾部：其余已发现文件按裸文件名附加（确定序）
+        others = sorted(rel for rel in set(self._index.all_files())
+                        if rel not in included and rel not in personal)
+        tags = tags + [(rel,) for rel in others]
+        included |= set(others)
+        # aider get_ranked_tags_map_uncached 的 special 前置（同款过滤,见 docstring）
+        special = [fn for fn in filter_important_files(others) if fn not in included]
+        tags = [(fn,) for fn in special] + tags
         if not tags:
             return RepoMapResult(text="", files=[], token_estimate=0)
         text = self._index.render_map(tags, budget_tokens=budget_tokens)
@@ -63,7 +80,8 @@ class CodeIntelService:
             return RepoMapResult(text="", files=[], token_estimate=0)
         shown = sorted({(t[0] if isinstance(t, tuple) else t.rel_path)
                         for t in tags if f"\n{(t[0] if isinstance(t, tuple) else t.rel_path)}" in text})
-        return RepoMapResult(text=text, files=shown, token_estimate=estimate_tokens(text))
+        return RepoMapResult(text=text, files=shown, token_estimate=estimate_tokens(text),
+                             truncated=self._index.truncated)
 
     def defs(self, file: str) -> list[SymbolTag]:
         """一个文件的定义（function/class/method；Python 带签名行）。"""

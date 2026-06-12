@@ -198,6 +198,7 @@ class AgentSession:
                              files_read=sorted(a._files_read),
                              files_modified=sorted(a._files_modified),
                              repo_map_budget_tokens=budget.repo_map_tokens,
+                             context_window_tokens=a.effective_window,
                              include_project_instructions=False, include_memory=False,
                              include_skills=False, include_agents=False,
                              include_deferred_tools=False)
