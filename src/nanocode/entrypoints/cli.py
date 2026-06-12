@@ -78,10 +78,10 @@ class _CommandCompleter(Completer):
                              display=name, display_meta=desc)
         try:
             for s in discover_skills():
-                if getattr(s, "user_invocable", False):
+                if s.user_invocable:
                     name = "/" + s.name
                     yield Completion(name, start_position=-len(text), display=name,
-                                     display_meta=(getattr(s, "description", "") or "skill"))
+                                     display_meta=(s.description or "skill"))
         except Exception:
             pass
 
@@ -351,7 +351,6 @@ def _load_env_files() -> None:
 
 
 # `handle_eval_command` / `_fmt_eval_row` 已迁入 commands/builtin（CMD-P0）；
-# 见文件顶部的 re-export（保持 cli.handle_eval_command / cli._fmt_eval_row 的 back-compat）。
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,7 +504,7 @@ async def run_repl(agent: Agent, lease=None) -> None:
     def handle_sigint(sig, frame):
         nonlocal sigint_count
         # 历史行为：主 REPL 的 SIGINT 一律「按两次退出」（docs/16 C-1：原永假的 capturing 分支已删；
-        # turn 内的 Ctrl-C 由 _async_read_line/confirm 流程内恢复的 handler 处理）。
+        # 与删除前行为一致：turn 内 Ctrl-C 不中断 agent（abort 分支在删除前即恒假））。
         sigint_count += 1
         if sigint_count >= 2:
             print("\nBye!\n")

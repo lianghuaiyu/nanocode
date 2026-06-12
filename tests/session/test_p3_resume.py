@@ -1,6 +1,6 @@
 """docs/14 SessionLease：resume = runtime 激活会话写者租约（SessionLease.open with lock）+ 从
 canonical 树渲染上下文（cli._load_from_manager）。canonical `session.jsonl` 树是**唯一**权威——
-无 flat fallback、无 runtime 自动迁移（离线 `nanocode sessions migrate`）；空树 → 空上下文。
+无 flat fallback、无 runtime 自动迁移（legacy 导入面已删，docs/16 C-3）；空树 → 空上下文。
 """
 
 from nanocode.agent.engine import Agent

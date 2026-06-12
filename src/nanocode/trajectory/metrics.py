@@ -141,7 +141,7 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
     """聚合 P3 harness 指标集（docs/10 P3）。
 
     参数：
-      - ``events``：merged wire 的 ``SessionEvent`` 列表（只读）。
+      - ``events``：canonical 树派生的 ``TrajEvent`` 列表（只读）。
       - ``steps``：可选的派生 step 列表（``trajectory.schema.Step`` 或其 ``to_record()`` dict），
         仅用于读 ``high_risk_action_count`` / reward 等派生标签——**绝不**写回 wire。
 
@@ -209,7 +209,7 @@ def compute_metrics(events: "list", steps: "list | None" = None) -> dict:
     for aid, agent_events in by_agent.items():
         ab = _agent_bucket(aid)
         # 单 agent 内按 seq 排序后配对（merge 已是展示序，但配对要的是因果/seq 序）。
-        ordered = sorted(agent_events, key=lambda e: (_as_int(getattr(e, "seq", 0)), getattr(e, "line_no", 0)))
+        ordered = sorted(agent_events, key=lambda e: (_as_int(e.seq), e.line_no))
 
         # llm_request 等待其后第一条 llm_response 配对延迟。
         # tool_call 按 tool_use_id 配对 tool_result；无 id 时退化为 FIFO。

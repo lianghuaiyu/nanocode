@@ -115,10 +115,8 @@ def _derive_metadata(
     start_time: "str | None" = None
     end_time: "str | None" = None
 
-    # trajectory_id / model：各取首个带该键且值为真的事件 data；缺则保留默认。
-    found_traj_id = _first_data_value(events, "trajectory_id")
-    if found_traj_id is not None:
-        traj_id = found_traj_id
+    # model：取首个带该键且值为真的事件 data；缺则保留默认。
+    # （docs/16 C-1：trajectory_id 的 data 查找已删——树 entry data 从不携带它，恒 traj_<sid>。）
     model = _first_data_value(events, "model")
 
     try:

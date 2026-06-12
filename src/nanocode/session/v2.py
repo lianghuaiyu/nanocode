@@ -43,7 +43,7 @@ def agent_dir(session_id: str, agent_id: str) -> Path:
     """每个 agent 的 artifact 主目录 = <session>/agents/<agent_id>/。
 
     主 agent 用 agent_id="main"；子 agent 用其 SubAgentRecord id（如 "agent-001"）。
-    messages.json / meta.json / prompt.txt / result.md 全部落在此目录下，
+    meta.json / prompt.txt / result.md 全部落在此目录下，
     保证「同一 agent 的全部产物自包含于一处」。
     """
     d = session_root(session_id) / "agents" / agent_id
