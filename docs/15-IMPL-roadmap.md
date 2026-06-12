@@ -36,7 +36,12 @@ capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py
 - Phase 4 🟡 read_file caps 完成;**剩余 tree-sitter repo map**（需加依赖 tree-sitter + grammars）。
 - Phase 5 🟡 typed profile/registry/permission + capabilities(PermissionContext/taxonomy) 完成;
   **剩余 engine._execute_tool_call 改经 CapabilityRouter 派发**。
-- Phase 6 🟡 ResultEnvelope 完成;**剩余 spawn_child relocation**（engine.py ~1100 行 → runtime/spawn.py）。
+- Phase 6 🟡 ResultEnvelope + **spawn slices 1+2 完成**(SubAgentRunner: build_sub_agent/写盘/run 原语/
+  finalizers 搬到 runtime/spawn.py,engine 保薄委托,~350 行已迁);**剩余 slices**: ① _execute_agent_tool
+  (fresh/resume/background 分派,~210 行) ② _spawn_background_subagent/_run_background_subagent(~180 行)
+  ③ _spawn_memory_consolidate/eval/optimize + _run_*(~200 行) ④ _execute_skill_tool fork(~90 行)。
+  全是 host-driven 搬迁 + engine 薄委托(tests 按名调用,delegate 必留)。保 background pin live leaf
+  (engine.py footgun)、双 flock、trajectory_id 不分叉。
 - Phase 7 ⬜ 未开始: CLI as runtime client。
 
 ### 继续指南（剩余 = 把旧 engine.py 代码迁入新架构;每步小颗粒 + 测试 + 提交,保持全绿）
