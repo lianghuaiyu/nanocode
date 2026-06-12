@@ -26,6 +26,16 @@ SCHEMA = {
 }
 
 
+# docs/16 #8：单行字符上限——minified/长行命中不应撑爆输出（与 100-match 上限正交）。
+MAX_LINE_CHARS = 500
+
+
+def _cap_line(line: str) -> str:
+    if len(line) <= MAX_LINE_CHARS:
+        return line
+    return line[:MAX_LINE_CHARS] + f"… [+{len(line) - MAX_LINE_CHARS} chars]"
+
+
 def run(inp: dict) -> str:
     pattern = inp["pattern"]
     path = inp.get("path") or "."
@@ -44,7 +54,7 @@ def run(inp: dict) -> str:
             if result.returncode == 1:
                 return "No matches found."
             if result.returncode == 0:
-                lines = [l for l in result.stdout.split("\n") if l]
+                lines = [_cap_line(l) for l in result.stdout.split("\n") if l]
                 output = "\n".join(lines[:100])
                 if len(lines) > 100:
                     output += f"\n... and {len(lines) - 100} more matches"
@@ -91,7 +101,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     walk(directory)
     if not matches:
         return "No matches found."
-    output = "\n".join(matches[:100])
+    output = "\n".join(_cap_line(m) for m in matches[:100])
     if len(matches) > 100:
         output += f"\n... and {len(matches) - 100} more matches"
     return output
