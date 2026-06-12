@@ -1267,129 +1267,19 @@ class Agent(PlanModeMixin):
 
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
                                          prompt: str, timeout_ms: int | None = None) -> str:
-        """注册 subagent + task（双向链）+ detached 协程，立即返回 task_id。"""
-        # 记录 EFFECTIVE 模型（manifest 覆盖优先），与前台/resume 一致。
-        eff_model = get_sub_agent_config(agent_type).get("model") or self.model
-        sub_rec = self.task_manager.create_subagent(
-            type=agent_type, description=description,
-            model=eff_model, provider=self._current_provider(),
-        )
-        self.task_manager.update_subagent(sub_rec.id, status="running")
-        task_rec = self.task_manager.create_task(
-            "subagent", description, owner_agent_id=sub_rec.id)
-        self.task_manager.update_subagent(sub_rec.id, task_id=task_rec.id)
-        # docs/14 §6b：记下 spawn 时父 leaf，供完成回注 pin 到 spawn 分支（而非完成时的 live leaf）。
-        try:
-            self.task_manager.update_task(
-                task_rec.id, spawn_entry_id=(self._session_mgr.get_leaf() if self._session_mgr else None))
-        except Exception:
-            pass
-        self._write_agent_spawn_artifacts(
-            agent_id=sub_rec.id, agent_type=agent_type, description=description,
-            prompt=prompt, model=eff_model, background=True)
-        self._sink.sub_agent_start(agent_type, description)
-        task = asyncio.create_task(self._run_background_subagent(
-            agent_id=sub_rec.id, task_id=task_rec.id, agent_type=agent_type,
-            description=description, prompt=prompt, timeout_ms=timeout_ms))
-        task._nanocode_task_id = task_rec.id
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task_rec.id
+        """注册 subagent + task + detached 协程（实现在 runtime/spawn.py）。"""
+        return await self._spawn.spawn_background_subagent(
+            self, agent_type=agent_type, description=description, prompt=prompt, timeout_ms=timeout_ms)
 
     async def _run_background_subagent(self, *, agent_id: str, task_id: str, agent_type: str,
                                        description: str, prompt: str,
                                        timeout_ms: int | None) -> None:
-        """detached 协程：构造 background 子 agent，跑 run_once，落终态 + 持久化。"""
-        sub_agent = None
-        try:
-            # 注意：构造放进 try——cancel 可能在协程首个 await 之前送达
-            # （status 已在 _spawn_* 同步置 running），此时仍须走 cancelled 清理。
-            config = get_sub_agent_config(agent_type)
-            sub_agent = self._build_sub_agent(
-                system_prompt=config["system_prompt"],
-                tools=config["tools"],
-                agent_type=agent_type,
-                background=True,
-                max_turns=self._bounded_sub_agent_max_turns(config.get("max_turns")),
-                model=config.get("model"),
-                artifact_id=agent_id,
-                agent_source=config.get("source"),
-            )
-            # 复用与前台一致的可靠超时原语（_await_subagent_run 内部不依赖 wait_for，
-            # 因此不受 chat() 吞 CancelledError 影响——超时不会被误判为完成）。
-            kind, payload = await self._await_subagent_run(sub_agent, prompt, timeout_ms)
-        except asyncio.CancelledError:
-            self.task_manager.update_task(
-                task_id, status="cancelled",
-                result_summary="(cancelled by task_stop)")
-            self.task_manager.update_subagent(agent_id, status="cancelled")
-            if sub_agent is not None:
-                self._persist_agent_messages(agent_id, sub_agent)
-            self._finalize_agent_meta(agent_id, "cancelled")
-            self._sink.sub_agent_end(agent_type, description)
-            raise
-        except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态，detached 任务不能悬挂 running
-            self.task_manager.update_task(
-                task_id, status="failed", error=str(e),
-                result_summary=f"(sub-agent error: {e})")
-            self.task_manager.update_subagent(agent_id, status="failed")
-            if sub_agent is not None:
-                self._persist_agent_messages(agent_id, sub_agent)
-            self._finalize_agent_meta(agent_id, "failed")
-            self._sink.sub_agent_end(agent_type, description)
-            return
+        """detached 后台子 agent 协程（实现在 runtime/spawn.py）。"""
+        return await self._spawn.run_background_subagent(
+            self, agent_id=agent_id, task_id=task_id, agent_type=agent_type,
+            description=description, prompt=prompt, timeout_ms=timeout_ms)
 
-        if kind == "timeout":
-            # SUBAGENT_STATUSES 现含 timed_out；保留既有约定：task=timed_out, sub=failed。
-            self._fold_subagent_tokens(sub_agent)  # 成本可见：超时也折算 token
-            rp = self._write_terminal_result(agent_id, sub_agent,
-                                             f"(timed out after {timeout_ms}ms)")
-            self.task_manager.update_task(
-                task_id, status="timed_out", result_path=rp,
-                result_summary=f"(timed out after {timeout_ms}ms)")
-            self.task_manager.update_subagent(agent_id, status="failed",
-                                              last_result_path=rp)
-            if sub_agent is not None:
-                self._persist_agent_messages(agent_id, sub_agent)
-            self._finalize_agent_meta(agent_id, "timed_out")
-            self._sink.sub_agent_end(agent_type, description)
-            return
-        if kind == "error":
-            self._fold_subagent_tokens(sub_agent)  # 成本可见：出错也折算 token
-            rp = self._write_terminal_result(agent_id, sub_agent,
-                                             f"(sub-agent error: {payload})")
-            self.task_manager.update_task(
-                task_id, status="failed", error=str(payload), result_path=rp,
-                result_summary=f"(sub-agent error: {payload})")
-            self.task_manager.update_subagent(agent_id, status="failed",
-                                              last_result_path=rp)
-            if sub_agent is not None:
-                self._persist_agent_messages(agent_id, sub_agent)
-            self._finalize_agent_meta(agent_id, "failed")
-            self._sink.sub_agent_end(agent_type, description)
-            return
-
-        result = payload  # kind == "ok"
-        # 成功：token 累加进父 + result.md + result_summary + 持久化 messages
-        self.total_input_tokens += result["tokens"]["input"]
-        self.total_output_tokens += result["tokens"]["output"]
-        text = result["text"] or ""
-        # result.md 双写：task_dir（既有，供 task_output）+ agent_dir（本 agent 自包含）。
-        result_path = self._write_subagent_result(task_id, text)
-        agent_result_path = self._write_agent_result(agent_id, text)
-        # P3：result_summary 用结构化 AgentResult 的 summary（模型自述或宿主回退），
-        # result_path 指向 task_dir/result.md，last_result_path 指向 agent_dir/result.md。
-        agent_result = self._build_agent_result(
-            sub_agent, text, result["tokens"], result_path)
-        self.task_manager.update_task(
-            task_id, status="completed", result_path=result_path,
-            result_summary=agent_result["summary"])
-        self.task_manager.update_subagent(
-            agent_id, status="completed", last_result_path=agent_result_path)
-        self._persist_agent_messages(agent_id, sub_agent)
-        self._finalize_agent_meta(agent_id, "completed")
-        self._sink.sub_agent_end(agent_type, description)
-
+    
     # ─── Memory consolidation (Auto-Dream) ────────────────────
 
     async def _spawn_memory_consolidate(self) -> str:

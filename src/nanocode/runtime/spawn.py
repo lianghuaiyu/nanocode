@@ -78,7 +78,7 @@ class SubAgentRunner:
         )
         if artifact_id and artifact_id != "main":
             from ..session.lease import SessionLease
-            sub._tree_session_id = self.child_session_id(host, artifact_id)
+            sub._tree_session_id = host.child_session_id(artifact_id)
             sub._child_parent_session = {"sessionId": host.session_id,
                                          "entryId": host._subagent_spawn_leaf.get(artifact_id),
                                          "taskId": artifact_id, "agentId": artifact_id}
@@ -127,7 +127,7 @@ class SubAgentRunner:
                 "type": agent_type,
                 "description": description,
                 "model": model,
-                "provider": self.current_provider(host),
+                "provider": host._current_provider(),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "background": background,
                 "parent_session_id": host.session_id,
@@ -166,7 +166,7 @@ class SubAgentRunner:
     def write_terminal_result(self, host, agent_id: str, sub_agent, reason: str) -> "str | None":
         """终态（超时/错误）写 result.md：有 partial 输出就写它,否则写 reason。"""
         partial = host._subagent_captured_text(sub_agent)
-        return self.write_agent_result(host, agent_id, partial or reason)
+        return host._write_agent_result(agent_id, partial or reason)
 
     # ─── 前台 run 原语 + 终态信封（搬迁自 engine,host-driven）──────────────────
     async def await_subagent_run(self, sub_agent, prompt: str,
@@ -212,7 +212,7 @@ class SubAgentRunner:
     async def run_foreground_subagent(self, host, sub_agent, prompt: str,
                                       timeout_ms: "int | None", record_id: "str | None") -> "tuple[str, str | dict]":
         """前台子 agent 执行：施加 wall-clock 超时,永不让异常逃逸。返回 (kind, payload)。"""
-        kind, payload = await self.await_subagent_run(sub_agent, prompt, timeout_ms)
+        kind, payload = await host._await_subagent_run(sub_agent, prompt, timeout_ms)
         if kind == "timeout":
             if record_id is not None:
                 try:
@@ -228,11 +228,11 @@ class SubAgentRunner:
                                      kind: str, payload, timeout_ms: "int | None") -> str:
         """前台 timeout/error 终态共用：折叠 token + 落 partial result.md + 回传带宿主派生
         files_modified 的最小信封（而非裸 '[timed out]' 字符串）。"""
-        self.fold_subagent_tokens(host, sub_agent)
+        host._fold_subagent_tokens(sub_agent)
         partial = host._subagent_captured_text(sub_agent)
         reason = (f"[sub-agent timed out after {timeout_ms} ms]" if kind == "timeout"
                   else str(payload))
-        result_path = self.write_agent_result(host, record_id, partial or reason)
+        result_path = host._write_agent_result(record_id, partial or reason)
         if result_path:
             try:
                 host.task_manager.update_subagent(record_id, last_result_path=result_path)
@@ -424,3 +424,97 @@ class SubAgentRunner:
         host._finalize_agent_meta(rec.id, "completed")
         host._sink.sub_agent_end(agent_type, description)
         return host._finalize_foreground_result(sub_agent, result, result_path, rec.id)
+
+    # ─── 后台 detached 子 agent（auto-deny-but-continue,搬迁自 engine）────────────
+    async def spawn_background_subagent(self, host, *, agent_type: str, description: str,
+                                        prompt: str, timeout_ms: "int | None" = None) -> str:
+        """注册 subagent + task（双向链）+ detached 协程,立即返回 task_id。"""
+        eff_model = get_sub_agent_config(agent_type).get("model") or host.model
+        sub_rec = host.task_manager.create_subagent(
+            type=agent_type, description=description,
+            model=eff_model, provider=host._current_provider())
+        host.task_manager.update_subagent(sub_rec.id, status="running")
+        task_rec = host.task_manager.create_task("subagent", description, owner_agent_id=sub_rec.id)
+        host.task_manager.update_subagent(sub_rec.id, task_id=task_rec.id)
+        # docs/14 §6b：记 spawn 时父 leaf,供完成回注 pin 到 spawn 分支（而非完成时 live leaf）。
+        try:
+            host.task_manager.update_task(
+                task_rec.id, spawn_entry_id=(host._session_mgr.get_leaf() if host._session_mgr else None))
+        except Exception:
+            pass
+        host._write_agent_spawn_artifacts(agent_id=sub_rec.id, agent_type=agent_type, description=description,
+            prompt=prompt, model=eff_model, background=True)
+        host._sink.sub_agent_start(agent_type, description)
+        task = asyncio.create_task(host._run_background_subagent(agent_id=sub_rec.id, task_id=task_rec.id, agent_type=agent_type,
+            description=description, prompt=prompt, timeout_ms=timeout_ms))
+        task._nanocode_task_id = task_rec.id
+        host._background_tasks.add(task)
+        task.add_done_callback(host._background_tasks.discard)
+        return task_rec.id
+
+    async def run_background_subagent(self, host, *, agent_id: str, task_id: str, agent_type: str,
+                                      description: str, prompt: str, timeout_ms: "int | None") -> None:
+        """detached 协程：构造 background 子 agent,跑 run_once,落终态 + 持久化。"""
+        sub_agent = None
+        try:
+            config = get_sub_agent_config(agent_type)
+            sub_agent = host._build_sub_agent(system_prompt=config["system_prompt"], tools=config["tools"],
+                agent_type=agent_type, background=True,
+                max_turns=host._bounded_sub_agent_max_turns(config.get("max_turns")),
+                model=config.get("model"), artifact_id=agent_id, agent_source=config.get("source"))
+            kind, payload = await host._await_subagent_run(sub_agent, prompt, timeout_ms)
+        except asyncio.CancelledError:
+            host.task_manager.update_task(task_id, status="cancelled",
+                                          result_summary="(cancelled by task_stop)")
+            host.task_manager.update_subagent(agent_id, status="cancelled")
+            if sub_agent is not None:
+                host._persist_agent_messages(agent_id, sub_agent)
+            host._finalize_agent_meta(agent_id, "cancelled")
+            host._sink.sub_agent_end(agent_type, description)
+            raise
+        except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态,detached 任务不能悬挂 running
+            host.task_manager.update_task(task_id, status="failed", error=str(e),
+                                          result_summary=f"(sub-agent error: {e})")
+            host.task_manager.update_subagent(agent_id, status="failed")
+            if sub_agent is not None:
+                host._persist_agent_messages(agent_id, sub_agent)
+            host._finalize_agent_meta(agent_id, "failed")
+            host._sink.sub_agent_end(agent_type, description)
+            return
+
+        if kind == "timeout":
+            host._fold_subagent_tokens(sub_agent)
+            rp = host._write_terminal_result(agent_id, sub_agent, f"(timed out after {timeout_ms}ms)")
+            host.task_manager.update_task(task_id, status="timed_out", result_path=rp,
+                                          result_summary=f"(timed out after {timeout_ms}ms)")
+            host.task_manager.update_subagent(agent_id, status="failed", last_result_path=rp)
+            if sub_agent is not None:
+                host._persist_agent_messages(agent_id, sub_agent)
+            host._finalize_agent_meta(agent_id, "timed_out")
+            host._sink.sub_agent_end(agent_type, description)
+            return
+        if kind == "error":
+            host._fold_subagent_tokens(sub_agent)
+            rp = host._write_terminal_result(agent_id, sub_agent, f"(sub-agent error: {payload})")
+            host.task_manager.update_task(task_id, status="failed", error=str(payload), result_path=rp,
+                                          result_summary=f"(sub-agent error: {payload})")
+            host.task_manager.update_subagent(agent_id, status="failed", last_result_path=rp)
+            if sub_agent is not None:
+                host._persist_agent_messages(agent_id, sub_agent)
+            host._finalize_agent_meta(agent_id, "failed")
+            host._sink.sub_agent_end(agent_type, description)
+            return
+
+        result = payload  # kind == "ok"
+        host.total_input_tokens += result["tokens"]["input"]
+        host.total_output_tokens += result["tokens"]["output"]
+        text = result["text"] or ""
+        result_path = host._write_subagent_result(task_id, text)
+        agent_result_path = host._write_agent_result(agent_id, text)
+        agent_result = host._build_agent_result(sub_agent, text, result["tokens"], result_path)
+        host.task_manager.update_task(task_id, status="completed", result_path=result_path,
+                                      result_summary=agent_result["summary"])
+        host.task_manager.update_subagent(agent_id, status="completed", last_result_path=agent_result_path)
+        host._persist_agent_messages(agent_id, sub_agent)
+        host._finalize_agent_meta(agent_id, "completed")
+        host._sink.sub_agent_end(agent_type, description)
