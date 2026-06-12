@@ -1249,38 +1249,15 @@ class Agent(PlanModeMixin):
 
     def _finalize_foreground_terminal(self, sub_agent: "Agent", record_id: str,
                                       kind: str, payload, timeout_ms: int | None) -> str:
-        """前台 timeout/error 终态共用：折叠 token（成本可见）+ 落 partial result.md +
-        回传带宿主派生 files_modified 的最小信封（而非裸 '[timed out]' 字符串），
-        使「改了文件后超时」的子 agent 也给父留下面包屑。"""
-        self._fold_subagent_tokens(sub_agent)
-        partial = self._subagent_captured_text(sub_agent)
-        reason = (f"[sub-agent timed out after {timeout_ms} ms]" if kind == "timeout"
-                  else str(payload))
-        result_path = self._write_agent_result(record_id, partial or reason)
-        if result_path:
-            try:
-                self.task_manager.update_subagent(record_id, last_result_path=result_path)
-            except Exception:
-                pass
-        agent_result = self._build_agent_result(
-            sub_agent, partial or reason, {"input": 0, "output": 0}, result_path)
-        agent_result["summary"] = reason + (
-            " — partial transcript persisted" if partial else "")
-        return self._render_agent_result_envelope(agent_result, "")
+        """前台 timeout/error 终态共用（实现在 runtime/spawn.py）。"""
+        return self._spawn.finalize_foreground_terminal(
+            self, sub_agent, record_id, kind, payload, timeout_ms)
 
     def _finalize_foreground_result(self, sub_agent: "Agent", result: dict,
                                     result_path: str | None, record_id: str | None) -> str:
-        """前台/skill-fork 成功路径共用：装配 AgentResult → 渲染有界信封 → 回填
-        SubAgentRecord.last_result_path。返回给父的就是这个有界信封（非整段 transcript）。"""
-        text = result.get("text") or ""
-        agent_result = self._build_agent_result(
-            sub_agent, text, result.get("tokens") or {}, result_path)
-        if record_id is not None and result_path:
-            try:
-                self.task_manager.update_subagent(record_id, last_result_path=result_path)
-            except Exception:
-                pass
-        return self._render_agent_result_envelope(agent_result, text)
+        """前台/skill-fork 成功路径共用（实现在 runtime/spawn.py）。"""
+        return self._spawn.finalize_foreground_result(
+            self, sub_agent, result, result_path, record_id)
 
     # ─── Background sub-agent (detached, auto-deny-but-continue) ──
 
@@ -1775,67 +1752,15 @@ class Agent(PlanModeMixin):
 
     async def _await_subagent_run(self, sub_agent: "Agent", prompt: str,
                                   timeout_ms: int | None) -> tuple[str, object]:
-        """可靠地 await 一次子 agent run_once，并施加可选 wall-clock 超时。
-
-        返回 (kind, payload)：'ok'->result dict；'timeout'->None；'error'->Exception。
-
-        关键：Agent.chat() 会吞掉 CancelledError（优雅 abort），因此 asyncio.wait_for
-        在超时 cancel 后内层吞掉取消、"正常返回"——wait_for 会回值而非抛 TimeoutError。
-        这里改用 asyncio.wait 的 pending 集合可靠判定超时，并用 _aborted 兜底。
-        外层取消（如 task_stop）先取消内层任务再向上传播，避免任务泄漏。
-        """
-        inner = asyncio.ensure_future(sub_agent.run_once(prompt))
-        try:
-            if timeout_ms is not None and timeout_ms > 0:
-                done, pending = await asyncio.wait({inner}, timeout=timeout_ms / 1000.0)
-                timed_out = inner in pending
-            else:
-                await asyncio.wait({inner})
-                timed_out = False
-        except asyncio.CancelledError:
-            inner.cancel()
-            try:
-                await inner
-            except BaseException:
-                pass
-            raise
-
-        if timed_out or getattr(sub_agent, "_aborted", False):
-            if not inner.done():
-                inner.cancel()
-            try:
-                await inner
-            except BaseException:
-                pass
-            return "timeout", None
-        try:
-            return "ok", inner.result()
-        except asyncio.CancelledError:
-            return "timeout", None
-        except Exception as e:  # noqa: BLE001 - 归一为 error，不外泄崩溃父循环
-            return "error", e
+        """可靠 await 子 agent run_once + 超时判定（实现在 runtime/spawn.py;§7 风险#1 cancel 语义保留）。"""
+        return await self._spawn.await_subagent_run(sub_agent, prompt, timeout_ms)
 
     async def _run_foreground_subagent(self, sub_agent: "Agent", prompt: str,
                                        timeout_ms: int | None,
                                        record_id: str | None) -> tuple[str, str | dict]:
-        """前台子 agent 执行：施加 wall-clock 超时，永不让异常逃逸。
-
-        返回 (kind, payload)：
-        - kind='ok'      -> payload 是 run_once 的 result dict（含 text + tokens）。
-        - kind='timeout' -> payload 是给模型的超时字符串；record 已标 'timed_out'。
-        - kind='error'   -> payload 是给模型的错误字符串。
-        """
-        kind, payload = await self._await_subagent_run(sub_agent, prompt, timeout_ms)
-        if kind == "timeout":
-            if record_id is not None:
-                try:
-                    self.task_manager.update_subagent(record_id, status="timed_out")
-                except Exception:
-                    pass
-            return "timeout", f"[sub-agent timed out after {timeout_ms} ms]"
-        if kind == "error":
-            return "error", f"Sub-agent error: {payload}"
-        return "ok", payload  # type: ignore[return-value]
+        """前台子 agent 执行 + 超时（实现在 runtime/spawn.py）。"""
+        return await self._spawn.run_foreground_subagent(
+            self, sub_agent, prompt, timeout_ms, record_id)
 
     async def _execute_agent_tool(self, inp: dict) -> str:
         # ─── Variable extraction (hoisted; shared by background/resume/fresh) ───
