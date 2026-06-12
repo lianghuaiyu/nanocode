@@ -1,33 +1,34 @@
-"""Task 3: coder 类型归一 —— coder 与 general 显式同义。"""
+"""coder 类型归一（coder 与 general 显式同义）—— docs/16 #7：断言面改写为 build_profile。"""
 
-from nanocode.subagents.config import get_sub_agent_config
+from nanocode.agents.registry import build_profile, effective_tools
 from nanocode.subagents.prompts import EXPLORE_PROMPT, GENERAL_PROMPT
 
 
+def _names(agent_type):
+    return {t["name"] for t in effective_tools(build_profile(agent_type))}
+
+
 def test_coder_is_synonym_of_general():
-    coder = get_sub_agent_config("coder")
-    general = get_sub_agent_config("general")
-    assert coder["system_prompt"] == general["system_prompt"]
-    coder_names = {t["name"] for t in coder["tools"]}
-    general_names = {t["name"] for t in general["tools"]}
-    assert coder_names == general_names
+    coder = build_profile("coder")
+    general = build_profile("general")
+    assert coder.prompt == general.prompt
+    assert _names("coder") == _names("general")
 
 
 def test_coder_uses_general_prompt():
-    assert get_sub_agent_config("coder")["system_prompt"] == GENERAL_PROMPT
+    assert build_profile("coder").prompt == GENERAL_PROMPT
 
 
 def test_coder_has_full_tools_minus_agent():
-    coder = get_sub_agent_config("coder")
-    names = {t["name"] for t in coder["tools"]}
+    names = _names("coder")
     assert "agent" not in names
     assert "read_file" in names
     assert "run_shell" in names
 
 
 def test_explore_is_read_only():
-    explore = get_sub_agent_config("explore")
-    assert explore["system_prompt"] == EXPLORE_PROMPT
-    names = {t["name"] for t in explore["tools"]}
+    explore = build_profile("explore")
+    assert explore.prompt == EXPLORE_PROMPT
+    names = _names("explore")
     assert names <= {"read_file", "list_files", "grep_search"}
     assert "run_shell" not in names

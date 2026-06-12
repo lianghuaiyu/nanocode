@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from nanocode.tasks.manager import TaskManager
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 from nanocode.tools import tasks_tool
 
 

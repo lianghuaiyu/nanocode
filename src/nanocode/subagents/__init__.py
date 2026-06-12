@@ -1,3 +1,1 @@
-"""nanocode sub-agent system."""
-from .config import (READ_ONLY_TOOLS, get_sub_agent_config,
-                     get_available_agent_types, build_agent_descriptions, reset_agent_cache)
+"""nanocode sub-agent system（prompts + 结构化结果解析；配置代数已迁 agents/registry，docs/16 #7）。"""

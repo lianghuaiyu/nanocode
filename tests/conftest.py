@@ -35,7 +35,7 @@ def _trust_cwd(monkeypatch):
     逐测试落 trust.json，也不动 trust.is_trusted 本体——后者的单测才能照常验证）。
     需要验证未信任发现行为的测试，再用自己的 monkeypatch.setattr 覆写为返回 False。"""
     monkeypatch.setattr(
-        "nanocode.subagents.config._project_agents_trusted",
+        "nanocode.agents.registry._project_agents_trusted",
         lambda: True, raising=False,
     )
     yield
@@ -54,7 +54,7 @@ def _reset_caches():
         except Exception:
             pass
         try:
-            from nanocode.subagents import reset_agent_cache
+            from nanocode.agents.registry import reset_agent_cache
             reset_agent_cache()
         except Exception:
             pass

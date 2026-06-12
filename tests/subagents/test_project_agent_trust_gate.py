@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 from nanocode.paths import data_dir
 
 
@@ -53,16 +53,16 @@ def test_user_agent_always_discovered_even_when_untrusted(tmp_path, monkeypatch)
     assert "useragent" in agents  # user agents are the user's own -> always loaded
 
 
-def test_get_sub_agent_config_ignores_untrusted_project_agent(tmp_path, monkeypatch):
+def test_build_profile_ignores_untrusted_project_agent(tmp_path, monkeypatch):
     proj = tmp_path / ".nanocode" / "agents"
     _write(proj, "projagent",
            "---\nname: projagent\nallowed-tools: read_file\n---\nReview.")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(config, "_project_agents_trusted", lambda: False)
     config.reset_agent_cache()
-    # untrusted: projagent is unknown -> get_sub_agent_config falls to general semantics.
-    cfg = config.get_sub_agent_config("projagent")
-    assert cfg["source"] is None  # not loaded from the project .md
+    # untrusted: projagent is unknown -> build_profile falls to general semantics.
+    profile = config.build_profile("projagent")
+    assert profile.source is None  # not loaded from the project .md
 
 
 def test_reset_agent_cache_reevaluates_trust(tmp_path, monkeypatch):

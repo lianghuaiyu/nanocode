@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from .skills.listing import SKILL_PROMPT_GUIDANCE
-from .subagents import build_agent_descriptions
+from .agents.registry import build_agent_descriptions
 from .tools import get_deferred_tool_names
 
 # ─── System prompt template (externalized to system_prompt.md) ──────────────

@@ -131,7 +131,7 @@ class AgentDescriptionsProvider:
     enable_attr = "include_agents"
 
     async def collect(self, request):
-        from ..subagents import build_agent_descriptions
+        from ..agents.registry import build_agent_descriptions
         text = build_agent_descriptions()
         if not text.strip():
             return None

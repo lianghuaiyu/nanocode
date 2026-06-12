@@ -7,8 +7,7 @@
 - 后台子 agent：auto_deny_confirms（无 TTY,危险确认一律拒）；
 - spawn：子默认不可 spawn 孙（can_spawn 取父子合取,且父显式允许才行）。
 
-这是 capabilities/permissions.py 的 PermissionContext 的单一派生点（取代散落在
-engine._build_sub_agent + subagents.config 的继承逻辑）。
+这是 capabilities/permissions.py 的 PermissionContext 的单一派生点。
 """
 
 from __future__ import annotations
@@ -19,7 +18,8 @@ from .profile import AgentProfile, IsolationPolicy, PermissionProfile
 
 
 def intersect_allow(parent: "set[str] | None", child: "set[str] | None") -> "set[str] | None":
-    """allow-list 交集语义（None = 无约束/全部）。与 subagents.config._intersect_allowed 同语义。
+    """allow-list 交集语义（None = 无约束/全部）。docs/16 #7 合一后的**唯一**实现
+    （registry._resolve_effective 的 extends 收窄与 child 派生共用）。
 
     - 都 None → None；一方 None → 另一方；都有 → 交集（子绝不获得父没有的工具）。
     """

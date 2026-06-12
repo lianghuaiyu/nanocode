@@ -15,7 +15,7 @@ import pytest
 from nanocode.agent.engine import Agent
 from nanocode.tools.permissions import ALWAYS_ALLOWED_META as _ALWAYS_ALLOWED_META
 from nanocode.tools import tool_definitions
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):
@@ -25,9 +25,9 @@ def _agent(**kw):
 
 def _read_only_sub(parent):
     """Build an explore (read-only) sub-agent: allowed = READ_ONLY_TOOLS."""
-    cfg = config.get_sub_agent_config("explore")
+    profile = config.build_profile("explore")
     return parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"], agent_type="explore")
+        system_prompt=profile.prompt, tools=config.effective_tools(profile), agent_type="explore")
 
 
 # ─── keystone: out-of-set real tool is blocked at call time ──────
@@ -154,10 +154,10 @@ def test_main_agent_allowlist_is_none_and_never_blocks():
 
 def test_build_sub_agent_sets_allowlist_from_effective_tools():
     parent = _agent()
-    cfg = config.get_sub_agent_config("explore")
+    tools = config.effective_tools(config.build_profile("explore"))
     sub = parent._build_sub_agent(
-        system_prompt="s", tools=cfg["tools"], agent_type="explore")
-    assert sub._allowed_tool_names == {t["name"] for t in cfg["tools"]}
+        system_prompt="s", tools=tools, agent_type="explore")
+    assert sub._allowed_tool_names == {t["name"] for t in tools}
     assert "agent" not in sub._allowed_tool_names
     assert "write_file" not in sub._allowed_tool_names
 
@@ -174,12 +174,13 @@ def test_allowlist_uses_effective_set_not_allowed_names_alone(tmp_path, monkeypa
     config.reset_agent_cache()
 
     parent = _agent()
-    cfg = config.get_sub_agent_config("noshell")
-    # allowed_names is None (unrestricted-except-deny) but run_shell is removed.
-    assert cfg["allowed_names"] is None
-    assert "run_shell" not in {t["name"] for t in cfg["tools"]}
+    profile = config.build_profile("noshell")
+    tools = config.effective_tools(profile)
+    # tools_allow is None (unrestricted-except-deny) but run_shell is removed.
+    assert profile.tools_allow is None
+    assert "run_shell" not in {t["name"] for t in tools}
     sub = parent._build_sub_agent(
-        system_prompt="s", tools=cfg["tools"], agent_type="noshell")
+        system_prompt="s", tools=tools, agent_type="noshell")
     # run_shell must be blocked even though allowed_names was None.
     assert sub._tool_blocked_by_allowlist("run_shell") is True
     res = asyncio.run(sub._execute_tool_call("run_shell", {"command": "echo x"}))

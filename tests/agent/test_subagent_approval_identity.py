@@ -7,7 +7,7 @@ import asyncio
 
 from nanocode.agent.engine import Agent
 from nanocode.tools import tool_definitions
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):
@@ -23,9 +23,9 @@ def test_subagent_confirm_message_contains_identity():
         return True
 
     parent = _agent(confirm_fn=spy_confirm)
-    cfg = config.get_sub_agent_config("coder")
+    tools = config.effective_tools(config.build_profile("coder"))
     sub = parent._build_sub_agent(
-        system_prompt="s", tools=cfg["tools"], agent_type="coder",
+        system_prompt="s", tools=tools, agent_type="coder",
         artifact_id="agent-042")
     ok = asyncio.run(sub._confirm_dangerous("rm -rf /tmp/x"))
     assert ok is True
@@ -50,11 +50,11 @@ def test_subagent_confirm_message_includes_source(tmp_path, monkeypatch):
         return False
 
     parent = _agent(confirm_fn=spy_confirm)
-    cfg = config.get_sub_agent_config("reviewer")
+    profile = config.build_profile("reviewer")
     sub = parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"],
+        system_prompt=profile.prompt, tools=config.effective_tools(profile),
         agent_type="reviewer", artifact_id="agent-007",
-        agent_source=cfg.get("source"))
+        agent_source=profile.source)
     asyncio.run(sub._confirm_dangerous("dangerous-cmd"))
     msg = captured["message"]
     assert "agent-007" in msg

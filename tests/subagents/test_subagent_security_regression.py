@@ -17,7 +17,7 @@ import asyncio
 from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import tool_definitions
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):
@@ -53,13 +53,14 @@ def test_build_sub_agent_with_empty_tools_yields_no_tools():
     assert sub.tools == []
 
 
-def test_curator_config_is_toolless_and_does_not_widen():
-    # reserved curators return tools:[]; the empty list must stay empty.
-    cfg = config.get_sub_agent_config(config.MEMORY_CURATOR_TYPE)
-    assert cfg["tools"] == []
+def test_curator_profile_is_toolless_and_does_not_widen():
+    # reserved curators are toolless; the empty list must stay empty.
+    profile = config.build_profile(config.MEMORY_CURATOR_TYPE)
+    tools = config.effective_tools(profile)
+    assert tools == []
     parent = _agent()
     sub = parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"],
+        system_prompt=profile.prompt, tools=tools,
         agent_type=config.MEMORY_CURATOR_TYPE, background=True)
     assert sub.tools == []
 
@@ -71,11 +72,12 @@ def test_allowed_tools_agent_cannot_smuggle_agent_tool(tmp_path, monkeypatch):
     _write(d, "smuggle", "---\nname: smuggle\nallowed-tools: agent\n---\nbody")
     monkeypatch.chdir(tmp_path)
     config.reset_agent_cache()
-    cfg = config.get_sub_agent_config("smuggle")
-    assert cfg["tools"] == []
+    profile = config.build_profile("smuggle")
+    tools = config.effective_tools(profile)
+    assert tools == []
     parent = _agent()
     sub = parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"], agent_type="smuggle")
+        system_prompt=profile.prompt, tools=tools, agent_type="smuggle")
     assert {t["name"] for t in sub.tools} == set()
 
 
@@ -136,8 +138,7 @@ def test_extends_unknown_base_fails_closed_not_to_child_allowlist(tmp_path, monk
                       "allowed-tools: run_shell,write_file,read_file\n---\nbody")
     monkeypatch.chdir(tmp_path)
     config.reset_agent_cache()
-    cfg = config.get_sub_agent_config("typo")
-    names = {t["name"] for t in cfg["tools"]}
+    names = {t["name"] for t in config.effective_tools(config.build_profile("typo"))}
     assert "run_shell" not in names    # would have leaked under fail-open
     assert "write_file" not in names
     # fail-closed floor is read-only ∩ self-allow -> read_file survives, nothing dangerous
@@ -150,8 +151,7 @@ def test_extends_cycle_fails_closed(tmp_path, monkeypatch):
     _write(d, "q", "---\nname: q\nextends: p\nallowed-tools: run_shell,read_file\n---\nbody")
     monkeypatch.chdir(tmp_path)
     config.reset_agent_cache()
-    cfg = config.get_sub_agent_config("p")
-    names = {t["name"] for t in cfg["tools"]}
+    names = {t["name"] for t in config.effective_tools(config.build_profile("p"))}
     assert "run_shell" not in names
     assert names <= config.READ_ONLY_TOOLS
 

@@ -1,15 +1,15 @@
-"""Task 1: memory-curator 内置保留类型。
+"""memory-curator 内置保留类型 —— docs/16 #7：断言面改写为 build_profile。
 
-curator 是内置保留类型 "memory-curator"：
-- 在 RESERVED_AGENT_TYPES 中。
-- get_sub_agent_config 返回 {system_prompt: CURATOR_CONSOLIDATION_PROMPT, tools: []}。
+- 在 RESERVED_AGENT_TYPES 中；profile.mode == "system"、hidden=True。
+- build_profile 返回 CURATOR_CONSOLIDATION_PROMPT + 恒无工具（tools_allow=set()）。
 - 不出现在 get_available_agent_types（不向模型暴露为可 spawn 类型）。
 - 项目 .nanocode/agents 下同名 .md 不能覆盖（保留类型判定在 custom 发现之前）。
 """
 
-from nanocode.subagents.config import (
+from nanocode.agents.registry import (
     RESERVED_AGENT_TYPES,
-    get_sub_agent_config,
+    build_profile,
+    effective_tools,
     get_available_agent_types,
     reset_agent_cache,
 )
@@ -23,13 +23,13 @@ def test_curator_is_reserved():
 
 
 def test_curator_uses_consolidation_prompt():
-    cfg = get_sub_agent_config(MEMORY_CURATOR_TYPE)
-    assert cfg["system_prompt"] == CURATOR_CONSOLIDATION_PROMPT
+    profile = build_profile(MEMORY_CURATOR_TYPE)
+    assert profile.prompt == CURATOR_CONSOLIDATION_PROMPT
+    assert profile.mode == "system" and profile.hidden
 
 
 def test_curator_has_no_tools():
-    cfg = get_sub_agent_config(MEMORY_CURATOR_TYPE)
-    assert cfg["tools"] == []
+    assert effective_tools(build_profile(MEMORY_CURATOR_TYPE)) == []
 
 
 def test_curator_not_in_available_types():
@@ -49,10 +49,10 @@ def test_project_agents_cannot_override_curator(tmp_path, monkeypatch):
     )
     reset_agent_cache()
 
-    cfg = get_sub_agent_config(MEMORY_CURATOR_TYPE)
+    profile = build_profile(MEMORY_CURATOR_TYPE)
     # 仍是内置：CURATOR_CONSOLIDATION_PROMPT + 无工具，未被覆盖。
-    assert cfg["system_prompt"] == CURATOR_CONSOLIDATION_PROMPT
-    assert cfg["tools"] == []
+    assert profile.prompt == CURATOR_CONSOLIDATION_PROMPT
+    assert effective_tools(profile) == []
     # 也不出现在可用类型里（保留名被过滤）。
     names = {t["name"] for t in get_available_agent_types()}
     assert MEMORY_CURATOR_TYPE not in names

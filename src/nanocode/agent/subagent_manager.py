@@ -62,13 +62,13 @@ class SubAgentManager:
         return mt > 0 and self.running_background_count() >= mt
 
     @staticmethod
-    def foreground_timeout(tool_timeout_ms, config: dict, fleet_cfg: dict):
-        """前台子 agent 的有效超时：工具入参 > manifest 'timeout-ms' > settings
-        [agents] default_timeout_ms。全缺省 -> None（无 wall-clock 超时）。"""
+    def foreground_timeout(tool_timeout_ms, manifest_timeout_ms, fleet_cfg: dict):
+        """前台子 agent 的有效超时：工具入参 > manifest 'timeout-ms'（profile.timeout_ms）>
+        settings [agents] default_timeout_ms。全缺省 -> None（无 wall-clock 超时）。"""
         if tool_timeout_ms is not None:
             return tool_timeout_ms
-        if config.get("timeout_ms") is not None:
-            return config.get("timeout_ms")
+        if manifest_timeout_ms is not None:
+            return manifest_timeout_ms
         return fleet_cfg.get("default_timeout_ms")
 
     def bounded_max_turns(self, manifest_max_turns: int | None) -> int:

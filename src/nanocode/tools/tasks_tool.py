@@ -103,11 +103,11 @@ def list_agent_definitions_text(manager=None) -> str:
     每行：name — one-line description；自定义额外附 source 路径与 model（若设）。
     与运行实例(list_subagents_text)互补——这是"定义"而非"实例"。
     """
-    from ..subagents.config import (
-        get_available_agent_types, _discover_custom_agents, get_sub_agent_config,
+    from ..agents.registry import (
+        build_profile, discover_custom_agents, get_available_agent_types,
     )
     types = get_available_agent_types()
-    custom = _discover_custom_agents()
+    custom = discover_custom_agents()
     lines = ["Available agent definitions:"]
     for t in types:
         name = t["name"]
@@ -115,11 +115,11 @@ def list_agent_definitions_text(manager=None) -> str:
         line = f"  {name}  —  {desc}"
         extra = []
         if name in custom:
-            cfg = get_sub_agent_config(name)
-            if cfg.get("model"):
-                extra.append(f"model={cfg['model']}")
-            if cfg.get("source"):
-                extra.append(f"source={cfg['source']}")
+            profile = build_profile(name)
+            if profile.model:
+                extra.append(f"model={profile.model}")
+            if profile.source:
+                extra.append(f"source={profile.source}")
         if extra:
             line += "  [" + ", ".join(extra) + "]"
         lines.append(line)
@@ -129,33 +129,35 @@ def list_agent_definitions_text(manager=None) -> str:
 def agent_definition_detail_text(name: str) -> str | None:
     """渲染单个 agent 定义的详情（source / extends / 有效工具 / disallowed / model /
     系统提示词预览）。若 name 不是已知定义则返回 None（调用方再尝试当 instance id）。"""
-    from ..subagents.config import (
-        get_available_agent_types, _discover_custom_agents, get_sub_agent_config,
-        RESERVED_AGENT_TYPES,
+    from ..agents.registry import (
+        RESERVED_AGENT_TYPES, build_profile, discover_custom_agents,
+        effective_tools, get_available_agent_types,
     )
     known = {t["name"] for t in get_available_agent_types()}
     if name not in known or name in RESERVED_AGENT_TYPES:
         return None
-    cfg = get_sub_agent_config(name)
-    custom = _discover_custom_agents().get(name)
-    tool_names = sorted(t["name"] for t in cfg["tools"])
-    disallowed = sorted(cfg.get("disallowed_names") or [])
-    allowed = cfg.get("allowed_names")
+    profile = build_profile(name)
+    custom = discover_custom_agents().get(name)
+    tool_names = sorted(t["name"] for t in effective_tools(profile))
+    disallowed = sorted(profile.tools_deny)
+    # allow-list 显示语义与旧 dict API 一致：无 allow-list → unrestricted；有 → **有效**名集
+    # （deny 与 agent 剔除后的真实集合，即 call-time 强制的那一份）。
+    allowed = None if profile.tools_allow is None else set(tool_names)
     parts = [
         f"Agent definition: {name}",
         f"Description: {(custom.get('description') if custom else '') or '(built-in)'}",
-        f"Source: {cfg.get('source') or '(built-in)'}",
-        f"Extends: {cfg.get('extends') or '(none)'}",
-        f"Model: {cfg.get('model') or '(inherits parent)'}",
+        f"Source: {profile.source or '(built-in)'}",
+        f"Extends: {(custom.get('extends') if custom else None) or '(none)'}",
+        f"Model: {profile.model or '(inherits parent)'}",
         f"Effective tools ({len(tool_names)}): {', '.join(tool_names) or '(none)'}",
         f"Allow-list: {'(unrestricted except agent)' if allowed is None else ', '.join(sorted(allowed)) or '(none)'}",
         f"Disallowed tools: {', '.join(disallowed) or '(none)'}",
     ]
-    if cfg.get("max_turns"):
-        parts.append(f"Max turns: {cfg['max_turns']}")
-    if cfg.get("timeout_ms"):
-        parts.append(f"Timeout (ms): {cfg['timeout_ms']}")
-    preview = (cfg.get("system_prompt") or "").strip().replace("\n", " ")
+    if profile.max_turns:
+        parts.append(f"Max turns: {profile.max_turns}")
+    if profile.timeout_ms:
+        parts.append(f"Timeout (ms): {profile.timeout_ms}")
+    preview = (profile.prompt or "").strip().replace("\n", " ")
     if len(preview) > 200:
         preview = preview[:200] + "…"
     parts.append(f"System-prompt preview: {preview or '(empty)'}")

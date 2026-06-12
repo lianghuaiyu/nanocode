@@ -6,7 +6,7 @@ import asyncio
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.sink import EventSink, TerminalSink, BufferSink, NullSink
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):
@@ -15,9 +15,9 @@ def _agent(**kw):
 
 
 def _read_only_sub(parent):
-    cfg = config.get_sub_agent_config("explore")
+    profile = config.build_profile("explore")
     return parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"], agent_type="explore")
+        system_prompt=profile.prompt, tools=config.effective_tools(profile), agent_type="explore")
 
 
 class RecordingSink(NullSink):

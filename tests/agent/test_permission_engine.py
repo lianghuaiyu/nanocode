@@ -15,7 +15,7 @@ from nanocode.tools.permissions import (
     PermissionEngine, Decision, allowlist_blocks,
     ALWAYS_ALLOWED_META, AGENT_META_TOOL,
 )
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):
@@ -24,9 +24,9 @@ def _agent(**kw):
 
 
 def _read_only_sub(parent):
-    cfg = config.get_sub_agent_config("explore")
+    profile = config.build_profile("explore")
     return parent._build_sub_agent(
-        system_prompt=cfg["system_prompt"], tools=cfg["tools"], agent_type="explore")
+        system_prompt=profile.prompt, tools=config.effective_tools(profile), agent_type="explore")
 
 
 # ─── 纯函数 allowlist_blocks ────────────────────────────────────

@@ -6,7 +6,7 @@ from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import tool_definitions
 from nanocode.tools.agent import SCHEMA
-from nanocode.subagents import config
+from nanocode.agents import registry as config
 
 
 def _agent(**kw):

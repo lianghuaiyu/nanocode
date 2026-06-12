@@ -29,7 +29,7 @@ from ..memory.maintenance import (
 )
 from ..agent.subagent_manager import SubAgentManager
 from ..session import v2 as _session_v2
-from ..subagents import get_sub_agent_config
+from ..agents.registry import build_profile, effective_tools
 
 
 async def _auto_deny_confirm(_command: str) -> bool:
@@ -266,12 +266,12 @@ class SubAgentRunner:
         """`agent` 工具的派发：类型归一 → depth backstop → background / resume / fresh 三路。
         host-driven 搬迁自 engine._execute_agent_tool（行为逐字一致）。"""
         agent_type = inp.get("type", "general")
-        from ..subagents.config import _discover_custom_agents, RESERVED_AGENT_TYPES
+        from ..agents.registry import RESERVED_AGENT_TYPES, discover_custom_agents
         if agent_type in ("general", "coder"):
             agent_type = "coder"
         elif agent_type in ("explore", "plan"):
             pass
-        elif agent_type in _discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
+        elif agent_type in discover_custom_agents() and agent_type not in RESERVED_AGENT_TYPES:
             pass  # 已发现的自定义类型：保留
         else:
             agent_type = "coder"  # 真正未知（含保留名）→ general 语义
@@ -294,10 +294,9 @@ class SubAgentRunner:
             max_threads = host._subagents.max_threads()
             if max_threads > 0 and host._subagents.running_background_count() >= max_threads:
                 return (f"Error: max concurrent sub-agents ({max_threads}) reached; try again later.")
-            bg_cfg = get_sub_agent_config(agent_type)
             bg_timeout = tool_timeout_ms
             if bg_timeout is None:
-                bg_timeout = bg_cfg.get("timeout_ms")
+                bg_timeout = build_profile(agent_type).timeout_ms
             if bg_timeout is None:
                 bg_timeout = fleet_cfg.get("background_timeout_ms")
             task_id = await host._spawn_background_subagent(
@@ -320,14 +319,14 @@ class SubAgentRunner:
                 return (f"Error: provider mismatch — sub-agent '{resume_id}' was created with "
                         f"provider '{rec.provider}' but current provider is '{host._current_provider()}'. "
                         f"Cannot resume across providers.")
-            config = get_sub_agent_config(rec.type)
-            current_eff_model = config.get("model") or host.model
+            profile = build_profile(rec.type)
+            current_eff_model = profile.model or host.model
             if rec.model and rec.model != current_eff_model:
                 return (f"Error: model mismatch — sub-agent '{resume_id}' was created with "
                         f"model '{rec.model}' but its current effective model is '{current_eff_model}'. "
                         f"Cannot resume with a different model.")
-            eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
-            max_turns = host._subagents.bounded_max_turns(config.get("max_turns"))
+            eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
+            max_turns = host._subagents.bounded_max_turns(profile.max_turns)
             host._sink.sub_agent_start(rec.type, description)
             host.task_manager.update_subagent(resume_id, status="running")
             host._write_agent_spawn_artifacts(
@@ -336,10 +335,10 @@ class SubAgentRunner:
             sub_agent = None
             try:
                 sub_agent = host._build_sub_agent(
-                    system_prompt=config["system_prompt"], tools=config["tools"],
+                    system_prompt=profile.prompt, tools=effective_tools(profile),
                     agent_type=rec.type, max_turns=max_turns,
                     model=rec.model or current_eff_model, artifact_id=resume_id,
-                    agent_source=config.get("source"))
+                    agent_source=profile.source)
                 kind, payload = await host._run_foreground_subagent(
                     sub_agent, prompt, eff_timeout, resume_id)
             except asyncio.CancelledError:
@@ -376,10 +375,10 @@ class SubAgentRunner:
             return host._finalize_foreground_result(sub_agent, result, result_path, resume_id)
 
         # ── fresh path ──
-        config = get_sub_agent_config(agent_type)
-        eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, config, fleet_cfg)
-        max_turns = host._subagents.bounded_max_turns(config.get("max_turns"))
-        eff_model = config.get("model") or host.model
+        profile = build_profile(agent_type)
+        eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
+        max_turns = host._subagents.bounded_max_turns(profile.max_turns)
+        eff_model = profile.model or host.model
         host._sink.sub_agent_start(agent_type, description)
         rec = host.task_manager.create_subagent(
             type=agent_type, description=description,
@@ -391,9 +390,9 @@ class SubAgentRunner:
         sub_agent = None
         try:
             sub_agent = host._build_sub_agent(
-                system_prompt=config["system_prompt"], tools=config["tools"],
+                system_prompt=profile.prompt, tools=effective_tools(profile),
                 agent_type=agent_type, max_turns=max_turns, model=eff_model,
-                artifact_id=rec.id, agent_source=config.get("source"))
+                artifact_id=rec.id, agent_source=profile.source)
             kind, payload = await host._run_foreground_subagent(
                 sub_agent, prompt, eff_timeout, rec.id)
         except asyncio.CancelledError:
@@ -433,7 +432,7 @@ class SubAgentRunner:
     async def spawn_background_subagent(self, host, *, agent_type: str, description: str,
                                         prompt: str, timeout_ms: "int | None" = None) -> str:
         """注册 subagent + task（双向链）+ detached 协程,立即返回 task_id。"""
-        eff_model = get_sub_agent_config(agent_type).get("model") or host.model
+        eff_model = build_profile(agent_type).model or host.model
         sub_rec = host.task_manager.create_subagent(
             type=agent_type, description=description,
             model=eff_model, provider=host._current_provider())
@@ -461,11 +460,11 @@ class SubAgentRunner:
         """detached 协程：构造 background 子 agent,跑 run_once,落终态 + 持久化。"""
         sub_agent = None
         try:
-            config = get_sub_agent_config(agent_type)
-            sub_agent = host._build_sub_agent(system_prompt=config["system_prompt"], tools=config["tools"],
+            profile = build_profile(agent_type)
+            sub_agent = host._build_sub_agent(system_prompt=profile.prompt, tools=effective_tools(profile),
                 agent_type=agent_type, background=True,
-                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
-                model=config.get("model"), artifact_id=agent_id, agent_source=config.get("source"))
+                max_turns=host._subagents.bounded_max_turns(profile.max_turns),
+                model=profile.model, artifact_id=agent_id, agent_source=profile.source)
             kind, payload = await host._await_subagent_run(sub_agent, prompt, timeout_ms)
         except asyncio.CancelledError:
             host.task_manager.update_task(task_id, status="cancelled",
@@ -569,20 +568,20 @@ class SubAgentRunner:
 
         **不复用** _run_background_subagent（后者把子文本当最终 result；巩固需 parse+apply
         后处理）。**绕开** _execute_agent_tool（其 type 归一会把 memory-curator 改成 coder
-        拿全工具）——直接 get_sub_agent_config(memory-curator)[tools=[]] + _build_sub_agent
+        拿全工具）——直接 build_profile(memory-curator)（恒无工具）+ _build_sub_agent
         (background=True)。四态对称：cancel/timeout/error 写终态；成功则 token 累加 + 持久化
         messages + 写 result.md，再 parse(坏JSON→completed "no changes")+apply→summary_line。
         """
         sub_agent = None
         description = "memory consolidation"
         try:
-            config = get_sub_agent_config(host._MEMORY_CURATOR_TYPE)
+            profile = build_profile(host._MEMORY_CURATOR_TYPE)
             sub_agent = host._build_sub_agent(
-                system_prompt=config["system_prompt"],
-                tools=config["tools"],
+                system_prompt=profile.prompt,
+                tools=effective_tools(profile),
                 agent_type=host._MEMORY_CURATOR_TYPE,
                 background=True,
-                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
+                max_turns=host._subagents.bounded_max_turns(profile.max_turns),
                 artifact_id=agent_id,
             )
             if timeout_ms is not None:
@@ -694,13 +693,13 @@ class SubAgentRunner:
         sub_agent = None
         description = "memory eval generation"
         try:
-            config = get_sub_agent_config(host._MEMORY_EVAL_CURATOR_TYPE)
+            profile = build_profile(host._MEMORY_EVAL_CURATOR_TYPE)
             sub_agent = host._build_sub_agent(
-                system_prompt=config["system_prompt"],
-                tools=config["tools"],
+                system_prompt=profile.prompt,
+                tools=effective_tools(profile),
                 agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
                 background=True,
-                max_turns=host._subagents.bounded_max_turns(config.get("max_turns")),
+                max_turns=host._subagents.bounded_max_turns(profile.max_turns),
                 artifact_id=agent_id,
             )
             if timeout_ms is not None:
