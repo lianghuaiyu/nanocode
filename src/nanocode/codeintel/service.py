@@ -64,12 +64,19 @@ class CodeIntelService:
 
         - manual：有 last_map 直接返回（永不重算,除非 force）；
         - always：从不用缓存；
-        - files：总是用缓存（key 含 personal 文件 + budget,文件没变即命中）；
+        - files：文件集 + 内容（mtime）+ budget 不变即命中；
         - auto：仅当上次构建 >1s（map_processing_time）才用缓存——便宜的小仓库每次重算
-          保证新鲜,贵的大仓库吃缓存。auto 档 cache_key 额外纳入 mentioned（aider 同款）。"""
+          保证新鲜,贵的大仓库吃缓存。auto 档 cache_key 额外纳入 mentioned（aider 同款）。
+
+        cache_key 纳入 touched 文件 mtime 指纹（相对 aider map_cache 的有意正确性增强）：
+        aider 是人辅助、map 可滞后;nanocode 的 map 是 agent 自动消费的主上下文,缓存命中
+        绕过 _ensure_indexed 会注入 stale 结构（codex P2）。先刷新 touched 索引,内容变 →
+        指纹变 → key miss → 重算;文件没变仍命中（保留 aider 缓存的性能价值）。"""
         import time
         q = query or RepoQuery()
         mode = refresh or self.refresh
+        # 先刷新 touched 文件索引（mtime 变 → 重抽取）,使下面的 key 指纹能反映内容变化。
+        self._ensure_indexed(q.chat_files + q.files_read + q.files_modified + q.mentioned_files)
         key = self._map_cache_key(q, budget_tokens, mode)
         if not force_refresh:
             if mode == "manual" and self._last_map is not None:
@@ -85,15 +92,17 @@ class CodeIntelService:
         self._last_map = result
         return result
 
-    @staticmethod
-    def _map_cache_key(q: "RepoQuery", budget_tokens: int, mode: str) -> tuple:
-        """aider get_ranked_tags_map cache_key 等价：personal 文件 + budget;auto 档纳入
-        mentioned（refresh!=auto 时 mention 变化不触发重算——aider 同款取舍）。"""
+    def _map_cache_key(self, q: "RepoQuery", budget_tokens: int, mode: str) -> tuple:
+        """aider get_ranked_tags_map cache_key + touched 文件 mtime 指纹（内容变即失效）。
+        auto 档纳入 mentioned（aider 同款）。指纹用已 _ensure_indexed 刷新过的 _mtime。"""
         base = (tuple(sorted(q.chat_files)), tuple(sorted(q.files_read)),
                 tuple(sorted(q.files_modified)), budget_tokens)
         if mode == "auto":
             base += (tuple(sorted(q.mentioned_files)), tuple(sorted(q.mentioned_identifiers)))
-        return base
+        rels = sorted({self._index._rel(Path(f)) for f in
+                       (q.chat_files + q.files_read + q.files_modified + q.mentioned_files)})
+        fingerprint = tuple((r, self._index._mtime.get(r)) for r in rels)
+        return base + (fingerprint,)
 
     def _repo_map_uncached(self, q: "RepoQuery", budget_tokens: int) -> RepoMapResult:
         """组装与 aider get_ranked_tags(_map_uncached) 同构：图排名 tags 之后接**全量发现

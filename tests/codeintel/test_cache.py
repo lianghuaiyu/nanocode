@@ -108,6 +108,21 @@ def test_refresh_files_uses_cache(tmp_path, monkeypatch):
     assert calls["n"] == 2
 
 
+def test_cache_invalidated_on_touched_content_change(tmp_path):
+    # codex P2 修复：files 档下，touched 文件内容变（mtime 变）→ map 反映新内容,不 stale。
+    p = _write(tmp_path, "shown.py", "def helper_old():\n    pass\n")
+    svc = get_service(str(tmp_path))
+    q = RepoQuery(mentioned_files=[str(p)])
+    r1 = svc.repo_map(q, budget_tokens=5000, refresh="files")
+    assert "helper_old" in r1.text
+    import os, time
+    time.sleep(0.01)
+    p.write_text("def helper_new():\n    pass\n")
+    os.utime(p, None)
+    r2 = svc.repo_map(q, budget_tokens=5000, refresh="files")        # 同 query+budget
+    assert "helper_new" in r2.text and "helper_old" not in r2.text   # mtime 指纹变 → 重算
+
+
 def test_refresh_always_never_caches(tmp_path, monkeypatch):
     _write(tmp_path, "a.py", "def fn():\n    pass\n")
     svc = get_service(str(tmp_path))
