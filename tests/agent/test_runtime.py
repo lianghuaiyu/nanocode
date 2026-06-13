@@ -98,6 +98,18 @@ def test_cancel_delegates_to_abort_order():
     assert calls == ["abort"]
 
 
+def test_thread_status_snapshot_exposes_session_state():
+    """docs/17 Phase 5a：status() 是客户端（footer/RPC）读会话状态的稳定 API，不跨边界 reach 私有面。"""
+    rt = AgentRuntime()
+    a = _agent()
+    th = rt.adopt(a)
+    st = th.status()
+    assert st["session_id"] == a.session_id
+    assert st["model"] == a.model
+    assert set(st) >= {"session_id", "cwd", "session_name", "input_tokens", "output_tokens",
+                       "cost_usd", "context_window", "model", "thinking"}
+
+
 def test_final_response_derived_from_event_stream():
     """docs/17 Phase 0：TurnResult.final_response 从 agent 的 emit 流（AssistantDelta.text）派生，
     无需 capturing sink。"""

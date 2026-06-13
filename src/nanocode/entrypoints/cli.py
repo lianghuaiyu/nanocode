@@ -539,27 +539,26 @@ async def run_repl(agent: Agent, lease=None) -> None:
     print_welcome()
 
     def _footer_toolbar():
-        """bottom_toolbar 回调:从当前 thread 的 agent + session 组装 Pi 两行页脚（ANSI）。
-        高频重绘——只读字段 + git 分支 TTL 缓存,失败返回空串（绝不让页脚拖垮 REPL）。"""
+        """bottom_toolbar 回调:从当前 thread 的 status() 组装 Pi 两行页脚（ANSI）。
+        高频重绘——RuntimeThread.status() 是稳定只读快照（docs/17 Phase 5a，不再 reach 进 Agent
+        私有面）+ git 分支 TTL 缓存,失败返回空串（绝不让页脚拖垮 REPL）。"""
         try:
             from .interactive.footer import FooterState, git_branch, render_footer
             from prompt_toolkit.application import get_app
-            a = _host.current_thread.agent
-            mgr = getattr(a, "_session_mgr", None)
-            cwd = mgr._cwd() if mgr is not None else os.getcwd()
-            mode = getattr(a, "_thinking_mode", "disabled")
+            st = _host.current_thread.status()
+            cwd = st["cwd"]
             state = FooterState(
                 cwd=cwd,
                 home=os.path.expanduser("~"),
                 branch=git_branch(cwd),
-                session_name=(mgr.name() if mgr is not None else None),
-                input_tokens=a.total_input_tokens,
-                output_tokens=a.total_output_tokens,
-                cost_usd=a._get_current_cost_usd(),
-                context_used=a.total_input_tokens,
-                context_window=getattr(a, "effective_window", 0),
-                model=a.model,
-                thinking=None if mode == "disabled" else mode,
+                session_name=st["session_name"],
+                input_tokens=st["input_tokens"],
+                output_tokens=st["output_tokens"],
+                cost_usd=st["cost_usd"],
+                context_used=st["input_tokens"],
+                context_window=st["context_window"],
+                model=st["model"],
+                thinking=st["thinking"],
             )
             try:
                 width = get_app().output.get_size().columns

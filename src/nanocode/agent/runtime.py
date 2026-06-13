@@ -253,6 +253,25 @@ class RuntimeThread:
     def tokens(self) -> dict:
         return self.agent.get_token_usage()
 
+    def status(self) -> dict:
+        """会话状态快照——供客户端（footer / RPC / 状态栏）读取，不再跨边界 reach 进 Agent 私有面
+        （docs/17 Phase 5a）。高频可调（footer 每次重绘）；纯读、无副作用。"""
+        import os as _os
+        a = self.agent
+        mgr = getattr(a, "_session_mgr", None)
+        mode = getattr(a, "_thinking_mode", "disabled")
+        return {
+            "session_id": a.session_id,
+            "cwd": mgr._cwd() if mgr is not None else _os.getcwd(),
+            "session_name": (mgr.name() if mgr is not None else None),
+            "input_tokens": a.total_input_tokens,
+            "output_tokens": a.total_output_tokens,
+            "cost_usd": a._get_current_cost_usd(),
+            "context_window": getattr(a, "effective_window", 0),
+            "model": a.model,
+            "thinking": None if mode == "disabled" else mode,
+        }
+
     def events(self) -> list[dict]:
         """push 流的近期快照（docs/16 #4：ring buffer，最多 EVENT_LOG_MAX 条）。
 
