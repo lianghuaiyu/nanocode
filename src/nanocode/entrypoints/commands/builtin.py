@@ -11,7 +11,7 @@ import，使测试可在各自 source 模块打桩拦截；会话状态经 ctx.t
 from __future__ import annotations
 
 from ...memory import eval_store
-from ...ui import print_error, print_info
+from ...tui import print_error, print_info
 from .registry import Registry
 from .types import Command, CommandContext, CommandSpec, Control, Local
 

@@ -1,5 +1,5 @@
 """verbosity 开关：默认静默 print_cost，verbose 才打印。"""
-from nanocode import ui
+from nanocode import tui as ui
 
 
 def test_default_quiet_no_cost(capsys):

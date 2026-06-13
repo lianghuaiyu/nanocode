@@ -1,8 +1,13 @@
-"""Terminal UI rendering — colored output, spinner, tool display."""
+"""tui —— 与 agent 无关的终端渲染框架（docs/17：Pi `packages/tui` 对位层）。
+
+只提供**通用**原语：rich console、markdown / thinking 渲染、bullet / connector / diff 行、
+spinner、plan/approval/confirmation 显示部件、颜色化 print。**不含任何领域知识**——工具名→标题、
+结果摘要、文件改动解析等 agent 领域渲染在客户端侧 `entrypoints/render.py`。core 不 import 本模块
+（渲染只在订阅端 client）。
+"""
 
 from __future__ import annotations
 
-import re
 import sys
 import threading
 import time
@@ -66,62 +71,26 @@ def render_thinking(text: str) -> None:
     console.print(grid)
 
 
-def print_tool_call(name, inp) -> None:
-    title = _TOOL_TITLES.get(name, name)
-    summary = _get_tool_summary(name, inp)
+def print_bullet(title: str, summary: "str | None" = None) -> None:
+    """通用 ⏺ 行：cyan bullet + bold title + 可选 dim (summary)。领域调用方（render.py）传好文案。"""
     line = f"[cyan]{BULLET}[/cyan] [bold]{escape(title)}[/bold]"
     if summary:
         line += f"([dim]{escape(summary)}[/dim])"
     console.print(line)
 
 
-def print_tool_result(name, result) -> None:
-    if name in ("edit_file", "write_file") and not result.startswith("Error"):
-        _print_file_change_result(name, result)
-        return
-    console.print(f"  [dim]{CONNECTOR} {escape(_summarize_result(name, result))}[/dim]")
+def print_connector(text: str) -> None:
+    """通用 ↳ 摘要行（dim）。"""
+    console.print(f"  [dim]{CONNECTOR} {escape(text)}[/dim]")
 
 
-def _summarize_result(name, result) -> str:
-    r = result or ""
-    first = r.split("\n", 1)[0].strip()
-    if r.startswith(("Error", "Command failed", "Command timed out")):
-        return first or "error"
-    if name == "read_file":
-        return f"Read {(r.count(chr(10)) + 1) if r else 0} lines"
-    if name == "grep_search":
-        if r.startswith("No matches"):
-            return "No matches"
-        n = len([l for l in r.split("\n") if l and not l.startswith("... and ")])
-        return f"{n} matches"
-    if name == "list_files":
-        if r.startswith("No files"):
-            return "No files"
-        n = len([l for l in r.split("\n") if l and not l.startswith("... and ")])
-        return f"{n} files"
-    if name in ("run_shell", "sandbox_shell"):
-        if r.strip() == "(no output)":
-            return "(no output)"
-        for l in r.split("\n"):
-            if l.strip():
-                return l.strip()[:80]
-        return "(no output)"
-    return first[:80] or "done"
-
-
-def _print_file_change_result(name, result) -> None:
-    lines = result.split("\n")
-    body = lines[1:]
-    adds = sum(1 for l in body if l.startswith("+ "))
-    dels = sum(1 for l in body if l.startswith("- "))
-    if name == "write_file" and adds == 0 and dels == 0:
-        m = re.search(r"\((\d+) lines?\)", lines[0])
-        adds = int(m.group(1)) if m else 0
+def print_diff(adds: int, dels: int, body_lines: list, max_lines: int = 12) -> None:
+    """通用 diff 块渲染：+adds -dels 头 + 着色的 @@/+/- 行（领域方负责解析出 body_lines）。"""
     console.print(f"  [dim]{CONNECTOR} +{adds} -{dels}[/dim]")
-    nonempty = [l for l in body if l.strip()]
+    nonempty = [l for l in body_lines if l.strip()]
     shown = 0
     for line in nonempty:
-        if shown >= 12:
+        if shown >= max_lines:
             break
         if line.startswith("@@"):
             console.print(f"     [cyan]{escape(line)}[/cyan]")
@@ -227,44 +196,3 @@ def print_sub_agent_start(agent_type, description) -> None:
 
 def print_sub_agent_end(agent_type, _description) -> None:
     console.print(f"  [dim]{CONNECTOR} {escape(agent_type)} done[/dim]")
-
-
-# ─── Tool titles and summaries ──────────────────────────────
-
-_TOOL_TITLES = {
-    "read_file": "Read",
-    "write_file": "Write",
-    "edit_file": "Update",
-    "list_files": "List",
-    "grep_search": "Grep",
-    "run_shell": "Bash",
-    "sandbox_shell": "Sandbox",
-    "skill": "Skill",
-    "agent": "Task",
-}
-
-
-def _get_tool_summary(name: str, inp: dict) -> str:
-    if name == "read_file":
-        return inp.get("file_path", "")
-    if name == "write_file":
-        return inp.get("file_path", "")
-    if name == "edit_file":
-        return inp.get("file_path", "")
-    if name == "list_files":
-        return inp.get("pattern", "")
-    if name == "grep_search":
-        return f'"{inp.get("pattern", "")}" in {inp.get("path", ".")}'
-    if name == "run_shell":
-        cmd = inp.get("command", "")
-        return cmd[:60] + "..." if len(cmd) > 60 else cmd
-    if name == "sandbox_shell":
-        cmd = inp.get("command", "")
-        image = inp.get("image", "python:3.12")
-        summary = cmd[:60] + "..." if len(cmd) > 60 else cmd
-        return f"[{image}] {summary}"
-    if name == "skill":
-        return inp.get("skill_name", "")
-    if name == "agent":
-        return f'[{inp.get("type", "general")}] {inp.get("description", "")}'
-    return ""

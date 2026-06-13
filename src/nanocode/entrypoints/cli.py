@@ -17,7 +17,7 @@ from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
-from ..ui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
+from ..tui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from ..session import get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
@@ -721,7 +721,7 @@ Examples:
 """)
         sys.exit(0)
 
-    from ..ui import set_verbose
+    from ..tui import set_verbose
     set_verbose(args.verbose or os.environ.get("NANOCODE_VERBOSE", "").lower() in ("1", "true", "yes"))
     permission_mode = _resolve_permission_mode(args)
     model = args.model or os.environ.get("NANOCODE_MODEL", "claude-opus-4-6")

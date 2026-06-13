@@ -5,7 +5,8 @@ TerminalClient 从事件流渲染。本测试锚定 client 的事件→ui 映射
 `Agent.emit` 经 `_event_subscribers` 把事件推给订阅者的 live 接线。
 """
 
-import nanocode.ui as ui
+import nanocode.tui as tui
+from nanocode.entrypoints import render
 from nanocode.entrypoints.terminal_client import TerminalClient
 from nanocode.agent.events import (
     ALL_AGENT_EVENTS,
@@ -26,20 +27,20 @@ from nanocode.agent.events import (
 
 
 def _capture_ui(monkeypatch):
-    """把 ui 渲染原语替成记录器，返回 calls 列表。"""
+    """把渲染原语替成记录器：通用原语在 tui，工具领域渲染在 render（客户端侧）。"""
     calls = []
-    monkeypatch.setattr(ui, "render_assistant_markdown", lambda t: calls.append(("assistant_markdown", t)))
-    monkeypatch.setattr(ui, "render_thinking", lambda t: calls.append(("thinking", t)))
-    monkeypatch.setattr(ui, "print_tool_call", lambda n, i: calls.append(("tool_call", n, i)))
-    monkeypatch.setattr(ui, "print_tool_result", lambda n, r: calls.append(("tool_result", n, r)))
-    monkeypatch.setattr(ui, "print_info", lambda m: calls.append(("info", m)))
-    monkeypatch.setattr(ui, "print_retry", lambda a, m, r: calls.append(("retry", a, m, r)))
-    monkeypatch.setattr(ui, "print_sub_agent_start", lambda t, d: calls.append(("sub_start", t, d)))
-    monkeypatch.setattr(ui, "print_sub_agent_end", lambda t, d: calls.append(("sub_end", t, d)))
-    monkeypatch.setattr(ui, "print_cost", lambda i, o: calls.append(("cost", i, o)))
-    monkeypatch.setattr(ui, "print_confirmation", lambda m: calls.append(("confirmation", m)))
-    monkeypatch.setattr(ui, "start_spinner", lambda *a: calls.append(("spinner_start",)))
-    monkeypatch.setattr(ui, "stop_spinner", lambda: calls.append(("spinner_stop",)))
+    monkeypatch.setattr(tui, "render_assistant_markdown", lambda t: calls.append(("assistant_markdown", t)))
+    monkeypatch.setattr(tui, "render_thinking", lambda t: calls.append(("thinking", t)))
+    monkeypatch.setattr(render, "print_tool_call", lambda n, i: calls.append(("tool_call", n, i)))
+    monkeypatch.setattr(render, "print_tool_result", lambda n, r: calls.append(("tool_result", n, r)))
+    monkeypatch.setattr(tui, "print_info", lambda m: calls.append(("info", m)))
+    monkeypatch.setattr(tui, "print_retry", lambda a, m, r: calls.append(("retry", a, m, r)))
+    monkeypatch.setattr(tui, "print_sub_agent_start", lambda t, d: calls.append(("sub_start", t, d)))
+    monkeypatch.setattr(tui, "print_sub_agent_end", lambda t, d: calls.append(("sub_end", t, d)))
+    monkeypatch.setattr(tui, "print_cost", lambda i, o: calls.append(("cost", i, o)))
+    monkeypatch.setattr(tui, "print_confirmation", lambda m: calls.append(("confirmation", m)))
+    monkeypatch.setattr(tui, "start_spinner", lambda *a: calls.append(("spinner_start",)))
+    monkeypatch.setattr(tui, "stop_spinner", lambda: calls.append(("spinner_stop",)))
     return calls
 
 

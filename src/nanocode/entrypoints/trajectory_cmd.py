@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..ui import console, print_error, print_info
+from ..tui import console, print_error, print_info
 
 
 def run(argv: list[str]) -> int:

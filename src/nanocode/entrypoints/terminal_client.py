@@ -25,7 +25,8 @@ spinner **client 派生**（旧 core 的 cfg.sink.spinner_start/stop）：llm_re
 
 from __future__ import annotations
 
-from .. import ui
+from .. import tui
+from . import render
 
 # 触发「停 spinner」的事件 kind：首个内容到达 / turn 终态 / 需要打印的通知。
 # 不含 retry_raised——重试发生在同一 stream_fn 调用内、无后续 LlmRequestPrepared 重启 spinner，
@@ -48,34 +49,34 @@ class TerminalClient:
         event = env.get("event")
 
         if kind == "llm_request_prepared":
-            ui.start_spinner()
+            tui.start_spinner()
             return
 
         if kind in _STOP_SPINNER_KINDS:
-            ui.stop_spinner()   # 渲染任何内容前先停 spinner，避免与 spinner 行交错（幂等）
+            tui.stop_spinner()   # 渲染任何内容前先停 spinner，避免与 spinner 行交错（幂等）
 
         if kind == "assistant_delta":
             if getattr(event, "text", ""):
-                ui.render_assistant_markdown(event.text)
+                tui.render_assistant_markdown(event.text)
             if getattr(event, "thinking", ""):
-                ui.render_thinking(event.thinking)
+                tui.render_thinking(event.thinking)
         elif kind == "tool_call_requested":
-            ui.print_tool_call(event.tool, event.input)
+            render.print_tool_call(event.tool, event.input)      # 领域渲染（客户端侧）
         elif kind == "tool_result_observed":
-            ui.print_tool_result(event.tool, event.result)
+            render.print_tool_result(event.tool, event.result)
         elif kind == "notice_raised":
-            ui.print_info(event.text)
+            tui.print_info(event.text)
         elif kind == "retry_raised":
-            ui.print_retry(event.attempt, event.max_retries, event.reason)
+            tui.print_retry(event.attempt, event.max_retries, event.reason)
         elif kind == "sub_agent_started":
-            ui.print_sub_agent_start(event.agent_type, event.description)
+            tui.print_sub_agent_start(event.agent_type, event.description)
         elif kind == "sub_agent_ended":
-            ui.print_sub_agent_end(event.agent_type, event.description)
+            tui.print_sub_agent_end(event.agent_type, event.description)
         elif kind == "budget_exceeded":
-            ui.print_info(f"Budget exceeded: {event.reason}")
+            tui.print_info(f"Budget exceeded: {event.reason}")
         elif kind == "tool_call_authorized" and getattr(event, "action", None) == "deny":
-            ui.print_info(f"Denied: {event.message}")
+            tui.print_info(f"Denied: {event.message}")
         elif kind == "approval_requested":
-            ui.print_confirmation(event.message)   # 显示告警；y/n 决策经注入的 confirm_fn
+            tui.print_confirmation(event.message)   # 显示告警；y/n 决策经注入的 confirm_fn
         elif kind == "turn_completed":
-            ui.print_cost(event.input_tokens, event.output_tokens)
+            tui.print_cost(event.input_tokens, event.output_tokens)
