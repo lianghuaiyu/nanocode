@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..paths import data_dir
+from .events import NoticeRaised
 
 
 class PlanModeMixin:
@@ -22,14 +23,14 @@ class PlanModeMixin:
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            self._sink.info(f"Exited plan mode → {self.permission_mode} mode")
+            self.emit(NoticeRaised(text=f"Exited plan mode → {self.permission_mode} mode"))
             return self.permission_mode
         else:
             self._pre_plan_mode = self.permission_mode
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            self._sink.info(f"Entered plan mode. Plan file: {self._plan_file_path}")
+            self.emit(NoticeRaised(text=f"Entered plan mode. Plan file: {self._plan_file_path}"))
             return "plan"
 
     # ─── Plan mode helpers ──────────────────────────────────────
@@ -68,7 +69,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            self._sink.info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
+            self.emit(NoticeRaised(text="Entered plan mode (read-only). Plan file: " + self._plan_file_path))
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
 
         if name == "exit_plan_mode":
@@ -108,7 +109,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 if choice == "clear-and-execute":
                     self.agent_session.clear_for_plan_execution()
-                    self._sink.info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
+                    self.emit(NoticeRaised(text=f"Plan approved. Context cleared, executing in {target_mode} mode."))
                     return (
                         f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
                         f"Plan file: {saved_plan_path}\n\n"
@@ -116,7 +117,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         f"Proceed with implementation."
                     )
 
-                self._sink.info(f"Plan approved. Executing in {target_mode} mode.")
+                self.emit(NoticeRaised(text=f"Plan approved. Executing in {target_mode} mode."))
                 return (
                     f"User approved the plan. Permission mode: {target_mode}\n\n"
                     f"## Approved Plan:\n{plan_content}\n\n"
@@ -128,7 +129,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            self._sink.info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
+            self.emit(NoticeRaised(text="Exited plan mode. Restored to " + self.permission_mode + " mode."))
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"

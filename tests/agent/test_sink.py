@@ -122,13 +122,16 @@ def test_direct_sink_calls_land_in_injected_sink():
     assert kinds == ["tool_call", "sub_agent_start", "sub_agent_end"]
 
 
-def test_permission_deny_routes_info_through_sink():
-    """_authorize_dispatch 的 'Denied: ...' 经 self._sink.info，不再直达 ..ui。"""
-    rec = RecordingSink()
-    a = _agent(sink=rec, permission_mode="plan")  # plan 模式下 run_shell 被策略拒
+def test_permission_deny_emits_tool_call_authorized():
+    """docs/17 Phase 2：_authorize_dispatch 的拒绝经 ToolCallAuthorized(action=deny) 事件流出，
+    由订阅端 TerminalClient 渲染 "Denied: ..."，不再直调 sink.info。"""
+    a = _agent(permission_mode="plan")  # plan 模式下 run_shell 被策略拒
+    seen = []
+    a._event_subscribers.append(seen.append)
     allowed, denial = asyncio.run(a._authorize_dispatch("run_shell", {"command": "ls"}))
     assert allowed is False
-    assert any(e[0] == "info" and "Denied" in e[1] for e in rec.events)
+    deny = [e for e in seen if getattr(e, "kind", None) == "tool_call_authorized" and e.action == "deny"]
+    assert deny and "run_shell" in (deny[0].message or "") + deny[0].tool
 
 
 def test_buffer_sink_reset_clears_capture():

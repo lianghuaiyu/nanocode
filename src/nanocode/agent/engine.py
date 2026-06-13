@@ -22,6 +22,9 @@ from ..tools import (
 from .sink import EventSink, TerminalSink, BufferSink
 from .events import (
     AssistantDelta,
+    NoticeRaised,
+    SubAgentEnded,
+    SubAgentStarted,
     ToolBlocked,
     ToolCallAuthorized,
 )
@@ -419,7 +422,7 @@ class Agent(PlanModeMixin):
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
-        self._sink.info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+        self.emit(NoticeRaised(text=f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}"))
 
     def _get_current_cost_usd(self) -> float:
         return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
@@ -541,7 +544,7 @@ class Agent(PlanModeMixin):
         self._reset_working_sets()
         self._reset_session_mode()              # plan/permission 复位到 baseline（recompute _system_prompt，新 sid）
         # 请求是 request-local 投影（每轮从新 session 树重渲染，docs/16 #3c）——无需装载 flat 列表。
-        self._sink.info(f"Session → {new_sid} ({len(built.messages)} messages).")
+        self.emit(NoticeRaised(text=f"Session → {new_sid} ({len(built.messages)} messages)."))
 
     # docs/16 #3b：_auto_save 迁入 AgentSession.auto_save（chat/rebind 经 agent_session 调用）。
 
@@ -601,7 +604,7 @@ class Agent(PlanModeMixin):
             _session_v2.write_state(self.session_id, self.task_manager.to_state())
         except Exception as e:
             # docs/16 #2：silent pass 已清——derived cache 落盘失败必须可观测（不破坏 live turn）。
-            self._sink.info(f"[state] v2 state persist failed: {e}")
+            self.emit(NoticeRaised(text=f"[state] v2 state persist failed: {e}"))
 
     # ─── Autocompact ──────────────────────────────────────────
     # docs/16 #3a：_check_and_compact / _compact_conversation 已迁入 AgentSession
@@ -831,7 +834,7 @@ class Agent(PlanModeMixin):
             self._write_agent_spawn_artifacts(
                 agent_id=rec.id, agent_type="skill-fork", description=skill_name,
                 prompt=fork_prompt, model=self.model, background=False)
-            self._sink.sub_agent_start("skill-fork", skill_name)
+            self.emit(SubAgentStarted(agent_type="skill-fork", description=skill_name))
             sub_agent = None
             try:
                 sub_agent = self._build_sub_agent(
@@ -850,14 +853,14 @@ class Agent(PlanModeMixin):
                 if sub_agent is not None:
                     self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
-                self._sink.sub_agent_end("skill-fork", skill_name)
+                self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 self.task_manager.update_subagent(rec.id, status="failed")
                 if sub_agent is not None:
                     self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
-                self._sink.sub_agent_end("skill-fork", skill_name)
+                self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 return f"Skill fork error: {e}"
 
             if kind == "timeout":
@@ -865,13 +868,13 @@ class Agent(PlanModeMixin):
                 self.task_manager.update_subagent(rec.id, status="cancelled")
                 self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "cancelled")
-                self._sink.sub_agent_end("skill-fork", skill_name)
+                self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 raise asyncio.CancelledError()
             if kind == "error":
                 self.task_manager.update_subagent(rec.id, status="failed")
                 self._close_child_session(rec.id, sub_agent)
                 self._finalize_agent_meta(rec.id, "failed")
-                self._sink.sub_agent_end("skill-fork", skill_name)
+                self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 return f"Skill fork error: {payload}"
 
             sub_result = payload
@@ -881,7 +884,7 @@ class Agent(PlanModeMixin):
             self._close_child_session(rec.id, sub_agent)
             result_path = self._write_agent_result(rec.id, sub_result["text"] or "")
             self._finalize_agent_meta(rec.id, "completed")
-            self._sink.sub_agent_end("skill-fork", skill_name)
+            self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
             # 与 fresh/resume 一致：回传有界信封而非整段 transcript（完整在 result.md）。
             return self._finalize_foreground_result(sub_agent, sub_result, result_path, rec.id)
 
@@ -1009,7 +1012,6 @@ class Agent(PlanModeMixin):
         d = self.permission.check(name, inp)
         self.emit(ToolCallAuthorized(tool=name, action=d.action, message=d.message))
         if d.action == "deny":
-            self._sink.info(f"Denied: {d.message}")
             return False, f"Action denied: {d.message}"
         if d.action == "confirm" and d.message:
             if not await self._confirm_if_needed(d.message):

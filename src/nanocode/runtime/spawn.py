@@ -28,6 +28,7 @@ from ..memory.maintenance import (
     parse_consolidation_plan,
 )
 from ..agent.subagent_manager import SubAgentManager
+from ..agent.events import SubAgentStarted, SubAgentEnded
 from ..session import v2 as _session_v2
 from ..agents.permissions import effective_child_tools
 from ..agents.result import ResultEnvelope
@@ -380,7 +381,7 @@ class SubAgentRunner:
                         f"Cannot resume with a different model.")
             eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
             max_turns = host._subagents.bounded_max_turns(profile.max_turns)
-            host._sink.sub_agent_start(rec.type, description)
+            host.emit(SubAgentStarted(agent_type=rec.type, description=description))
             host.task_manager.update_subagent(resume_id, status="running")
             host._write_agent_spawn_artifacts(
                 agent_id=resume_id, agent_type=rec.type, description=description,
@@ -399,14 +400,14 @@ class SubAgentRunner:
                 if sub_agent is not None:
                     host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(resume_id, "cancelled")
-                host._sink.sub_agent_end(rec.type, description)
+                host.emit(SubAgentEnded(agent_type=rec.type, description=description))
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 host.task_manager.update_subagent(resume_id, status="failed")
                 if sub_agent is not None:
                     host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(resume_id, "failed")
-                host._sink.sub_agent_end(rec.type, description)
+                host.emit(SubAgentEnded(agent_type=rec.type, description=description))
                 return f"Sub-agent error: {e}"
             if kind != "ok":
                 if kind == "error":
@@ -414,7 +415,7 @@ class SubAgentRunner:
                 host._close_child_session(resume_id, sub_agent)
                 host._finalize_agent_meta(
                     resume_id, "timed_out" if kind == "timeout" else "failed")
-                host._sink.sub_agent_end(rec.type, description)
+                host.emit(SubAgentEnded(agent_type=rec.type, description=description))
                 return host._finalize_foreground_terminal(
                     sub_agent, resume_id, kind, payload, eff_timeout)
             result = payload  # type: ignore[assignment]
@@ -424,7 +425,7 @@ class SubAgentRunner:
             host._close_child_session(resume_id, sub_agent)
             result_path = host._write_agent_result(resume_id, result["text"] or "")
             host._finalize_agent_meta(resume_id, "completed")
-            host._sink.sub_agent_end(rec.type, description)
+            host.emit(SubAgentEnded(agent_type=rec.type, description=description))
             return host._finalize_foreground_result(sub_agent, result, result_path, resume_id)
 
         # ── fresh path ──
@@ -442,7 +443,7 @@ class SubAgentRunner:
         eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
         max_turns = host._subagents.bounded_max_turns(profile.max_turns)
         eff_model = profile.model or host.model
-        host._sink.sub_agent_start(agent_type, description)
+        host.emit(SubAgentStarted(agent_type=agent_type, description=description))
         rec = host.task_manager.create_subagent(
             type=agent_type, description=description,
             model=eff_model, provider=host._current_provider())
@@ -463,14 +464,14 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(rec.id, "cancelled")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             raise
         except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
             host.task_manager.update_subagent(rec.id, status="failed")
             if sub_agent is not None:
                 host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(rec.id, "failed")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return f"Sub-agent error: {e}"
         if kind != "ok":
             if kind == "error":
@@ -478,7 +479,7 @@ class SubAgentRunner:
             host._close_child_session(rec.id, sub_agent)
             host._finalize_agent_meta(
                 rec.id, "timed_out" if kind == "timeout" else "failed")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return host._finalize_foreground_terminal(
                 sub_agent, rec.id, kind, payload, eff_timeout)
         result = payload  # type: ignore[assignment]
@@ -488,7 +489,7 @@ class SubAgentRunner:
         host._close_child_session(rec.id, sub_agent)
         result_path = host._write_agent_result(rec.id, result["text"] or "")
         host._finalize_agent_meta(rec.id, "completed")
-        host._sink.sub_agent_end(agent_type, description)
+        host.emit(SubAgentEnded(agent_type=agent_type, description=description))
         return host._finalize_foreground_result(sub_agent, result, result_path, rec.id)
 
     # ─── chain / parallel fan-in（docs/16 #9：借 pi {previous} 与 fan-in 的编排点子）──
@@ -583,7 +584,7 @@ class SubAgentRunner:
             pass
         host._write_agent_spawn_artifacts(agent_id=sub_rec.id, agent_type=agent_type, description=description,
             prompt=prompt, model=eff_model, background=True)
-        host._sink.sub_agent_start(agent_type, description)
+        host.emit(SubAgentStarted(agent_type=agent_type, description=description))
         task = asyncio.create_task(host._run_background_subagent(agent_id=sub_rec.id, task_id=task_rec.id, agent_type=agent_type,
             description=description, prompt=prompt, timeout_ms=timeout_ms))
         task._nanocode_task_id = task_rec.id
@@ -610,7 +611,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             raise
         except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态,detached 任务不能悬挂 running
             host.task_manager.update_task(task_id, status="failed", error=str(e),
@@ -619,7 +620,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
 
         if kind == "timeout":
@@ -631,7 +632,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
         if kind == "error":
             host._fold_subagent_tokens(sub_agent)
@@ -642,7 +643,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
-            host._sink.sub_agent_end(agent_type, description)
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
 
         result = payload  # kind == "ok"
@@ -657,7 +658,7 @@ class SubAgentRunner:
         host.task_manager.update_subagent(agent_id, status="completed", last_result_path=agent_result_path)
         host._close_child_session(agent_id, sub_agent)
         host._finalize_agent_meta(agent_id, "completed")
-        host._sink.sub_agent_end(agent_type, description)
+        host.emit(SubAgentEnded(agent_type=agent_type, description=description))
 
     # ─── memory curator spawns（搬迁自 engine,host-driven;curator 是 subagent,§13.8）──────────
     # ─── Memory consolidation (Auto-Dream) ────────────────────
@@ -690,7 +691,7 @@ class SubAgentRunner:
             agent_id=sub_rec.id, agent_type=host._MEMORY_CURATOR_TYPE,
             description=description, prompt=user_message, model=host.model,
             background=True)
-        host._sink.sub_agent_start(host._MEMORY_CURATOR_TYPE, description)
+        host.emit(SubAgentStarted(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
         task = asyncio.create_task(host._run_memory_consolidate(
             agent_id=sub_rec.id, task_id=task_rec.id, user_message=user_message))
         task._nanocode_task_id = task_rec.id
@@ -734,7 +735,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
-            host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             raise
         except asyncio.TimeoutError:
             host.task_manager.update_task(
@@ -744,7 +745,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
-            host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
         except Exception as e:
             host.task_manager.update_task(
@@ -754,7 +755,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
-            host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
 
         # curator 成功产出 JSON 提案：token 累加 + 持久化 + 写 result.md
@@ -774,14 +775,14 @@ class SubAgentRunner:
             host.task_manager.update_task(
                 task_id, status="completed", result_path=result_path,
                 result_summary="Consolidation: no changes (unparseable plan)")
-            host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
 
         apply_result = apply_plan(plan)
         host.task_manager.update_task(
             task_id, status="completed", result_path=result_path,
             result_summary=apply_result.summary_line())
-        host._sink.sub_agent_end(host._MEMORY_CURATOR_TYPE, description)
+        host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
 
     # ─── Memory eval candidate generation (EVAL-mode curator) ──
 
@@ -811,7 +812,7 @@ class SubAgentRunner:
             agent_id=sub_rec.id, agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
             description=description, prompt=user_message, model=host.model,
             background=True)
-        host._sink.sub_agent_start(host._MEMORY_EVAL_CURATOR_TYPE, description)
+        host.emit(SubAgentStarted(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
         task = asyncio.create_task(host._run_memory_eval(
             agent_id=sub_rec.id, task_id=task_rec.id, user_message=user_message))
         task._nanocode_task_id = task_rec.id
@@ -852,7 +853,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "cancelled")
-            host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             raise
         except asyncio.TimeoutError:
             host.task_manager.update_task(
@@ -862,7 +863,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "timed_out")
-            host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             return
         except Exception as e:
             host.task_manager.update_task(
@@ -872,7 +873,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
             host._finalize_agent_meta(agent_id, "failed")
-            host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             return
 
         host.total_input_tokens += result["tokens"]["input"]
@@ -895,7 +896,7 @@ class SubAgentRunner:
             host.task_manager.update_task(
                 task_id, status="completed", result_path=result_path,
                 result_summary="Generated 0 pending eval candidates (unparseable output)")
-            host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
+            host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             return
 
         for item in candidates:
@@ -924,7 +925,7 @@ class SubAgentRunner:
         host.task_manager.update_task(
             task_id, status="completed", result_path=result_path,
             result_summary=summary)
-        host._sink.sub_agent_end(host._MEMORY_EVAL_CURATOR_TYPE, description)
+        host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
 
     # ─── Memory optimization (EvolveMem, host-only) ───────────
 

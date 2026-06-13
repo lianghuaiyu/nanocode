@@ -22,6 +22,8 @@ from .events import (
     AssistantDelta,
     BudgetExceeded,
     LlmRequestPrepared,
+    NoticeRaised,
+    RetryRaised,
     ToolCallRequested,
     ToolResultObserved,
 )
@@ -48,9 +50,6 @@ class AgentCore:
             cfg.poll_memory()
             cfg.inject_turn_context()
 
-            if not cfg.is_sub_agent:
-                cfg.sink.spinner_start()
-
             early_executions: dict[str, asyncio.Task] = {}
             early_started: dict[str, float] = {}
 
@@ -63,16 +62,16 @@ class AgentCore:
 
             proj = cfg.rebuild_snapshot()
             messages = proj.messages
+            # docs/17 Phase 2：LlmRequestPrepared 是订阅端派生 spinner 的「起」信号（旧 cfg.sink.spinner_start）。
             emit(LlmRequestPrepared(
                 model=cfg.model, message_count=len(messages),
                 messages_chars=len(json.dumps(messages, default=str))))
             _t_req = time.time()
             cb = StreamCallbacks(
-                spinner_stop=cfg.sink.spinner_stop,
                 text_block=lambda t: emit(AssistantDelta(text=t)),
                 thinking_block=lambda t: emit(AssistantDelta(thinking=t)),
                 tool_block=_on_tool_block,
-                retry=cfg.sink.retry,
+                retry=lambda a, m, r: emit(RetryRaised(attempt=a, max_retries=m, reason=r)),
             )
             try:
                 response = await stream_fn(
@@ -84,16 +83,12 @@ class AgentCore:
                 if (not overflow_retried and not cfg.is_aborted()
                         and is_context_overflow_error(e)):
                     overflow_retried = True
-                    if not cfg.is_sub_agent:
-                        cfg.sink.spinner_stop()
-                    cfg.sink.info("Provider context overflow — compacting and retrying once...")
+                    emit(NoticeRaised(text="Provider context overflow — compacting and retrying once...",
+                                      level="warn"))
                     await cfg.compact()
                     continue
                 raise
             _latency_ms = int((time.time() - _t_req) * 1000)
-
-            if not cfg.is_sub_agent:
-                cfg.sink.spinner_stop()
 
             cfg.note_api_call()
             cfg.add_usage(response.usage.input_tokens, response.usage.output_tokens)
@@ -111,14 +106,12 @@ class AgentCore:
                 latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
 
             if not tool_uses:
-                if not cfg.is_sub_agent:
-                    cfg.sink.cost(*cfg.token_totals())
                 break
 
             cfg.bump_turn()
             budget = cfg.check_budget()
             if budget["exceeded"]:
-                cfg.sink.info(f"Budget exceeded: {budget['reason']}")
+                # docs/17 Phase 2：BudgetExceeded 事件即人面通知源（订阅端渲染），不再额外 sink.info。
                 emit(BudgetExceeded(reason=budget["reason"]))
                 break
 
@@ -179,18 +172,14 @@ class AgentCore:
             cfg.poll_memory()
             cfg.inject_turn_context()
 
-            if not cfg.is_sub_agent:
-                cfg.sink.spinner_start()
-
             proj = cfg.rebuild_snapshot()
             messages = proj.messages
             emit(LlmRequestPrepared(
                 model=cfg.model, message_count=len(messages),
                 messages_chars=len(json.dumps(messages, default=str))))
             _t_req = time.time()
-            cb = StreamCallbacks(spinner_stop=cfg.sink.spinner_stop,
-                                 text_block=lambda t: emit(AssistantDelta(text=t)),
-                                 retry=cfg.sink.retry)
+            cb = StreamCallbacks(text_block=lambda t: emit(AssistantDelta(text=t)),
+                                 retry=lambda a, m, r: emit(RetryRaised(attempt=a, max_retries=m, reason=r)))
             try:
                 response = await stream_fn(
                     model=cfg.model, system=None, tools=cfg.tools,
@@ -199,16 +188,12 @@ class AgentCore:
                 if (not overflow_retried and not cfg.is_aborted()
                         and is_context_overflow_error(e)):
                     overflow_retried = True
-                    if not cfg.is_sub_agent:
-                        cfg.sink.spinner_stop()
-                    cfg.sink.info("Provider context overflow — compacting and retrying once...")
+                    emit(NoticeRaised(text="Provider context overflow — compacting and retrying once...",
+                                      level="warn"))
                     await cfg.compact()
                     continue
                 raise
             _latency_ms = int((time.time() - _t_req) * 1000)
-
-            if not cfg.is_sub_agent:
-                cfg.sink.spinner_stop()
 
             cfg.note_api_call()
             if response.get("usage"):
@@ -227,14 +212,11 @@ class AgentCore:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                if not cfg.is_sub_agent:
-                    cfg.sink.cost(*cfg.token_totals())
                 break
 
             cfg.bump_turn()
             budget = cfg.check_budget()
             if budget["exceeded"]:
-                cfg.sink.info(f"Budget exceeded: {budget['reason']}")
                 emit(BudgetExceeded(reason=budget["reason"]))
                 break
 

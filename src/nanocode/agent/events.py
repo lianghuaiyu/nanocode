@@ -157,11 +157,15 @@ class ContextInjected:
 
 @dataclass(frozen=True)
 class TurnCompleted:
-    """turn 正常收尾（落 TURN_END 遥测 entry，finalStatus=completed）。"""
+    """turn 正常收尾（落 TURN_END 遥测 entry，finalStatus=completed）。
+
+    cost_usd（additive，docs/17 Phase 2）：emit 时算好的累计美元成本，供订阅客户端（含 RPC headless）
+    直接显示而无需自带定价表；None 表示未知（无定价）。"""
 
     input_tokens: int
     output_tokens: int
     turns: int
+    cost_usd: float | None = None
     kind: str = "turn_completed"
 
 
@@ -183,6 +187,51 @@ class ErrorRaised:
     kind: str = "error_raised"
 
 
+# ─── UI-only 事件（docs/17 Phase 2：从 EventSink 直渲迁到 typed 事件流）──────────
+# 这些无持久化等价物（DURABLE_ENTRY_FOR_EVENT=None）：旧经 self._sink.<info/retry/sub_agent_*>
+# 直接驱动表现层，现升格为事件、由订阅端 TerminalClient 渲染——core 只 emit、不再认识表现层。
+
+@dataclass(frozen=True)
+class NoticeRaised:
+    """自由文本诊断/状态通知（取代散落的 self._sink.info）。level ∈ info|warn。
+
+    仅用于没有更具体 typed 事件的人面消息（overflow-retry、压缩状态、tree/state 持久化告警、
+    session 切换、MCP 连接日志等）。已有 typed 事件的（BudgetExceeded、ToolCallAuthorized deny）
+    一律渲染那些事件，绝不再走 NoticeRaised——避免它退化成 info sink 的别名。"""
+
+    text: str
+    level: str = "info"
+    kind: str = "notice_raised"
+
+
+@dataclass(frozen=True)
+class RetryRaised:
+    """provider 流重试通知（旧 self._sink.retry，经 StreamCallbacks.retry 触发）。"""
+
+    attempt: int
+    max_retries: int
+    reason: str
+    kind: str = "retry_raised"
+
+
+@dataclass(frozen=True)
+class SubAgentStarted:
+    """子 agent / skill-fork 开始（旧 host._sink.sub_agent_start）。父 agent 的事件流可见。"""
+
+    agent_type: str
+    description: str
+    kind: str = "sub_agent_started"
+
+
+@dataclass(frozen=True)
+class SubAgentEnded:
+    """子 agent / skill-fork 结束（旧 host._sink.sub_agent_end）。"""
+
+    agent_type: str
+    description: str
+    kind: str = "sub_agent_ended"
+
+
 # 整个 union（用于 isinstance fan-out / 类型注解）。
 AgentEvent = Union[
     UserMessageAccepted,
@@ -200,6 +249,10 @@ AgentEvent = Union[
     TurnCompleted,
     TurnAborted,
     ErrorRaised,
+    NoticeRaised,
+    RetryRaised,
+    SubAgentStarted,
+    SubAgentEnded,
 ]
 
 ALL_AGENT_EVENTS: tuple[type, ...] = (
@@ -207,6 +260,7 @@ ALL_AGENT_EVENTS: tuple[type, ...] = (
     ToolCallRequested, ToolCallAuthorized, ToolResultCompleted, ToolResultObserved,
     ToolBlocked, BudgetExceeded,
     CompactionRequested, ContextInjected, TurnCompleted, TurnAborted, ErrorRaised,
+    NoticeRaised, RetryRaised, SubAgentStarted, SubAgentEnded,
 )
 
 # 事件 kind → 对应的 canonical 树 entry 持久化通道（None = 仅 UI / 无树等价物）。
@@ -228,6 +282,11 @@ DURABLE_ENTRY_FOR_EVENT: dict[str, str | None] = {
     "turn_completed": "turn_end",
     "turn_aborted": "turn_end",
     "error_raised": None,
+    # docs/17 Phase 2：UI-only 事件——无树等价物，由 TerminalClient 渲染。
+    "notice_raised": None,
+    "retry_raised": None,
+    "sub_agent_started": None,
+    "sub_agent_ended": None,
 }
 
 

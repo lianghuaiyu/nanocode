@@ -60,7 +60,7 @@ class AgentSession:
                 if mcp_defs:
                     a.tools = a.tools + mcp_defs
             except Exception as e:
-                a._sink.info(f"[mcp] Init failed: {e}")
+                a.emit(_events.NoticeRaised(text=f"[mcp] Init failed: {e}"))
 
         a._aborted = False
         a._pending_context_break = False        # turn-scoped：上一 turn 的遗留信号绝不跨 turn
@@ -83,9 +83,14 @@ class AgentSession:
         finally:
             a._current_task = None
         # turn-end 累计遥测落树（trajectory 的 total_turns + 终态 step 从此派生；record_event 单写）。
-        ev_cls = _events.TurnAborted if a._aborted else _events.TurnCompleted
-        a.emit(ev_cls(input_tokens=a.total_input_tokens,
-                      output_tokens=a.total_output_tokens, turns=a.current_turns))
+        if a._aborted:
+            a.emit(_events.TurnAborted(input_tokens=a.total_input_tokens,
+                                       output_tokens=a.total_output_tokens, turns=a.current_turns))
+        else:
+            # docs/17 Phase 2：TurnCompleted 携 cost_usd，订阅端（含 RPC）据此渲染成本，无需自带定价。
+            a.emit(_events.TurnCompleted(input_tokens=a.total_input_tokens,
+                                         output_tokens=a.total_output_tokens, turns=a.current_turns,
+                                         cost_usd=a._get_current_cost_usd()))
         if not a.is_sub_agent:
             self.auto_save()
 
@@ -209,7 +214,7 @@ class AgentSession:
                                                    RepoMapProvider()],
                                         budget=budget).collect(req)
         except Exception as e:
-            a._sink.info(f"[context] per-turn volatile collect failed: {e}")
+            a.emit(_events.NoticeRaised(text=f"[context] per-turn volatile collect failed: {e}"))
             return None
         led = getattr(a, "_context_ledger", None)
         if led is not None:
@@ -248,7 +253,7 @@ class AgentSession:
                         provider.commit()      # 写成功才推进 dedup（_already_surfaced + 字节预算）
                     self._ledger_note(pack, ok)
         except Exception as e:
-            a._sink.info(f"[memory] recall injection failed: {e}")
+            a.emit(_events.NoticeRaised(text=f"[memory] recall injection failed: {e}"))
 
     async def compact(self, instructions: str | None = None) -> None:
         """压缩当前对话（docs/16 #3a/#10：compaction owner = turn shell）。
@@ -261,7 +266,7 @@ class AgentSession:
         a = self.agent
         mgr = a._session_mgr
         if mgr is None:
-            a._sink.info("Nothing to compact (no active session tree).")
+            a.emit(_events.NoticeRaised(text="Nothing to compact (no active session tree)."))
             return
         tokens_before = a.last_input_token_count
         before_count = len(mgr.build_context().messages)
@@ -279,7 +284,7 @@ class AgentSession:
                 message_count_before=before_count,
                 message_count_after=self._predicted_post_compaction_count(summary, first_kept),
             ))
-        a._sink.info("Conversation compacted.")
+        a.emit(_events.NoticeRaised(text="Conversation compacted."))
         a._sent_skill_names = set()  # 清单消息被压缩丢弃 → 下一轮重新播报
 
     async def check_and_compact(self) -> None:
@@ -289,7 +294,7 @@ class AgentSession:
         if a._aborted:
             return
         if a.last_input_token_count > a.effective_window * 0.85:
-            a._sink.info("Context window filling up, compacting conversation...")
+            a.emit(_events.NoticeRaised(text="Context window filling up, compacting conversation..."))
             await self.compact()
 
     def keep_recent_tokens(self) -> int:
@@ -440,7 +445,7 @@ class AgentSession:
                     message_count_after=event.message_count_after)
                 return True
             except Exception as e:
-                a._sink.info(f"[tree] compaction entry append failed: {e}")
+                a.emit(_events.NoticeRaised(text=f"[tree] compaction entry append failed: {e}"))
                 return False
         if k in ("turn_completed", "turn_aborted"):
             self._tree_event(_tree.TURN_END, inputTokens=event.input_tokens,
@@ -461,7 +466,7 @@ class AgentSession:
             a._session_mgr.append_message(neutral_msg)
         except Exception as e:
             try:
-                a._sink.info(f"[tree] record_event failed: {e}")
+                a.emit(_events.NoticeRaised(text=f"[tree] record_event failed: {e}"))
             except Exception:
                 pass
             if required:
@@ -480,7 +485,7 @@ class AgentSession:
             if a._session_mgr is not None:
                 a._session_mgr.append(entry_type, data)
         except Exception as e:
-            a._sink.info(f"[tree] telemetry append failed ({entry_type}): {e}")
+            a.emit(_events.NoticeRaised(text=f"[tree] telemetry append failed ({entry_type}): {e}"))
 
     def _tree_custom_message(self, custom_type: str, content, *, parent_id: "str | None" = None) -> bool:
         """把一次注入作为 custom_message entry 写进 canonical 树（主 agent=自身树，子 agent=child 树；
@@ -495,7 +500,7 @@ class AgentSession:
                                   parent_id=parent_id)
             return True
         except Exception as e:
-            a._sink.info(f"[tree] custom_message append failed ({custom_type}): {e}")
+            a.emit(_events.NoticeRaised(text=f"[tree] custom_message append failed ({custom_type}): {e}"))
             return False
 
     # ── 请求构建（docs/13 S2；#3b 自 engine 迁入）────────────────────────────────
@@ -548,7 +553,7 @@ class AgentSession:
         try:
             plan = await ContextRuntime(budget=BudgetPolicy.for_window(a.effective_window)).collect(req)
         except Exception as e:
-            a._sink.info(f"[context] session-context collect failed: {e}")
+            a.emit(_events.NoticeRaised(text=f"[context] session-context collect failed: {e}"))
             return
         for pack in plan.packs:
             if pack.kind not in present:                  # per-customType：只注入缺失的 kind
@@ -645,7 +650,7 @@ class AgentSession:
         a._active_hooks = []
         from ..skills.discovery import reset_skill_cache
         reset_skill_cache()
-        a._sink.info("Conversation cleared (leaf reset to root; history kept — /tree to revisit).")
+        a.emit(_events.NoticeRaised(text="Conversation cleared (leaf reset to root; history kept — /tree to revisit)."))
 
     def clear_for_plan_execution(self) -> None:
         """plan clear-and-execute（docs/16 #3c，取代 flat 的 _clear_history_keep_system +
