@@ -125,7 +125,7 @@ class AgentSession:
         return AgentLoopConfig(
             provider=("openai" if a.use_openai else "anthropic"),
             model=a.model, thinking_mode=a._thinking_mode, tools=a.tools,
-            is_sub_agent=a.is_sub_agent, sink=a._sink,
+            is_sub_agent=a.is_sub_agent,
             rebuild_snapshot=self.project_request,
             record_provider_messages=self.record_provider_messages,
             execute_tool=a._execute_tool_call,

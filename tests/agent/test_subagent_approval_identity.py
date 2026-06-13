@@ -35,6 +35,26 @@ def test_subagent_confirm_message_contains_identity():
     assert "rm -rf /tmp/x" in msg      # original command preserved
 
 
+def test_confirm_dangerous_fail_closed_without_confirm_fn():
+    """docs/17 Phase 4：无注入 confirm_fn → fail-closed deny（取代旧阻塞 input() 回退）。"""
+    a = _agent()  # confirm_fn=None
+    assert a.confirm_fn is None
+    assert asyncio.run(a._confirm_dangerous("rm -rf /")) is False
+
+
+def test_confirm_dangerous_emits_approval_requested():
+    """docs/17 Phase 4：审批显示经 ApprovalRequested 事件流出（订阅端渲染告警），决策仍走 confirm_fn。"""
+    async def yes(message):
+        return True
+
+    a = _agent(confirm_fn=yes)
+    seen = []
+    a._event_subscribers.append(seen.append)
+    asyncio.run(a._confirm_dangerous("sudo reboot"))
+    appr = [e for e in seen if getattr(e, "kind", None) == "approval_requested"]
+    assert appr and appr[0].command == "sudo reboot" and appr[0].request_id
+
+
 def test_subagent_confirm_message_includes_source(tmp_path, monkeypatch):
     d = tmp_path / ".nanocode" / "agents"
     d.mkdir(parents=True)

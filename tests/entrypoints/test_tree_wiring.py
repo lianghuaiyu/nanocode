@@ -21,7 +21,7 @@ def _agent(sid):
 
 
 def _ctx(a, interactive=False):
-    return CommandContext(agent=a, session=AgentSession(a), out=a._sink, interactive=interactive)
+    return CommandContext(agent=a, session=AgentSession(a), interactive=interactive)
 
 
 def test_append_label_writes_and_reads_back():

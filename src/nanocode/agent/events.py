@@ -232,6 +232,18 @@ class SubAgentEnded:
     kind: str = "sub_agent_ended"
 
 
+@dataclass(frozen=True)
+class ApprovalRequested:
+    """危险动作待审批（旧 self._sink.confirmation）——**显示**事件，订阅端据此渲染告警。
+    实际决策仍经注入的 confirm_fn 往返（interactive：读 y/n；RPC：stdout 请求 + stdin 响应）。
+    request_id 为 RPC 关联键（interactive 不需要，默认空）。"""
+
+    command: str
+    message: str
+    request_id: str = ""
+    kind: str = "approval_requested"
+
+
 # 整个 union（用于 isinstance fan-out / 类型注解）。
 AgentEvent = Union[
     UserMessageAccepted,
@@ -253,6 +265,7 @@ AgentEvent = Union[
     RetryRaised,
     SubAgentStarted,
     SubAgentEnded,
+    ApprovalRequested,
 ]
 
 ALL_AGENT_EVENTS: tuple[type, ...] = (
@@ -260,7 +273,7 @@ ALL_AGENT_EVENTS: tuple[type, ...] = (
     ToolCallRequested, ToolCallAuthorized, ToolResultCompleted, ToolResultObserved,
     ToolBlocked, BudgetExceeded,
     CompactionRequested, ContextInjected, TurnCompleted, TurnAborted, ErrorRaised,
-    NoticeRaised, RetryRaised, SubAgentStarted, SubAgentEnded,
+    NoticeRaised, RetryRaised, SubAgentStarted, SubAgentEnded, ApprovalRequested,
 )
 
 # 事件 kind → 对应的 canonical 树 entry 持久化通道（None = 仅 UI / 无树等价物）。
@@ -287,6 +300,7 @@ DURABLE_ENTRY_FOR_EVENT: dict[str, str | None] = {
     "retry_raised": None,
     "sub_agent_started": None,
     "sub_agent_ended": None,
+    "approval_requested": None,
 }
 
 

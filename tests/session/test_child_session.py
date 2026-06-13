@@ -16,7 +16,7 @@ def _agent(sid, **kw):
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a), out=a._sink)
+    return CommandContext(agent=a, session=AgentSession(a))
 
 
 def _sub_with_child(parent, agent_id, spawn_leaf):

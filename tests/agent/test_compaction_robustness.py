@@ -10,7 +10,6 @@ import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.providers import is_context_overflow_error
-from nanocode.agent.sink import NullSink
 
 
 class _FakeBlock:
@@ -32,7 +31,7 @@ class _FakeResp:
 
 
 def _agent(sid):
-    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions", sink=NullSink())
+    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
     a._mcp_initialized = True
     a.model = "claude-x"
     return a

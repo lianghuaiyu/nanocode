@@ -22,7 +22,6 @@ def test_context_binds_current_thread_and_is_regenerated():
     c1 = host.context()
     assert c1.agent is a
     assert c1.session is t.session
-    assert c1.out is a._sink
     # 每次新建、不缓存——替换 thread 后无需通知 handler
     c2 = host.context()
     assert c2 is not c1 and c2.agent is a

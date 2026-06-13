@@ -46,11 +46,11 @@ class StreamCallbacks:
     """流式期间的 UI 副作用注入点（fire-and-forget，绝不影响控制流）。
 
     与旧 `_call_*_stream` 内联的 UI 副作用一一对应（docs/16 #2 后由 host.emit 的 typed 事件承载）：
-    - spinner_stop：首个 text/thinking block 收尾前停 spinner；
+    - spinner_stop：默认 no-op（docs/17 Phase 2：spinner 改订阅端从事件流派生，不再经 callback）；
     - text_block：完整 text block（UI markdown，= host._emit_block → AssistantDelta(text)）；
     - thinking_block：完整 thinking block（= emit AssistantDelta(thinking)）；
     - tool_block：tool_use block 收尾（流式早执行触发，= on_tool_block_complete）；
-    - retry：重试通知（= self._sink.retry），None 则不通知。
+    - retry：重试通知（docs/17 Phase 2：= emit(RetryRaised)），None 则不通知。
     """
 
     spinner_stop: Callable[[], None] = _noop

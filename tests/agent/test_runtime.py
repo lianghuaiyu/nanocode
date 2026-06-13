@@ -1,7 +1,7 @@
 """P4：AgentRuntime / RuntimeThread / TurnResult / ApprovalManager（in-process facade）。
 
 重点是不可回归契约：取消经 abort()、status 在 await 后读 _aborted 映射、final_response
-经 TeeSink 捕获不碍打印、ApprovalManager 装两条审批通道。
+从 agent 的 emit 流派生（docs/17 Phase 0：agent.final_text()）、ApprovalManager 装两条审批通道。
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ import asyncio
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.runtime import AgentRuntime, RuntimeThread, TurnResult, ApprovalManager, AgentConfig
-from nanocode.agent.sink import TeeSink, BufferSink, TerminalSink
 
 
 def _agent(**kw):
@@ -99,25 +98,22 @@ def test_cancel_delegates_to_abort_order():
     assert calls == ["abort"]
 
 
-def test_capture_response_via_tee_preserves_display():
-    """capture_response 经 TeeSink：助手文本既进显示 sink 又被捕获到 final_response。"""
+def test_final_response_derived_from_event_stream():
+    """docs/17 Phase 0：TurnResult.final_response 从 agent 的 emit 流（AssistantDelta.text）派生，
+    无需 capturing sink。"""
     rt = AgentRuntime()
     a = _agent()
-    orig_sink = a._sink
 
     async def fake_chat(prompt):
         a._emit_block("hello world")
 
-    th = rt.adopt(a, capture_response=True)
+    th = rt.adopt(a)
     th.session.run_turn = fake_chat
-    assert isinstance(a._sink, TeeSink)        # sink 被外挂为 tee
     res = asyncio.run(th.run("q"))
-    assert res.final_response == "hello world"  # 捕获到
-    # 原显示 sink 仍在 tee 内（不回归打印）
-    assert orig_sink in a._sink._sinks
+    assert res.final_response == "hello world"
 
 
-def test_capture_resets_between_turns():
+def test_final_response_resets_between_turns():
     rt = AgentRuntime()
     a = _agent()
     seq = iter(["first", "second"])
@@ -125,12 +121,12 @@ def test_capture_resets_between_turns():
     async def fake_chat(prompt):
         a._emit_block(next(seq))
 
-    th = rt.adopt(a, capture_response=True)
+    th = rt.adopt(a)
     th.session.run_turn = fake_chat
     r1 = asyncio.run(th.run("a"))
     r2 = asyncio.run(th.run("b"))
     assert r1.final_response == "first"
-    assert r2.final_response == "second"   # 不累积
+    assert r2.final_response == "second"   # 不累积（每 turn 入口 reset_final_text）
 
 
 def test_approval_manager_attaches_both_channels():

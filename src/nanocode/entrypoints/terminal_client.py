@@ -33,7 +33,7 @@ from .. import ui
 _STOP_SPINNER_KINDS = frozenset({
     "assistant_delta", "tool_call_requested", "tool_result_observed",
     "turn_completed", "turn_aborted", "error_raised", "budget_exceeded",
-    "notice_raised", "sub_agent_started",
+    "notice_raised", "sub_agent_started", "approval_requested",
 })
 
 
@@ -75,5 +75,7 @@ class TerminalClient:
             ui.print_info(f"Budget exceeded: {event.reason}")
         elif kind == "tool_call_authorized" and getattr(event, "action", None) == "deny":
             ui.print_info(f"Denied: {event.message}")
+        elif kind == "approval_requested":
+            ui.print_confirmation(event.message)   # 显示告警；y/n 决策经注入的 confirm_fn
         elif kind == "turn_completed":
             ui.print_cost(event.input_tokens, event.output_tokens)

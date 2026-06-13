@@ -32,7 +32,6 @@ class AgentLoopConfig:
     thinking_mode: str
     tools: list
     is_sub_agent: bool
-    sink: Any                                         # EventSink（spinner/cost/info/retry）
     # ── 请求构建 / 消息落树 ──
     rebuild_snapshot: Callable[[], Any]               # () -> ProviderProjection（每请求树渲染）
     record_provider_messages: Callable[..., None]     # (provider_msg, **kw) -> None（capture-at-emit）

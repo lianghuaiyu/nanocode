@@ -37,6 +37,7 @@ def _capture_ui(monkeypatch):
     monkeypatch.setattr(ui, "print_sub_agent_start", lambda t, d: calls.append(("sub_start", t, d)))
     monkeypatch.setattr(ui, "print_sub_agent_end", lambda t, d: calls.append(("sub_end", t, d)))
     monkeypatch.setattr(ui, "print_cost", lambda i, o: calls.append(("cost", i, o)))
+    monkeypatch.setattr(ui, "print_confirmation", lambda m: calls.append(("confirmation", m)))
     monkeypatch.setattr(ui, "start_spinner", lambda *a: calls.append(("spinner_start",)))
     monkeypatch.setattr(ui, "stop_spinner", lambda: calls.append(("spinner_stop",)))
     return calls
@@ -103,6 +104,14 @@ def test_client_tool_call_authorized_allow_is_noop(monkeypatch):
     calls = _capture_ui(monkeypatch)
     TerminalClient().on_event(_env(ToolCallAuthorized(tool="read_file", action="allow")))
     assert _content(calls) == []
+
+
+def test_client_renders_approval_requested(monkeypatch):
+    # docs/17 Phase 4：审批显示经事件流（client 渲染告警）；y/n 决策经注入的 confirm_fn。
+    from nanocode.agent.events import ApprovalRequested
+    calls = _capture_ui(monkeypatch)
+    TerminalClient().on_event(_env(ApprovalRequested(command="rm -rf /", message="⚠ rm -rf /", request_id="abc")))
+    assert _content(calls) == [("confirmation", "⚠ rm -rf /")]
 
 
 def test_client_derives_spinner(monkeypatch):

@@ -19,9 +19,9 @@ from ..tools import (
     PermissionEngine,
     ToolDef,
 )
-from .sink import EventSink, TerminalSink, BufferSink
 from .events import (
     AssistantDelta,
+    ApprovalRequested,
     NoticeRaised,
     SubAgentEnded,
     SubAgentStarted,
@@ -99,7 +99,6 @@ class Agent(PlanModeMixin):
         depth: int = 0,
         agent_type: str | None = None,
         agent_source: str | None = None,
-        sink: "EventSink | None" = None,
     ):
         self.permission_mode = permission_mode
         # 构造时配置的 baseline permission_mode（plan toggle 前）：rebind_session 切 session 时
@@ -109,15 +108,6 @@ class Agent(PlanModeMixin):
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        # 表现层注入边界（P-1 解耦目标3）：core 经 self._sink 发 UI 事件，不直接 import ..ui。
-        # 显式注入优先；否则子 agent 用 BufferSink（捕获助手文本、抑制其余），主 agent 用
-        # TerminalSink（包装 ui.py，行为不变）。_output_buffer 的旧职责并入 BufferSink。
-        if sink is not None:
-            self._sink = sink
-        elif is_sub_agent:
-            self._sink = BufferSink()
-        else:
-            self._sink = TerminalSink()
         # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
         # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
         # 工具名集（{t['name'] for t in cfg['tools']}，已剔除 agent + disallowed）。
@@ -216,7 +206,7 @@ class Agent(PlanModeMixin):
         # Thinking mode
         self._thinking_mode = self._resolve_thinking_mode()
 
-        # 子 agent 输出捕获已并入注入的 BufferSink（见 self._sink / _captured_text）。
+        # docs/17 Phase 0：子 agent 输出捕获经 _final_text_chunks 累加器（见 _captured_text）。
 
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
@@ -373,12 +363,9 @@ class Agent(PlanModeMixin):
     # ─── Sub-agent entry point ────────────────────────────────
 
     async def run_once(self, prompt: str) -> dict:
-        # 每轮入口重置捕获——复刻旧 `_output_buffer = []` / BufferSink.reset()，使复用的
-        # （持久/resume/headless）子 agent 实例不把上一轮文本泄漏进本轮结果（Codex review P2）。
+        # 每轮入口重置捕获——复刻旧 `_output_buffer = []`，使复用的（持久/resume/headless）
+        # 子 agent 实例不把上一轮文本泄漏进本轮结果（Codex review P2）。
         self.reset_final_text()
-        resetter = getattr(self._sink, "reset", None)
-        if callable(resetter):
-            resetter()
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
         await self.chat(prompt)
@@ -577,9 +564,9 @@ class Agent(PlanModeMixin):
         树先于 UI：required 写失败 fail-loud 时不画半截 UI。返回 record_event 的写入结果
         （ContextInjected 调用方据此推进 dedup）。
 
-        docs/17 Phase 1：UI 投影腿（project_agent_event → EventSink）已删——assistant/tool 的
-        流式渲染改由订阅端 TerminalClient 从事件流渲染（TUI 客户端化）。spinner/cost/info/retry/
-        sub_agent 暂仍经 self._sink 直渲（Phase 2 升格为事件后迁入 client）。"""
+        docs/17 Phase 1-4：UI 投影腿（project_agent_event → EventSink）已删——所有表现
+        （assistant/tool/spinner/cost/info/retry/sub_agent/approval）由订阅端 TerminalClient 从
+        事件流渲染（TUI 客户端化）。core 只 emit、不再认识表现层。"""
         written = self.agent_session.record_event(event)
         if isinstance(event, AssistantDelta) and event.text:
             # docs/17 Phase 0：final_response / 子 agent 文本从 emit 流派生（取代 BufferSink）。
@@ -1023,15 +1010,14 @@ class Agent(PlanModeMixin):
         # 否则审批人无从判断是哪个（可能由不受信项目定义的）子 agent 在请求危险操作。
         # 仅 enrich 传给 confirm_fn 的消息字符串，签名不变；主 agent 行为不变。
         message = self._decorate_confirm_message(command)
-        self._sink.confirmation(message)
+        # docs/17 Phase 4：审批显示经事件流（订阅端 TerminalClient 渲染告警），决策经注入的
+        # confirm_fn 往返。未注入 confirm_fn → fail-closed deny（取代旧阻塞 input() 回退——
+        # core 绝不直接读 stdin；headless/RPC 必须显式注入审批回调）。
+        self.emit(ApprovalRequested(command=command, message=message,
+                                    request_id=uuid.uuid4().hex[:8]))
         if self.confirm_fn:
             return await self.confirm_fn(message)
-        # Fallback: blocking input
-        try:
-            answer = input("  Allow? (y/n): ")
-            return answer.lower().startswith("y")
-        except EOFError:
-            return False
+        return False
 
     def _confirm_dedupe_key(self, message: str) -> str:
         """共享 _confirmed_paths 的去重键：子 agent 按身份隔离，避免「A 批过的危险命令

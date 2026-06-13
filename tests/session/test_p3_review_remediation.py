@@ -50,7 +50,7 @@ def test_fork_pre3a_first_message_yields_empty_new_session():
     mgr, start_id, u1 = _seed_pre3a_tree("pre3a_fork")
     a = _agent("pre3a_fork")
     a._session_mgr = mgr
-    ctx = CommandContext(agent=a, session=AgentSession(a), out=a._sink)
+    ctx = CommandContext(agent=a, session=AgentSession(a))
     res = asyncio.run(_fork(ctx, u1.id[-8:]))
     assert isinstance(res, Control) and res.payload["kind"] == "fork"
     rt = AgentRuntime()

@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, runtim
 
 if TYPE_CHECKING:  # 仅类型；避免 import 期耦合（agent 包较重）
     from ...agent import Agent, AgentSession
-    from ...agent.sink import EventSink
     from .registry import Registry
 
 
@@ -139,11 +138,11 @@ class CommandContext:
       SessionContextBuilder 身份，是静默行为变更。
     - `agent` 这条宽引用是 **shim**：handler 暂时仍 reach 进 Agent 私有面
       （clear_history / _spawn_* / _background_tasks）；目标是随 docs/09 P-1 解耦逐步收缩。
-    - out：输出朝 EventSink 收敛（当前可包 ui.print_*，见 agent/sink.py）。
+    - docs/17 Phase 3：旧 `out: EventSink` 字段已删——命令是 client 代码，直接调 ui 渲染；
+      EventSink 边界已随 sink 机构整体移除（渲染走订阅端 TerminalClient）。
     """
     agent: "Agent"
     session: "AgentSession"
-    out: "EventSink"
     cwd: Path = field(default_factory=Path.cwd)
     registry: "Registry | None" = None   # /help 等命令用它自省命令表（CMD-P1）
     interactive: bool = False            # 真 TTY?决定 /tree /fork /sessions 走交互选择器还是文本回退。

@@ -11,7 +11,6 @@ import asyncio
 from datetime import date
 
 from nanocode.agent.engine import Agent
-from nanocode.agent.sink import NullSink
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
@@ -35,7 +34,7 @@ class _FakeResp:
 
 
 def _agent(sid):
-    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions", sink=NullSink())
+    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
     a._mcp_initialized = True
     a.model = "claude-x"
     return a

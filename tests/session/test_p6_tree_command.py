@@ -11,7 +11,7 @@ from nanocode.session.manager import SessionManager
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a), out=a._sink)
+    return CommandContext(agent=a, session=AgentSession(a))
 
 
 def _agent(sid):

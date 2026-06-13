@@ -38,10 +38,10 @@ class RuntimeHost:
         return self._current_thread
 
     def context(self) -> CommandContext:
-        """每次 dispatch 重新生成——handler 永远看到当前 thread 的 agent/session/sink，
+        """每次 dispatch 重新生成——handler 永远看到当前 thread 的 agent/session，
         替换 thread 后无需通知任何 handler（它们不缓存 agent/session）。"""
         t = self._current_thread
-        return CommandContext(agent=t.agent, session=t.session, out=t.agent._sink,
+        return CommandContext(agent=t.agent, session=t.session,
                               registry=self._registry, interactive=self._interactive)
 
     def replace_thread(self, new_thread) -> None:

@@ -22,8 +22,6 @@ from typing import Awaitable, Callable, Literal
 from .session import AgentSession
 from collections import deque
 
-from .sink import BufferSink, TeeSink
-
 
 # ─── 结果对象 ────────────────────────────────────────────────
 
@@ -80,7 +78,6 @@ class AgentConfig:
     workspace_trusted: bool = True
     memory_backend: object | None = None
     session_id: str | None = None          # resume adopt 目标（None = 新 mint）
-    sink: object | None = None
 
     def build_agent(self):
         from .engine import Agent
@@ -90,7 +87,7 @@ class AgentConfig:
             api_base=self.api_base, anthropic_base_url=self.anthropic_base_url, api_key=self.api_key,
             trajectory_enabled=self.trajectory_enabled,
             trajectory_level=self.trajectory_level, workspace_trusted=self.workspace_trusted,
-            session_id=self.session_id, memory_backend=self.memory_backend, sink=self.sink,
+            session_id=self.session_id, memory_backend=self.memory_backend,
         )
 
 
@@ -126,19 +123,18 @@ class ApprovalManager:
 class RuntimeThread:
     """外部 API 面向的会话句柄：run→TurnResult、cancel、token 计数。
 
-    包住 AgentSession（P3）；in-process。final_response：主线程经注入的 capturing
-    BufferSink 取回（不回归 TerminalSink 打印——见 AgentRuntime.thread_start 的 sink 决策）。
+    包住 AgentSession（P3）；in-process。final_response 从 agent 的 emit 流派生
+    （docs/17 Phase 0：agent.final_text() 累计 AssistantDelta.text，取代旧 capturing sink）。
     """
 
     # push 事件流的 ring buffer 上限（防膨胀，docs/16 #4）：超出丢最旧，events() 是近期快照。
     EVENT_LOG_MAX = 512
 
     def __init__(self, runtime: "AgentRuntime", agent, session: AgentSession,
-                 *, capture: "BufferSink | None" = None, lease=None) -> None:
+                 *, lease=None) -> None:
         self._runtime = runtime
         self.agent = agent
         self.session = session
-        self._capture = capture  # 若注入则用于 final_response 捕获
         # docs/16 #4（EVENT-P2）：typed AgentEvent push 流。tap 挂在 agent.emit 的订阅者扇出腿上，
         # 每条事件包成 {thread_id, session_id, seq, type, event} 信封（绝不携带 tree entry id，
         # docs/12 boundary 5）——ring buffer 留快照（events()），listeners 实时收推送。
@@ -206,8 +202,6 @@ class RuntimeThread:
         # docs/17 Phase 0：final_response 从 agent 的 emit 流派生（AssistantMessageCompleted），
         # 每 turn 入口重置累加器，取代旧 BufferSink/TeeSink 捕获。
         self.agent.reset_final_text()
-        if self._capture is not None and hasattr(self._capture, "reset"):
-            self._capture.reset()  # 每 turn 重置捕获，避免跨 turn 累积
         prev_in = self.agent.total_input_tokens
         prev_out = self.agent.total_output_tokens
         await self.session.run_turn(prompt)
@@ -230,14 +224,13 @@ class RuntimeThread:
         self.agent.abort()
 
     def dispose(self) -> None:
-        """从 runtime registry 注销本 thread、置 disposed（使 run/cancel inert）并丢弃 capture（docs/14 P1）。
+        """从 runtime registry 注销本 thread、置 disposed（使 run/cancel inert）（docs/14 P1）。
 
         **不** finalize tracer / 不动 Agent —— 那是 Agent.rebind_session（P2）的职责。in-place
         rebind 下 old/new thread 复用同一 Agent，dispose 只做 wrapper 级清理；unregister 按
         **对象身份** compare-and-delete，即便 old/new 共享同一 session_id 也不会误删 new。"""
         self._disposed = True
         self._runtime.unregister(self)
-        self._capture = None
         # 摘除 emit 订阅 tap（old/new thread 复用同一 Agent：disposed thread 不再累积事件）。
         try:
             self.agent._event_subscribers.remove(self._agent_tap)
@@ -289,11 +282,11 @@ class AgentRuntime:
         self._threads: dict[str, RuntimeThread] = {}
 
     def adopt(self, agent, *, approvals: "ApprovalManager | None" = None,
-              capture_response: bool = False, lease=None) -> RuntimeThread:
+              lease=None) -> RuntimeThread:
         """把一个已构造的 Agent 纳管为 RuntimeThread（in-process 起点）。
 
-        capture_response=True 时，给主 agent 的 sink 外挂一个 BufferSink（经 TeeSink 与现有
-        显示 sink 并存），使 TurnResult.final_response 能取回助手文本而不影响终端打印。
+        TurnResult.final_response 从 agent 的 emit 流派生（docs/17 Phase 0：agent.final_text()），
+        无需外挂 capturing sink。
 
         lease（docs/14 SessionLease）：调用方（CLI bootstrap）已激活的会话写者租约——其
         `lease.manager` 注入给 agent 作 _session_mgr。adopt 不自己取锁/建树。"""
@@ -301,25 +294,18 @@ class AgentRuntime:
             approvals.attach(agent)
         if lease is not None:
             agent._session_mgr = lease.manager
-        # docs/16 #4：events()/subscribe 走 typed push tap（RuntimeThread ctor 挂上 agent.emit），
-        # 不再需要 RecordingSink。capture_response 时外挂 BufferSink 取 final_response。
-        capture: "BufferSink | None" = None
-        if capture_response:
-            capture = BufferSink()
-            agent._sink = TeeSink(agent._sink, capture)
         session = AgentSession(agent)
-        thread = RuntimeThread(self, agent, session, capture=capture, lease=lease)
+        thread = RuntimeThread(self, agent, session, lease=lease)
         return self.register(thread)
 
     def thread_start(self, config: "AgentConfig", *, approvals: "ApprovalManager | None" = None,
-                     capture_response: bool = False, lease=None) -> RuntimeThread:
+                     lease=None) -> RuntimeThread:
         """从 AgentConfig 构造一个全新 Agent 并 adopt 为首个 thread（docs/14 §3.1）。
 
         CLI / SDK / AppServer 的统一入口：config.build_agent() 造 Agent，再 adopt（attach 审批 +
-        可选 capture + 注入 lease + 注册）。live 切换（/new /resume…）走 thread_new/thread_resume
+        注入 lease + 注册）。live 切换（/new /resume…）走 thread_new/thread_resume
         （in-place rebind），不经此路径。"""
-        return self.adopt(config.build_agent(), approvals=approvals,
-                          capture_response=capture_response, lease=lease)
+        return self.adopt(config.build_agent(), approvals=approvals, lease=lease)
 
     def register(self, thread: "RuntimeThread") -> RuntimeThread:
         """把 thread 纳入 registry（按 thread_id）。adopt / runtime 构造器（P2）/ host.replace_thread 共用入口。"""
@@ -367,8 +353,7 @@ class AgentRuntime:
             # rebind 边界（docs/16 #4）：旧 thread 的订阅者得知流被切走，新 thread 的流以切换开篇。
             host.current_thread.push_boundary("session_switch",
                                               from_session=old_sid, to_session=new_sid)
-            new_thread = RuntimeThread(self, agent, AgentSession(agent),
-                                       capture=host.current_thread._capture, lease=lease)
+            new_thread = RuntimeThread(self, agent, AgentSession(agent), lease=lease)
             new_thread.push_boundary("session_switch", from_session=old_sid, to_session=new_sid)
             host.replace_thread(new_thread)
         except BaseException:

@@ -27,7 +27,7 @@ def _host(sid):
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a), out=a._sink)
+    return CommandContext(agent=a, session=AgentSession(a))
 
 
 # ─── /name ─────────────────────────────────────────────────────────────────
