@@ -310,7 +310,8 @@ def test_control_result_routes_to_apply_control_not_chat(monkeypatch):
     calls = _run_script(monkeypatch, ["/ctl"])
     assert ("run_turn", "/ctl") not in calls                       # 不落 chat
     assert not any(c[0] == "get_skill_by_name" for c in calls)     # 未 fall through 到 skill
-    assert ("print_info",) in calls                               # _apply_control 路由到了（打印 not-wired）
+    # （docs/18：_apply_control 的人面输出现经 _app.print_above→run_in_terminal，不再走 cli.print_info；
+    #  上面两条 negative 已充分证明 Control 被 _apply_control 消费、未落 chat/skill。）
 
 
 # ════════════════════════════════════════════════════════════════

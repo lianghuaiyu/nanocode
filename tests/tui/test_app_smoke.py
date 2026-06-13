@@ -176,7 +176,20 @@ def test_ctrl_d_on_empty_buffer_exits():
     assert asyncio.run(scenario()) is True
 
 
-def test_submitted_lines_recall_via_up_arrow():
+def test_render_event_invoked_for_each_event():
+    """回归守卫：app 必须把每条事件转给注入的 render_event（transcript 渲染）。
+
+    docs/18 fix：早期 smoke 从不设 render_event，导致「transcript 不渲染」的 bug（patch_stdout
+    被 app 重绘覆盖）漏网。loop 未起时 _emit_above 直跑 fn，故可同步断言 render_event 被调。"""
+    seen = []
+    app = TuiApp(output=DummyOutput(), render_event=lambda env: seen.append(env.get("type")))
+    app.bind_thread(FakeThread())
+    for ev in (E.UserMessageAccepted(text="hi"),
+               E.AssistantDelta(text="yo"),
+               E.TurnCompleted(input_tokens=1, output_tokens=1, turns=1)):
+        app.on_event(_env(ev))   # loop=None → _apply 同步、_emit_above 直跑
+    assert seen == ["user_message_accepted", "assistant_delta", "turn_completed"]
+
     """docs/18 step 6：提交的行记入历史，↑（首行）回溯——cutover 平价回归守卫。"""
     from prompt_toolkit.history import InMemoryHistory
 

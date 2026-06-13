@@ -286,6 +286,14 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
     # CMD-P2.5 / docs/15 Phase 7：普通 chat / skill turn **一律**经 RuntimeThread.run 驱动
     # （取 host 的 current_thread）。逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删——runtime 是唯一 turn 路径。
 
+    # docs/18 fix：app 运行中的人面输出必须经 run_in_terminal 印到 app 之上（直接 print 会被连续重绘
+    # 覆盖）。_say/_err 经 TuiApp.print_above 走该路径；命令/控制/skill 的提示都用它。
+    def _say(text) -> None:
+        _app.print_above(str(text))
+
+    def _err(text) -> None:
+        _app.print_above(str(text), error=True)
+
     async def _drive_turn(prompt: str) -> None:
         await _host.current_thread.run(prompt)
 
@@ -295,7 +303,7 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
         所有 live agent 替换都在此统一路由。"""
         ok, reason = host.can_switch()
         if not ok:
-            print_info(f"cannot switch sessions right now: {reason}")
+            _say(f"cannot switch sessions right now: {reason}")
             return
         action, payload = ctrl.action, (ctrl.payload or {})
         if action == "replace_thread" and payload.get("kind") == "new":
@@ -303,33 +311,33 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
         elif action == "replace_thread" and payload.get("kind") == "clone":
             # pi /clone：复制当前 active branch 到当前 leaf → 新 session；编辑器为空。
             if host.runtime.thread_clone(host, payload.get("sourceSid")) is None:
-                print_error("clone failed (no canonical tree / nothing to clone).")
+                _err("clone failed (no canonical tree / nothing to clone).")
         elif action == "replace_thread" and payload.get("kind") == "fork":
             # pi /fork：复制到选中 user 消息**之前** → 新 session；该 prompt 放回编辑器（app 输入框）。
             if host.runtime.thread_fork(host, payload.get("sourceSid"),
                                         payload.get("userEntryId")) is None:
-                print_error("fork failed (no canonical tree / unknown entry).")
+                _err("fork failed (no canonical tree / unknown entry).")
             else:
                 _app.input_buffer.text = payload.get("prefill") or ""
         elif action == "resume":
             sid = payload.get("sessionId")
             if sid == host.current_thread.thread_id:
-                print_info(f"Already on session {sid}.")
+                _say(f"Already on session {sid}.")
                 return
             if payload.get("fork"):
                 # --fork：把目标 clone 成新 session 切入（绝不做第二个 writer，docs/14 §5.2）
                 if host.runtime.thread_clone(host, sid) is None:
-                    print_error(f"cannot fork-resume '{sid}'.")
+                    _err(f"cannot fork-resume '{sid}'.")
                 return
             from ..session.tree import SessionBusyError
             try:
                 if host.runtime.thread_resume(host, sid) is None:
-                    print_error(f"cannot resume '{sid}' (no canonical tree).")
+                    _err(f"cannot resume '{sid}' (no canonical tree).")
             except SessionBusyError:
-                print_error(f"session '{sid}' is busy (another writer holds it). "
-                            f"Use `/resume {sid} --fork` to fork it into a new session.")
+                _err(f"session '{sid}' is busy (another writer holds it). "
+                     f"Use `/resume {sid} --fork` to fork it into a new session.")
         else:
-            print_info(f"(control '{action}' is not wired yet — coming in a later phase)")
+            _say(f"(control '{action}' is not wired yet — coming in a later phase)")
 
     # docs/18：审批/plan 不再读一行，改成 TuiApp 的 modal future（confirm_fn → y/n modal；
     # plan_approval_fn → 1-4 modal）。
@@ -347,15 +355,14 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
         if not inp:
             return
         if inp in ("exit", "quit"):
-            print("\nBye!\n")
-            _app.request_exit()
+            _app.request_exit()           # "Bye!" 在 _app.run() 返回后统一打印
             return
 
         # !<command>：用户直跑 shell（等同终端执行），不进 AI 对话、不走模型权限系统。
         if inp.startswith("!"):
             cmd = inp[1:].strip()
             if cmd:
-                print_info(await _run_user_shell(cmd))
+                _say(await _run_user_shell(cmd))
             return
 
         # REPL slash 命令 —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
@@ -365,9 +372,8 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
                 await _drive_turn(_result.prompt)
             elif isinstance(_result, Local):
                 if _result.output:
-                    print_info(_result.output)
+                    _say(_result.output)
                 if _result.exit_repl:
-                    print("\nBye!\n")
                     _app.request_exit()
             elif isinstance(_result, Control):
                 await _apply_control(_host, _result)
@@ -380,7 +386,7 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
             cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
             skill = get_skill_by_name(cmd_name)
             if skill and skill.user_invocable:
-                print_info(f"Invoking skill: {skill.name}")
+                _say(f"Invoking skill: {skill.name}")
                 try:
                     if skill.hooks:
                         agent._register_skill_hooks(skill)
@@ -393,7 +399,7 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
                         await _drive_turn(resolved)
                 except Exception as e:
                     if "abort" not in str(e).lower():
-                        print_error(str(e))
+                        _err(str(e))
                 return
 
         # Normal chat
@@ -406,6 +412,7 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
     try:
         await _app.run()
     finally:
+        print("\nBye!\n")          # app 退出后终端已复原，plain print 干净（覆盖所有退出路径）
         # docs/14 SessionLease：REPL 退出 → 释放当前 thread 的会话写锁（rebind 已交接/关闭旧租约，
         # 故只需释放 current_thread 的那把，幂等）。
         try:

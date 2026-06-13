@@ -38,7 +38,6 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import Frame
 
 from .reducer import hydrate_status, reduce
@@ -111,11 +110,34 @@ class TuiApp:
     def _apply(self, env: dict) -> None:
         reduce(self.state, env)
         if self._render_event is not None:
+            # transcript → terminal scrollback **above** the app via run_in_terminal（协调
+            # erase→print→repaint）；直接 print 会被 app 连续重绘覆盖（尤其无 CPR 的终端光标跟踪失准）。
+            self._emit_above(lambda: self._render_event(env))
+        self._safe_invalidate()
+
+    def _emit_above(self, fn) -> None:
+        """在 app 渲染区**之上**输出（run_in_terminal 挂起 app→运行 fn→重绘）。无 loop 则直跑。"""
+        loop = self._loop
+        if loop is None:
             try:
-                self._render_event(env)  # transcript → scrollback（领域渲染，client 注入）
+                fn()
             except Exception:
                 pass
-        self._safe_invalidate()
+            return
+        from prompt_toolkit.application import run_in_terminal
+
+        async def _run():
+            try:
+                await run_in_terminal(fn)
+            except Exception:
+                pass
+
+        asyncio.ensure_future(_run())
+
+    def print_above(self, text: str, *, error: bool = False) -> None:
+        """client（命令输出 / 通知）经此把文本印到 app 之上（同 transcript 路径，避免被重绘覆盖）。"""
+        from .. import tui as _tui
+        self._emit_above(lambda: (_tui.print_error if error else _tui.print_info)(text))
 
     def _safe_invalidate(self) -> None:
         try:
@@ -612,9 +634,7 @@ class TuiApp:
 
     # ── 运行 ──────────────────────────────────────────────────────────────────
     async def run(self, *, patch: bool = True) -> None:
+        # 不用 patch_stdout：所有 transcript / 命令输出经 _emit_above→run_in_terminal 印到 app 之上
+        # （patch_stdout 的被动 proxy 与 app 连续重绘相互覆盖，且会吞掉 run_in_terminal 内的 print）。
         self._loop = asyncio.get_running_loop()
-        if patch:
-            with patch_stdout():
-                await self._app.run_async()
-        else:
-            await self._app.run_async()  # 测试：DummyOutput 下不包 patch_stdout
+        await self._app.run_async()
