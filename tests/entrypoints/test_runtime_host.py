@@ -20,11 +20,11 @@ def _host(sid="h"):
 def test_context_binds_current_thread_and_is_regenerated():
     a, rt, t, host = _host("h1")
     c1 = host.context()
-    assert c1.agent is a
-    assert c1.session is t.session
+    assert c1.thread.agent is a
+    assert c1.thread is t
     # 每次新建、不缓存——替换 thread 后无需通知 handler
     c2 = host.context()
-    assert c2 is not c1 and c2.agent is a
+    assert c2 is not c1 and c2.thread.agent is a
 
 
 def test_replace_thread_disposes_old_and_rebinds_registry():
@@ -36,7 +36,7 @@ def test_replace_thread_disposes_old_and_rebinds_registry():
     assert host.current_thread is t2
     assert rt.thread(t1.thread_id) is None       # 旧 thread 已注销
     assert rt.thread(t2.thread_id) is t2
-    assert host.context().agent is a2            # context 现在绑新 thread
+    assert host.context().thread.agent is a2            # context 现在绑新 thread
 
 
 def test_dispose_is_idempotent():

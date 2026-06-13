@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 
-from nanocode.agent import AgentSession
+from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _resume, _session
 from nanocode.entrypoints.commands.types import CommandContext, Local
@@ -72,7 +72,7 @@ def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
 
     a = Agent(api_key="test", session_id="ROOTSID", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.open("ROOTSID")
-    ctx = CommandContext(agent=a, session=AgentSession(a), interactive=False)
+    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
     import io
     from contextlib import redirect_stdout
     buf = io.StringIO()
@@ -90,7 +90,7 @@ def test_session_shows_current_stats(capsys):
     mgr = SessionManager.create("CURSTAT")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
-    ctx = CommandContext(agent=a, session=AgentSession(a), interactive=False)
+    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
     res = asyncio.run(_session(ctx, ""))
     out = capsys.readouterr().out
     assert isinstance(res, Local)

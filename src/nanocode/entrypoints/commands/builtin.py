@@ -5,7 +5,7 @@
 从 cli 迁入此处（cli 顶部 re-export 以兼容直接调用它们的测试）。
 
 领域 helper（list_memories / discover_skills / sandbox_defaults / tasks_tool）用 call-time
-import，使测试可在各自 source 模块打桩拦截；agent/会话状态经 ctx.agent / ctx.session。
+import，使测试可在各自 source 模块打桩拦截；会话状态经 ctx.thread（RuntimeThread 稳定命令面，docs/17 B-list）。
 """
 
 from __future__ import annotations
@@ -74,17 +74,17 @@ def handle_eval_command(rest: str) -> str:
 # ─── handlers（镜像 cli.run_repl 的分支体）────────────────────────────────────
 
 async def _clear(ctx: CommandContext, args: str) -> Local:
-    ctx.agent.agent_session.clear_history()
+    ctx.thread.clear_history()
     return Local()
 
 
 async def _plan(ctx: CommandContext, args: str) -> Local:
-    ctx.agent.toggle_plan_mode()
+    ctx.thread.toggle_plan_mode()
     return Local()
 
 
 async def _cost(ctx: CommandContext, args: str) -> Local:
-    ctx.agent.show_cost()
+    ctx.thread.show_cost()
     return Local()
 
 
@@ -92,9 +92,8 @@ async def _context(ctx: CommandContext, args: str) -> Local:
     """/context —— 展示 ContextRuntime 组装的上下文 packs + token 预算 + survival matrix（docs/15 §8.2）。"""
     import os
     from ...context import BudgetPolicy, ContextRequest, ContextRuntime
-    a = ctx.agent
-    budget = BudgetPolicy.for_window(getattr(a, "effective_window", 200000))
-    req = ContextRequest(cwd=os.getcwd(), is_sub_agent=getattr(a, "is_sub_agent", False),
+    budget = BudgetPolicy.for_window(ctx.thread.effective_window)
+    req = ContextRequest(cwd=os.getcwd(), is_sub_agent=ctx.thread.is_sub_agent,
                          include_repo_map=True)
     plan = await ContextRuntime(budget=budget).collect(req)
     print_info(plan.ledger.render_summary())
@@ -103,24 +102,24 @@ async def _context(ctx: CommandContext, args: str) -> Local:
 
 async def _compact(ctx: CommandContext, args: str) -> Local:
     try:
-        await ctx.agent.agent_session.compact()
+        await ctx.thread.compact()
     except Exception as e:
         print_error(str(e))
     return Local()
 
 
 async def _memory_consolidate(ctx: CommandContext, args: str) -> Local:
-    print_info(await ctx.agent._spawn_memory_consolidate())
+    print_info(await ctx.thread.spawn_memory_consolidate())
     return Local()
 
 
 async def _memory_eval_generate(ctx: CommandContext, args: str) -> Local:
-    print_info(await ctx.agent._spawn_memory_eval())
+    print_info(await ctx.thread.spawn_memory_eval())
     return Local()
 
 
 async def _memory_optimize(ctx: CommandContext, args: str) -> Local:
-    print_info(await ctx.agent._spawn_memory_optimize())
+    print_info(await ctx.thread.spawn_memory_optimize())
     return Local()
 
 
@@ -178,19 +177,19 @@ async def _sandbox(ctx: CommandContext, args: str) -> Local:
 async def _tasks(ctx: CommandContext, args: str) -> Local:
     from ...tools.tasks_tool import list_tasks_text
     status = args.split()[0] if args else None
-    print(list_tasks_text(ctx.agent.task_manager, status, None))
+    print(list_tasks_text(ctx.thread.task_manager, status, None))
     return Local()
 
 
 async def _task_stop(ctx: CommandContext, args: str) -> Local:
     from ...tools.tasks_tool import task_stop
-    print(await task_stop(ctx.agent.task_manager, ctx.agent._background_tasks, args.strip()))
+    print(await task_stop(ctx.thread.task_manager, ctx.thread.background_tasks, args.strip()))
     return Local()
 
 
 async def _task(ctx: CommandContext, args: str) -> Local:
     from ...tools.tasks_tool import task_output_text
-    print(task_output_text(ctx.agent.task_manager, args.strip()))
+    print(task_output_text(ctx.thread.task_manager, args.strip()))
     return Local()
 
 
@@ -203,19 +202,19 @@ async def _agents(ctx: CommandContext, args: str) -> Local:
     toks = args.split(maxsplit=1)
     sub = toks[0] if toks else ""
     if sub == "":
-        print(agents_overview_text(ctx.agent.task_manager))
+        print(agents_overview_text(ctx.thread.task_manager))
         # docs/14 §6b：磁盘派生的 child session（经 header parentSession 回指），survives restart，
         # 不依赖 in-process task_manager。可 `/resume <child-sid>` 进入、`/sessions` 浏览父子。
         from ...session.manager import children
-        kids = children(ctx.agent.session_id)
+        kids = children(ctx.thread.session_id)
         if kids:
             print("\nChild sessions (/resume <id> to enter):")
             for k in kids:
                 print(f"    {k}")
     elif sub == "available":
-        print(list_agent_definitions_text(ctx.agent.task_manager))
+        print(list_agent_definitions_text(ctx.thread.task_manager))
     elif sub == "running":
-        print(list_subagents_text(ctx.agent.task_manager))
+        print(list_subagents_text(ctx.thread.task_manager))
     elif sub == "show":
         arg = toks[1].strip() if len(toks) > 1 else ""
         if not arg:
@@ -223,7 +222,7 @@ async def _agents(ctx: CommandContext, args: str) -> Local:
         else:
             detail = agent_definition_detail_text(arg)
             print(detail if detail is not None
-                  else subagent_detail_text(ctx.agent.task_manager, arg, ctx.agent.session_id))
+                  else subagent_detail_text(ctx.thread.task_manager, arg, ctx.thread.session_id))
     else:
         print_error("Usage: /agents [available|running|show <name|id>]")
     return Local()
@@ -233,7 +232,7 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
     """/agent <id> —— 若 id 对应一个 child session（docs/14 §6b）则导航进入（Control resume）；否则打印
     子 agent 详情。`/agent next|prev` 在兄弟 child session 间循环；从父 session 上 `next` 进入首个 child。"""
     from ...session.manager import SessionManager, children, parent_of, siblings
-    sid = ctx.agent.session_id
+    sid = ctx.thread.session_id
     arg = args.strip()
     if arg in ("next", "prev"):
         # 当前在父：兄弟集 = children(sid)；当前在 child：兄弟集 = siblings + 自己（同父下）。
@@ -252,13 +251,13 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
             return Local()
         return Control("resume", {"sessionId": nxt})
     if arg:
-        child_sid = ctx.agent.child_session_id(arg) if hasattr(ctx.agent, "child_session_id") else None
+        child_sid = ctx.thread.child_session_id(arg)
         target = (arg if SessionManager.exists(arg) and parent_of(arg)         # 已是 child sid
                   else child_sid if child_sid and SessionManager.exists(child_sid) else None)
         if target:
             return Control("resume", {"sessionId": target})
     from ...tools.tasks_tool import subagent_detail_text
-    print(subagent_detail_text(ctx.agent.task_manager, arg, sid))
+    print(subagent_detail_text(ctx.thread.task_manager, arg, sid))
     return Local()
 
 
@@ -278,11 +277,11 @@ async def _tree(ctx: CommandContext, args: str) -> Local:
     if args.strip():
         return await _checkout(ctx, args)
     from ...session.manager import SessionManager
-    sid = ctx.agent.session_id
+    sid = ctx.thread.session_id
     if not SessionManager.exists(sid):
         print("No canonical session tree yet for this session.")
         return Local()
-    mgr = ctx.agent._session_mgr or SessionManager.open(sid)
+    mgr = ctx.thread.session_manager or SessionManager.open(sid)
     if not ctx.interactive:
         from ..interactive.treemodel import render_tree_text
         name = mgr.name() or "(unnamed)"
@@ -294,7 +293,7 @@ async def _tree(ctx: CommandContext, args: str) -> Local:
     res = await run_tree(mgr, ask_text=_ask_text)
     if res and res.get("action") == "checkout":
         try:
-            msgs = ctx.session.move_to(res["entry_id"])
+            msgs = ctx.thread.move_to(res["entry_id"])
             print(f"Checked out …{res['entry_id'][-8:]} — context reloaded ({len(msgs)} messages).")
         except ValueError as e:
             print_error(str(e))
@@ -308,7 +307,7 @@ async def _checkout(ctx: CommandContext, args: str) -> Local:
         print_error("Usage: /tree <entry_id>  (run /tree to browse entry ids)")
         return Local()
     from ...session.manager import SessionManager
-    sid = ctx.agent.session_id
+    sid = ctx.thread.session_id
     if SessionManager.exists(sid):  # 解析：exact > suffix(尾部唯一) > prefix
         ids = [e.id for e in SessionManager.open(sid).entries()]
         matches = ([i for i in ids if i == target] or [i for i in ids if i.endswith(target)]
@@ -319,7 +318,7 @@ async def _checkout(ctx: CommandContext, args: str) -> Local:
             print_error(f"ambiguous id '{target}' ({len(matches)} matches) — use a longer suffix")
             return Local()
     try:
-        msgs = ctx.session.move_to(target)
+        msgs = ctx.thread.move_to(target)
         print(f"Checked out {target[:12]} — context reloaded ({len(msgs)} messages).")
     except ValueError as e:
         print_error(str(e))
@@ -393,7 +392,7 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     """/fork [entry] —— pi 语义：选择一条历史 user 消息，**新建 session** 复制到该消息**之前**，
     并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。原 session 保留（header 记 parentSession）。
     无参 + TTY → 交互选择器挑 user 消息；无参 + 非 TTY → 最近一条 user 消息；/fork <entry> → 指定。"""
-    mgr = ctx.agent._session_mgr
+    mgr = ctx.thread.session_manager
     if mgr is None:
         print_info("No active session for this agent.")
         return Local()
@@ -409,7 +408,7 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
             print_error("Fork target must be a user message.")
             return Local()
         return Control("replace_thread", {
-            "kind": "fork", "sourceSid": ctx.agent.session_id, "userEntryId": sel.id,
+            "kind": "fork", "sourceSid": ctx.thread.session_id, "userEntryId": sel.id,
             "prefill": _user_message_text(sel.data.get("message")),
         })
     if target:
@@ -427,7 +426,7 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
                     + _user_message_candidates(mgr))
         return Local()
     return Control("replace_thread", {
-        "kind": "fork", "sourceSid": ctx.agent.session_id, "userEntryId": sel.id,
+        "kind": "fork", "sourceSid": ctx.thread.session_id, "userEntryId": sel.id,
         "prefill": _user_message_text(sel.data.get("message")),
     })
 
@@ -441,7 +440,7 @@ async def _clone(ctx: CommandContext, args: str) -> "Control | Local":
         print_error("/clone takes no arguments (it copies the current branch to the current leaf). "
                     "Use /fork [entry] to branch before a user message.")
         return Local()
-    sid = ctx.agent.session_id
+    sid = ctx.thread.session_id
     if not SessionManager.exists(sid):
         print_info("No canonical session tree yet for this session.")
         return Local()
@@ -452,9 +451,9 @@ async def _name(ctx: CommandContext, args: str) -> Local:
     """/name [text] —— 无参显示当前 session 名；/name <text> 设名（写 session_info，不移动 leaf）；
     /name --clear（或显式空）清空为 tombstone（docs/14 P4 / §5.6）。
 
-    docs/14 SessionLease：设名是写操作（append_session_info），走 active 写者租约（ctx.agent._session_mgr）；
+    docs/14 SessionLease：设名是写操作（append_session_info），走 active 写者租约（ctx.thread.session_manager）；
     缺租约则只读提示，不再 lazy 打开未加锁 mgr。"""
-    mgr = ctx.agent._session_mgr
+    mgr = ctx.thread.session_manager
     text = args.strip()
     if not text:
         print_info(f"Session name: {mgr.name() or '(unnamed)'}" if mgr is not None
@@ -503,10 +502,10 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
     # 无参 + TTY → 交互浏览器（Pi /resume 打开 session selector UI）。
     if ctx.interactive:
         import os
-        sid = ctx.agent.session_id
-        cwd = ctx.agent._session_mgr._cwd() if ctx.agent._session_mgr is not None else os.getcwd()
+        sid = ctx.thread.session_id
+        cwd = ctx.thread.session_manager._cwd() if ctx.thread.session_manager is not None else os.getcwd()
         from ..interactive.session_select import run_sessions
-        res = await run_sessions(current_sid=sid, cwd=cwd, current_mgr=ctx.agent._session_mgr,
+        res = await run_sessions(current_sid=sid, cwd=cwd, current_mgr=ctx.thread.session_manager,
                                  ask_text=_ask_text)
         if res and res.get("action") == "resume" and res["sid"] != sid:
             return Control("resume", {"sessionId": res["sid"]})
@@ -519,7 +518,7 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
         print("No sessions found.")
         return Local()
     print("Resumable sessions (/resume <id> to switch):")
-    print("\n".join(_SM.render_sessions_text(infos, ctx.agent.session_id, _time.time())))
+    print("\n".join(_SM.render_sessions_text(infos, ctx.thread.session_id, _time.time())))
     return Local()
 
 
@@ -527,23 +526,23 @@ async def _session(ctx: CommandContext, args: str) -> Local:
     """/session —— 显示**当前** session 的信息与统计（Pi /session）。跨 session 浏览/切换用 /resume。"""
     from ...session import tree as _tree
     from ...session.manager import SessionManager
-    sid = ctx.agent.session_id
-    mgr = ctx.agent._session_mgr or (SessionManager.open(sid) if SessionManager.exists(sid) else None)
+    sid = ctx.thread.session_id
+    mgr = ctx.thread.session_manager or (SessionManager.open(sid) if SessionManager.exists(sid) else None)
     if mgr is None:
         print_info("No active session.")
         return Local()
     msgs = [e for e in mgr.entries() if e.type == _tree.MESSAGE]
     ps = mgr.parent_session()
     origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
-    a = ctx.agent
+    st = ctx.thread.status()
     lines = [
         f"Session {sid}",
         f"  name     {mgr.name() or '(unnamed)'}",
         f"  cwd      {mgr._cwd()}",
-        f"  model    {a.model}",
+        f"  model    {st['model']}",
         f"  origin   {origin}" + (f"  (parent …{ps['sessionId'][-8:]})" if ps and ps.get('sessionId') else ""),
         f"  entries  {len(msgs)} messages    leaf …{str(mgr.get_leaf())[-8:]}",
-        f"  tokens   ↑{a.total_input_tokens} ↓{a.total_output_tokens}  ${a._get_current_cost_usd():.4f}",
+        f"  tokens   ↑{st['input_tokens']} ↓{st['output_tokens']}  ${st['cost_usd']:.4f}",
     ]
     print("\n".join(lines))
     return Local()

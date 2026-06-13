@@ -13,7 +13,7 @@ from nanocode.entrypoints.commands.types import CommandContext, Local
 
 def _ctx():
     # /help 只用 args / ctx.registry，不碰 agent/session，故传 None 即可。
-    return CommandContext(agent=None, session=None, registry=build_registry())
+    return CommandContext(thread=None, registry=build_registry())
 
 
 def test_help_lists_commands_and_escapes(capsys):

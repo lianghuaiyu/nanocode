@@ -4,7 +4,7 @@ parentSession 血缘，artifacts 仍 parent-keyed）。children() 发现；/pare
 
 import asyncio
 
-from nanocode.agent import AgentSession
+from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.types import CommandContext, Control
 from nanocode.session import tree as T
@@ -16,7 +16,7 @@ def _agent(sid, **kw):
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a))
+    return CommandContext(thread=AgentRuntime().adopt(a))
 
 
 def _sub_with_child(parent, agent_id, spawn_leaf):

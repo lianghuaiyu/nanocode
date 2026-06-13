@@ -2,7 +2,7 @@
 
 import asyncio
 
-from nanocode.agent import AgentSession
+from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _checkout, _resume, _tree
 from nanocode.entrypoints.commands.types import CommandContext
@@ -11,7 +11,7 @@ from nanocode.session.manager import SessionManager
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a))
+    return CommandContext(thread=AgentRuntime().adopt(a))
 
 
 def _agent(sid):

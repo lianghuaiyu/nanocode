@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # 仅类型；避免 import 期耦合（agent 包较重）
-    from ...agent import Agent, AgentSession
+    from ...agent import RuntimeThread
     from .registry import Registry
 
 
@@ -131,18 +131,15 @@ class Command:
 class CommandContext:
     """handler 执行上下文。
 
-    设计约束（CMD-P0 验收项，见 docs/11）：
-    - 必须同时携带 agent 与 session：现有 handler 是对 `agent`（参数）与局部
-      `session = AgentSession(agent)`（cli.py:477）的**双重闭包**，两者都要可达。
-    - session 必须是 run_repl 现有的那个实例，**不得新建** —— 新建会换掉
-      SessionContextBuilder 身份，是静默行为变更。
-    - `agent` 这条宽引用是 **shim**：handler 暂时仍 reach 进 Agent 私有面
-      （clear_history / _spawn_* / _background_tasks）；目标是随 docs/09 P-1 解耦逐步收缩。
-    - docs/17 Phase 3：旧 `out: EventSink` 字段已删——命令是 client 代码，直接调 ui 渲染；
-      EventSink 边界已随 sink 机构整体移除（渲染走订阅端 TerminalClient）。
+    docs/17 B-list：handler 经 `thread`（RuntimeThread，面向 client 的稳定句柄）操作会话——
+    clear/compact/plan/cost/tasks/sessions 全走 thread 的稳定方法面，**不再 reach 进 Agent 私有面**
+    （_session_mgr / _spawn_* / _background_tasks / task_manager / agent_session）。导航类命令
+    （new/resume/fork/clone）返回 Control，由 host 经 AgentRuntime 完成。
+
+    `thread` 在每次 dispatch 由 host 重新绑定为 current_thread——lifecycle 替换（/new /resume…）后
+    handler 无需缓存任何句柄。
     """
-    agent: "Agent"
-    session: "AgentSession"
+    thread: "RuntimeThread"
     cwd: Path = field(default_factory=Path.cwd)
     registry: "Registry | None" = None   # /help 等命令用它自省命令表（CMD-P1）
     interactive: bool = False            # 真 TTY?决定 /tree /fork /sessions 走交互选择器还是文本回退。

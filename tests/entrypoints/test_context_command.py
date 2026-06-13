@@ -6,13 +6,13 @@ from nanocode.entrypoints.commands.builtin import _context
 from nanocode.entrypoints.commands.types import Local
 
 
-class _FakeAgent:
+class _FakeThread:
     effective_window = 200000
     is_sub_agent = False
 
 
 class _FakeCtx:
-    agent = _FakeAgent()
+    thread = _FakeThread()
 
 
 def test_context_command_returns_local_and_renders(capsys):

@@ -279,6 +279,66 @@ class RuntimeThread:
         （或边界 dict，如 session_switch）。实时消费用 subscribe(listener)。"""
         return list(self._event_log)
 
+    # ── 命令面稳定 API（docs/17 B-list）────────────────────────────────────────
+    # slash 命令经 CommandContext.thread 调这些方法，不再 reach 进 Agent 私有面
+    # （_session_mgr / _spawn_* / _background_tasks / task_manager / agent_session）。
+    # 这是面向 client（REPL / RPC / 其它）的命令操作面；导航类（new/resume/fork/clone）走
+    # AgentRuntime + Control，不在此。
+
+    @property
+    def session_id(self) -> str:
+        return self.agent.session_id
+
+    @property
+    def session_manager(self):
+        """当前 active 写者租约的 SessionManager（无租约则 None）。命令的会话树读写经它。"""
+        return self.agent._session_mgr
+
+    @property
+    def task_manager(self):
+        return self.agent.task_manager
+
+    @property
+    def background_tasks(self):
+        return self.agent._background_tasks
+
+    @property
+    def effective_window(self) -> int:
+        return getattr(self.agent, "effective_window", 200000)
+
+    @property
+    def is_sub_agent(self) -> bool:
+        return getattr(self.agent, "is_sub_agent", False)
+
+    def clear_history(self) -> None:
+        self.agent.agent_session.clear_history()
+
+    async def compact(self) -> None:
+        await self.agent.agent_session.compact()
+
+    def toggle_plan_mode(self) -> str:
+        return self.agent.toggle_plan_mode()
+
+    def show_cost(self) -> None:
+        self.agent.show_cost()
+
+    def move_to(self, entry_id: str):
+        """in-file 树导航（移 active leaf）；返回重载后的 messages。"""
+        return self.session.move_to(entry_id)
+
+    def child_session_id(self, name: str) -> "str | None":
+        fn = getattr(self.agent, "child_session_id", None)
+        return fn(name) if callable(fn) else None
+
+    async def spawn_memory_consolidate(self) -> str:
+        return await self.agent._spawn_memory_consolidate()
+
+    async def spawn_memory_eval(self) -> str:
+        return await self.agent._spawn_memory_eval()
+
+    async def spawn_memory_optimize(self) -> str:
+        return await self.agent._spawn_memory_optimize()
+
 
 # ─── Runtime ────────────────────────────────────────────────
 

@@ -27,7 +27,7 @@ def _host(sid):
 
 
 def _ctx(a):
-    return CommandContext(agent=a, session=AgentSession(a))
+    return CommandContext(thread=AgentRuntime().adopt(a))
 
 
 # ─── /name ─────────────────────────────────────────────────────────────────

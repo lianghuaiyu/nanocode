@@ -11,7 +11,7 @@ import asyncio
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _tree
 from nanocode.entrypoints.commands.types import CommandContext, Local
-from nanocode.agent import AgentSession
+from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
@@ -21,7 +21,7 @@ def _agent(sid):
 
 
 def _ctx(a, interactive=False):
-    return CommandContext(agent=a, session=AgentSession(a), interactive=interactive)
+    return CommandContext(thread=AgentRuntime().adopt(a), interactive=interactive)
 
 
 def test_append_label_writes_and_reads_back():
