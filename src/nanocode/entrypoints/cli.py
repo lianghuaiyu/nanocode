@@ -423,7 +423,12 @@ async def run_repl(agent: Agent, lease=None) -> None:
     # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
     _runtime = AgentRuntime()
     _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
-    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty())
+    # docs/17 Phase 1：TUI 是挂在 runtime/session 上的订阅客户端——渲染从事件流派生，不再由 core
+    # 经 EventSink 投影。host 持有它并在 thread 替换时重新订阅。
+    from .terminal_client import TerminalClient
+    _client = TerminalClient()
+    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty(),
+                        client=_client)
 
     # CMD-P2.5 / docs/15 Phase 7：普通 chat / skill turn **一律**经 RuntimeThread.run 驱动
     # （取 host 的 current_thread）。逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删——runtime 是唯一 turn 路径。
@@ -842,7 +847,10 @@ Examples:
         # （逃生阀已删）。
 
         async def _one_shot() -> None:
-            await AgentRuntime().adopt(agent, lease=_lease).run(prompt)
+            from .terminal_client import TerminalClient
+            th = AgentRuntime().adopt(agent, lease=_lease)
+            th.subscribe(TerminalClient().on_event)   # docs/17 Phase 1：headless 也经订阅客户端渲染
+            await th.run(prompt)
 
         try:
             asyncio.run(_one_shot())

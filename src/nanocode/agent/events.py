@@ -1,9 +1,10 @@
 """agent/events.py — typed AgentEvent union（docs/15 §6）。
 
 AgentCore / engine 经 **单一出口 `Agent.emit(event)`** 发出这些事件（docs/16 #2），扇出
-`[AgentSession.record_event（canonical 树）, runtime_events.project_agent_event（UI 投影）]`
+`[AgentSession.record_event（canonical 树）, _event_subscribers（订阅者 push）]`
 ——旧的**双发**（`_dispatch_event` 的 RuntimeEvent + `_tree_event` / `_tree_record` /
-`_tree_custom_message` 各自直调）已被取代。
+`_tree_custom_message` 各自直调）已被取代。docs/17 Phase 1：UI 投影腿（project_agent_event）
+已删，assistant/tool 的渲染改由订阅端 TerminalClient 从事件流派生。
 
 **additive 契约**（trajectory 从 canonical 树派生，docs/14 B2；持久化通道映射见
 DURABLE_ENTRY_FOR_EVENT）：事件字段只增不改名/不删。每个事件携带把它落成 session entry 所需的全部中立事实

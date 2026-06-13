@@ -30,15 +30,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC = _REPO_ROOT / "src" / "nanocode"
 
 # 用户边界点名的 runtime 模块（绝不得 import trajectory）。docs/14 Milestone B：trace/ 已删除，
-# runtime 事实源现为 engine/core/loop/providers/session（写 canonical 树 / 跑模型循环）+ runtime_events
-# （内存事件流）。docs/15 STEP C：backend mixin 已删，循环上移到 agent/core.py + loop.py + providers.py。
+# runtime 事实源现为 engine/core/loop/providers/session（写 canonical 树 / 跑模型循环）。
+# docs/15 STEP C：backend mixin 已删，循环上移到 agent/core.py + loop.py + providers.py。
+# docs/17 Phase 1：runtime_events（UI 投影）已删——渲染改由订阅端 TerminalClient 承担。
 _RUNTIME_SOURCES = (
     _SRC / "agent" / "engine.py",
     _SRC / "agent" / "core.py",
     _SRC / "agent" / "loop.py",
     _SRC / "agent" / "providers.py",
     _SRC / "agent" / "session.py",
-    _SRC / "agent" / "runtime_events.py",
 )
 
 # 任务点名的「import trajectory」文本形态（兜底子串扫描用）。

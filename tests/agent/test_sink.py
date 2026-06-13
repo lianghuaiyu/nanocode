@@ -62,11 +62,11 @@ def test_protocol_conformance():
 
 # ─── BufferSink 捕获（取代旧 _output_buffer）──────────────────
 
-def test_emit_block_captured_by_buffer_sink():
+def test_emit_block_captured_by_accumulator():
+    # docs/17 Phase 0/1：助手文本捕获从 emit 流派生（AssistantDelta.text），与 sink 解耦。
     sub = _read_only_sub(_agent())
     sub._emit_block("hello ")
     sub._emit_block("world")
-    assert sub._sink.text() == "hello world"
     assert sub._captured_text() == "hello world"
 
 
@@ -108,17 +108,18 @@ def test_core_is_headless_with_null_sink():
     assert a._captured_text() == "x"
 
 
-# ─── 事件经 sink 发出，而非直达 UI ──────────────────────────
+# ─── sink 直渲事件（Phase 1 仍走 sink：spinner/cost/info/retry/sub_agent/confirmation）──
 
-def test_routed_events_land_in_injected_sink():
+def test_direct_sink_calls_land_in_injected_sink():
+    # docs/17 Phase 1：assistant/tool 已迁出 sink（改由 TerminalClient 从事件流渲染）；
+    # sub_agent 等仍经 sink 直渲，注入的 sink 照常记录这些直接调用。
     rec = RecordingSink()
     a = _agent(sink=rec)
-    a._emit_block("md")
     a._sink.tool_call("grep_search", {"pattern": "x"})
     a._sink.sub_agent_start("explore", "desc")
     a._sink.sub_agent_end("explore", "desc")
     kinds = [e[0] for e in rec.events]
-    assert kinds == ["assistant_markdown", "tool_call", "sub_agent_start", "sub_agent_end"]
+    assert kinds == ["tool_call", "sub_agent_start", "sub_agent_end"]
 
 
 def test_permission_deny_routes_info_through_sink():
@@ -155,18 +156,14 @@ def test_run_once_resets_capture_per_invocation():
     assert r2["text"] == "run:b"   # 不是 "run:arun:b"——上一轮已重置
 
 
-def test_accumulator_equiv_buffer_sink_multi_block():
-    """docs/17 Phase 0：emit 流派生的 final_text 与旧 BufferSink.text() 在多 block 下逐字节等价。
-
-    BufferSink.assistant_markdown 由 project_agent_event 喂 AssistantDelta.text；新累加器也只收
-    AssistantDelta.text。thinking-only delta（text 空）两者都不收。"""
+def test_accumulator_captures_text_deltas_only():
+    """docs/17 Phase 0/1：final_text 累加器只收 AssistantDelta.text（多 block 拼接），
+    thinking-only delta（text 空）不收——复刻旧 BufferSink.assistant_markdown 的规则，但与 sink 解耦。"""
     from nanocode.agent.events import AssistantDelta
 
     a = _agent()
     a.reset_final_text()
-    a._sink = BufferSink()
     for ev in [AssistantDelta(text="foo "), AssistantDelta(thinking="（略）"),
                AssistantDelta(text="bar"), AssistantDelta(text="")]:
         a.emit(ev)
     assert a.final_text() == "foo bar"
-    assert a.final_text() == a._sink.text()   # 与旧机制逐字节等价

@@ -17,11 +17,17 @@ from .commands.types import CommandContext
 
 
 class RuntimeHost:
-    def __init__(self, runtime, thread, *, registry=None, interactive=True) -> None:
+    def __init__(self, runtime, thread, *, registry=None, interactive=True, client=None) -> None:
         self._runtime = runtime
         self._current_thread = thread
         self._registry = registry
         self._interactive = interactive
+        # docs/17 Phase 1：TUI 客户端（订阅事件流渲染）。host 持有它并在 thread 替换（/new /resume
+        # /clone /fork）时重新订阅新 thread——保证渲染跨 lifecycle 切换不断。None = 无渲染客户端
+        # （测试 / headless）。
+        self._client = client
+        if client is not None and thread is not None:
+            thread.subscribe(client.on_event)
 
     @property
     def runtime(self):
@@ -47,6 +53,10 @@ class RuntimeHost:
         old = self._current_thread
         self._runtime.register(new_thread)
         self._current_thread = new_thread
+        # docs/17 Phase 1：渲染客户端跟随当前 thread——订阅新 thread 的事件流（旧 thread 随
+        # dispose 丢弃，其 _listeners 一并消失，故无需显式 unsubscribe）。
+        if self._client is not None and new_thread is not None:
+            new_thread.subscribe(self._client.on_event)
         if old is not None and old is not new_thread:
             old.dispose()
 

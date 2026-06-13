@@ -52,7 +52,6 @@ from .core import AgentCore
 
 # 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
 from .subagent_manager import SubAgentManager  # noqa: E402
-from . import runtime_events  # noqa: E402 — typed AgentEvent UI 投影（docs/16 #2/#4）
 
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
 # 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
@@ -571,17 +570,19 @@ class Agent(PlanModeMixin):
 
     def emit(self, event) -> bool:
         """docs/16 #2：**单一事件出口**——一条 typed AgentEvent 扇出
-        `[agent_session.record_event（canonical 树）, project_agent_event（UI 投影）,
-        _event_subscribers（RuntimeThread push，docs/16 #4）]`。树先于 UI：required 写失败 fail-loud 时
-        不画半截 UI。返回 record_event 的写入结果（ContextInjected 调用方据此推进 dedup）。"""
+        `[agent_session.record_event（canonical 树）, _event_subscribers（订阅者 push）]`。
+        树先于 UI：required 写失败 fail-loud 时不画半截 UI。返回 record_event 的写入结果
+        （ContextInjected 调用方据此推进 dedup）。
+
+        docs/17 Phase 1：UI 投影腿（project_agent_event → EventSink）已删——assistant/tool 的
+        流式渲染改由订阅端 TerminalClient 从事件流渲染（TUI 客户端化）。spinner/cost/info/retry/
+        sub_agent 暂仍经 self._sink 直渲（Phase 2 升格为事件后迁入 client）。"""
         written = self.agent_session.record_event(event)
         if isinstance(event, AssistantDelta) and event.text:
             # docs/17 Phase 0：final_response / 子 agent 文本从 emit 流派生（取代 BufferSink）。
-            # 逐字节复刻旧 BufferSink.assistant_markdown：它由 project_agent_event 喂的正是
-            # AssistantDelta.text（仅 text block,不含 thinking）。多轮 turn 累计全部 text delta,
-            # 每轮入口 reset。每个 Agent 实例各持一份,子 agent 是独立实例故捕获天然隔离。
+            # 仅 text block（不含 thinking），多轮 turn 累计、每轮入口 reset；每个 Agent 实例各持
+            # 一份，子 agent 是独立实例故捕获天然隔离。
             self._final_text_chunks.append(event.text)
-        runtime_events.project_agent_event(event, self._sink)
         for listener in list(self._event_subscribers):
             try:
                 listener(event)
