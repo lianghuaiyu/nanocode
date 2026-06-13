@@ -66,18 +66,21 @@ def test_hyphenated_command_narrows():
 
 def test_menu_auto_pops_while_typing():
     """Typing '/co' auto-pops the completion menu (Claude Code-style), i.e. the
-    buffer's complete_state is populated without pressing Tab. Regression guard:
-    enable_history_search=True would suppress complete_while_typing and break this."""
+    buffer's complete_state is populated without pressing Tab. docs/18: the completer
+    now lives on the TuiApp input buffer (complete_while_typing) instead of PromptSession."""
+    from nanocode.tui.app import TuiApp
+
     async def scenario():
         with create_pipe_input() as pipe:
-            session = cli._get_session(input=pipe, output=DummyOutput(), persistent=True)
-            task = asyncio.create_task(session.prompt_async())
+            comp = cli.FuzzyCompleter(cli._CommandCompleter(), pattern=r"^[a-zA-Z0-9_-]+")
+            app = TuiApp(input=pipe, output=DummyOutput(), completer=comp)
+            task = asyncio.create_task(app.run(patch=False))
             await asyncio.sleep(0.15)
             pipe.send_text("/co")            # type, do NOT press Tab/Enter
             await asyncio.sleep(0.4)          # let the async completer run
-            state = session.default_buffer.complete_state
+            state = app.input_buffer.complete_state
             n = len(state.completions) if state else 0
-            pipe.send_text("\n")
+            app.request_exit()
             try:
                 await asyncio.wait_for(task, timeout=2)
             except Exception:
@@ -85,3 +88,4 @@ def test_menu_auto_pops_while_typing():
             return n
 
     assert asyncio.run(scenario()) > 0
+

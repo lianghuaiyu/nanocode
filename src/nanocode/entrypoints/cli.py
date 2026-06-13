@@ -5,19 +5,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import signal
 import sys
 from pathlib import Path
 
-from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
-from ..tui import print_welcome, print_error, print_info, print_plan_for_approval, print_plan_approval_options
+from ..tui import print_welcome, print_error, print_info
 from ..session import get_latest_session_id
 from ..session import v2 as _session_v2
 from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
@@ -36,11 +32,6 @@ from .commands.builtin import build_registry
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
-
-
-# REPL 输入哨兵：区分「用户输入空行」与「stdin EOF」。
-EOF = object()      # stdin EOF (Ctrl-D)
-CANCEL = object()   # line cancelled at prompt (Ctrl-C)
 
 
 def _sigint_decision(is_processing: bool, sigint_count: int) -> tuple[str, int]:
@@ -96,156 +87,7 @@ class _CommandCompleter(Completer):
 
 
 
-_session = None
-_ephemeral_session = None
 
-
-def _prime_history(session: PromptSession) -> None:
-    """Force the FileHistory to load synchronously, up front.
-
-    prompt_toolkit loads history lazily inside an asyncio *background task* the
-    first time a prompt is drawn. Reading the file synchronously here (the same
-    work History.load() caches into _loaded_strings on first use) means later
-    reads come from memory, not disk. Best-effort: failure falls back to lazy
-    load."""
-    try:
-        hist = session.history
-        hist._loaded_strings = list(hist.load_history_strings())
-        hist._loaded = True
-    except Exception:
-        pass
-
-
-def _make_prime_buffer(session: PromptSession):
-    """Build a `pre_run` hook that deterministically populates UP-arrow history.
-
-    Why this is needed: every `prompt_async` call runs Buffer.reset(), which
-    cancels/clears the history-load task and empties _working_lines. prompt_toolkit
-    then repopulates _working_lines from history inside an asyncio *background
-    task* on the first repaint. Pressing UP before that task runs recalls nothing
-    — a race on every prompt (the previously typed line isn't recalled). `pre_run`
-    fires synchronously once the app loop is live but before keys are read, so we
-    copy the in-memory history into _working_lines ourselves and mark the load
-    task done, eliminating the race. Best-effort + idempotent."""
-    def _prime_buffer() -> None:
-        try:
-            buf = session.default_buffer
-            if buf._load_history_task is not None:
-                return  # already loaded/primed for this prompt
-            # Iterate newest -> oldest so appendleft() yields working_lines
-            # [oldest, ..., newest, current]; the first UP then recalls the most
-            # recent entry (oldest-first iteration would reverse this and make UP
-            # surface the oldest command first).
-            for item in reversed(list(buf.history.get_strings())):
-                buf._working_lines.appendleft(item)
-                buf.working_index += 1
-            fut = asyncio.get_event_loop().create_future()
-            fut.set_result(None)
-            buf._load_history_task = fut  # tell prompt_toolkit not to respawn the loader
-        except Exception:
-            pass  # fall back to prompt_toolkit's async load
-    return _prime_buffer
-
-
-def _get_session(*, input=None, output=None, persistent=True, bottom_toolbar=None) -> PromptSession:
-    """Build the PromptSession (history + editing + completion).
-
-    Production path (input/output both None) caches a single shared session bound
-    to the real terminal. When an explicit input/output pair is supplied (tests
-    injecting a pipe + DummyOutput), build a fresh, uncached session so the real
-    prompt_toolkit code path is exercised without touching the global terminal.
-
-    persistent=True uses the on-disk FileHistory (the main REPL prompt). Transient
-    prompts (tool confirmations y/n, plan-approval 1-4) pass persistent=False so
-    their answers never leak into ~/.nanocode/history and get recalled/autosuggested
-    at a later command prompt."""
-    def _history():
-        return FileHistory(str(history_file())) if persistent else InMemoryHistory()
-
-    # FuzzyCompleter wraps _CommandCompleter so '/cmt' subsequence-matches '/commit';
-    # complete_while_typing pops the menu live as you type (Claude Code-style).
-    # pattern keeps hyphens in the matched word (so '/task-s' narrows to /task-stop)
-    # but excludes '/' so the inner completer still sees the leading slash and its
-    # gate fires. The default word pattern breaks at '-' and would bury hyphenated
-    # commands (e.g. /task-stop).
-    def _completer():
-        return FuzzyCompleter(_CommandCompleter(), pattern=r"^[a-zA-Z0-9_-]+")
-
-    if input is not None or output is not None:
-        session = PromptSession(
-            history=_history(),
-            auto_suggest=AutoSuggestFromHistory(),
-            # enable_history_search MUST stay False: prompt_toolkit suppresses
-            # complete_while_typing when history-search is on (mutually exclusive),
-            # which would stop the '/' menu from popping up as you type. Plain
-            # Up/Down history + Ctrl+R reverse-search still work without it.
-            enable_history_search=False,
-            completer=_completer(),
-            complete_while_typing=True,
-            bottom_toolbar=bottom_toolbar,
-            input=input,
-            output=output,
-        )
-        _prime_history(session)
-        return session
-    if not persistent:
-        global _ephemeral_session
-        if _ephemeral_session is None:
-            _ephemeral_session = PromptSession(
-                history=InMemoryHistory(),
-                completer=None,
-                complete_while_typing=False,
-            )
-        return _ephemeral_session
-    global _session
-    if _session is None:
-        _session = PromptSession(
-            history=_history(),
-            auto_suggest=AutoSuggestFromHistory(),
-            enable_history_search=False,  # keep False so complete_while_typing fires (see above)
-            completer=_completer(),
-            complete_while_typing=True,
-            bottom_toolbar=bottom_toolbar,
-        )
-        _prime_history(_session)
-    return _session
-
-
-async def _async_read_line(prompt="", *, input=None, output=None, persistent=True,
-                           default="", bottom_toolbar=None) -> object:
-    """Read one line with full line editing + history via prompt_toolkit,
-    cooperating with the asyncio loop (background tasks stay live).
-    Ctrl-D -> EOF sentinel; Ctrl-C -> CANCEL sentinel.
-
-    `input`/`output` are test seams (pipe + DummyOutput); production passes
-    neither and the session binds to the real terminal. persistent=False routes
-    a transient prompt (confirmation / plan menu) through an in-memory history so
-    its answer is not written to the on-disk REPL history.
-
-    SIGINT handling: prompt_async installs (and on some prompt_toolkit versions,
-    e.g. 3.0.29, leaves at SIG_DFL on return) its own SIGINT handler. We snapshot
-    the caller's handler and restore it in `finally`, so EVERY read site — the main
-    loop AND the transient confirm/plan prompts — comes back with the REPL's
-    handle_sigint intact. Without this, Ctrl-C during agent.chat after a
-    confirmation would bypass agent.abort() and raise KeyboardInterrupt."""
-    prev_sigint = signal.getsignal(signal.SIGINT)
-    try:
-        session = _get_session(input=input, output=output, persistent=persistent,
-                               bottom_toolbar=bottom_toolbar)
-        pre_run = _make_prime_buffer(session)
-        if input is not None or output is not None:
-            return await session.prompt_async(prompt, pre_run=pre_run, default=default)
-        with patch_stdout():
-            return await session.prompt_async(prompt, pre_run=pre_run, default=default)
-    except EOFError:
-        return EOF
-    except KeyboardInterrupt:
-        return CANCEL
-    finally:
-        try:
-            signal.signal(signal.SIGINT, prev_sigint)
-        except (TypeError, ValueError):
-            pass  # not in main thread / no prior handler — leave as-is
 
 
 async def _run_user_shell(command: str) -> str:
@@ -411,7 +253,7 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-async def run_repl(agent: Agent, lease=None) -> None:
+async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None:
     """Interactive REPL loop.
 
     docs/14 SessionLease：`lease` 是 main() 在 welcome 前激活的会话写者租约（已注入 agent._session_mgr）。
@@ -425,21 +267,27 @@ async def run_repl(agent: Agent, lease=None) -> None:
     # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
     _runtime = AgentRuntime()
     _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
-    # docs/17 Phase 1：TUI 是挂在 runtime/session 上的订阅客户端——渲染从事件流派生，不再由 core
-    # 经 EventSink 投影。host 持有它并在 thread 替换时重新订阅。
+    # docs/17 Phase 1 / docs/18：TUI 是挂在 runtime/session 上的订阅客户端——渲染从事件流派生。
+    # TuiApp（full_screen=False，保留 scrollback）持 footer/输入/modal/state；transcript 仍由
+    # TerminalClient 印到 scrollback（spinner=False：footer 的 running 态取代 spinner，且 spinner
+    # 线程的 \r 写会与 app 重绘区冲突）——经 render_event 注入 app，单订阅扇出 reduce + transcript。
     from .terminal_client import TerminalClient
-    _client = TerminalClient()
+    from ..tui.app import TuiApp
+    _transcript = TerminalClient(spinner=False)
+    # docs/18 step 6：补回输入框的命令补全 + 持久历史 + auto-suggest（cutover 平价；非交互/测试用
+    # InMemoryHistory 避免写盘）。FuzzyCompleter 让 '/cmt' 子序列匹配 '/commit'。
+    _history = FileHistory(str(history_file())) if input is None else InMemoryHistory()
+    _app = TuiApp(render_event=_transcript.on_event, input=input, output=output,
+                  completer=FuzzyCompleter(_CommandCompleter(), pattern=r"^[a-zA-Z0-9_-]+"),
+                  history=_history, auto_suggest=AutoSuggestFromHistory())
     _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty(),
-                        client=_client)
+                        client=_app)
 
     # CMD-P2.5 / docs/15 Phase 7：普通 chat / skill turn **一律**经 RuntimeThread.run 驱动
     # （取 host 的 current_thread）。逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删——runtime 是唯一 turn 路径。
 
     async def _drive_turn(prompt: str) -> None:
         await _host.current_thread.run(prompt)
-
-    # pi /fork 语义：选中的历史 prompt 放回编辑器（下一次主读取的 default 文本，one-shot）。
-    _pending_prefill = {"text": ""}
 
     async def _apply_control(host: RuntimeHost, ctrl: Control) -> None:
         """消费 lifecycle Control（docs/14 P2）：先过 host.can_switch() fail-closed 闸，再交
@@ -457,12 +305,12 @@ async def run_repl(agent: Agent, lease=None) -> None:
             if host.runtime.thread_clone(host, payload.get("sourceSid")) is None:
                 print_error("clone failed (no canonical tree / nothing to clone).")
         elif action == "replace_thread" and payload.get("kind") == "fork":
-            # pi /fork：复制到选中 user 消息**之前** → 新 session；该 prompt 放回编辑器。
+            # pi /fork：复制到选中 user 消息**之前** → 新 session；该 prompt 放回编辑器（app 输入框）。
             if host.runtime.thread_fork(host, payload.get("sourceSid"),
                                         payload.get("userEntryId")) is None:
                 print_error("fork failed (no canonical tree / unknown entry).")
             else:
-                _pending_prefill["text"] = payload.get("prefill") or ""
+                _app.input_buffer.text = payload.get("prefill") or ""
         elif action == "resume":
             sid = payload.get("sessionId")
             if sid == host.current_thread.thread_id:
@@ -483,155 +331,47 @@ async def run_repl(agent: Agent, lease=None) -> None:
         else:
             print_info(f"(control '{action}' is not wired yet — coming in a later phase)")
 
-    async def confirm_fn(message: str) -> bool:
-        answer = await _async_read_line("  Allow? (y/n): ", persistent=False)
-        if answer is EOF or answer is CANCEL:
-            return False
-        return answer.lower().startswith("y")
+    # docs/18：审批/plan 不再读一行，改成 TuiApp 的 modal future（confirm_fn → y/n modal；
+    # plan_approval_fn → 1-4 modal）。
+    ApprovalManager(confirm_fn=_app.confirm_fn, plan_approval_fn=_app.plan_approval_fn).attach(agent)
 
-    async def plan_approval_fn(plan_content: str) -> dict:
-        print_plan_for_approval(plan_content)
-        print_plan_approval_options()
-        while True:
-            choice = await _async_read_line("  Enter choice (1-4): ", persistent=False)
-            if choice is EOF or choice is CANCEL:
-                return {"choice": "manual-execute"}
-            choice = choice.strip()
-            if choice == "1":
-                return {"choice": "clear-and-execute"}
-            elif choice == "2":
-                return {"choice": "execute"}
-            elif choice == "3":
-                return {"choice": "manual-execute"}
-            elif choice == "4":
-                feedback = await _async_read_line("  Feedback (what to change): ", persistent=False)
-                feedback = "" if feedback in (EOF, CANCEL) else feedback.strip()
-                return {"choice": "keep-planning", "feedback": feedback or None}
-            else:
-                print("  Invalid choice. Enter 1, 2, 3, or 4.")
+    async def _submit(text: str) -> None:
+        """用户提交一行：命令分发 / skill / !shell / 跑一轮 chat（注入给 TuiApp）。
 
-    # CMD-P2.5：审批经 ApprovalManager 注入（取代散点 agent.set_confirm_fn / set_plan_approval_fn）。
-    ApprovalManager(confirm_fn=confirm_fn, plan_approval_fn=plan_approval_fn).attach(agent)
-
-    sigint_count = 0
-
-    def handle_sigint(sig, frame):
-        nonlocal sigint_count
-        # turn 进行中（thinking/streaming/工具）：Ctrl-C 打断当前 turn——优雅 abort（置 _aborted +
-        # cancel current task），run_turn 把 CancelledError 吞成 _aborted 正常返回,控制权回 prompt,
-        # 输入框随下一轮 _async_read_line 重绘（不退出、不消失）。空闲时保留「按两次退出」。
-        a = _host.current_thread.agent
-        action, sigint_count = _sigint_decision(a.is_processing, sigint_count)
-        if action == "abort":
-            a.abort()
-            print("\n  Interrupted — back to prompt.")
-            return
-        if action == "exit":
-            print("\nBye!\n")
-            try:
-                _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
-            except Exception:
-                pass
-            sys.exit(0)
-        print("\n  Press Ctrl+C again to exit.")
-
-    signal.signal(signal.SIGINT, handle_sigint)
-    print_welcome()
-
-    def _footer_toolbar():
-        """bottom_toolbar 回调:从当前 thread 的 status() 组装 Pi 两行页脚（ANSI）。
-        高频重绘——RuntimeThread.status() 是稳定只读快照（docs/17 Phase 5a，不再 reach 进 Agent
-        私有面）+ git 分支 TTL 缓存,失败返回空串（绝不让页脚拖垮 REPL）。"""
-        try:
-            from .interactive.footer import FooterState, git_branch, render_footer
-            from prompt_toolkit.application import get_app
-            st = _host.current_thread.status()
-            cwd = st["cwd"]
-            state = FooterState(
-                cwd=cwd,
-                home=os.path.expanduser("~"),
-                branch=git_branch(cwd),
-                session_name=st["session_name"],
-                input_tokens=st["input_tokens"],
-                output_tokens=st["output_tokens"],
-                cost_usd=st["cost_usd"],
-                context_used=st["input_tokens"],
-                context_window=st["context_window"],
-                model=st["model"],
-                thinking=st["thinking"],
-            )
-            try:
-                width = get_app().output.get_size().columns
-            except Exception:
-                width = None
-            return ANSI("\n".join(render_footer(state, width)))
-        except Exception:
-            return ""
-
-    cancel_count = 0
-    while True:
-        _prefill, _pending_prefill["text"] = _pending_prefill["text"], ""
-        line = await _async_read_line(ANSI("\n\x1b[1;32m> \x1b[0m"), default=_prefill,
-                                      bottom_toolbar=_footer_toolbar)
-        # SIGINT handler is restored inside _async_read_line (covers this read and
-        # the transient confirm/plan prompts too), so Ctrl-C during agent.chat
-        # always reaches handle_sigint.
-        if line is EOF:
-            print("\nBye!\n")
-            break
-        if line is CANCEL:
-            # At the prompt Ctrl-C is a raw-mode keypress (not a SIGINT), so it
-            # comes back as CANCEL rather than firing handle_sigint. First press
-            # clears the current line; a second consecutive press exits — matching
-            # the old two-Ctrl-C-to-quit behavior. Ctrl-D / `exit` also quit.
-            cancel_count += 1
-            if cancel_count >= 2:
-                print("\nBye!\n")
-                break
-            print("  (Press Ctrl-C again, or Ctrl-D, to exit)")
-            continue
-        cancel_count = 0
-        inp = line.strip()
-        # 中文输入法常打出全角斜杠／：命令以 / 开头，开头的 ／ 归一为半角，
-        # 否则 "／memory" 不匹配任何命令分支、被当成普通文本发给 AI。
+        替代旧 while-loop body。TuiApp 把本协程跑成 task、维护运行态、Ctrl-C→abort，故这里不再
+        处理 SIGINT / 行读 / 取消计数。异常由 TuiApp._run_turn 吞（error_raised 事件已入 timeline）。"""
+        inp = text.strip()
+        # 中文输入法的全角斜杠／归一为半角，否则 "／memory" 不匹配命令、被当普通文本发给 AI。
         if inp[:1] == "／":
             inp = "/" + inp[1:]
-        sigint_count = 0
-
         if not inp:
-            continue
+            return
         if inp in ("exit", "quit"):
             print("\nBye!\n")
-            break
+            _app.request_exit()
+            return
 
-        # !<command>：用户直跑 shell（等同自己在终端执行），不进 AI 对话、不走
-        # 模型权限系统——权限系统约束的是模型行为，用户自己敲的命令直接执行。
+        # !<command>：用户直跑 shell（等同终端执行），不进 AI 对话、不走模型权限系统。
         if inp.startswith("!"):
             cmd = inp[1:].strip()
             if cmd:
                 print_info(await _run_user_shell(cmd))
-            continue
+            return
 
-        # REPL slash commands —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
-        # !shell / exit / quit / 全角归一 / 未知斜杠 fallthrough 仍在本 loop 处理（见上下）。
+        # REPL slash 命令 —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
         _result = await dispatch(inp, _REGISTRY, _host.context())
         if _result is not NOT_A_COMMAND:
-            # 按 CommandResult variant 路由（Codex cross-review MED）：Prompt 驱动一个 turn；
-            # Local 打印 output / 可退出；Control 经 _apply_control 路由 lifecycle（P2 起接通）。
             if isinstance(_result, Prompt):
                 await _drive_turn(_result.prompt)
-                continue
-            if isinstance(_result, Local):
+            elif isinstance(_result, Local):
                 if _result.output:
                     print_info(_result.output)
                 if _result.exit_repl:
                     print("\nBye!\n")
-                    break
-                continue
-            if isinstance(_result, Control):
+                    _app.request_exit()
+            elif isinstance(_result, Control):
                 await _apply_control(_host, _result)
-                continue
-            continue
+            return
 
         # Skill invocation: /<skill-name> [args]
         if inp.startswith("/"):
@@ -654,21 +394,24 @@ async def run_repl(agent: Agent, lease=None) -> None:
                 except Exception as e:
                     if "abort" not in str(e).lower():
                         print_error(str(e))
-                continue
+                return
 
         # Normal chat
-        try:
-            await _drive_turn(inp)
-        except Exception as e:
-            if "abort" not in str(e).lower():
-                print_error(str(e))
+        await _drive_turn(inp)
 
-    # docs/14 SessionLease：REPL 退出（正常 break / exit / quit / 双 Ctrl-C-at-prompt）→ 释放当前
-    # thread 的会话写锁。rebind 已交接/关闭旧租约，故只需释放 current_thread 的那把（幂等）。
+    _app.set_submit_handler(_submit)
+    print_welcome()
+    # docs/18：TuiApp（full_screen=False）接管输入主循环——取代 _async_read_line while-loop +
+    # signal SIGINT handler（Ctrl-C 现由 app key binding 处理：运行中→abort、idle 空行双击→退）。
     try:
-        _host.current_thread.release_lease()
-    except Exception:
-        pass
+        await _app.run()
+    finally:
+        # docs/14 SessionLease：REPL 退出 → 释放当前 thread 的会话写锁（rebind 已交接/关闭旧租约，
+        # 故只需释放 current_thread 的那把，幂等）。
+        try:
+            _host.current_thread.release_lease()
+        except Exception:
+            pass
 
 
 def main() -> None:

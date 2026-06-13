@@ -15,7 +15,7 @@ from prompt_toolkit.formatted_text import ANSI
 
 from ...session import tree as T
 from . import treemodel as TM
-from .selector import KeyResult, Outcome, SelectorModel, run_selector
+from .selector import KeyResult, Outcome, SelectorModel
 
 # ANSI 颜色(轻量,不引 theme):dim 前缀 / accent 光标与 active / warning label
 _DIM = "\x1b[2m"
@@ -111,18 +111,20 @@ def _wrap(text: str, width: int) -> list[str]:
     return out
 
 
-async def run_tree(manager, *, ask_text: Callable[[str], Awaitable[str | None]],
-                   fork_mode: bool = False) -> dict | None:
+async def run_tree(manager, *, host, fork_mode: bool = False) -> dict | None:
     """跑 /tree 或 /fork 交互循环。返回:
        {"action":"checkout","entry_id":id} / {"action":"fork","entry_id":id} / None(取消)。
-    label 编辑在此就地写 manager.append_label 后重跑(保持光标+filter)。"""
+    label 编辑在此就地写 manager.append_label 后重跑(保持光标+filter)。
+
+    host：SelectorHost（TuiApp）——`host.run_selector(model)` 渲 in-app overlay、`host.ask_text` 读
+    label 文本（docs/18 step 4，取代旧独立 Application + ask_text 回调）。"""
     mode: TM.FilterMode = "default"
     index = 0
     while True:
         entries = manager.entries()
         leaf = manager.get_leaf()
         model = _TreeModel(entries, leaf, mode, fork_mode)
-        outcome: Outcome = await run_selector(model, initial_index=index)
+        outcome: Outcome = await host.run_selector(model, initial_index=index)
         mode = model.mode
         index = outcome.index
         if outcome.kind == "cancel":
@@ -133,7 +135,7 @@ async def run_tree(manager, *, ask_text: Callable[[str], Awaitable[str | None]],
         if outcome.kind == "edit" and outcome.edit_action == "label":
             e = outcome.item.entry
             cur = T.labels_by_id(entries).get(e.id, "")
-            text = await ask_text(f"label for …{e.id[-8:]} (blank=clear) [{cur}]: ")
+            text = await host.ask_text(f"label for …{e.id[-8:]} (blank=clear) [{cur}]: ")
             if text is not None:
                 manager.append_label(e.id, text.strip())
             continue

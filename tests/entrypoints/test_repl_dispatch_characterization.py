@@ -10,10 +10,12 @@
   5. 裸词 exit/quit 跳出循环（不读后续行、不进 chat）
   6. !shell 直跑用户 shell（不进 chat）
 
-驱动方式：**不重构 run_repl**。monkeypatch cli._async_read_line 喂脚本化输入 + EOF 收尾；
-monkeypatch cli.AgentSession 为录制替身（绕开真实 SessionContextBuilder / agent.chat）；
-把 run_repl 触达的模块级 helper 与 tasks_tool 的延迟 import 全部换成录制 stub。所有 handler
-命中都落到一个 `calls` 列表，按输入断言「哪个分支触发」。
+驱动方式（docs/18 cutover 后）：run_repl 的输入主循环已从 `_async_read_line` while-loop 改成
+`TuiApp`（full_screen=False）。本测试经 `run_repl(agent, input=pipe, output=DummyOutput())` 的测试
+seam 注入 prompt_toolkit pipe，逐行 `send_text(line + "\r")` 提交、末尾 `\x04`(Ctrl-D) 退出；
+monkeypatch cli.AgentSession 为录制替身（绕开真实 SessionContextBuilder / agent.chat）；把 run_repl
+触达的模块级 helper 与 tasks_tool 的延迟 import 全部换成录制 stub。所有 handler 命中都落到一个
+`calls` 列表，按输入断言「哪个分支触发」（命中语义跨 cutover 不变——逻辑搬进 `_submit` 闭包）。
 
 两档断言：
   · Tier A（refactor-stable）—— chat/shell 落点的分区、顺序、exit、全角归一。改造后仍成立。
@@ -26,6 +28,8 @@ import asyncio
 import signal
 
 import pytest
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from nanocode.entrypoints import cli
 
@@ -116,21 +120,7 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     calls: list = []
     agent = _FakeAgent(calls)
 
-    # 1) 脚本化输入：依次返回 lines，耗尽后 EOF 终止循环
-    it = iter(lines)
-
-    async def _fake_read(prompt="", *, input=None, output=None, persistent=True, default="",
-                         bottom_toolbar=None):
-        if default:
-            calls.append(("prefill", default))   # docs/16 pi /fork：编辑器预填经 default 透传
-        try:
-            return next(it)
-        except StopIteration:
-            return cli.EOF
-
-    monkeypatch.setattr(cli, "_async_read_line", _fake_read)
-
-    # 2) 替身 session：绕开真实 SessionContextBuilder / agent.chat
+    # 1) 替身 session：绕开真实 SessionContextBuilder / agent.chat
     monkeypatch.setattr(cli, "AgentSession", _RecordingSession)
 
     # 3) 静默欢迎语；info/error 记录但不打印
@@ -181,10 +171,24 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
 
     monkeypatch.setattr(tt, "task_stop", _fake_task_stop)
 
-    # 6) 跑循环；run_repl 会装 SIGINT handler 但不还原 —— 测试负责快照/恢复
+    # 6) 跑 REPL：经 input/output 测试 seam 注入 pipe；逐行 send_text(line+"\r") 提交、末尾
+    #    \x04(Ctrl-D) 退出。run_repl 不再装/留 SIGINT handler（Ctrl-C 现由 TuiApp key binding 处理），
+    #    仍保守快照恢复 SIGINT。每行提交后让出事件循环，等其 submit task 跑完（REPL 串行——
+    #    各测试用例至多触发一次真 turn，其余为 exit/blank，故不会撞串行闸）。
     prev = signal.getsignal(signal.SIGINT)
+
+    async def _scenario():
+        with create_pipe_input() as pipe:
+            task = asyncio.ensure_future(cli.run_repl(agent, input=pipe, output=DummyOutput()))
+            await asyncio.sleep(0.05)
+            for ln in lines:
+                pipe.send_text(ln + "\r")
+                await asyncio.sleep(0.06)
+            pipe.send_text("\x04")  # Ctrl-D 空行退出
+            await asyncio.wait_for(task, timeout=5)
+
     try:
-        asyncio.run(cli.run_repl(agent))
+        asyncio.run(_scenario())
     finally:
         try:
             signal.signal(signal.SIGINT, prev)

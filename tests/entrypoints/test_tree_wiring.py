@@ -53,7 +53,7 @@ def test_tree_no_arg_non_interactive_prints_text_tree(capsys):
     mgr.append_message(T.assistant_message([T.text_block("好的")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
     res = asyncio.run(_tree(_ctx(a, interactive=False), ""))
-    out = capsys.readouterr().out
+    out = res.output or ""                       # docs/18 step 5：结构化 output（不再 print）
     assert isinstance(res, Local)
     assert "session tree [TREETXT]" in out
     assert "user: 初始化项目" in out
@@ -61,10 +61,10 @@ def test_tree_no_arg_non_interactive_prints_text_tree(capsys):
     assert "◀ current" in out  # leaf 标记
 
 
-def test_tree_no_canonical_tree(capsys):
+def test_tree_no_canonical_tree():
     a = _agent("NOTREE")
     # 不建树,不设 _session_mgr
     a._session_mgr = None
     res = asyncio.run(_tree(_ctx(a), ""))
     assert isinstance(res, Local)
-    assert "No canonical session tree" in capsys.readouterr().out
+    assert "No canonical session tree" in (res.output or "")

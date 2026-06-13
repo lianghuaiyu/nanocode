@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 from prompt_toolkit.formatted_text import ANSI
 
 from . import sessionmodel as SM
-from .selector import KeyResult, Outcome, SelectorModel, run_selector
+from .selector import KeyResult, Outcome, SelectorModel
 
 _DIM = "\x1b[2m"
 _RESET = "\x1b[0m"
@@ -91,16 +91,18 @@ def _write_name(sid: str, current_sid: str | None, current_mgr, text: str) -> st
     return None
 
 
-async def run_sessions(*, current_sid: str | None, cwd: str, current_mgr,
-                       ask_text: Callable[[str], Awaitable[str | None]]) -> dict | None:
+async def run_sessions(*, current_sid: str | None, cwd: str, current_mgr, host) -> dict | None:
     """跑 /sessions 交互循环。返回 {"action":"resume","sid":id} 或 None(取消)。
-    rename 就地写后重跑(保持光标+scope)。"""
+    rename 就地写后重跑(保持光标+scope)。
+
+    host：SelectorHost（TuiApp），经 `host.run_selector(model)` 渲 in-app overlay、
+    `host.ask_text(prompt)` 读 rename 文本（docs/18 step 4，取代旧独立 Application + ask_text 回调）。"""
     scope = "current"
     index = 0
     while True:
         infos = SM.scan_sessions()
         model = _SessionModel(infos, current_sid, cwd, scope, time.time())
-        outcome: Outcome = await run_selector(model, initial_index=index)
+        outcome: Outcome = await host.run_selector(model, initial_index=index)
         scope = model.scope
         index = outcome.index
         if outcome.kind == "cancel":
@@ -109,7 +111,7 @@ async def run_sessions(*, current_sid: str | None, cwd: str, current_mgr,
             return {"action": "resume", "sid": outcome.item.info.sid}
         if outcome.kind == "edit" and outcome.edit_action == "rename":
             i = outcome.item.info
-            text = await ask_text(f"rename session {i.sid[-8:]} (blank=clear) [{i.name or ''}]: ")
+            text = await host.ask_text(f"rename session {i.sid[-8:]} (blank=clear) [{i.name or ''}]: ")
             if text is not None:
                 err = _write_name(i.sid, current_sid, current_mgr, text.strip())
                 if err:

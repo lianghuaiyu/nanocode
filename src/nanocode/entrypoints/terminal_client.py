@@ -42,18 +42,27 @@ class TerminalClient:
     """把 thread 事件流渲染到终端；经 `thread.subscribe(client.on_event)` 挂载。
 
     spinner 是唯一状态（ui 模块级单例，本 client 是唯一驱动者）。无其它会话态——thread 替换时
-    host 重新订阅即可，client 实例可复用。"""
+    host 重新订阅即可，client 实例可复用。
+
+    spinner 开关（docs/18）：在 full_screen=False 的 TuiApp 下，footer 的 running 态取代 spinner，
+    且 spinner 线程的 `\r` 写会与 app 的底部重绘区冲突——故 TuiApp 注入本 client 作 transcript
+    渲染器时传 `spinner=False`；旧/headless 路径默认 True。"""
+
+    def __init__(self, *, spinner: bool = True) -> None:
+        self._spinner = spinner
 
     def on_event(self, env: dict) -> None:
         kind = env.get("type")
         event = env.get("event")
 
         if kind == "llm_request_prepared":
-            tui.start_spinner()
+            if self._spinner:
+                tui.start_spinner()
             return
 
         if kind in _STOP_SPINNER_KINDS:
-            tui.stop_spinner()   # 渲染任何内容前先停 spinner，避免与 spinner 行交错（幂等）
+            if self._spinner:
+                tui.stop_spinner()   # 渲染任何内容前先停 spinner，避免与 spinner 行交错（幂等）
 
         if kind == "assistant_delta":
             if getattr(event, "text", ""):

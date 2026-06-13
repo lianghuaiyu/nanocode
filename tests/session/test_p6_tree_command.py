@@ -24,17 +24,17 @@ def test_tree_command_prints_entries_and_leaf(capsys):
     mgr.append_message(T.user_message("hi"))
     mgr.append_message(T.assistant_message([T.text_block("yo")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
-    asyncio.run(_tree(_ctx(a), ""))
-    out = capsys.readouterr().out
+    res = asyncio.run(_tree(_ctx(a), ""))
+    out = res.output or ""                       # docs/18 step 5：结构化 output
     assert "session tree" in out
     assert "user: hi" in out and "assistant: yo" in out
     assert "◀ current" in out
 
 
-def test_tree_command_no_tree(capsys):
+def test_tree_command_no_tree():
     a = _agent("notree")
-    asyncio.run(_tree(_ctx(a), ""))
-    assert "No canonical session tree" in capsys.readouterr().out
+    res = asyncio.run(_tree(_ctx(a), ""))
+    assert "No canonical session tree" in (res.output or "")
 
 
 def _seed(a, sid):
@@ -69,13 +69,13 @@ def test_checkout_bad_id_fails_closed(capsys):
 # （test_fork_no_arg_returns_control_with_last_user_and_prefill 等）——此处不再重复。
 
 
-def test_resume_lists_sessions(capsys):
+def test_resume_lists_sessions():
     from nanocode.session.manager import SessionManager
     SessionManager.create("rs1").close()                  # canonical 树才进列表（docs/16 C-3）
     a = _agent("rs_cur")
     _seed(a, "rs_cur").append_message(T.user_message("hi"))
-    asyncio.run(_resume(_ctx(a), ""))                     # 无参非交互 → 嵌套文本列表
-    out = capsys.readouterr().out
+    res = asyncio.run(_resume(_ctx(a), ""))               # 无参非交互 → 嵌套文本列表
+    out = res.output or ""                                # docs/18 step 5：结构化 output
     assert "Resumable sessions" in out
     assert "rs1" in out and "rs_cur" in out and "← current" in out
 

@@ -27,7 +27,16 @@ class RuntimeHost:
         # （测试 / headless）。
         self._client = client
         if client is not None and thread is not None:
-            thread.subscribe(client.on_event)
+            self._bind_client(thread)
+
+    def _bind_client(self, thread) -> None:
+        """把渲染客户端挂到 thread。client 实现 `bind_thread`（docs/18 TuiApp：解绑旧+hydrate+
+        订阅新）时优先走它；否则退回裸 `subscribe`（旧 TerminalClient）。"""
+        binder = getattr(self._client, "bind_thread", None)
+        if callable(binder):
+            binder(thread)
+        else:
+            thread.subscribe(self._client.on_event)
 
     @property
     def runtime(self):
@@ -41,7 +50,8 @@ class RuntimeHost:
         """每次 dispatch 重新生成——handler 永远经 current_thread 的稳定命令面操作，
         替换 thread 后无需通知任何 handler（它们不缓存句柄）。"""
         return CommandContext(thread=self._current_thread,
-                              registry=self._registry, interactive=self._interactive)
+                              registry=self._registry, interactive=self._interactive,
+                              selector_host=self._client)
 
     def replace_thread(self, new_thread) -> None:
         """切到新 thread；register 新 thread（保证 registry 始终含当前 thread）+ dispose 旧 thread。
@@ -52,10 +62,11 @@ class RuntimeHost:
         old = self._current_thread
         self._runtime.register(new_thread)
         self._current_thread = new_thread
-        # docs/17 Phase 1：渲染客户端跟随当前 thread——订阅新 thread 的事件流（旧 thread 随
-        # dispose 丢弃，其 _listeners 一并消失，故无需显式 unsubscribe）。
+        # docs/17 Phase 1 / docs/18：渲染客户端跟随当前 thread。bind_thread 型 client（TuiApp）自行
+        # 解绑旧+hydrate+订阅新；裸 client（TerminalClient）订阅新 thread（旧 thread 随 dispose 丢弃
+        # 其 _listeners，故无需显式 unsubscribe）。
         if self._client is not None and new_thread is not None:
-            new_thread.subscribe(self._client.on_event)
+            self._bind_client(new_thread)
         if old is not None and old is not new_thread:
             old.dispose()
 

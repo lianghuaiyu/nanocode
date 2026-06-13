@@ -261,16 +261,6 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
     return Local()
 
 
-async def _ask_text(prompt: str) -> "str | None":
-    """选择器内文本输入(label / rename)——经 cli 主读取器读一行;取消/EOF → None。
-    lazy import 避开 cli↔builtin 循环依赖。"""
-    from ..cli import CANCEL, EOF, _async_read_line
-    ans = await _async_read_line(prompt, persistent=False)
-    if ans is EOF or ans is CANCEL:
-        return None
-    return ans
-
-
 async def _tree(ctx: CommandContext, args: str) -> Local:
     """/tree —— 无参:TTY 进交互树选择器(↑↓/enter checkout/l label/f filter/q);
     非 TTY 打印文本树。/tree <entry>:把 active leaf 移到该 entry（in-file 导航）。"""
@@ -279,24 +269,22 @@ async def _tree(ctx: CommandContext, args: str) -> Local:
     from ...session.manager import SessionManager
     sid = ctx.thread.session_id
     if not SessionManager.exists(sid):
-        print("No canonical session tree yet for this session.")
-        return Local()
+        return Local(output="No canonical session tree yet for this session.")
     mgr = ctx.thread.session_manager or SessionManager.open(sid)
     if not ctx.interactive:
         from ..interactive.treemodel import render_tree_text
         name = mgr.name() or "(unnamed)"
         leaf = mgr.get_leaf()
-        print(f"session tree [{sid}] {name} — leaf=…{str(leaf)[-8:]}")
-        print("\n".join(render_tree_text(mgr.entries(), leaf)))
-        return Local()
+        head = f"session tree [{sid}] {name} — leaf=…{str(leaf)[-8:]}"
+        return Local(output=head + "\n" + "\n".join(render_tree_text(mgr.entries(), leaf)))
     from ..interactive.tree_select import run_tree
-    res = await run_tree(mgr, ask_text=_ask_text)
+    res = await run_tree(mgr, host=ctx.selector_host)
     if res and res.get("action") == "checkout":
         try:
             msgs = ctx.thread.move_to(res["entry_id"])
-            print(f"Checked out …{res['entry_id'][-8:]} — context reloaded ({len(msgs)} messages).")
+            return Local(output=f"Checked out …{res['entry_id'][-8:]} — context reloaded ({len(msgs)} messages).")
         except ValueError as e:
-            print_error(str(e))
+            return Local(output=f"Error: {e}")
     return Local()
 
 
@@ -400,7 +388,7 @@ async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     if not target and ctx.interactive:
         # TTY:交互选择器只列 user 消息,右栏预览将回填的 prompt;选中→走与下方同一 Control。
         from ..interactive.tree_select import run_tree
-        res = await run_tree(mgr, ask_text=_ask_text, fork_mode=True)
+        res = await run_tree(mgr, host=ctx.selector_host, fork_mode=True)
         if not res:
             return Local()
         sel = next((e for e in mgr.entries() if e.id == res["entry_id"]), None)
@@ -506,7 +494,7 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
         cwd = ctx.thread.session_manager._cwd() if ctx.thread.session_manager is not None else os.getcwd()
         from ..interactive.session_select import run_sessions
         res = await run_sessions(current_sid=sid, cwd=cwd, current_mgr=ctx.thread.session_manager,
-                                 ask_text=_ask_text)
+                                 host=ctx.selector_host)
         if res and res.get("action") == "resume" and res["sid"] != sid:
             return Control("resume", {"sessionId": res["sid"]})
         return Local()
@@ -515,11 +503,9 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
     from ..interactive import sessionmodel as _SM
     infos = _SM.scan_sessions()
     if not infos:
-        print("No sessions found.")
-        return Local()
-    print("Resumable sessions (/resume <id> to switch):")
-    print("\n".join(_SM.render_sessions_text(infos, ctx.thread.session_id, _time.time())))
-    return Local()
+        return Local(output="No sessions found.")
+    body = "\n".join(_SM.render_sessions_text(infos, ctx.thread.session_id, _time.time()))
+    return Local(output="Resumable sessions (/resume <id> to switch):\n" + body)
 
 
 async def _session(ctx: CommandContext, args: str) -> Local:
@@ -529,8 +515,7 @@ async def _session(ctx: CommandContext, args: str) -> Local:
     sid = ctx.thread.session_id
     mgr = ctx.thread.session_manager or (SessionManager.open(sid) if SessionManager.exists(sid) else None)
     if mgr is None:
-        print_info("No active session.")
-        return Local()
+        return Local(output="No active session.")
     msgs = [e for e in mgr.entries() if e.type == _tree.MESSAGE]
     ps = mgr.parent_session()
     origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
@@ -544,8 +529,7 @@ async def _session(ctx: CommandContext, args: str) -> Local:
         f"  entries  {len(msgs)} messages    leaf …{str(mgr.get_leaf())[-8:]}",
         f"  tokens   ↑{st['input_tokens']} ↓{st['output_tokens']}  ${st['cost_usd']:.4f}",
     ]
-    print("\n".join(lines))
-    return Local()
+    return Local(output="\n".join(lines))
 
 
 async def _help(ctx: CommandContext, args: str) -> Local:

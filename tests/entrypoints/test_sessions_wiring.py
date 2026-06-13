@@ -73,26 +73,22 @@ def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     a = Agent(api_key="test", session_id="ROOTSID", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.open("ROOTSID")
     ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
-    import io
-    from contextlib import redirect_stdout
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        res = asyncio.run(_resume(ctx, ""))
-    out = buf.getvalue()
+    res = asyncio.run(_resume(ctx, ""))
+    out = res.output or ""                       # docs/18 step 5：命令返回结构化 output（不再 print）
     assert isinstance(res, Local)
     assert "Resumable sessions" in out
     assert "ROOTSID"[-8:] in out and "CHILDSID"[-8:] in out
     assert "fork" in out
 
 
-def test_session_shows_current_stats(capsys):
+def test_session_shows_current_stats():
     a = Agent(api_key="test", session_id="CURSTAT", permission_mode="bypassPermissions")
     mgr = SessionManager.create("CURSTAT")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
     ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
     res = asyncio.run(_session(ctx, ""))
-    out = capsys.readouterr().out
+    out = res.output or ""
     assert isinstance(res, Local)
     assert "Session CURSTAT" in out
     assert "origin   root" in out
