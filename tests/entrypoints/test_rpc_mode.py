@@ -130,6 +130,19 @@ def test_rpc_approval_round_trip(monkeypatch):
     assert tr["status"] == "completed"
 
 
+def test_rpc_get_state_returns_snapshot(monkeypatch):
+    """docs/17 #2：get_state 经 stdio 返回会话快照（Pi get_state 对位）。"""
+    async def stream(*, model, system, tools, messages, thinking_mode, callbacks):
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a = _agent("rpcstate", stream)
+    msgs = _run(a, [('{"cmd": "get_state"}', None),
+                    ('{"cmd": "exit"}', "state")], monkeypatch)
+    st = next(m for m in msgs if m.get("type") == "state")
+    assert st["state"]["session_id"] == "rpcstate"
+    assert "messages" in st["state"] and "model" in st["state"]
+
+
 def test_rpc_approval_denied_blocks_tool(monkeypatch):
     calls = {"n": 0}
 

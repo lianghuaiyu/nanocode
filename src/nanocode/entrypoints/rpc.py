@@ -7,6 +7,7 @@ AgentSession，core 一行不改。这是 pi `modes/rpc` 的对位实现。
   stdin  命令：
     {"cmd": "prompt", "text": "..."}                 → 跑一个 turn（异步,不阻塞 stdin 读取）
     {"cmd": "cancel"}                                → thread.cancel()（abort 当前 turn）
+    {"cmd": "get_state"}                             → 回 {"type":"state","state":{...messages...}}（Pi get_state）
     {"cmd": "approval_response", "approved": bool}   → 应答待审批（FIFO；turn 内审批串行）
     {"cmd": "exit"}                                  → 退出
   stdout 输出：
@@ -84,6 +85,9 @@ async def run_rpc_mode(agent, lease=None) -> None:
             turn_task = asyncio.create_task(_run_turn(cmd.get("text", "")))
         elif kind == "cancel":
             thread.cancel()
+        elif kind == "get_state":
+            # Pi get_state 对位：完整会话快照（status + messages）。
+            _emit_line({"type": "state", "state": thread.state()})
         elif kind == "approval_response":
             fut = pending_approval["fut"]
             if fut is not None and not fut.done():

@@ -272,6 +272,28 @@ class RuntimeThread:
             "thinking": None if mode == "disabled" else mode,
         }
 
+    def messages(self) -> list:
+        """当前 active branch 的中立 Message[] 快照（docs/17 #2：从 canonical 树 build_context 派生）。
+
+        重绘 / RPC get_state 的视图地基——**on-demand 重建**（每次重读树），非每帧热路径；无会话写者
+        租约（_session_mgr=None）或树不可折叠时返回 []。中立 Message dict 与 provider 无关，
+        客户端据此自渲染。"""
+        mgr = getattr(self.agent, "_session_mgr", None)
+        if mgr is None:
+            return []
+        try:
+            return list(mgr.build_context().messages)
+        except Exception:
+            return []
+
+    def state(self) -> dict:
+        """完整会话快照（Pi `get_state` 对位）：status 字段 + is_processing + 中立 messages。
+        供客户端重绘与 RPC get_state；on-demand 派生（含 messages 重建，勿当每帧热路径）。"""
+        snap = self.status()
+        snap["is_processing"] = self.is_processing
+        snap["messages"] = self.messages()
+        return snap
+
     def events(self) -> list[dict]:
         """push 流的近期快照（docs/16 #4：ring buffer，最多 EVENT_LOG_MAX 条）。
 

@@ -110,6 +110,19 @@ def test_thread_status_snapshot_exposes_session_state():
                        "cost_usd", "context_window", "model", "thinking"}
 
 
+def test_thread_messages_and_state_snapshot():
+    """docs/17 #2：messages()/state() 是重绘 / RPC get_state 的视图地基（从 canonical 树派生）。"""
+    rt = AgentRuntime()
+    a = _agent()
+    th = rt.adopt(a)
+    # 无会话写者租约 → 空快照（不抛）
+    assert th.messages() == []
+    state = th.state()
+    assert state["messages"] == [] and state["is_processing"] is False
+    assert state["session_id"] == a.session_id        # state ⊇ status 字段
+    assert "model" in state and "cost_usd" in state
+
+
 def test_final_response_derived_from_event_stream():
     """docs/17 Phase 0：TurnResult.final_response 从 agent 的 emit 流（AssistantDelta.text）派生，
     无需 capturing sink。"""
