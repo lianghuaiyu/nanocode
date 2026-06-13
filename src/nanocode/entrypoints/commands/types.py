@@ -146,6 +146,9 @@ class CommandContext:
     out: "EventSink"
     cwd: Path = field(default_factory=Path.cwd)
     registry: "Registry | None" = None   # /help 等命令用它自省命令表（CMD-P1）
+    interactive: bool = False            # 真 TTY?决定 /tree /fork /sessions 走交互选择器还是文本回退。
+                                         # 默认 False:测试/headless/rpc 自动走文本(选择器需真终端);
+                                         # 仅真 REPL 经 RuntimeHost(interactive=isatty()) 置 True。
 
 
 # ─── 查找契约 ────────────────────────────────────────────────────

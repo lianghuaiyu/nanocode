@@ -205,7 +205,7 @@ async def _agents(ctx: CommandContext, args: str) -> Local:
     if sub == "":
         print(agents_overview_text(ctx.agent.task_manager))
         # docs/14 §6b：磁盘派生的 child session（经 header parentSession 回指），survives restart，
-        # 不依赖 in-process task_manager。可 `/resume <child-sid>` 进入、`/parent` 回来。
+        # 不依赖 in-process task_manager。可 `/resume <child-sid>` 进入、`/sessions` 浏览父子。
         from ...session.manager import children
         kids = children(ctx.agent.session_id)
         if kids:
@@ -262,9 +262,19 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
     return Local()
 
 
+async def _ask_text(prompt: str) -> "str | None":
+    """选择器内文本输入(label / rename)——经 cli 主读取器读一行;取消/EOF → None。
+    lazy import 避开 cli↔builtin 循环依赖。"""
+    from ..cli import CANCEL, EOF, _async_read_line
+    ans = await _async_read_line(prompt, persistent=False)
+    if ans is EOF or ans is CANCEL:
+        return None
+    return ans
+
+
 async def _tree(ctx: CommandContext, args: str) -> Local:
-    """/tree [entry] —— 无参打印 canonical session 树（entry 结构 + 当前 leaf）；带 entry 则把 active
-    leaf 移到该 entry 并重载上下文（in-file 导航，主路径；等同 /checkout，docs/14 §5.1）。"""
+    """/tree —— 无参:TTY 进交互树选择器(↑↓/enter checkout/l label/f filter/q);
+    非 TTY 打印文本树。/tree <entry>:把 active leaf 移到该 entry（in-file 导航）。"""
     if args.strip():
         return await _checkout(ctx, args)
     from ...session.manager import SessionManager
@@ -272,29 +282,30 @@ async def _tree(ctx: CommandContext, args: str) -> Local:
     if not SessionManager.exists(sid):
         print("No canonical session tree yet for this session.")
         return Local()
-    mgr = SessionManager.open(sid)
-    leaf = mgr.get_leaf()
-    name = mgr.name() or "(unnamed)"
-    lines = [f"session tree [{sid}] {name} — {len(mgr.entries())} entries, leaf=…{str(leaf)[-8:]}"]
-    for e in mgr.entries():
-        label = e.type
-        if e.type == "message":
-            label = f"message/{(e.data.get('message') or {}).get('role', '?')}"
-        elif e.type == "compaction":
-            label = "compaction(summary)"
-        mark = "  ← leaf" if e.id == leaf else ""
-        # uuidv7 是时间有序：同毫秒 id 前缀相同，唯一部分在尾部 → 展示尾 8 位作 handle。
-        parent = "root" if not e.parentId else "…" + e.parentId[-8:]
-        lines.append(f"  …{e.id[-8:]}  ↰{parent}  {label}{mark}")
-    print("\n".join(lines))
+    mgr = ctx.agent._session_mgr or SessionManager.open(sid)
+    if not ctx.interactive:
+        from ..interactive.treemodel import render_tree_text
+        name = mgr.name() or "(unnamed)"
+        leaf = mgr.get_leaf()
+        print(f"session tree [{sid}] {name} — leaf=…{str(leaf)[-8:]}")
+        print("\n".join(render_tree_text(mgr.entries(), leaf)))
+        return Local()
+    from ..interactive.tree_select import run_tree
+    res = await run_tree(mgr, ask_text=_ask_text)
+    if res and res.get("action") == "checkout":
+        try:
+            msgs = ctx.session.move_to(res["entry_id"])
+            print(f"Checked out …{res['entry_id'][-8:]} — context reloaded ({len(msgs)} messages).")
+        except ValueError as e:
+            print_error(str(e))
     return Local()
 
 
 async def _checkout(ctx: CommandContext, args: str) -> Local:
-    """/checkout <entry_id> —— 把 active leaf 移到树中某 entry 并重载上下文（in-file 导航，docs/13 P6）。"""
+    """把 active leaf 移到树中某 entry 并重载上下文（in-file 导航）。`_tree` 的 <entry> 直达内部复用。"""
     target = args.strip()
     if not target:
-        print_error("Usage: /checkout <entry_id>  (run /tree to see entry ids)")
+        print_error("Usage: /tree <entry_id>  (run /tree to browse entry ids)")
         return Local()
     from ...session.manager import SessionManager
     sid = ctx.agent.session_id
@@ -310,26 +321,6 @@ async def _checkout(ctx: CommandContext, args: str) -> Local:
     try:
         msgs = ctx.session.move_to(target)
         print(f"Checked out {target[:12]} — context reloaded ({len(msgs)} messages).")
-    except ValueError as e:
-        print_error(str(e))
-    return Local()
-
-
-async def _rewind(ctx: CommandContext, args: str) -> Local:
-    """/rewind —— 回到最近一条 user 消息之前（撤销上一轮；后续输入在 in-file 新分支重开，docs/13 P6）。"""
-    from ...session.manager import SessionManager
-    sid = ctx.agent.session_id
-    if not SessionManager.exists(sid):
-        print("No canonical session tree yet for this session.")
-        return Local()
-    target = _last_user_message(SessionManager.open(sid))
-    if target is None:
-        print("No user message to rewind to.")
-        return Local()
-    try:
-        ctx.session.move_to(target.parentId)         # parentId=None（首条消息）→ 复位到 root（空上下文）
-        content = (target.data.get("message") or {}).get("content")
-        print(f"Rewound to before your last message (in-file branch). Re-enter it if you like:\n  {content}")
     except ValueError as e:
         print_error(str(e))
     return Local()
@@ -365,7 +356,7 @@ def _is_user_message(e) -> bool:
 
 
 def _last_user_message(mgr):
-    """branch 上最近一条 user MESSAGE entry（无则 None）。/fork 无参与 /rewind 共用。"""
+    """branch 上最近一条 user MESSAGE entry（无则 None）。/fork 无参用。"""
     sel = None
     for e in mgr.get_branch():                     # root-first → 末个命中即最近
         if _is_user_message(e):
@@ -400,13 +391,27 @@ def _user_message_text(msg: dict) -> str:
 
 async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     """/fork [entry] —— pi 语义：选择一条历史 user 消息，**新建 session** 复制到该消息**之前**，
-    并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。无参 = 最近一条 user 消息。
-    原 session 保留（header 记 parentSession 血缘）。同 session 内的 leaf 移动用 /tree <entry>。"""
+    并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。原 session 保留（header 记 parentSession）。
+    无参 + TTY → 交互选择器挑 user 消息；无参 + 非 TTY → 最近一条 user 消息；/fork <entry> → 指定。"""
     mgr = ctx.agent._session_mgr
     if mgr is None:
         print_info("No active session for this agent.")
         return Local()
     target = args.strip()
+    if not target and ctx.interactive:
+        # TTY:交互选择器只列 user 消息,右栏预览将回填的 prompt;选中→走与下方同一 Control。
+        from ..interactive.tree_select import run_tree
+        res = await run_tree(mgr, ask_text=_ask_text, fork_mode=True)
+        if not res:
+            return Local()
+        sel = next((e for e in mgr.entries() if e.id == res["entry_id"]), None)
+        if sel is None or not _is_user_message(sel):
+            print_error("Fork target must be a user message.")
+            return Local()
+        return Control("replace_thread", {
+            "kind": "fork", "sourceSid": ctx.agent.session_id, "userEntryId": sel.id,
+            "prefill": _user_message_text(sel.data.get("message")),
+        })
     if target:
         resolved, err = _resolve_entry(mgr, target)
         if resolved is None:
@@ -471,9 +476,8 @@ def _child_session_ids() -> set:
 
 
 async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
-    """/resume [<id>] —— 无参列出可恢复 session；带 id 返回 Control("resume") 交 runtime 原子切换
-    （AgentRuntime.thread_resume：rebind + 重建 thread；canonical 树缺则拒绝，docs/16 C-3）。"""
-    from ...session import tree as _tree
+    """/resume [<id>] —— Pi 语义:无参 + TTY 打开交互会话浏览器(按 parentSession 嵌套树 + 右栏详情,
+    enter resume / r rename / tab scope);无参 + 非 TTY 列文本;带 id 直达,返回 Control("resume")。"""
     from ...session.manager import SessionManager, _scan_headers
     target = args.strip()
     if target:
@@ -496,33 +500,53 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
                         f"`nanocode --resume {target}`.")
             return Local()
         return Control("resume", {"sessionId": resolved, "fork": fork})
-    headers = _scan_headers()
-    if not headers:
+    # 无参 + TTY → 交互浏览器（Pi /resume 打开 session selector UI）。
+    if ctx.interactive:
+        import os
+        sid = ctx.agent.session_id
+        cwd = ctx.agent._session_mgr._cwd() if ctx.agent._session_mgr is not None else os.getcwd()
+        from ..interactive.session_select import run_sessions
+        res = await run_sessions(current_sid=sid, cwd=cwd, current_mgr=ctx.agent._session_mgr,
+                                 ask_text=_ask_text)
+        if res and res.get("action") == "resume" and res["sid"] != sid:
+            return Control("resume", {"sessionId": res["sid"]})
+        return Local()
+    # 无参 + 非 TTY → 文本列表（headless/脚本）:按 parentSession 嵌套 + origin,与交互浏览器同源。
+    import time as _time
+    from ..interactive import sessionmodel as _SM
+    infos = _SM.scan_sessions()
+    if not infos:
         print("No sessions found.")
         return Local()
-    # 默认隐藏 child session（有 parentSession header 回指）——它们经 /agents /agent 导航（docs/14 §5.2）。
-    child_ids = {sid for sid, ps in headers if ps}
-    top = sorted(s for s, _ps in headers if s not in child_ids or s == ctx.agent.session_id)
-    lines = ["Resumable sessions (/resume <id> to switch; child sessions hidden — see /agents):"]
-    for s in top:
-        n = sum(1 for e in SessionManager.open(s).entries() if e.type == _tree.MESSAGE)
-        mark = "  ← current" if s == ctx.agent.session_id else ""
-        lines.append(f"  {s}  messages={n}{mark}")
-    print("\n".join(lines))
+    print("Resumable sessions (/resume <id> to switch):")
+    print("\n".join(_SM.render_sessions_text(infos, ctx.agent.session_id, _time.time())))
     return Local()
 
 
-async def _parent(ctx: CommandContext, args: str) -> "Control | Local":
-    """/parent —— 切到当前 session 的父 session（docs/14 §6b child-session 导航）。顶层 session 无父则提示。
-    运行时经 Control → thread_resume（rebind）。"""
+async def _session(ctx: CommandContext, args: str) -> Local:
+    """/session —— 显示**当前** session 的信息与统计（Pi /session）。跨 session 浏览/切换用 /resume。"""
+    from ...session import tree as _tree
     from ...session.manager import SessionManager
     sid = ctx.agent.session_id
     mgr = ctx.agent._session_mgr or (SessionManager.open(sid) if SessionManager.exists(sid) else None)
-    ps = mgr.parent_session() if mgr is not None else None
-    if not ps or not ps.get("sessionId"):
-        print_info("This is a top-level session (no parent).")
+    if mgr is None:
+        print_info("No active session.")
         return Local()
-    return Control("resume", {"sessionId": ps["sessionId"]})
+    msgs = [e for e in mgr.entries() if e.type == _tree.MESSAGE]
+    ps = mgr.parent_session()
+    origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
+    a = ctx.agent
+    lines = [
+        f"Session {sid}",
+        f"  name     {mgr.name() or '(unnamed)'}",
+        f"  cwd      {mgr._cwd()}",
+        f"  model    {a.model}",
+        f"  origin   {origin}" + (f"  (parent …{ps['sessionId'][-8:]})" if ps and ps.get('sessionId') else ""),
+        f"  entries  {len(msgs)} messages    leaf …{str(mgr.get_leaf())[-8:]}",
+        f"  tokens   ↑{a.total_input_tokens} ↓{a.total_output_tokens}  ${a._get_current_cost_usd():.4f}",
+    ]
+    print("\n".join(lines))
+    return Local()
 
 
 async def _help(ctx: CommandContext, args: str) -> Local:
@@ -568,15 +592,13 @@ _BUILTINS = [
     ("/agents", _agents, "exact_or_prefix",
      "Agent definitions + running instances", "[available|running|show <name|id>]"),
     ("/agent", _agent, "prefix", "Show a sub-agent instance's details", "<id>"),
-    ("/parent", _parent, "exact", "Switch to this session's parent session (child-session nav)", ""),
-    ("/tree", _tree, "exact_or_prefix", "Show the session tree, or /tree <entry> to navigate (move leaf)", "[entry_id]"),
-    ("/checkout", _checkout, "prefix", "Move the active leaf to a tree entry (in-file navigation)", "<entry_id>"),
-    ("/rewind", _rewind, "exact", "Rewind to before your last message (in-file branch)", ""),
+    ("/tree", _tree, "exact_or_prefix", "Browse the session tree (interactive), or /tree <entry> to checkout", "[entry_id]"),
     ("/new", _new, "exact", "Start a new empty session and switch to it", ""),
     ("/clone", _clone, "exact_or_prefix", "New session: copy the current branch up to the current leaf and switch (editor empty)", ""),
     ("/fork", _fork, "exact_or_prefix", "New session: copy up to BEFORE a user message and put that prompt back in the editor", "[entry_id]"),
     ("/name", _name, "exact_or_prefix", "Show or set this session's name (/name <text> | --clear)", "[text]"),
-    ("/resume", _resume, "exact_or_prefix", "List resumable sessions, or /resume <id> to switch mid-REPL", "[id]"),
+    ("/resume", _resume, "exact_or_prefix", "Browse sessions (interactive) or /resume <id> to switch", "[id]"),
+    ("/session", _session, "exact", "Show current session info & stats", ""),
     ("/help", _help, "exact", "List REPL commands", ""),
 ]
 

@@ -192,6 +192,11 @@ class SessionManager:
         session_info 不移动 leaf（leaf_id_after_entry 返回不变哨兵）。"""
         return self.append(tree.SESSION_INFO, {"name": name})
 
+    def append_label(self, entry_id: str, text: str) -> Entry:
+        """给某条 entry 打/改 label（LWW，空白=tombstone 清除,见 tree.labels_by_id）。
+        label 经 data['targetId'] 关联目标 entry（**不靠 parentId**）;label 是注解型,不移动 leaf。"""
+        return self.append(tree.LABEL, {"targetId": entry_id, "label": text})
+
     def set_leaf(self, target_id: str | None) -> Entry:
         """移动 activeLeaf：append 一条 leaf entry（target_id=None → 复位到 root）。Pi setLeafId。"""
         if target_id is not None and target_id not in self._by_id:

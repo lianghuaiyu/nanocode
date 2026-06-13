@@ -6,7 +6,6 @@ import asyncio
 
 from nanocode.agent import AgentSession
 from nanocode.agent.engine import Agent
-from nanocode.entrypoints.commands.builtin import _parent
 from nanocode.entrypoints.commands.types import CommandContext, Control
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager, children
@@ -84,22 +83,6 @@ def test_empty_subagent_leaves_headeronly_child_session():
     assert SessionManager.exists(child_sid)                          # 租约在 spawn 时建了 header
     child = SessionManager.open(child_sid)
     assert [e for e in child.entries() if e.type == T.MESSAGE] == []  # 但无任何 MESSAGE entry
-
-
-def test_parent_command_navigates_to_parent_session():
-    SessionManager.create("CHILDP", parent_session={"sessionId": "PAR", "entryId": "e1"})
-    a = _agent("CHILDP")
-    a._session_mgr = SessionManager.open("CHILDP")
-    res = asyncio.run(_parent(_ctx(a), ""))
-    assert isinstance(res, Control) and res.action == "resume" and res.payload["sessionId"] == "PAR"
-
-
-def test_parent_command_top_level_no_parent(capsys):
-    a = _agent("TOPLVL")
-    a._session_mgr = SessionManager.create("TOPLVL")
-    res = asyncio.run(_parent(_ctx(a), ""))
-    assert not isinstance(res, Control)
-    assert "top-level" in capsys.readouterr().out
 
 
 def test_agent_id_navigates_to_child():

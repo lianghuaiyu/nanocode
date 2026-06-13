@@ -43,6 +43,15 @@ EOF = object()      # stdin EOF (Ctrl-D)
 CANCEL = object()   # line cancelled at prompt (Ctrl-C)
 
 
+def _sigint_decision(is_processing: bool, sigint_count: int) -> tuple[str, int]:
+    """SIGINT 决策（纯函数,可测）。turn 进行中 → ('abort', 0)（打断当前轮,不计退出）;
+    空闲 → 计数,达 2 → ('exit', n);否则 ('warn', n)（提示再按一次退出）。"""
+    if is_processing:
+        return "abort", 0
+    sigint_count += 1
+    return ("exit" if sigint_count >= 2 else "warn"), sigint_count
+
+
 # 内置斜杠命令的单一来源：从命令 registry 派生（取代旧的手维护列表，消除与 dispatch 的漂移）。
 # exit/quit 是裸词（无 /），不进 /-gated 菜单，故不在 registry。
 _REGISTRY = build_registry()
@@ -138,7 +147,7 @@ def _make_prime_buffer(session: PromptSession):
     return _prime_buffer
 
 
-def _get_session(*, input=None, output=None, persistent=True) -> PromptSession:
+def _get_session(*, input=None, output=None, persistent=True, bottom_toolbar=None) -> PromptSession:
     """Build the PromptSession (history + editing + completion).
 
     Production path (input/output both None) caches a single shared session bound
@@ -173,6 +182,7 @@ def _get_session(*, input=None, output=None, persistent=True) -> PromptSession:
             enable_history_search=False,
             completer=_completer(),
             complete_while_typing=True,
+            bottom_toolbar=bottom_toolbar,
             input=input,
             output=output,
         )
@@ -195,13 +205,14 @@ def _get_session(*, input=None, output=None, persistent=True) -> PromptSession:
             enable_history_search=False,  # keep False so complete_while_typing fires (see above)
             completer=_completer(),
             complete_while_typing=True,
+            bottom_toolbar=bottom_toolbar,
         )
         _prime_history(_session)
     return _session
 
 
 async def _async_read_line(prompt="", *, input=None, output=None, persistent=True,
-                           default="") -> object:
+                           default="", bottom_toolbar=None) -> object:
     """Read one line with full line editing + history via prompt_toolkit,
     cooperating with the asyncio loop (background tasks stay live).
     Ctrl-D -> EOF sentinel; Ctrl-C -> CANCEL sentinel.
@@ -219,7 +230,8 @@ async def _async_read_line(prompt="", *, input=None, output=None, persistent=Tru
     confirmation would bypass agent.abort() and raise KeyboardInterrupt."""
     prev_sigint = signal.getsignal(signal.SIGINT)
     try:
-        session = _get_session(input=input, output=output, persistent=persistent)
+        session = _get_session(input=input, output=output, persistent=persistent,
+                               bottom_toolbar=bottom_toolbar)
         pre_run = _make_prime_buffer(session)
         if input is not None or output is not None:
             return await session.prompt_async(prompt, pre_run=pre_run, default=default)
@@ -411,7 +423,7 @@ async def run_repl(agent: Agent, lease=None) -> None:
     # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
     _runtime = AgentRuntime()
     _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
-    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY)
+    _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty())
 
     # CMD-P2.5 / docs/15 Phase 7：普通 chat / skill turn **一律**经 RuntimeThread.run 驱动
     # （取 host 的 current_thread）。逃生阀 NANOCODE_REPL_VIA_RUNTIME 已删——runtime 是唯一 turn 路径。
@@ -498,10 +510,16 @@ async def run_repl(agent: Agent, lease=None) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        # 历史行为：主 REPL 的 SIGINT 一律「按两次退出」（docs/16 C-1：原永假的 capturing 分支已删；
-        # 与删除前行为一致：turn 内 Ctrl-C 不中断 agent（abort 分支在删除前即恒假））。
-        sigint_count += 1
-        if sigint_count >= 2:
+        # turn 进行中（thinking/streaming/工具）：Ctrl-C 打断当前 turn——优雅 abort（置 _aborted +
+        # cancel current task），run_turn 把 CancelledError 吞成 _aborted 正常返回,控制权回 prompt,
+        # 输入框随下一轮 _async_read_line 重绘（不退出、不消失）。空闲时保留「按两次退出」。
+        a = _host.current_thread.agent
+        action, sigint_count = _sigint_decision(a.is_processing, sigint_count)
+        if action == "abort":
+            a.abort()
+            print("\n  Interrupted — back to prompt.")
+            return
+        if action == "exit":
             print("\nBye!\n")
             try:
                 _host.current_thread.release_lease()   # 释放当前 thread 的会话写锁后退出
@@ -513,10 +531,42 @@ async def run_repl(agent: Agent, lease=None) -> None:
     signal.signal(signal.SIGINT, handle_sigint)
     print_welcome()
 
+    def _footer_toolbar():
+        """bottom_toolbar 回调:从当前 thread 的 agent + session 组装 Pi 两行页脚（ANSI）。
+        高频重绘——只读字段 + git 分支 TTL 缓存,失败返回空串（绝不让页脚拖垮 REPL）。"""
+        try:
+            from .interactive.footer import FooterState, git_branch, render_footer
+            from prompt_toolkit.application import get_app
+            a = _host.current_thread.agent
+            mgr = getattr(a, "_session_mgr", None)
+            cwd = mgr._cwd() if mgr is not None else os.getcwd()
+            mode = getattr(a, "_thinking_mode", "disabled")
+            state = FooterState(
+                cwd=cwd,
+                home=os.path.expanduser("~"),
+                branch=git_branch(cwd),
+                session_name=(mgr.name() if mgr is not None else None),
+                input_tokens=a.total_input_tokens,
+                output_tokens=a.total_output_tokens,
+                cost_usd=a._get_current_cost_usd(),
+                context_used=a.total_input_tokens,
+                context_window=getattr(a, "effective_window", 0),
+                model=a.model,
+                thinking=None if mode == "disabled" else mode,
+            )
+            try:
+                width = get_app().output.get_size().columns
+            except Exception:
+                width = None
+            return ANSI("\n".join(render_footer(state, width)))
+        except Exception:
+            return ""
+
     cancel_count = 0
     while True:
         _prefill, _pending_prefill["text"] = _pending_prefill["text"], ""
-        line = await _async_read_line(ANSI("\n\x1b[1;32m> \x1b[0m"), default=_prefill)
+        line = await _async_read_line(ANSI("\n\x1b[1;32m> \x1b[0m"), default=_prefill,
+                                      bottom_toolbar=_footer_toolbar)
         # SIGINT handler is restored inside _async_read_line (covers this read and
         # the transient confirm/plan prompts too), so Ctrl-C during agent.chat
         # always reaches handle_sigint.

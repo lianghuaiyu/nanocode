@@ -17,10 +17,11 @@ from .commands.types import CommandContext
 
 
 class RuntimeHost:
-    def __init__(self, runtime, thread, *, registry=None) -> None:
+    def __init__(self, runtime, thread, *, registry=None, interactive=True) -> None:
         self._runtime = runtime
         self._current_thread = thread
         self._registry = registry
+        self._interactive = interactive
 
     @property
     def runtime(self):
@@ -35,7 +36,7 @@ class RuntimeHost:
         替换 thread 后无需通知任何 handler（它们不缓存 agent/session）。"""
         t = self._current_thread
         return CommandContext(agent=t.agent, session=t.session, out=t.agent._sink,
-                              registry=self._registry)
+                              registry=self._registry, interactive=self._interactive)
 
     def replace_thread(self, new_thread) -> None:
         """切到新 thread；register 新 thread（保证 registry 始终含当前 thread）+ dispose 旧 thread。

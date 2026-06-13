@@ -115,7 +115,8 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     # 1) 脚本化输入：依次返回 lines，耗尽后 EOF 终止循环
     it = iter(lines)
 
-    async def _fake_read(prompt="", *, input=None, output=None, persistent=True, default=""):
+    async def _fake_read(prompt="", *, input=None, output=None, persistent=True, default="",
+                         bottom_toolbar=None):
         if default:
             calls.append(("prefill", default))   # docs/16 pi /fork：编辑器预填经 default 透传
         try:
