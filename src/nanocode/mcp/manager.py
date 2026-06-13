@@ -22,8 +22,15 @@ class McpManager:
         self._tools: list[dict] = []
         self._connected = False
 
-    async def load_and_connect(self) -> None:
-        """Read settings, connect to all configured MCP servers, discover tools."""
+    async def load_and_connect(self, notify=None) -> None:
+        """Read settings, connect to all configured MCP servers, discover tools.
+
+        docs/17 Phase 5：core 不再直接 import ..ui / print——连接日志经注入的 `notify(text, level)`
+        回调（调用方传 `lambda t, level: agent.emit(NoticeRaised(...))`），订阅端渲染。None = 静默。"""
+        def _notify(text: str, level: str = "info") -> None:
+            if notify is not None:
+                notify(text, level)
+
         if self._connected:
             return
         self._connected = True
@@ -47,11 +54,9 @@ class McpManager:
                 server_tools = await asyncio.wait_for(conn.list_tools(), timeout=timeout)
                 self._connections[name] = conn
                 self._tools.extend(server_tools)
-                from ..ui import is_verbose
-                if is_verbose():
-                    print(f"[mcp] Connected to '{name}' — {len(server_tools)} tools", flush=True)
+                _notify(f"[mcp] Connected to '{name}' — {len(server_tools)} tools", "info")
             except Exception as e:
-                print(f"[mcp] Failed to connect to '{name}': {e}", flush=True)
+                _notify(f"[mcp] Failed to connect to '{name}': {e}", "warn")
                 conn.close()
 
     def get_tool_definitions(self) -> list[dict]:

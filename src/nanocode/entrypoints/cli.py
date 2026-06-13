@@ -391,6 +391,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-backend", choices=["auto", "simplemem", "markdown", "off"],
                         default=None,
                         help="Long-term memory backend (default: auto)")
+    parser.add_argument("--rpc", action="store_true",
+                        help="Headless RPC mode: JSON-lines over stdio drive the same session (docs/17)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-turn token cost and MCP connection logs")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -842,7 +844,18 @@ Examples:
         except Exception:
             pass
 
-    if prompt:
+    if args.rpc:
+        # Headless RPC mode（docs/17 Phase 5b）：JSON-lines over stdio 驱动同一 session,无 TUI。
+        from .rpc import run_rpc_mode
+        try:
+            asyncio.run(run_rpc_mode(agent, _lease))
+        finally:
+            try:
+                _lease.close()
+            except Exception:
+                pass
+            _finish_session()
+    elif prompt:
         # One-shot mode —— docs/15 Phase 7：headless 路径同样**仅**经 RuntimeThread.run,不绕过 runtime
         # （逃生阀已删）。
 

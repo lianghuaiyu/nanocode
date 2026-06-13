@@ -55,7 +55,8 @@ class AgentSession:
         if not a._mcp_initialized and not a.is_sub_agent:
             a._mcp_initialized = True
             try:
-                await a._mcp_manager.load_and_connect()
+                await a._mcp_manager.load_and_connect(
+                    notify=lambda text, level="info": a.emit(_events.NoticeRaised(text=text, level=level)))
                 mcp_defs = a._mcp_manager.get_tool_definitions()
                 if mcp_defs:
                     a.tools = a.tools + mcp_defs
