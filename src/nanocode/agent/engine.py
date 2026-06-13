@@ -172,6 +172,12 @@ class Agent(PlanModeMixin):
         # fire-and-forget——订阅者异常绝不影响 turn。
         self._event_subscribers: list = []
 
+        # docs/17 Phase 0：final_response / 子 agent 文本捕获从 emit 流派生（取代 BufferSink）。
+        # emit() 见 AssistantDelta.text 即 append；run_once / RuntimeThread.run 入口 reset
+        # （复刻 BufferSink.reset 的每轮语义）。每个 Agent 实例各持一份——子 agent 是独立实例，
+        # 故捕获天然隔离，无需按身份过滤。
+        self._final_text_chunks: list[str] = []
+
         # docs/16 #6（STEP E）：per-turn 上下文状态。_turn_context_plan = 本 turn 的 volatile packs
         # （date/git…，request-local 置尾、不入树）；_context_ledger = 本 turn 全量记账（/context）。
         # 都由 AgentSession.run_turn 每 turn 重置。
@@ -365,8 +371,9 @@ class Agent(PlanModeMixin):
     # ─── Sub-agent entry point ────────────────────────────────
 
     async def run_once(self, prompt: str) -> dict:
-        # 每轮入口重置捕获——复刻旧 `_output_buffer = []`，使复用的（持久/resume/headless）
-        # 子 agent 实例不把上一轮文本泄漏进本轮结果（Codex review P2）。
+        # 每轮入口重置捕获——复刻旧 `_output_buffer = []` / BufferSink.reset()，使复用的
+        # （持久/resume/headless）子 agent 实例不把上一轮文本泄漏进本轮结果（Codex review P2）。
+        self.reset_final_text()
         resetter = getattr(self._sink, "reset", None)
         if callable(resetter):
             resetter()
@@ -383,10 +390,17 @@ class Agent(PlanModeMixin):
 
     # ─── Output helper ────────────────────────────────────────
 
+    def reset_final_text(self) -> None:
+        """清空 final-text 累加器（docs/17 Phase 0）——每轮入口调用（run_once / RuntimeThread.run）。"""
+        self._final_text_chunks = []
+
+    def final_text(self) -> str:
+        """本轮累积的 assistant 文本（从 emit 的 AssistantMessageCompleted 流派生）。"""
+        return "".join(self._final_text_chunks)
+
     def _captured_text(self) -> str:
-        """子 agent 累积的助手文本：从注入的 BufferSink 取回（无 buffer 能力则空串）。"""
-        getter = getattr(self._sink, "text", None)
-        return getter() if callable(getter) else ""
+        """子 agent 累积的助手文本（docs/17 Phase 0：从 emit 流派生，不再读 BufferSink）。"""
+        return self.final_text()
 
     @staticmethod
     def _subagent_captured_text(sub_agent) -> str:
@@ -561,6 +575,12 @@ class Agent(PlanModeMixin):
         _event_subscribers（RuntimeThread push，docs/16 #4）]`。树先于 UI：required 写失败 fail-loud 时
         不画半截 UI。返回 record_event 的写入结果（ContextInjected 调用方据此推进 dedup）。"""
         written = self.agent_session.record_event(event)
+        if isinstance(event, AssistantDelta) and event.text:
+            # docs/17 Phase 0：final_response / 子 agent 文本从 emit 流派生（取代 BufferSink）。
+            # 逐字节复刻旧 BufferSink.assistant_markdown：它由 project_agent_event 喂的正是
+            # AssistantDelta.text（仅 text block,不含 thinking）。多轮 turn 累计全部 text delta,
+            # 每轮入口 reset。每个 Agent 实例各持一份,子 agent 是独立实例故捕获天然隔离。
+            self._final_text_chunks.append(event.text)
         runtime_events.project_agent_event(event, self._sink)
         for listener in list(self._event_subscribers):
             try:

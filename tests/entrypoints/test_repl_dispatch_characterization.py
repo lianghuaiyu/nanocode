@@ -58,6 +58,10 @@ class _FakeAgent:
     def set_confirm_fn(self, fn): self.calls.append(("set_confirm_fn",))
     def set_plan_approval_fn(self, fn): self.calls.append(("set_plan_approval_fn",))
 
+    # docs/17 Phase 0：RuntimeThread.run 入口 reset 累加器、收尾读 final_text。
+    def reset_final_text(self): pass
+    def final_text(self) -> str: return ""
+
     # 直接改 Agent 状态的命令
     def clear_history(self): self.calls.append(("clear_history",))
     def toggle_plan_mode(self): self.calls.append(("toggle_plan_mode",))

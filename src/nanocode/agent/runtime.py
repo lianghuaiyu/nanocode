@@ -203,6 +203,9 @@ class RuntimeThread:
             # 被 dispose 的 thread 复用同一 Agent，但 Agent 可能已 rebind 到别的 session；
             # 让 stale 句柄驱动会写错 session（codex B2）。inert 化：拒绝运行。
             raise RuntimeError("RuntimeThread is disposed; obtain the current thread from the host")
+        # docs/17 Phase 0：final_response 从 agent 的 emit 流派生（AssistantMessageCompleted），
+        # 每 turn 入口重置累加器，取代旧 BufferSink/TeeSink 捕获。
+        self.agent.reset_final_text()
         if self._capture is not None and hasattr(self._capture, "reset"):
             self._capture.reset()  # 每 turn 重置捕获，避免跨 turn 累积
         prev_in = self.agent.total_input_tokens
@@ -210,7 +213,7 @@ class RuntimeThread:
         await self.session.run_turn(prompt)
         # 取消语义：chat() 把取消吞成 _aborted 并正常返回——必须在此 await 之后读 _aborted。
         status: "Literal['completed','cancelled']" = "cancelled" if self.agent._aborted else "completed"
-        final = self._capture.text() if self._capture is not None and hasattr(self._capture, "text") else ""
+        final = self.agent.final_text()
         return TurnResult(
             session_id=self.agent.session_id,
             thread_id=self.thread_id,

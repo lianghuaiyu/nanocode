@@ -104,7 +104,8 @@ def test_core_is_headless_with_null_sink():
     a._sink.info("note")
     a._sink.spinner_start(); a._sink.spinner_stop()
     a._sink.cost(1, 2)
-    assert a._captured_text() == ""  # NullSink 无 text()
+    # docs/17 Phase 0：捕获从 emit 流派生，与 sink 解耦——NullSink 下文本照样被捕获。
+    assert a._captured_text() == "x"
 
 
 # ─── 事件经 sink 发出，而非直达 UI ──────────────────────────
@@ -152,3 +153,20 @@ def test_run_once_resets_capture_per_invocation():
     r2 = asyncio.run(sub.run_once("b"))
     assert r1["text"] == "run:a"
     assert r2["text"] == "run:b"   # 不是 "run:arun:b"——上一轮已重置
+
+
+def test_accumulator_equiv_buffer_sink_multi_block():
+    """docs/17 Phase 0：emit 流派生的 final_text 与旧 BufferSink.text() 在多 block 下逐字节等价。
+
+    BufferSink.assistant_markdown 由 project_agent_event 喂 AssistantDelta.text；新累加器也只收
+    AssistantDelta.text。thinking-only delta（text 空）两者都不收。"""
+    from nanocode.agent.events import AssistantDelta
+
+    a = _agent()
+    a.reset_final_text()
+    a._sink = BufferSink()
+    for ev in [AssistantDelta(text="foo "), AssistantDelta(thinking="（略）"),
+               AssistantDelta(text="bar"), AssistantDelta(text="")]:
+        a.emit(ev)
+    assert a.final_text() == "foo bar"
+    assert a.final_text() == a._sink.text()   # 与旧机制逐字节等价
