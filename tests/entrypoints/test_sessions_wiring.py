@@ -1,4 +1,4 @@
-"""Step 5:/sessions —— sessionmodel 纯逻辑 + _sessions 非交互文本路径。
+"""Step 5:/sessions —— session.listing 纯逻辑 + _sessions 非交互文本路径。
 
 交互 selector 需真 TTY,测纯逻辑(嵌套树/相对时间/详情/scope)与文本回退。
 """
@@ -11,13 +11,17 @@ from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _resume, _session
 from nanocode.entrypoints.commands.types import CommandContext, Local
-from nanocode.entrypoints.interactive import sessionmodel as SM
+from nanocode.session import listing as SM
+from nanocode.session import search as SS
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
+from nanocode.tui.session_pages.resume import ResumeSessionModel
 
 
 def _info(sid, parent=None, origin="root", modified=0.0, name=None, cwd="/x", n=1):
-    return SM.SessionInfo(sid=sid, name=name, first_message=f"msg of {sid}", message_count=n,
+    return SM.SessionInfo(sid=sid, path=f"/sessions/{sid}/session.jsonl", name=name,
+                          first_message=f"msg of {sid}", all_messages_text=f"msg of {sid} hi",
+                          message_count=n, created=modified - 10 if modified else 0.0,
                           modified=modified, cwd=cwd, parent_sid=parent, origin=origin,
                           leaf="L"+sid, latest_role="user", latest_text="hi")
 
@@ -58,6 +62,64 @@ def test_session_detail_lines():
     lines = SM.session_detail_lines(_info("c42d", parent="a7f3", origin="clone", n=18))
     joined = "\n".join(lines)
     assert "c42d" in joined and "origin   clone" in joined and "entries  18" in joined
+
+
+def test_search_phrase_regex_and_named_filter():
+    infos = [
+        _info("alpha", name="Build cache", modified=10),
+        _info("beta", modified=20),
+        _info("gamma", modified=30),
+    ]
+    infos[1].all_messages_text = "fix flaky tree view rendering"
+    assert [i.sid for i in SS.filter_and_sort_sessions(infos, '"tree view"', "relevance")] == ["beta"]
+    assert [i.sid for i in SS.filter_and_sort_sessions(infos, "re:build", "relevance")] == ["alpha"]
+    assert [i.sid for i in SS.filter_and_sort_sessions(infos, "", "recent", "named")] == ["alpha"]
+
+
+def test_search_invalid_regex_returns_empty():
+    assert SS.filter_and_sort_sessions([_info("alpha")], "re:[", "relevance") == []
+
+
+def test_resume_model_pi_style_ctrl_keys():
+    model = ResumeSessionModel([_info("alpha", name="A")], None, "/x", "current", 1000)
+    item = model.items()[0]
+    assert "c-s" in model.extra_keys() and "r" not in model.extra_keys()
+    model.on_key("c-s", item, 0)
+    assert model.sort_mode == "recent"
+    model.on_key("c-n", item, 0)
+    assert model.name_filter == "named"
+    model.on_key("c-p", item, 0)
+    assert model.show_path is True
+    assert model.on_key("c-r", item, 0).edit_action == "rename"
+
+
+def test_resume_delete_confirm_and_protect_current(monkeypatch):
+    infos = [_info("CUR", cwd="/x", modified=100), _info("OTH", cwd="/x", modified=50)]
+    model = ResumeSessionModel(infos, "CUR", "/x", "current", 1000)
+    by = {i.info.sid: i for i in model.items()}
+    assert "c-d" in model.extra_keys()
+    # 禁删当前 session
+    model.on_key("c-d", by["CUR"], 0)
+    assert not model.confirming() and "cannot delete" in model.status
+    # 非当前 → 进确认；confirm → 调 delete_session 并移除
+    model.on_key("c-d", by["OTH"], 0)
+    assert model.confirming()
+    calls = []
+    monkeypatch.setattr(SM, "delete_session", lambda sid: (calls.append(sid) or "session deleted"))
+    model.on_key("confirm", by["OTH"], 0)
+    assert calls == ["OTH"] and not model.confirming()
+    assert "OTH" not in [i.info.sid for i in model.items()]
+
+
+def test_resume_delete_abort_keeps_session():
+    infos = [_info("CUR", cwd="/x", modified=100), _info("OTH", cwd="/x", modified=50)]
+    model = ResumeSessionModel(infos, "CUR", "/x", "current", 1000)
+    oth = {i.info.sid: i for i in model.items()}["OTH"]
+    model.on_key("c-d", oth, 0)
+    assert model.confirming()
+    model.on_key("abort", oth, 0)
+    assert not model.confirming()
+    assert "OTH" in [i.info.sid for i in model.items()]
 
 
 def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):

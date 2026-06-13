@@ -19,20 +19,18 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Optional
-
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import ANSI, merge_formatted_text, to_formatted_text
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
     ConditionalContainer,
     Float,
     FloatContainer,
     HSplit,
     Layout,
-    VSplit,
     Window,
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -214,12 +212,12 @@ class TuiApp:
             pass
 
     # ── SelectorHost：in-app overlay 选择器 + 文本输入（docs/18 step 4）─────────────
-    # owner（session_select / tree_select）经注入的 host 调这两个 async 方法，取代旧
+    # owner（tui.session_pages.*）经注入的 host 调这两个 async 方法，取代旧
     # selector.py 独立 Application + ask_text 回调。对齐 Pi `ui.showOverlay()` 模型。
 
     async def run_selector(self, model, *, initial_index: int = 0):
         """把 SelectorModel 渲染成 app 内 overlay 区域，路由按键，返回 Outcome。无 loop → cancel。"""
-        from ..entrypoints.interactive.selector import Outcome
+        from .selector import Outcome
         loop = self._loop
         if loop is None:
             return Outcome("cancel", index=initial_index)
@@ -228,7 +226,7 @@ class TuiApp:
         self.state.selector = SelectorState(model=model, index=self._sel_clamped)
         self.state.mode = "selector"
         try:
-            self._app.layout.focus(self._sel_list_window)
+            self._app.layout.focus(self._sel_window)
         except Exception:
             pass
         self._safe_invalidate()
@@ -272,12 +270,17 @@ class TuiApp:
 
     def _sel_move(self, delta: int) -> None:
         s = self.state.selector
-        if s is None:
+        if s is None or s.model.confirming():
             return
         items = s.model.items()
         if items:
             s.index = max(0, min(s.index + delta, len(items) - 1))
         self._safe_invalidate()
+
+    def _sel_page(self) -> int:
+        _, height = self._sel_size()
+        s = self.state.selector
+        return max(1, s.model.max_visible(height)) if s is not None else 5
 
     def _sel_current(self):
         s = self.state.selector
@@ -295,19 +298,39 @@ class TuiApp:
             fut.set_result(outcome)
 
     def _sel_key(self, key: str) -> None:
-        """extra_key（r/tab/l/f）→ model.on_key → continue/refresh/done/cancel/edit。"""
-        from ..entrypoints.interactive.selector import Outcome
+        """Route a selector extra-key through the owner model (or into query text)."""
         s = self.state.selector
         if s is None:
             return
         if key not in s.model.extra_keys():
+            if len(key) == 1 and key.isprintable() and s.model.supports_query():
+                self._sel_query_input(key)
             return
-        r = s.model.on_key(key, self._sel_current(), s.index)
-        if r is None or r.kind == "continue":
+        self._apply_keyresult(s.model.on_key(key, self._sel_current(), s.index), key)
+
+    def _sel_dispatch(self, key: str) -> None:
+        """Route a key straight to the model regardless of extra_keys (confirm enter/abort)."""
+        s = self.state.selector
+        if s is not None:
+            self._apply_keyresult(s.model.on_key(key, self._sel_current(), s.index), key)
+
+    def _apply_keyresult(self, r, key: str) -> None:
+        from .selector import Outcome
+        if r is None:
+            return
+        if r.clipboard_text is not None:
+            try:
+                self._app.clipboard.set_text(r.clipboard_text)
+            except Exception:
+                pass
+        s = self.state.selector
+        if r.kind == "continue":
+            self._safe_invalidate()
             return
         if r.kind == "refresh":
-            self._clamp_selector(s.model, s.index)
-            s.index = self._sel_clamped
+            if s is not None:
+                self._clamp_selector(s.model, s.index)
+                s.index = self._sel_clamped
             self._safe_invalidate()
         elif r.kind == "done":
             self._resolve_selector(Outcome("done", item=r.result if r.result is not None else self._sel_current()))
@@ -315,6 +338,27 @@ class TuiApp:
             self._resolve_selector(Outcome("cancel"))
         elif r.kind == "edit":
             self._resolve_selector(Outcome("edit", item=self._sel_current(), edit_action=r.edit_action or key))
+
+    def _sel_query_input(self, text: str) -> None:
+        s = self.state.selector
+        if s is None or s.model.confirming() or not s.model.supports_query():
+            return
+        s.model.set_query(s.model.query() + text)
+        self._clamp_selector(s.model, s.index)
+        s.index = self._sel_clamped
+        self._safe_invalidate()
+
+    def _sel_query_backspace(self) -> None:
+        s = self.state.selector
+        if s is None or not s.model.supports_query():
+            return
+        query = s.model.query()
+        if not query:
+            return
+        s.model.set_query(query[:-1])
+        self._clamp_selector(s.model, s.index)
+        s.index = self._sel_clamped
+        self._safe_invalidate()
 
     # ── 运行态 ────────────────────────────────────────────────────────────────
     def _is_running(self) -> bool:
@@ -352,7 +396,7 @@ class TuiApp:
         if self.thread is None:
             return ANSI("")
         try:
-            from ..entrypoints.interactive.footer import FooterState, git_branch, render_footer
+            from .footer import FooterState, git_branch, render_footer
 
             st = self.thread.status()
             cwd = st["cwd"]
@@ -362,7 +406,7 @@ class TuiApp:
                 input_tokens=st.get("input_tokens", 0), output_tokens=st.get("output_tokens", 0),
                 cost_usd=st.get("cost_usd") or 0.0, context_used=st.get("input_tokens", 0),
                 context_window=st.get("context_window", 0), model=st.get("model", ""),
-                thinking=st.get("thinking"),
+                thinking=st.get("thinking"), activity=self._activity_label(),
             )
             try:
                 from prompt_toolkit.application import get_app
@@ -372,6 +416,25 @@ class TuiApp:
             return ANSI("\n".join(render_footer(fs, width)))
         except Exception:
             return ANSI("")
+
+    def _activity_label(self) -> str | None:
+        """Short live-status label for the inline footer."""
+        running_tools = [
+            str(t.name) for t in self.state.active_tools.values()
+            if getattr(t, "status", "") == "running" and getattr(t, "name", "")
+        ]
+        if running_tools:
+            names = []
+            for name in running_tools:
+                if name not in names:
+                    names.append(name)
+            shown = ", ".join(names[:2])
+            if len(names) > 2:
+                shown += f" +{len(names) - 2}"
+            return f"Running {shown}"
+        if self._is_running() or self.state.mode == "running":
+            return "Thinking..."
+        return None
 
     def _modal_fragments(self):
         m = self.state.modal
@@ -390,51 +453,47 @@ class TuiApp:
             "  3 execute, manually approve   4 keep planning"
         )
 
-    # ── 选择器 overlay 渲染（port 自旧 selector.py：list 滚动窗 + 右侧 preview）──────
-    def _sel_dims(self):
+    # ── 选择器 overlay 渲染（Pi 单列带边框面板：header/search 在上、list 在下、无 preview）──────
+    @staticmethod
+    def _as_str(x) -> str:
+        return x.value if isinstance(x, ANSI) else ("" if x is None else str(x))
+
+    def _sel_size(self):
         try:
             from prompt_toolkit.application import get_app
             sz = get_app().output.get_size()
-            width, lines = sz.columns, sz.rows
+            return sz.columns, sz.rows
         except Exception:
-            width, lines = 80, 24
-        list_w = max(20, width // 2 - 2)
-        preview_w = max(20, width - list_w - 3)
-        height = max(3, lines - 8)
-        return list_w, preview_w, height
+            return 80, 30
 
-    def _sel_title_fragments(self):
-        s = self.state.selector
-        return ANSI(s.model.title()) if s is not None else ANSI("")
-
-    def _sel_hint_fragments(self):
-        s = self.state.selector
-        return ANSI(s.model.hint()) if s is not None else ANSI("")
-
-    def _sel_list_fragments(self):
+    def _sel_panel_fragments(self):
+        """整块单列面板：accent 上下边框 + header_lines + search_line + 空行 + 滚动窗 list + (i/total)。"""
         s = self.state.selector
         if s is None:
-            return to_formatted_text("")
+            return ANSI("")
+        width, height = self._sel_size()
+        accent, dim, reset = "\x1b[36m", "\x1b[2m", "\x1b[0m"
+        lines: list[str] = [f"{accent}{'─' * width}{reset}"]
+        for hl in s.model.header_lines(width):
+            lines.append(self._as_str(hl))
+        sl = s.model.search_line(width)
+        if sl is not None:
+            lines.append(self._as_str(sl))
+        lines.append("")
         items = s.model.items()
         if not items:
-            return to_formatted_text("  (empty)")
-        list_w, _, height = self._sel_dims()
-        n = len(items)
-        idx = max(0, min(s.index, n - 1))
-        start = max(0, min(idx - height // 2, max(0, n - height)))
-        end = min(start + height, n)
-        frags: list = []
-        for i in range(start, end):
-            frags.append(to_formatted_text(s.model.list_text(items[i], i == idx, list_w)))
-            frags.append(to_formatted_text("\n"))
-        return merge_formatted_text(frags)
-
-    def _sel_preview_fragments(self):
-        item = self._sel_current()
-        if item is None:
-            return ANSI("")
-        _, preview_w, _ = self._sel_dims()
-        return ANSI("\n".join(self.state.selector.model.preview_text(item, preview_w)))
+            lines.append(f"{dim}  (no entries){reset}")
+        else:
+            n = len(items)
+            idx = max(0, min(s.index, n - 1))
+            mv = max(3, s.model.max_visible(height))
+            start = max(0, min(idx - mv // 2, max(0, n - mv)))
+            end = min(start + mv, n)
+            for i in range(start, end):
+                lines.append(self._as_str(s.model.list_text(items[i], i == idx, width)))
+            lines.append(f"{dim}  ({idx + 1}/{n}){s.model.status_suffix()}{reset}")
+        lines.append(f"{accent}{'─' * width}{reset}")
+        return ANSI("\n".join(lines))
 
     def _ask_fragments(self):
         return ANSI(self.state.text_prompt or "")
@@ -502,34 +561,78 @@ class TuiApp:
                 self._resolve_plan(_d)
 
         # ── 选择器导航/退出/extra 键（仅 has_selector 活跃）──────────────────────
+        # 搜索态下（model.supports_query()）j/k/q 是**文本**而非导航/取消——只有方向键导航、
+        # 只有 Esc 取消（对齐 Pi：搜索框里任何可打印字符都进 query）。
+        sel_nav = Condition(
+            lambda: self.state.selector is not None and not self.state.selector.model.supports_query()
+        )
+
         @kb.add("up", filter=has_selector)
-        @kb.add("k", filter=has_selector)
-        @kb.add("c-p", filter=has_selector)
         def _sel_up(event):
             self._sel_move(-1)
 
+        @kb.add("k", filter=sel_nav)
+        def _sel_up_k(event):
+            self._sel_move(-1)
+
         @kb.add("down", filter=has_selector)
-        @kb.add("j", filter=has_selector)
-        @kb.add("c-n", filter=has_selector)
         def _sel_down(event):
+            self._sel_move(1)
+
+        @kb.add("j", filter=sel_nav)
+        def _sel_down_j(event):
             self._sel_move(1)
 
         @kb.add("enter", filter=has_selector)
         def _sel_enter(event):
-            from ..entrypoints.interactive.selector import Outcome
+            from .selector import Outcome
+            s = self.state.selector
+            if s is not None and s.model.confirming():
+                self._sel_dispatch("confirm")   # destructive confirm (e.g. delete)
+                return
             if self._sel_current() is not None:
                 self._resolve_selector(Outcome("done", item=self._sel_current()))
 
-        @kb.add("q", filter=has_selector)
-        @kb.add("escape", filter=has_selector)
-        def _sel_cancel(event):
-            from ..entrypoints.interactive.selector import Outcome
+        @kb.add("q", filter=sel_nav)
+        def _sel_cancel_q(event):
+            from .selector import Outcome
             self._resolve_selector(Outcome("cancel"))
 
-        for _xk in ("r", "tab", "l", "f"):     # 已知 owner extra_keys 的超集
+        @kb.add("escape", filter=has_selector)
+        def _sel_cancel_esc(event):
+            from .selector import Outcome
+            s = self.state.selector
+            if s is not None and s.model.confirming():
+                self._sel_dispatch("abort")     # back out of confirm, stay in selector
+                return
+            self._resolve_selector(Outcome("cancel"))
+
+        @kb.add("pageup", filter=has_selector)
+        def _sel_pageup(event):
+            self._sel_move(-self._sel_page())
+
+        @kb.add("pagedown", filter=has_selector)
+        def _sel_pagedown(event):
+            self._sel_move(self._sel_page())
+
+        # owner extra_keys 中的**特殊/ctrl 键**（可打印字符走 Keys.Any → _sel_key，见下）。
+        for _xk in ("tab", "c-r", "c-s", "c-n", "c-p", "c-d", "c-t", "c-u", "c-l", "c-a",
+                    "c-o", "c-left", "c-right"):
             @kb.add(_xk, filter=has_selector)
             def _sel_extra(event, _k=_xk):
                 self._sel_key(_k)
+
+        @kb.add("backspace", filter=has_selector)
+        @kb.add("c-h", filter=has_selector)
+        def _sel_backspace(event):
+            self._sel_query_backspace()
+
+        @kb.add(Keys.Any, filter=has_selector)
+        def _sel_any(event):
+            data = event.data or ""
+            if data and data.isprintable():
+                # 经 _sel_key 统一路由：在 model.extra_keys 里 → on_key；否则 → query（如支持）。
+                self._sel_key(data)
 
         @kb.add("escape", filter=has_ask)
         def _ask_cancel(event):
@@ -546,7 +649,7 @@ class TuiApp:
                 self._resolve_plan("4")   # keep-planning（不执行）
                 return
             if self.state.selector is not None:
-                from ..entrypoints.interactive.selector import Outcome
+                from .selector import Outcome
                 self._resolve_selector(Outcome("cancel"))
                 return
             if self.state.text_prompt is not None:
@@ -570,10 +673,9 @@ class TuiApp:
             if self._cancel_count >= 2:
                 event.app.exit()
 
-        @kb.add("c-d")
+        @kb.add("c-d", filter=plain)   # 仅在基础 prompt 生效——overlay 下 c-d 归 selector（如 resume 删除）
         def _ctrl_d(event):
-            if (not self.input_buffer.text and self.state.modal is None and self.state.plan_modal is None
-                    and self.state.selector is None and self.state.text_prompt is None):
+            if not self.input_buffer.text:
                 event.app.exit()
 
         footer = Window(FormattedTextControl(self._footer_fragments), height=2, style="class:footer")
@@ -591,31 +693,24 @@ class TuiApp:
             Frame(Window(FormattedTextControl(self._plan_fragments), height=Dimension(min=4)), title="Plan Approval"),
             filter=has_plan,
         )
-        # 选择器是大区域（列表|预览），按 Pi overlay-clamped-by-maxHeight 的语义占多行；放进内容
-        # HSplit（非小 Float），打开时把 scrollback 往上顶、关闭归还。list 窗 focusable 以吞导航键。
-        self._sel_list_window = Window(FormattedTextControl(self._sel_list_fragments, focusable=True),
-                                       wrap_lines=False, width=Dimension(weight=1))
-        sel_body = VSplit([
-            self._sel_list_window,
-            Window(width=1, char="│"),
-            Window(FormattedTextControl(self._sel_preview_fragments), wrap_lines=True, width=Dimension(weight=1)),
-        ])
+        # Pi 单列带边框面板（无 preview）：整块由 _sel_panel_fragments 渲一个 ANSI；focusable 吞导航键。
+        self._sel_window = Window(FormattedTextControl(self._sel_panel_fragments, focusable=True),
+                                  wrap_lines=False)
         selector_region = ConditionalContainer(
-            HSplit([
-                Window(FormattedTextControl(self._sel_title_fragments), height=1),
-                Window(height=1, char="─"),
-                sel_body,
-                Window(height=1, char="─"),
-                Window(FormattedTextControl(self._sel_hint_fragments), height=1),
-            ], height=Dimension(min=6, weight=1)),
+            HSplit([self._sel_window], height=Dimension(min=6, weight=1)),
             filter=has_selector,
         )
         ask_line = ConditionalContainer(
             Window(FormattedTextControl(self._ask_fragments), height=1, style="class:prompt"),
             filter=has_ask,
         )
+        # selector 打开时面板独占（其 `Search:` 行即输入，位于列表上方）——隐藏 footer + 主输入框，
+        # 否则主 `>` 会落在列表/详情下方（Pi：选择器接管视图，editor 不参与选择）。
+        no_sel = ~has_selector
+        footer_c = ConditionalContainer(footer, filter=no_sel)
+        input_c = ConditionalContainer(self._input_window, filter=no_sel)
         root = FloatContainer(
-            content=HSplit([selector_region, footer, ask_line, self._input_window]),
+            content=HSplit([selector_region, footer_c, ask_line, input_c]),
             floats=[
                 Float(content=modal, top=1, left=2, right=2),
                 Float(content=plan_modal, top=1, left=2, right=2),

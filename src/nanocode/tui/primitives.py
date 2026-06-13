@@ -46,10 +46,6 @@ def print_welcome() -> None:
     console.print("[dim]/clear /plan /cost /compact /memory /skills /sandbox /tasks /agents · !cmd runs shell · /<skill>[/dim]")
 
 
-def print_user_prompt() -> None:
-    console.print("\n[bold green]>[/bold green] ", end="")
-
-
 def render_assistant_markdown(text: str) -> None:
     # skip blank; render cyan ⏺ gutter in col 1 aligned with markdown body in col 2
     if not text.strip():
@@ -113,10 +109,6 @@ def print_confirmation(command) -> None:
     console.print(f"[yellow]⚠ Dangerous command:[/yellow] {escape(command)}")
 
 
-def print_divider() -> None:
-    return  # no-op; turn separation now comes from prompt spacing
-
-
 def print_retry(attempt, max_retries, reason) -> None:
     console.print(f"[yellow]↻ retry {attempt}/{max_retries}: {escape(str(reason))}[/yellow]")
 
@@ -169,22 +161,6 @@ def stop_spinner() -> None:
     _spinner_thread = None
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
-
-
-# ─── Plan approval display ──────────────────────────────────
-
-
-def print_plan_for_approval(plan_content) -> None:
-    console.print(f"\n[cyan]{BULLET} Plan for approval[/cyan]")
-    console.print(Markdown(plan_content))
-
-
-def print_plan_approval_options() -> None:
-    console.print("[yellow]Choose an option:[/yellow]")
-    console.print("  [white]1[/white][dim] — clear context and execute (auto-accept edits)[/dim]")
-    console.print("  [white]2[/white][dim] — execute, keep context (auto-accept edits)[/dim]")
-    console.print("  [white]3[/white][dim] — execute, manually approve each edit[/dim]")
-    console.print("  [white]4[/white][dim] — keep planning (give feedback)[/dim]")
 
 
 # ─── Sub-agent display ──────────────────────────────────────

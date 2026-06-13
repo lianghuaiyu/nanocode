@@ -43,26 +43,26 @@ def _seed(a, sid):
     return mgr
 
 
-def test_checkout_moves_leaf_and_reloads_context(capsys):
+def test_checkout_moves_leaf_and_reloads_context():
     a = _agent("co1")
     mgr = _seed(a, "co1")
     u1 = mgr.append_message(T.user_message("first"))
     mgr.append_message(T.assistant_message([T.text_block("r1")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
     mgr.append_message(T.user_message("second"))
-    asyncio.run(_checkout(_ctx(a), u1.id[-8:]))   # uuidv7 尾部唯一 handle
-    out = capsys.readouterr().out
+    res = asyncio.run(_checkout(_ctx(a), u1.id[-8:]))   # uuidv7 尾部唯一 handle
+    out = res.output or ""
     assert "Checked out" in out
     assert mgr.get_leaf() == u1.id
     live = str(a.agent_session.build_request_messages())
     assert "first" in live and "second" not in live   # 上下文回到 first 之处
 
 
-def test_checkout_bad_id_fails_closed(capsys):
+def test_checkout_bad_id_fails_closed():
     a = _agent("co2")
     _seed(a, "co2").append_message(T.user_message("x"))
-    asyncio.run(_checkout(_ctx(a), "ent_nonexistent"))
-    assert "not found" in capsys.readouterr().out
+    res = asyncio.run(_checkout(_ctx(a), "ent_nonexistent"))
+    assert "not found" in (res.output or "")
 
 
 # /fork handler 的 Control payload / prefill / 源不动 钉点在 tests/entrypoints/test_commands_pi.py

@@ -15,10 +15,10 @@ class _FakeCtx:
     thread = _FakeThread()
 
 
-def test_context_command_returns_local_and_renders(capsys):
+def test_context_command_returns_local_and_renders():
     res = asyncio.run(_context(_FakeCtx(), ""))
     assert isinstance(res, Local)
-    out = capsys.readouterr().out
+    out = res.output or ""
     # ledger summary header（token 计 + budget）出现
     assert "Context ledger" in out
     assert "tokens" in out

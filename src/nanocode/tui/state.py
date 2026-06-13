@@ -152,7 +152,7 @@ class PlanModal:
 class SelectorState:
     """in-app 选择器 overlay 状态（docs/18：/resume /tree /fork 从独立 Application 改成 app 内区域）。
 
-    model 是 owner 的 SelectorModel（entrypoints/interactive/selector.py 协议）；index 为光标位。
+    model 是 owner 的 SelectorModel（tui/selector.py 协议）；index 为光标位。
     渲染（标题/列表/预览/提示）与按键路由在 TuiApp，结果经 future 回 owner。"""
 
     model: Any

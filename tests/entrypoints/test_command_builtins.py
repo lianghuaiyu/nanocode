@@ -16,11 +16,11 @@ def _ctx():
     return CommandContext(thread=None, registry=build_registry())
 
 
-def test_help_lists_commands_and_escapes(capsys):
-    """/help 输出含若干 registry 命令 + skill/shell 两条（命令行经 bare print，capsys 可捕获）。"""
+def test_help_lists_commands_and_escapes():
+    """/help 输出含若干 registry 命令 + skill/shell 两条，且不直接写 stdout。"""
     res = asyncio.run(_help(_ctx(), ""))
     assert isinstance(res, Local)
-    out = capsys.readouterr().out
+    out = res.output or ""
     assert "/clear" in out
     assert "/help" in out
     assert "/<skill-name>" in out

@@ -139,10 +139,6 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     monkeypatch.setattr(_builtin, "handle_eval_command",
                         lambda rest: (calls.append(("handle_eval_command", rest)) or "stub"))
     monkeypatch.setattr("nanocode.tools.sandbox_defaults", _FakeSandbox(calls))
-    # builtin handler 经 ...ui 打印；静默以免污染输出（断言只看 calls 录制）。
-    monkeypatch.setattr(_builtin, "print_info", lambda *a, **k: None)
-    monkeypatch.setattr(_builtin, "print_error", lambda *a, **k: None)
-
     async def _fake_shell(cmd):
         calls.append(("shell", cmd))
         return "shellout"

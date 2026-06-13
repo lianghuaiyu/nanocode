@@ -31,12 +31,12 @@ def _ctx(a):
 
 
 # ─── /name ─────────────────────────────────────────────────────────────────
-def test_name_set_show_clear(capsys):
+def test_name_set_show_clear():
     a, rt, t, host = _host("NAMESID")
     asyncio.run(_name(_ctx(a), "my session"))
     assert a._session_mgr.name() == "my session"
-    asyncio.run(_name(_ctx(a), ""))                      # 无参显示
-    assert "my session" in capsys.readouterr().out
+    res = asyncio.run(_name(_ctx(a), ""))                 # 无参显示
+    assert isinstance(res, Local) and "my session" in (res.output or "")
     asyncio.run(_name(_ctx(a), "--clear"))               # tombstone
     assert a._session_mgr.name() is None
 
@@ -160,7 +160,7 @@ def test_tree_entry_navigates_moves_leaf(capsys):
     assert "first" in str(a.agent_session.build_request_messages()) and "second" not in str(a.agent_session.build_request_messages())
 
 
-def test_fork_invalid_target_lists_user_message_candidates(capsys):
+def test_fork_invalid_target_lists_user_message_candidates():
     # pi 双层收窄的 UX 层：选错目标时打印 user 消息候选（getUserMessagesForForking 的文本等价）。
     a, rt, t, host = _host("FORKCAND")
     mgr = a._session_mgr
@@ -170,7 +170,7 @@ def test_fork_invalid_target_lists_user_message_candidates(capsys):
     mgr.append_message(T.user_message("pick me two"))
     res = asyncio.run(_fork(_ctx(a), a1.id[-8:]))             # 选了 assistant entry
     assert isinstance(res, Local)
-    out = capsys.readouterr().out
+    out = res.output or ""
     assert "must be a user message" in out
     assert "pick me one" in out and "pick me two" in out      # 候选清单（近期在前）
     assert "nope" not in out                                  # 非 user 不进候选

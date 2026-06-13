@@ -112,6 +112,16 @@ def test_rebind_unsubscribes_old_thread():
     assert len(t2._listeners) == 1
 
 
+def test_footer_activity_label_shows_thinking_then_running_tool():
+    app = TuiApp(output=DummyOutput())
+    app.bind_thread(FakeThread())
+    assert app._activity_label() is None
+    app.state.mode = "running"
+    assert app._activity_label() == "Thinking..."
+    app.state.active_tools["tu1"] = ToolItem(id="tu1", name="read_file")
+    assert app._activity_label() == "Running read_file"
+
+
 # ─── 提交一轮（pipe 驱动 run_async）───────────────────────────────────────────
 
 
@@ -212,4 +222,3 @@ def test_render_event_invoked_for_each_event():
             return recalled
 
     assert asyncio.run(scenario()) == "/cost"
-

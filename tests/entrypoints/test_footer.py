@@ -1,8 +1,8 @@
-"""footer 纯函数单测（entrypoints/interactive/footer.py）——不碰终端、不 fork git。"""
+"""footer 纯函数单测（tui/footer.py）——不碰终端、不 fork git。"""
 
 from __future__ import annotations
 
-from nanocode.entrypoints.interactive.footer import (
+from nanocode.tui.footer import (
     FooterState,
     format_cwd,
     format_tokens,
@@ -72,3 +72,8 @@ def test_render_footer_right_aligns_model_within_width():
     assert len(line2) <= 80 or line2.endswith("gpt-5-codex • adaptive")
     # model 贴右
     assert line2.rstrip().endswith("gpt-5-codex • adaptive")
+
+
+def test_render_footer_activity_restores_live_feedback():
+    _, line2 = render_footer(_state(activity="Running read_file"))
+    assert line2.rstrip().endswith("gpt-5-codex • adaptive • Running read_file")

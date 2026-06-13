@@ -25,22 +25,13 @@ from .trajectory_cmd import run as _run_trajectory_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
-from .commands.types import CommandContext, Local, Prompt, Control
+from .commands.types import Local, Prompt, Control
 from .commands.runner import dispatch, NOT_A_COMMAND
 from .host import RuntimeHost
 from .commands.builtin import build_registry
 
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
-
-
-def _sigint_decision(is_processing: bool, sigint_count: int) -> tuple[str, int]:
-    """SIGINT 决策（纯函数,可测）。turn 进行中 → ('abort', 0)（打断当前轮,不计退出）;
-    空闲 → 计数,达 2 → ('exit', n);否则 ('warn', n)（提示再按一次退出）。"""
-    if is_processing:
-        return "abort", 0
-    sigint_count += 1
-    return ("exit" if sigint_count >= 2 else "warn"), sigint_count
 
 
 # 内置斜杠命令的单一来源：从命令 registry 派生（取代旧的手维护列表，消除与 dispatch 的漂移）。
