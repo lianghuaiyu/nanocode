@@ -166,7 +166,6 @@ async def select_relevant_memories(
     except Exception as e:
         if "cancel" in str(e).lower():
             return []
-        print(f"[memory] semantic recall failed: {e}")
         return []
 
 
@@ -186,8 +185,7 @@ async def _simplemem_prefetch(query, backend, already_surfaced):
     """SimpleMem 检索丢线程池（同步 retrieve 不阻塞事件循环），过滤 already_surfaced。"""
     try:
         hits = await asyncio.to_thread(backend.retrieve, query, limit=5)
-    except Exception as e:
-        print(f"[memory] simplemem prefetch failed: {e}")
+    except Exception:
         return []
     return [h for h in (hits or []) if h.path not in already_surfaced]
 

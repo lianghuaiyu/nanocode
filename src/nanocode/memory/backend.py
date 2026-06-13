@@ -201,8 +201,7 @@ class SimpleMemBackend(MemoryBackend):
         try:
             with self._silence():
                 entries = self._system.hybrid_retriever.retrieve(query)
-        except Exception as e:
-            print(f"[memory] simplemem retrieve failed: {e}", flush=True)
+        except Exception:
             return []
         return [self._entry_to_relevant(e) for e in (entries or [])[:limit]]
 
