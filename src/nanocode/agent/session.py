@@ -191,14 +191,16 @@ class AgentSession:
         from ..context.providers import EnvProvider, GitSnapshotProvider, RepoMapProvider
         from ..tools.permissions import load_context_config
         budget = BudgetPolicy.for_window(a.effective_window)
+        cfg = load_context_config()
         req = ContextRequest(cwd=os.getcwd(), is_sub_agent=False,
                              include_env=True, include_git=True,
-                             include_repo_map=load_context_config()["repo_map"],
+                             include_repo_map=cfg["repo_map"],
                              user_prompt=prompt,
                              files_read=sorted(a._files_read),
                              files_modified=sorted(a._files_modified),
                              repo_map_budget_tokens=budget.repo_map_tokens,
                              context_window_tokens=a.effective_window,
+                             repo_map_refresh=cfg["repo_map_refresh"],
                              include_project_instructions=False, include_memory=False,
                              include_skills=False, include_agents=False,
                              include_deferred_tools=False)

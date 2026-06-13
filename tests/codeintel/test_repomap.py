@@ -105,9 +105,10 @@ def test_no_files_budget_x8_capped_by_context_window(tmp_path, monkeypatch):
     seen = {}
     from nanocode.codeintel.service import CodeIntelService
     orig = CodeIntelService.repo_map
-    def spying(self, query=None, *, budget_tokens=1024):
+    def spying(self, query=None, *, budget_tokens=1024, refresh=None, force_refresh=False):
         seen["budget"] = budget_tokens
-        return orig(self, query, budget_tokens=budget_tokens)
+        return orig(self, query, budget_tokens=budget_tokens, refresh=refresh,
+                    force_refresh=force_refresh)
     monkeypatch.setattr(CodeIntelService, "repo_map", spying)
     # 无 personal 文件 + 知道窗口 → ×8（aider map_mul_no_files）
     asyncio.run(RepoMapProvider().collect(ContextRequest(

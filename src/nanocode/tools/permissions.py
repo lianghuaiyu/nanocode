@@ -67,10 +67,14 @@ _cached_agents_config: dict | None = None
 # ─── Context engineering config (.nanocode/settings.json "context" section) ──
 # repo_map：是否在每 turn 的 volatile tail 注入 Aider-style repo map（默认开；
 # 陌生/超大仓库可设 false 逃生）。
+# repo_map_refresh：repo map 结果缓存档（aider 同名）——auto（默认,贵才缓存）/
+# files（文件集不变即缓存）/always（每次重算）/manual（首算后固定）。
 CONTEXT_CONFIG_DEFAULTS: dict = {
     "repo_map": True,
+    "repo_map_refresh": "auto",
 }
 
+_REPO_MAP_REFRESH_MODES = frozenset({"auto", "files", "always", "manual"})
 _cached_context_config: dict | None = None
 
 
@@ -88,7 +92,11 @@ def load_context_config() -> dict:
         for key in CONTEXT_CONFIG_DEFAULTS:
             if key in section:
                 merged[key] = section[key]
-    cfg = {"repo_map": bool(merged.get("repo_map", True))}
+    refresh = merged.get("repo_map_refresh", "auto")
+    cfg = {
+        "repo_map": bool(merged.get("repo_map", True)),
+        "repo_map_refresh": refresh if refresh in _REPO_MAP_REFRESH_MODES else "auto",
+    }
     _cached_context_config = cfg
     return cfg
 

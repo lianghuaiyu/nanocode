@@ -141,9 +141,18 @@ class RepoIndex:
         self._tree_context_cache: dict = {}             # rel → (mtime, PyTreeContext | None)
         self._all_files: list[str] = []                 # 发现的全量 rel（含非源码,裸文件尾巴用）
         self.truncated = False                          # 语言文件超 max_files,索引被截断
+        self._tags_cache = None                         # diskcache 持久层（lazy；冷启动免重解析）
+
+    @property
+    def tags_cache(self):
+        from .cache import TagsCache
+        if self._tags_cache is None:
+            self._tags_cache = TagsCache(str(self.root))
+        return self._tags_cache
 
     def update(self, files) -> None:
-        """索引给定文件（rel 或 abs path 皆可）。mtime 未变则跳过（cache）。"""
+        """索引给定文件（rel 或 abs path 皆可）。进程内 mtime 未变则跳过；跨进程 tags 走
+        diskcache（abs_path+mtime 命中 → 免重 extract_symbols,aider get_tags 语义）。"""
         for f in files:
             p = Path(f)
             ap = p if p.is_absolute() else (self.root / p)
@@ -154,12 +163,22 @@ class RepoIndex:
                 mt = ap.stat().st_mtime
                 rel = self._rel(ap)
                 if self._mtime.get(rel) == mt:
-                    continue
+                    continue                            # 进程内已是最新
+            except Exception:
+                continue
+            cached = self.tags_cache.get(str(ap), mt)   # 磁盘命中 → 跳过解析（冷启动加速）
+            if cached is not None:
+                self._tags[rel] = cached
+                self._mtime[rel] = mt
+                continue
+            try:
                 text = ap.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
-            self._tags[rel] = extract_symbols(rel, str(ap), text)
+            tags = extract_symbols(rel, str(ap), text)
+            self._tags[rel] = tags
             self._mtime[rel] = mt
+            self.tags_cache.set(str(ap), mt, tags)
 
     def scan_repo(self, *, max_files: int = 2000) -> None:
         """发现 + 有界索引。git 仓库（root 即 toplevel）走 `git ls-files`——吃 .gitignore、

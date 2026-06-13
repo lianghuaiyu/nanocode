@@ -46,6 +46,7 @@ class ContextRequest:
     mentioned_identifiers: list[str] = field(default_factory=list)
     repo_map_budget_tokens: int = 1024
     context_window_tokens: int = 0         # 模型上下文窗（repo map ×8 放大的封顶基准）
+    repo_map_refresh: str = "auto"         # aider refresh 档（map 结果缓存策略）
 
 
 @runtime_checkable
@@ -191,7 +192,7 @@ class RepoMapProvider:
                          request.context_window_tokens - self.CONTEXT_WINDOW_PADDING)
             if target > 0:
                 budget = target
-        result = svc.repo_map(query, budget_tokens=budget)
+        result = svc.repo_map(query, budget_tokens=budget, refresh=request.repo_map_refresh)
         if not result.text:
             return None
         prov = {"source": "RepoMapProvider", "files": result.files}
