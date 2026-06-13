@@ -44,13 +44,25 @@ def _emit_line(obj: dict) -> None:
 async def run_rpc_mode(agent, lease=None) -> None:
     """在 agent 上跑 RPC 事件循环（stdin 命令 ↔ stdout 事件流）。"""
     loop = asyncio.get_event_loop()
-    pending_approval: dict = {"fut": None}
+    # 待审批 future（按 request_id 关联）。审批在 agent 循环内**串行**（turn 挂起等 confirm_fn），
+    # 同一时刻至多一个待审批；用 dict 仍便于按 id 精确应答 + FIFO 兜底。
+    pending: "dict[str, asyncio.Future]" = {}
+    approval_seq = [0]
 
     async def confirm_fn(message: str) -> bool:
-        # turn 在此自然挂起；stdin 的 approval_response 解决 future（FIFO，串行审批）。
+        # codex P1：confirm_fn **自带**审批请求往返——不依赖 ApprovalRequested 事件经订阅流到达
+        # 客户端。这点对前台子 agent 至关重要：子 agent 是独立 Agent，其事件发往子的 _event_subscribers
+        # （不连父 RuntimeThread 流），但它**继承父 confirm_fn**，故经此处自带的 approval_request 行
+        # 仍能让客户端看到并应答（否则危险子 agent 动作会让 turn 永久挂起）。
+        approval_seq[0] += 1
+        rid = f"appr-{approval_seq[0]}"
         fut = loop.create_future()
-        pending_approval["fut"] = fut
-        return await fut
+        pending[rid] = fut
+        _emit_line({"type": "approval_request", "request_id": rid, "message": message})
+        try:
+            return await fut
+        finally:
+            pending.pop(rid, None)
 
     rt = AgentRuntime()
     thread = rt.adopt(agent, approvals=ApprovalManager(confirm_fn=confirm_fn), lease=lease)
@@ -58,11 +70,19 @@ async def run_rpc_mode(agent, lease=None) -> None:
     thread.subscribe(lambda env: _emit_line({**env, "event": _serialize_event(env["event"])}))
 
     async def _run_turn(text: str) -> None:
-        res = await thread.run(text)
-        _emit_line({"type": "turn_result", "status": res.status,
-                    "final_response": res.final_response,
-                    "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
-                    "error": res.error})
+        # codex P2：detached task——必须自己兜住异常并 emit 结构化结果，否则 thread.run() 抛错时
+        # 任务静默死亡、客户端永远等不到协议承诺的 turn_result。
+        try:
+            res = await thread.run(text)
+            _emit_line({"type": "turn_result", "status": res.status,
+                        "final_response": res.final_response,
+                        "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
+                        "error": res.error})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _emit_line({"type": "turn_result", "status": "error", "final_response": "",
+                        "input_tokens": 0, "output_tokens": 0, "error": str(e)})
 
     turn_task: "asyncio.Task | None" = None
     while True:
@@ -81,15 +101,21 @@ async def run_rpc_mode(agent, lease=None) -> None:
 
         kind = cmd.get("cmd")
         if kind == "prompt":
-            # 不 await——turn 作为独立 task 跑,stdin 继续读（以便接收 approval_response / cancel）。
-            turn_task = asyncio.create_task(_run_turn(cmd.get("text", "")))
+            # codex P1：turn 串行——已有 turn 在跑时拒绝新 prompt（否则两 turn 共享同一 Agent 的
+            # _current_task / token 计数 / _final_text_chunks / pending 审批，必然串台/丢状态）。
+            if turn_task is not None and not turn_task.done():
+                _emit_line({"type": "error", "message": "a turn is already running; wait for turn_result"})
+            else:
+                turn_task = asyncio.create_task(_run_turn(cmd.get("text", "")))
         elif kind == "cancel":
             thread.cancel()
         elif kind == "get_state":
             # Pi get_state 对位：完整会话快照（status + messages）。
             _emit_line({"type": "state", "state": thread.state()})
         elif kind == "approval_response":
-            fut = pending_approval["fut"]
+            # 按 request_id 精确应答；缺 id 则 FIFO 解决最早一个待审批（串行下唯一）。
+            rid = cmd.get("request_id")
+            fut = pending.get(rid) if rid is not None else next(iter(pending.values()), None)
             if fut is not None and not fut.done():
                 fut.set_result(bool(cmd.get("approved", False)))
         elif kind == "exit":

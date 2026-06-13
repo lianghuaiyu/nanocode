@@ -117,17 +117,57 @@ def test_rpc_approval_round_trip(monkeypatch):
     a._authorize_dispatch = fake_authorize
 
     msgs = _run(a, [('{"cmd": "prompt", "text": "go"}', None),
-                    ('{"cmd": "approval_response", "approved": true}', "approval_requested"),
+                    ('{"cmd": "approval_response", "approved": true}', "approval_request"),
                     ('{"cmd": "exit"}', "turn_result")], monkeypatch)
 
     kinds = [m.get("type") for m in msgs]
-    assert "approval_requested" in kinds                    # 审批显示事件出 stdout
-    appr = next(m for m in msgs if m["type"] == "approval_requested")
-    assert appr["event"]["request_id"]                      # 携带关联 id
+    # codex P1 fix：审批的**可应答**通道是 confirm_fn 自带的 approval_request（带 request_id），
+    # 不依赖 ApprovalRequested 事件经订阅流到达（对子 agent 至关重要）。
+    req = next(m for m in msgs if m.get("type") == "approval_request")
+    assert req["request_id"] and "rm -rf" in req["message"]
     # 批准后工具继续执行 → 有工具结果观测，turn 正常收尾
     assert "tool_result_observed" in kinds
     tr = next(m for m in msgs if m["type"] == "turn_result")
     assert tr["status"] == "completed"
+
+
+def test_rpc_rejects_overlapping_prompt(monkeypatch):
+    """codex P1 fix：turn 运行中（这里卡在等审批）再发 prompt → 被拒，不开第二个并发 turn。"""
+    calls = {"n": 0}
+
+    async def stream(*, model, system, tools, messages, thinking_mode, callbacks):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeResp([_FakeBlock("tool_use", id="t1", name="list_files", input={"path": "."})])
+        return _FakeResp([_FakeBlock("text", text="done")])
+
+    a = _agent("rpcovl", stream)
+
+    async def fake_authorize(name, inp):
+        ok = await a._confirm_dangerous("rm -rf /tmp/x")
+        return (ok, None if ok else "Action denied")
+    a._authorize_dispatch = fake_authorize
+
+    msgs = _run(a, [('{"cmd": "prompt", "text": "one"}', None),
+                    ('{"cmd": "prompt", "text": "two"}', "approval_request"),   # 首 turn 等审批时插第二个
+                    ('{"cmd": "approval_response", "approved": true}', "already running"),
+                    ('{"cmd": "exit"}', "turn_result")], monkeypatch)
+
+    errs = [m for m in msgs if m.get("type") == "error" and "already running" in m.get("message", "")]
+    assert errs                                              # 第二个 prompt 被拒
+    assert len([m for m in msgs if m.get("type") == "turn_result"]) == 1   # 只有一个 turn 跑过
+
+
+def test_rpc_detached_turn_error_emits_result(monkeypatch):
+    """codex P2 fix：detached turn 抛错也要 emit 结构化 turn_result(status=error)，客户端不空等。"""
+    async def stream(*, model, system, tools, messages, thinking_mode, callbacks):
+        raise ValueError("provider boom")
+
+    a = _agent("rpcerr", stream)
+    msgs = _run(a, [('{"cmd": "prompt", "text": "go"}', None),
+                    ('{"cmd": "exit"}', "turn_result")], monkeypatch)
+    tr = next(m for m in msgs if m.get("type") == "turn_result")
+    assert tr["status"] == "error" and "boom" in (tr.get("error") or "")
 
 
 def test_rpc_get_state_returns_snapshot(monkeypatch):
