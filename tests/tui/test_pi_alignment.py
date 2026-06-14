@@ -252,7 +252,7 @@ def test_code_block_lines_do_not_fold():
     md = "```python\nif tc.arguments:\n    acc[i] += tc.arguments  # 拼参数\n```"
     con.print(app._render_message_block(AssistantItem(text=md, complete=True)))
     lines = [l.strip() for l in _plain(con.file.getvalue()).split("\n") if l.strip()]
-    assert any("```python" in l for l in lines)
+    assert not any("```" in l for l in lines)            # 不渲染字面 ``` 围栏
     assert any(l == "if tc.arguments:" for l in lines)
     # 含 CJK 注释的整行不被折断:代码与 '# 拼参数' 同处一行
     assert any("acc[i] += tc.arguments" in l and "# 拼参数" in l for l in lines)

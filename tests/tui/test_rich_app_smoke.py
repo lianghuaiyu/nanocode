@@ -296,7 +296,7 @@ def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
     assert "- item" in plain          # marker 与文本分别着色 → 用去色文本断言
     assert "A │ B" in out
     assert "x │ y" in out
-    assert "```python" in out
+    assert "```" not in plain          # fenced code 围栏不外漏(只渲染高亮代码)
     assert "def foo():" in plain
     assert "return 1" in plain
     assert "─" * 80 not in out

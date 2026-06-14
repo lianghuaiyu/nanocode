@@ -265,13 +265,12 @@ def _pi_markdown(text: str, width: int) -> Group:
                                     word_wrap=False, padding=(0, 1))
                 except Exception:
                     syntax = None
-            lines.append(Text(f"```{info}", style="muted"))
+            _append_blank(lines)                  # 与上文留空分隔(不渲染字面 ``` 围栏)
             if syntax is not None:
                 lines.append(syntax)
             else:
                 for code_line in code.split("\n"):
                     lines.append(Text(" " + code_line, style="md_code_block"))
-            lines.append(Text("```", style="muted"))
             _append_blank(lines)
         elif typ == "code_block":
             for code_line in token.content.rstrip("\n").split("\n"):
