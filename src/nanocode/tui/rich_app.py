@@ -18,8 +18,10 @@ import sys
 
 from rich.console import Group
 from rich.panel import Panel
+from rich.padding import Padding
 from rich.spinner import Spinner
 from rich.text import Text
+from rich import box as _box
 
 from .. import tui as _tui
 from .line_editor import KeyParser, LineEditor, PasteToken, raw_mode, restore
@@ -330,6 +332,7 @@ class RichApp:
             if text.strip():
                 self._editor.add_history(text)
                 self._save_history(text)
+                self._echo_user(text)        # 把用户消息印进 scrollback（开口 You 框），不再消失
             self._submit(text)
         elif action == "cancel":              # Ctrl-C
             if self._is_running():
@@ -483,15 +486,73 @@ class RichApp:
             parts.append(Text(st.text_prompt, style="dim"))
             parts.append(self._editor.render(self._term_w(), prompt=""))
             return Group(*parts)
-        # normal: 流式助手（未完成项）+ thinking spinner + footer + 输入行
+        # normal: 流式助手(⏺) + thinking spinner + 开口输入框 + footer（col2 左轨）
         streaming = self._open_assistant_text()
         if streaming:
-            parts.append(Text.from_ansi(_ACCENT + "⏺ " + _RESET) + Text(streaming))
-        if st.mode == "running":
+            parts.append(Text.assemble(("⏺ ", "cyan")) + Text(streaming))
+        if st.mode == "running" and not streaming:
             parts.append(self._spinner)
-        parts.extend(self._footer_lines())
-        parts.append(self._editor.render(self._term_w()))
+        parts.append(Text(""))               # 输入框前空一行（Codex 组间留空）
+        parts.append(self._input_frame())
+        foot = self._status_line()
+        if foot is not None:
+            parts.append(Padding(foot, (0, 0, 0, 2)))   # FOOTER_INDENT_COLS=2
         return Group(*parts)
+
+    # ── 开口框（HORIZONTALS：上下横线、左右开口；V1 设计）──────────────────────
+    @staticmethod
+    def _open_frame(body, *, title=None, subtitle=None, border="cyan"):
+        return Panel(body, box=_box.HORIZONTALS, border_style=border, padding=0,
+                     title=title, subtitle=subtitle, title_align="left", subtitle_align="right")
+
+    def _input_frame(self):
+        """底部输入开口框：标题 nanocode，副标题 model · ctx%，正文 `> ` gutter（文本落 col2）。"""
+        body = self._editor.render(self._term_w())   # "> text" + 光标块
+        sub = None
+        if self.thread is not None:
+            try:
+                s = self.thread.status()
+                model = s.get("model", "")
+                win = s.get("context_window", 0) or 0
+                used = s.get("input_tokens", 0) or 0
+                pct = f"{used / win * 100:.0f}%" if win else ""
+                sub = "[dim]" + " · ".join(x for x in (model, pct) if x) + "[/dim]"
+            except Exception:
+                sub = None
+        return self._open_frame(body, title="[cyan]nanocode[/]", subtitle=sub, border="cyan")
+
+    def _status_line(self):
+        """footer 单行（col2）：cwd (branch) · ↑in ↓out · $cost。model/ctx% 在输入框副标题。"""
+        if self.thread is None:
+            return None
+        try:
+            from .footer import format_tokens, format_cwd, git_branch
+            s = self.thread.status()
+            cwd = s.get("cwd", "")
+            pwd = format_cwd(cwd, os.path.expanduser("~"))
+            br = git_branch(cwd)
+            if br:
+                pwd = f"{pwd}  ({br})"
+            parts = [pwd]
+            it, ot = s.get("input_tokens", 0), s.get("output_tokens", 0)
+            if it or ot:
+                parts.append(f"↑{format_tokens(it)} ↓{format_tokens(ot)}")
+            cost = s.get("cost_usd")
+            if cost:
+                parts.append(f"${cost:.3f}")
+            return Text("  ·  ".join(parts), style="dim")
+        except Exception:
+            return None
+
+    def _echo_user(self, text: str) -> None:
+        """把用户消息印到 scrollback：开口 You 框（与 V1 mockup 一致）。"""
+        try:
+            frame = self._open_frame(Padding(Text(text.strip()), (0, 0, 0, 1)),
+                                     title="[grey62]You[/]", border="grey42")
+            self._console.print(frame)
+            self._console.print("")          # 组后空一行
+        except Exception:
+            pass
 
     def _open_assistant_text(self) -> str:
         for it in reversed(self.state.timeline):
@@ -500,22 +561,6 @@ class RichApp:
                     return it.text if isinstance(it, AssistantItem) else ""
                 return ""
         return ""
-
-    def _footer_lines(self) -> list:
-        if self.thread is None:
-            return []
-        try:
-            from .footer import FooterState, git_branch, render_footer
-            s = self.thread.status()
-            cwd = s["cwd"]
-            fs = FooterState(cwd=cwd, home=os.path.expanduser("~"), branch=git_branch(cwd),
-                             session_name=s.get("session_name"), input_tokens=s.get("input_tokens", 0),
-                             output_tokens=s.get("output_tokens", 0), cost_usd=s.get("cost_usd") or 0.0,
-                             context_used=s.get("input_tokens", 0), context_window=s.get("context_window", 0),
-                             model=s.get("model", ""), thinking=s.get("thinking"))
-            return [Text.from_ansi(line) for line in render_footer(fs, self._term_w())]
-        except Exception:
-            return []
 
     def _render_selector(self):
         s = self.state.selector
