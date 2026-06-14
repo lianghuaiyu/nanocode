@@ -218,7 +218,19 @@ def _pi_markdown(text: str, width: int) -> Group:
                     if current_list_prefix:
                         # 仅给 marker 上色;item 文本保持自身样式(prefix 作为 span 而非整行 base style)
                         line = Text()
-                        line.append(current_list_prefix, style="md_list_bullet")
+                        prefix = current_list_prefix
+                        plain = rendered.plain
+                        if prefix.endswith("• ") and plain[:4] in ("[ ] ", "[x] ", "[X] "):
+                            checked = plain[1] in "xX"      # 任务清单:勾选框替代字面 [ ]/[x]
+                            line.append(prefix[:-2], style="md_list_bullet")
+                            line.append("☑ " if checked else "☐ ",
+                                        style="success" if checked else "muted")
+                            try:
+                                rendered = rendered[4:]
+                            except Exception:
+                                rendered = Text(plain[4:])
+                        else:
+                            line.append(prefix, style="md_list_bullet")
                         line.append_text(rendered)
                         rendered = line
                     if quote_depth:

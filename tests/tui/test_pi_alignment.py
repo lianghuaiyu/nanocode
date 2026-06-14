@@ -268,6 +268,14 @@ def test_code_block_is_dedicated_themed_box():
     assert "python" in _plain(out)               # 语言标签(无 ``` 围栏)
     assert "```" not in _plain(out)
 
+
+def test_task_list_renders_checkboxes_not_literal_brackets():
+    """任务清单渲染勾选框 ☐/☑,不外漏字面 [ ]/[x]。"""
+    app = RichApp(output=_console())
+    out = _plain(_render(app, app._markdown("- [ ] todo\n- [x] done")))
+    assert "☐" in out and "☑" in out
+    assert "[ ]" not in out and "[x]" not in out
+
     import types
     from nanocode.tui.session_pages.fork import ForkModel
     e = types.SimpleNamespace(type="message", id="x", sessionId="abcdef1234",
