@@ -54,11 +54,12 @@ src/nanocode/
 │   ├── providers.py        # ProviderAdapter：Anthropic/OpenAI 流式 + capture 归一
 │   ├── state.py            # AgentState/ProviderProjection：build_context() 的可丢弃投影
 │   ├── events.py           # typed AgentEvent union
-│   ├── session.py          # AgentSession：state ↔ canonical 树同步边界
-│   ├── runtime.py          # AgentRuntime / RuntimeThread（含 events() 订阅）
+│   ├── session.py          # AgentSession 兼容 re-export（实现已迁至 session/agent.py）
+│   ├── runtime.py          # runtime facade 兼容 re-export（实现已迁至 runtime/facade.py）
 │   ├── engine.py           # Agent：bootstrap + collaborators 宿主（职责持续迁出、收缩中）
 │   └── compaction.py / plan_mode.py / models.py / subagent_manager.py
 ├── session/                # canonical session.jsonl 树（L3，唯一 durable truth）
+│   ├── agent.py            # AgentSession：state ↔ canonical 树同步边界
 │   ├── tree.py             # Entry envelope + 中立 Message 构造器 + 纯函数
 │   ├── manager.py          # 树存储 + flock 单写者 + build_context
 │   ├── context.py          # fold：branch → rich messages + 标量 + compaction 两区折叠
@@ -77,7 +78,8 @@ src/nanocode/
 ├── capabilities/           # 工具/MCP/skill/subagent 单一 dispatch
 │   ├── router.py           # CapabilityRouter：allowlist 咽喉点 + meta/agent/skill/real 路由 + hooks
 │   └── permissions.py      # 不可变 PermissionContext
-├── runtime/                # 子 session / 多 agent 编排层（L4）
+├── runtime/                # runtime facade + 子 session / 多 agent 编排层（L4）
+│   ├── facade.py           # AgentRuntime / RuntimeThread / ApprovalManager / events()
 │   ├── spawn.py            # SubAgentRunner：子 agent 构造 / 前后台执行 / 产物落盘
 │   └── teams.py            # TeamRuntime 骨架（多 agent 协作预留）
 ├── tools/                  # 一工具一模块 + registry / execute / permissions
@@ -89,7 +91,7 @@ src/nanocode/
 └── frontmatter.py          # 共享 YAML frontmatter 解析
 ```
 
-> **分层（docs/15）**：`session/`=唯一 durable truth；`agent/state.py`=可丢弃运行态投影；`agent/core.py`=模型循环；`agent/session.py`=两者的同步边界；`context/`=请求时上下文工程；`codeintel/`=代码库结构感知；`capabilities/`=工具单一 dispatch；`runtime/`=子 session/多 agent 编排。一句话：**Pi 管可信历史与状态重建，Claude Code 管请求时上下文工程，Aider 管代码库结构感知**。详见 [`docs/15-agent-core-context-runtime-multiagent-refactor.md`](./docs/15-agent-core-context-runtime-multiagent-refactor.md) 与落地路线图 [`docs/15-IMPL-roadmap.md`](./docs/15-IMPL-roadmap.md)。
+> **分层（docs/15）**：`session/`=唯一 durable truth；`agent/state.py`=可丢弃运行态投影；`agent/core.py`=模型循环；`session/agent.py`=两者的同步边界；`context/`=请求时上下文工程；`codeintel/`=代码库结构感知；`capabilities/`=工具单一 dispatch；`runtime/`=runtime facade + 子 session/多 agent 编排。一句话：**Pi 管可信历史与状态重建，Claude Code 管请求时上下文工程，Aider 管代码库结构感知**。详见 [`docs/15-agent-core-context-runtime-multiagent-refactor.md`](./docs/15-agent-core-context-runtime-multiagent-refactor.md) 与落地路线图 [`docs/15-IMPL-roadmap.md`](./docs/15-IMPL-roadmap.md)。
 
 Agent loop 的核心数据流：
 
@@ -125,15 +127,15 @@ Agent loop 的核心数据流：
 | 模块 | 职责 |
 |------|------|
 | `agent/core.py` · `loop.py` · `providers.py` | AgentCore 模型循环 + provider-independent 辅助 + ProviderAdapter（流式/capture 归一） |
-| `agent/state.py` · `events.py` · `session.py` | AgentState 可丢弃投影 / typed AgentEvent / AgentSession（state↔树同步、turn-end 一致性校验） |
+| `agent/state.py` · `events.py` + `session/agent.py` | AgentState 可丢弃投影 / typed AgentEvent / AgentSession（state↔树同步、turn-end 一致性校验） |
 | `agent/engine.py` | Agent bootstrap + collaborators 宿主（职责持续迁出新分层、收缩中） |
-| `agent/runtime.py` | AgentRuntime / RuntimeThread 句柄 + `events()` in-process 事件订阅 |
+| `runtime/facade.py` | AgentRuntime / RuntimeThread 句柄 + `events()` in-process 事件订阅 |
 | `session/` | canonical session.jsonl 树（唯一 durable truth）：tree/manager/context(fold)/render/capture/lease |
 | `context/` | 请求时上下文工程：ContextRuntime + ContextProvider + Pack/Ledger/Budget/cache 策略 |
 | `codeintel/` | Aider-style 代码库结构感知：词法 RepoIndex + RepoMapProvider + SymbolTag |
 | `agents/` | typed AgentProfile + registry（发现/extends 收窄/信任闸）+ child≤parent 权限派生 + ResultEnvelope |
 | `capabilities/` | CapabilityRouter 工具单一 dispatch（allowlist 咽喉点 + 路由 + hooks）+ 不可变 PermissionContext |
-| `runtime/` | 子 session / 多 agent 编排：SubAgentRunner（spawn）+ TeamRuntime 骨架 |
+| `runtime/` | Runtime facade + 子 session / 多 agent 编排：AgentRuntime / SubAgentRunner（spawn）+ TeamRuntime 骨架 |
 | `tools/` | 工具 SCHEMA/run 契约、注册表、分发、权限、read-before-edit + read_file 预算封顶 |
 | `memory/` · `skills/` · `subagents/` · `mcp/` | 记忆（四类型 + 语义召回）/ 技能（inline·fork）/ 子 agent 配置 / MCP stdio 路由 |
 | `prompt.py` | 稳定 system prompt 构建（项目指令/memory 改由 ContextRuntime 注入，不再烤进 system） |

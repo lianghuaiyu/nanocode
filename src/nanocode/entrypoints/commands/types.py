@@ -10,7 +10,7 @@
      · Local   —— 纯本地副作用，从不 query（第一批几乎所有命令）
      · Prompt  —— 产生一个 turn；**必须**经 AgentSession.run_turn / RuntimeThread.run
                   驱动，复用既有 TurnResult 与 cancel/_aborted/approval 不可回归契约
-                  （agent/runtime.py），绝不自行实现 turn/取消/审批
+                  （runtime/facade.py），绝不自行实现 turn/取消/审批
      · Control —— CMD-P3+ 的 lifecycle 信号（replace_thread/switch_runtime/resume/fork），
                   P0/P1 不产生
 

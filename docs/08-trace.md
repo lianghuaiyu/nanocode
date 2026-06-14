@@ -53,7 +53,7 @@ nanocode 有三条彼此独立、用途不同的记录线，务必区分：
   - trajectory level=**SUMMARY**：wire 丢弃重型 payload（messages / 大 result），event-tree rebuild **退化为 snapshot**——这是**预期行为**，已由 `SessionContextBuilder` 处理。
 - **trajectory（`src/nanocode/trajectory/`）= 派生（DERIVED）投影**，用于分析 / RL。
   - 它**绝不**驱动 runtime，**绝不**用于 resume / fork。
-  - 任何 runtime 模块（`agent/engine.py`、`agent/anthropic_backend.py`、`agent/openai_backend.py`、`agent/context_builder.py`、`agent/session.py`、`trace/tracer.py`、`trace/redaction.py`）**绝不**得 `import nanocode.trajectory`。
+  - 任何 runtime 模块（`agent/engine.py`、`agent/anthropic_backend.py`、`agent/openai_backend.py`、`agent/context_builder.py`、`session/agent.py`、`trace/tracer.py`、`trace/redaction.py`）**绝不**得 `import nanocode.trajectory`。
   - trajectory 包**只读** merged wire，**绝不**写回 wire。
 - **metrics / evals = 派生标签。** 绝不污染 wire：runtime 的 emit 路径**绝不**把 reward / eval_result 写进 wire；reward / eval 只活在 `metrics.json` / `evals.jsonl`。
 

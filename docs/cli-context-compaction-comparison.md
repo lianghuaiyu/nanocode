@@ -38,8 +38,8 @@ nanocode 的核心不是维护一份可变 flat transcript，而是维护 append
 
 1. `fold()` 对 branch 上的 entries 做折叠：普通标量状态按 last-write-wins；压缩相关 entry 使用 “summary + firstKeptEntryId 之后的原始消息” 两段式视图（`context.py:45-114`）。
 2. `convert_to_llm()` 把 compaction/branch summary 转成 user message，并为 summary 加 prefix/suffix；custom message 保持原始内容（`context.py:126-146`）。
-3. `project_request()` 读取渲染后的 tree，再追加 volatile tail：Anthropic 的 system 是 out-of-band，OpenAI 的 system 被放入 messages（`/Users/jyxc-dz-0101321/exam_project/nanocode/src/nanocode/agent/session.py:151-164`）。
-4. per-turn 的 `persist=none` 内容、环境和 git 状态不写入 tree，而是通过 user system-reminder 或 `ContextRuntime` pack 注入（`session.py:166-205`）。
+3. `project_request()` 读取渲染后的 tree，再追加 volatile tail：Anthropic 的 system 是 out-of-band，OpenAI 的 system 被放入 messages（`src/nanocode/session/agent.py`）。
+4. per-turn 的 `persist=none` 内容、环境和 git 状态不写入 tree，而是通过 user system-reminder 或 `ContextRuntime` pack 注入（`src/nanocode/session/agent.py`）。
 
 这意味着 nanocode 的“真实会话状态”和“某次请求的上下文投影”是分开的：前者可持久化、可 fork；后者允许带 volatile 环境上下文。
 

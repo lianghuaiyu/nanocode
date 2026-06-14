@@ -49,8 +49,8 @@ Pi 管可信历史与状态重建；Claude Code 管请求时上下文工程；Ai
 - `src/nanocode/session/capture.py`
 - `src/nanocode/session/lease.py`
 - `src/nanocode/agent/engine.py`
-- `src/nanocode/agent/session.py`
-- `src/nanocode/agent/runtime.py`
+- `src/nanocode/session/agent.py`
+- `src/nanocode/runtime/facade.py`
 - `src/nanocode/agent/anthropic_backend.py`
 - `src/nanocode/agent/openai_backend.py`
 - `src/nanocode/subagents/config.py`

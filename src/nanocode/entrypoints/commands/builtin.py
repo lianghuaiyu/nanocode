@@ -98,7 +98,7 @@ async def _context(ctx: CommandContext, args: str) -> Local:
     from ...context import BudgetPolicy, ContextRequest, ContextRuntime
     from ...context.model_policy import model_uses_repo_map
     from ...tools.permissions import load_context_config
-    from ...agent.runtime import _push_cwd
+    from ...runtime import _push_cwd
     budget = BudgetPolicy.for_window(ctx.thread.effective_window)
     cwd = getattr(ctx, "cwd", Path.cwd())
     with _push_cwd(str(cwd)):
@@ -319,7 +319,7 @@ def _resolve_entry(mgr, target: str):
     return None, f"ambiguous/unknown id '{target}' ({len(matches)} matches)"
 
 
-# ─── 会话导航命令族（pi 对齐语义表 = agent/runtime.py AgentRuntime docstring，唯一权威）──
+# ─── 会话导航命令族（pi 对齐语义表 = runtime/facade.py AgentRuntime docstring，唯一权威）──
 #   /tree      同文件移动 leaf，不新建 session
 #   /fork      选 user message，复制其 parent 之前的路径到新 session，prompt 回填编辑器
 #   /clone     复制当前 active branch 到当前 leaf → 新 session，编辑器为空

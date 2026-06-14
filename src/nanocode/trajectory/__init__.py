@@ -6,7 +6,7 @@
 - trajectory 是 DERIVED 投影：它**只读** merged wire，绝不写回 wire。
 - trajectory **绝不**驱动 runtime，**绝不**参与 resume / fork。
 - 任何 runtime 模块（agent/engine.py、agent/anthropic_backend.py、agent/openai_backend.py、
-  agent/context_builder.py、agent/session.py、trace/tracer.py、trace/redaction.py）
+  agent/context_builder.py、session/agent.py、trace/tracer.py、trace/redaction.py）
   **绝不**得 import nanocode.trajectory。
 - metrics / evals 是派生标签（reward / eval_result），只落 metrics.json / evals.jsonl，
   绝不污染 wire。

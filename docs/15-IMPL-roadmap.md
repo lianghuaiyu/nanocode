@@ -94,7 +94,7 @@ capabilities/{permissions,router}.py · codeintel/symbols.py · runtime/teams.py
 - `prompt.py:build_system_prompt()` 把 cwd/date/platform/shell/git/claude_md/memory/skills/agents/deferred_tools 全拼进 system(Phase 3 要拆)。
 - `read_file.py` 无 line/byte cap、无 range(Phase 4 要加;`shared._truncate_result` 50k 未接入 read_file)。
 - `subagents/config.py` dict 配置(Phase 5 → typed AgentProfile)。
-- `agent/session.py` AgentSession 是 58 行薄包装(Phase 2 升级为 state↔tree 同步边界)。
+- `session/agent.py` AgentSession 是 state↔tree 同步边界（`agent/session.py` 仅兼容 re-export）。
 - `runtime_events.py` RuntimeEvent 单流 + DURABLE_TYPES/DURABLE_EVENT_FIELDS(trajectory 从树派生,additive 契约不可破)。
 
 ## 推荐落地顺序(依赖修正版,优先于报告 Phase 编号)

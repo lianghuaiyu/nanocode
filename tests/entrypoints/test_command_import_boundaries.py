@@ -55,6 +55,10 @@ def test_agent_and_agent_profile_public_imports_are_light():
         sys.meta_path.insert(0, Blocker())
         import nanocode.agent
         from nanocode.agent import AgentConfig, AgentRuntime
+        import nanocode.runtime
+        from nanocode.runtime import AgentRuntime as RuntimeAgentRuntime
+        import nanocode.session
+        from nanocode.session import AgentSession
         import nanocode.agents
         from nanocode.agents import AgentProfile
         """

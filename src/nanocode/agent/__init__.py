@@ -27,7 +27,7 @@ def __getattr__(name: str):
         from .engine import Agent
         return Agent
     if name == "AgentSession":
-        from .session import AgentSession
+        from ..session.agent import AgentSession
         return AgentSession
     if name in {
         "AgentRuntime",
@@ -40,6 +40,6 @@ def __getattr__(name: str):
         "RuntimeApprovalBroker",
         "AgentConfig",
     }:
-        from . import runtime as _runtime
+        from .. import runtime as _runtime
         return getattr(_runtime, name)
     raise AttributeError(name)

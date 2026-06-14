@@ -1,26 +1,27 @@
-"""nanocode runtime 包（docs/15 §4/§11/§12）—— thread、child session、多 agent 协作编排层（L4）。
+"""nanocode runtime package — thread, child-session, and multi-agent orchestration (L4).
 
-当前内容：
-  teams.py   TeamRuntime 骨架（§12：TeamSession/TeamTaskBoard/AgentMailbox/ClaimLock/
-             SharedArtifactStore/TeamEventStream）+ 预留 session entry 类型。
-
-后续（Phase 6/7）：spawn.py（AgentRuntime.spawn_child）、thread.py/runtime.py（从 agent/runtime.py
-迁入的 RuntimeThread/AgentRuntime）、approvals.py、events.py。
+This package keeps its public surface lazy so importing ``nanocode.runtime.spawn``
+does not also import the in-process facade and agent session machinery.
 """
 
-from .teams import (
-    TeamRuntime,
-    TeamSession,
-    TeamTaskBoard,
-    TeamTask,
-    ClaimLock,
-    AgentMailbox,
-    MailboxMessage,
-    SharedArtifactStore,
-    TeamEventStream,
-)
+_FACADE_EXPORTS = {
+    "AgentConfig",
+    "AgentResult",
+    "AgentRuntime",
+    "ApprovalManager",
+    "ApprovalRequest",
+    "ReadOnlySessionView",
+    "RuntimeApprovalBroker",
+    "RuntimeServices",
+    "RuntimeThread",
+    "SkillInvocation",
+    "TurnResult",
+    "_apply_runtime_services",
+    "_push_cwd",
+    "serialize_event_envelope",
+}
 
-__all__ = [
+_TEAM_EXPORTS = {
     "TeamRuntime",
     "TeamSession",
     "TeamTaskBoard",
@@ -30,4 +31,16 @@ __all__ = [
     "MailboxMessage",
     "SharedArtifactStore",
     "TeamEventStream",
-]
+}
+
+__all__ = sorted(_FACADE_EXPORTS | _TEAM_EXPORTS)
+
+
+def __getattr__(name: str):
+    if name in _FACADE_EXPORTS:
+        from . import facade as _facade
+        return getattr(_facade, name)
+    if name in _TEAM_EXPORTS:
+        from . import teams as _teams
+        return getattr(_teams, name)
+    raise AttributeError(name)

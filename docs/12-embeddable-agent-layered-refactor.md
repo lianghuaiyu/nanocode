@@ -98,8 +98,8 @@ Layer 0  Platform Adapters
 
 | 能力 | 当前实现 | 评价 |
 |---|---|---|
-| Runtime facade | `agent/runtime.py` | `AgentRuntime`/`RuntimeThread`/`TurnResult`/`ApprovalManager` 已有。**但对 live CLI 是 dead code**：`run_repl` 不调用它们（见下）。 |
-| Agent session | `agent/session.py` | `AgentSession.run_turn/resume/fork_to` 已有；`run_turn()` 仍委托 `Agent.chat()`（薄包装，turn lifecycle 未抽离）。 |
+| Runtime facade | `runtime/facade.py` | `AgentRuntime`/`RuntimeThread`/`TurnResult`/`ApprovalManager` 已迁入 runtime 层；`agent/runtime.py` 仅作兼容 re-export。 |
+| Agent session | `session/agent.py` | `AgentSession` 是 state↔canonical tree 同步与 turn shell；`agent/session.py` 仅作兼容 re-export。 |
 | Message owner | `agent/message_store.py` | `MessageStore` 已收口；getter 返回 live list（in-place 操作不变），整表赋值经 setter→`store.load`（engine.py:501-515）。 |
 | Context builder | `agent/context_builder.py` | snapshot/event-tree resume/fork 入口已有；忠实才采用 rebuild、否则回退 snapshot。 |
 | Compression | `agent/compaction.py` | `CompressionPipeline` 收口 **budget/snip/microcompact**：owner 在 `engine.py:669-682 _run_compression_pipeline`（调 `prepare_openai/anthropic`），由模型循环每轮在 `backends:70` 调用（每次 provider call 前 in-place 跑）。注：**LLM 摘要式 full compaction 不在 pipeline**——由 `backends:53 _check_and_compact` 在 turn 边界触发 `engine.py:610 _compact_conversation`。 |

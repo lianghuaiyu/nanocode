@@ -173,10 +173,10 @@ render(Message[], model) → provider payload:     # 评审 B2/B3:transform + co
 | `agent/engine.py` | **捕获 `stop_reason`/abort 写入 assistant entry**(评审 B2 前置);turn 写树;config 变更 emit `*_change`;消息 message-end **立即落树**(评审 M7),仅 config/leaf 排队到 turn 边界;`restore_session` 改走 `build_context`;subagent spawn 先 mint child session、父写 `agent` tool_call/bounded toolResult;后台完成由主写者注入合成 `custom_message`;**删 `_run_compression_pipeline`**(snip/microcompact)与 `_inject_*` 原地改写(→ `custom_message` entry) |
 | `agent/anthropic_backend.py`/`openai_backend.py` | 入口从"读 live provider 列表"改为"接 `render()` 输出";**停止剥离 thinking,改为完整捕获 thinking 块 + `thinkingSignature`/`redacted`**(anthropic.ts:550-568/621-627;OpenAI reasoning 字段);删原地注入 |
 | `agent/message_store.py` | **收编**:live 上下文中立化、payload send-time render;不再双 provider 列表 |
-| `agent/session.py`(`AgentSession`) | `move_to`/`fork`/`clone`/`set_name`/`set_label`;fail-closed;leaf 动后 re-fold |
+| `session/agent.py`(`AgentSession`) | `move_to`/`fork`/`clone`/`set_name`/`set_label`;fail-closed;leaf 动后 re-fold |
 | `agent/context_builder.py` | 降薄/退役:`rebuild`→`SessionManager.build_context`;**退役 snapshot fallback** |
 | `tasks/models.py`+`tasks/manager.py` | `TaskRecord/SubAgentRecord` 增 `child_session_id` 与 `legacy_agent_id`;`resume`/`task_output` 先按 child session 解析,再兼容旧 `agent-001` |
-| `agent/runtime.py`+`entrypoints/*` | 落 `Control` 分支(cli.py:568 占位);命令见 §8;`--session/--fork/--clone` |
+| `runtime/facade.py`+`entrypoints/*` | 落 `Control` 分支(cli.py:568 占位);命令见 §8;`--session/--fork/--clone` |
 | `trajectory/project.py`+`metrics.py` | **重写**(评审 m2:两个独立消费者)从 `session.jsonl` 派生;退役 wire durable 契约 guard 或改钉 session schema |
 | 既有 `AgentSession.fork_to`/`Tracer.begin_branch`/wire `branch_id` | **同一 PR 退役/替换**(评审 M4),避免两套 fork |
 

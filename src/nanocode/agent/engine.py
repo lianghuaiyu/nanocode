@@ -30,11 +30,9 @@ from ..skills.discovery import (
     register_nested_skill_dirs,
     path_activates_skill,
     discover_skills,
-    reset_skill_cache,
 )
 from ..mcp import McpManager
 from ..tasks.manager import TaskManager
-from ..tasks.models import TERMINAL_TASK_STATUSES
 from ..tasks.runner import run_shell_background_task
 from ..session import v2 as _session_v2
 
@@ -450,50 +448,7 @@ class Agent(PlanModeMixin):
     # docs/14 SessionLease：`restore_session` 已退役。resume 由 runtime 激活会话写者租约
     # （SessionLease.open_or_create，cli._load_from_manager 渲染初始上下文）完成——canonical 树是
     # 唯一权威，不再读 legacy flat 快照（legacy 导入面已删，docs/16 C-3）。
-    # v2 state 的 TaskManager 重载/mark-lost 仍由 _reload_task_state 承担（被 rebind + cli 激活调用）。
-
-    def _reload_task_state(self, state) -> None:
-        """load 一个 session 的 v2 state 进 task_manager，并把非终态 task/subagent 标 "lost"
-        （进程已不在跑它们）。rebind_session 与 cli 的 SessionLease 激活共用。state 缺/非 dict → no-op。"""
-        if not (state and isinstance(state, dict)):
-            return
-        self.task_manager.load_state(state)
-        for t in self.task_manager.list_tasks():
-            if t.status not in TERMINAL_TASK_STATUSES:
-                self.task_manager.update_task(t.id, status="lost")
-        for a in self.task_manager.list_subagents():
-            if a.status in ("running", "idle"):
-                self.task_manager.update_subagent(a.id, status="lost")
-
     # ─── Runtime replacement：原地重指 session（docs/14 P2）────────────────────────
-
-    def _reset_working_sets(self) -> None:
-        """复位 session 维度的 working set（rebind_session 用——切到新 session 不应继承旧 session 的
-        审批白名单 / 读文件状态 / 已播报 skill / 已浮现 memory 等）。plan/permission 态另由
-        _reset_session_mode 处理（保持单一职责，避免 docstring 与实现漂移，docs/14 P2 review）。
-
-        注意：与 clear_history 的复位面**刻意不同**——clear_history 只清对话 + 部分 skill 态，
-        保留 _confirmed_paths/_read_file_state/memory（同一 session 内清屏）；rebind 是换 session 需全清。"""
-        self._sent_skill_names = set()
-        self._pending_skill_bodies = []
-        self._activated_path_skills = set()
-        self._active_hooks = []
-        self._confirmed_paths.clear()           # 与子 agent 共享的同一 set（切 session 时无 live 子 agent）
-        self._read_file_state = {}
-        self._files_read = set()
-        self._files_modified = set()
-        self._already_surfaced_memories = set()
-        self._session_memory_bytes = 0
-        reset_skill_cache()
-
-    def _reset_session_mode(self) -> None:
-        """把 permission/plan 态复位到构造时 baseline（rebind 用）。plan 是 session 工作态、不跨会话：
-        新 session 要么回到 baseline 非-plan 模式，要么（若启动即 --plan）以**新 sid** 的 plan 文件/提示
-        重新进入——等价于以同一 config 全新构造一个 agent。修复 P2 review 的 plan-mode 跨会话泄漏。"""
-        self.permission_mode = self._base_permission_mode
-        self._pre_plan_mode = None
-        self._pending_context_break = False
-        self._apply_permission_mode_prompt()    # 按 baseline mode 重算 _plan_file_path + _system_prompt（新 sid）
 
     def rebind_session(self, new_mgr, *, artifact_id: str = "main") -> None:
         """原地把**主** agent 重指到 new_mgr 所属的 session：finalize 旧 session 的全部 session-keyed
@@ -505,44 +460,8 @@ class Agent(PlanModeMixin):
         release-old 的 fail-closed 闸在 `_switch_via_rebind` 里完成，busy/corrupt 时根本不会走到这里）。
         rebind 自身不再 open/lock——只 finalize 旧、装载新。new_mgr.session_id==当前 sid → no-op。
         fail-closed 前置（turn/后台/子 agent 运行中拒绝）由 RuntimeHost.can_switch 在调用前保证。"""
-        if self.is_sub_agent:
-            raise RuntimeError("rebind_session is for the main agent only")
-        new_sid = new_mgr.session_id
-        if new_sid == self.session_id:
-            return
-        old_sid = self.session_id
-        built = new_mgr.build_context()         # 已由 _switch_via_rebind 校验过；纯内存 fold，无 I/O
-        # ── FINALIZE 旧 session（均为低风险/guarded 操作）──
-        old_mgr = self._session_mgr
-        self.agent_session.auto_save()          # 旧 session 的 v2 state
-        if old_mgr is not None and old_mgr is not new_mgr:
-            old_mgr.close()                     # 释放旧 session 写锁（旧 lease 的底层 mgr）
-        try:
-            from ..tools.sandbox_shell import cleanup_persist_sandbox
-            cleanup_persist_sandbox(old_sid)    # 旧 persist sandbox + fingerprint
-        except Exception:
-            pass
-        # ── REBUILD 新 session ──
-        self.session_id = new_sid
-        self._tree_session_id = new_sid         # 主 agent：tree sid == session sid（保持同步）
-        self.artifact_id = artifact_id
-        os.environ["NANOCODE_SESSION_ID"] = new_sid
-        self._session_mgr = new_mgr             # runtime lease 持有的已加锁 mgr
-        self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        # task_manager：fresh + load 目标 session 的 state + 非终态标 lost
-        self.task_manager = TaskManager()
-        self._subagents = SubAgentManager(self)
-        self._reload_task_state(_session_v2.read_state(new_sid) if _session_v2.is_v2_session(new_sid) else None)
-        # 计数复位（新 session 从零计 cost/turns）
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.last_input_token_count = 0
-        self.current_turns = 0
-        self._aborted = False
-        self._reset_working_sets()
-        self._reset_session_mode()              # plan/permission 复位到 baseline（recompute _system_prompt，新 sid）
-        # 请求是 request-local 投影（每轮从新 session 树重渲染，docs/16 #3c）——无需装载 flat 列表。
-        self.emit(NoticeRaised(text=f"Session → {new_sid} ({len(built.messages)} messages)."))
+        from ..runtime.rebind import rebind_agent_session
+        rebind_agent_session(self, new_mgr, artifact_id=artifact_id)
 
     # docs/16 #3b：_auto_save 迁入 AgentSession.auto_save（chat/rebind 经 agent_session 调用）。
 
@@ -565,7 +484,7 @@ class Agent(PlanModeMixin):
         """本 agent 的 AgentSession（state↔tree 同步边界）。docs/16 #1：message family 的树写入
         统一经 agent_session.record_event（required=True fail-loud），AgentCore 不再内联 _tree_record。"""
         if self._agent_session_obj is None:
-            from .session import AgentSession
+            from ..session.agent import AgentSession
             self._agent_session_obj = AgentSession(self)
         return self._agent_session_obj
 
