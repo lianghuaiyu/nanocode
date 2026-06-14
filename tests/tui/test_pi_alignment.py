@@ -12,7 +12,7 @@ import re
 from rich.console import Console
 
 from nanocode.tui.rich_app import RichApp
-from nanocode.tui.state import ToolItem, UserItem
+from nanocode.tui.state import AssistantItem, ToolItem, UserItem
 
 
 def _plain(s: str) -> str:
@@ -245,7 +245,18 @@ def test_h3_heading_has_no_literal_hashes():
     assert "###" not in out                      # 不渲染出字面 '###'
 
 
-def test_selectors_selected_row_no_reverse_video():
+def test_code_block_lines_do_not_fold():
+    """回归:代码块每条逻辑行占一行(不折行破坏结构);CJK 注释不被拆到悬挂续行。"""
+    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=72)
+    app = RichApp(output=con)
+    md = "```python\nif tc.arguments:\n    acc[i] += tc.arguments  # 拼参数\n```"
+    con.print(app._render_message_block(AssistantItem(text=md, complete=True)))
+    lines = [l.strip() for l in _plain(con.file.getvalue()).split("\n") if l.strip()]
+    assert any("```python" in l for l in lines)
+    assert any(l == "if tc.arguments:" for l in lines)
+    # 含 CJK 注释的整行不被折断:代码与 '# 拼参数' 同处一行
+    assert any("acc[i] += tc.arguments" in l and "# 拼参数" in l for l in lines)
+
     import types
     from nanocode.tui.session_pages.fork import ForkModel
     e = types.SimpleNamespace(type="message", id="x", sessionId="abcdef1234",

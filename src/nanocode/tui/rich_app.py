@@ -262,7 +262,7 @@ def _pi_markdown(text: str, width: int) -> Group:
                     from pygments.lexers import get_lexer_by_name
                     get_lexer_by_name(info)
                     syntax = Syntax(code, info, theme="monokai", background_color="default",
-                                    word_wrap=True, padding=(0, 1))
+                                    word_wrap=False, padding=(0, 1))
                 except Exception:
                     syntax = None
             lines.append(Text(f"```{info}", style="muted"))
@@ -1287,30 +1287,13 @@ class RichApp:
         return Padding(body, (0, 1), style=fill)
 
     def _assistant_grid(self, marker, body):
-        try:
-            rendered = self._console.render_lines(
-                body,
-                self._console.options.update(width=max(20, self._term_w() - 3)),
-                pad=False,
-                new_lines=True,
-            )
-        except Exception:
-            return Group(Text.from_markup(f"{marker} "), body)
-        if not rendered:
-            return Text.from_markup(marker)
-        lines: list[Text] = []
-        for idx, line in enumerate(rendered):
-            content = Text()
-            for segment in line:
-                if not segment.control and segment.text != "\n":
-                    content.append(segment.text, style=segment.style)
-            if not content.plain:
-                lines.append(Text(""))
-                continue
-            text = Text.from_markup(f"{marker} " if idx == 0 else "  ")
-            text.append_text(content)
-            lines.append(text)
-        return Group(*lines)
+        """marker(⏺/◌)在第 1 列、正文在第 2 列的网格——正文(含 Syntax/表格等块)**原生渲染**,
+        marker 只贴首行、后续行自动缩进。取代逐 segment 重拼(对 Syntax 的整宽背景填充/折行会出错)。"""
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=1, no_wrap=True)
+        grid.add_column(overflow="fold")
+        grid.add_row(Text.from_markup(marker), body)
+        return grid
 
     def _markdown(self, text: str):
         return _pi_markdown(text, max(20, self._term_w() - 4))
