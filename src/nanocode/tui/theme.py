@@ -62,7 +62,11 @@ _BG = {
     "tool_error_bg": "#3c2828",
     "selected_bg": "#3a3a4a",
     "custom_message_bg": "#2d2838",
+    "code_block_bg": "#1c1c28",          # markdown 代码块专用底色(独立配置;比工具块更深更中性)
 }
+
+# markdown 代码块的语法高亮主题(Rich Syntax / pygments 主题名;代码块专用,可独立切换)。
+CODE_SYNTAX_THEME = "monokai"
 
 # thinking 档位 → 边框前景角色(动态输入框边框用)。
 _THINK_LEVEL = {
@@ -98,6 +102,8 @@ def _styles() -> dict:
     styles["tool_error"] = f"on {_BG['tool_error_bg']}"
     styles["tool_denied"] = f"{_FG['warning']}"
     styles["selected"] = f"{_FG['accent']} on {_BG['selected_bg']}"
+    styles["code_block"] = f"{_FG['md_code_block']} on {_BG['code_block_bg']}"   # 未知语言的代码块底色
+    styles["code_label"] = f"{_FG['muted']} on {_BG['code_block_bg']}"           # 代码块语言标签
     return styles
 
 

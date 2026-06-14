@@ -255,22 +255,24 @@ def _pi_markdown(text: str, width: int) -> Group:
         elif typ == "fence":
             info = (token.info or "").strip().split(" ")[0] if (token.info or "").strip() else ""
             code = token.content.rstrip("\n")
+            bg = _theme.hex_of("code_block_bg")
             syntax = None
-            if info:                              # 已知语言 → Rich Syntax 高亮(背景跟随终端,不抢色块)
+            if info:                              # 已知语言 → Rich Syntax 高亮,底色用 code_block_bg
                 try:
                     from rich.syntax import Syntax
                     from pygments.lexers import get_lexer_by_name
                     get_lexer_by_name(info)
-                    syntax = Syntax(code, info, theme="monokai", background_color="default",
+                    syntax = Syntax(code, info, theme=_theme.CODE_SYNTAX_THEME, background_color=bg,
                                     word_wrap=False, padding=(0, 1))
                 except Exception:
                     syntax = None
-            _append_blank(lines)                  # 与上文留空分隔(不渲染字面 ``` 围栏)
+            _append_blank(lines)                  # 专用代码块:底色填充框 + 语言标签,不渲染字面 ``` 围栏
+            if info:
+                lines.append(Padding(Text(info, style="code_label"), (0, 1), style="code_label"))
             if syntax is not None:
                 lines.append(syntax)
             else:
-                for code_line in code.split("\n"):
-                    lines.append(Text(" " + code_line, style="md_code_block"))
+                lines.append(Padding(Text(code or " ", style="md_code_block"), (0, 1), style="code_block"))
             _append_blank(lines)
         elif typ == "code_block":
             for code_line in token.content.rstrip("\n").split("\n"):

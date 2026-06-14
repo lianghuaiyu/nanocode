@@ -257,6 +257,17 @@ def test_code_block_lines_do_not_fold():
     # 含 CJK 注释的整行不被折断:代码与 '# 拼参数' 同处一行
     assert any("acc[i] += tc.arguments" in l and "# 拼参数" in l for l in lines)
 
+
+def test_code_block_is_dedicated_themed_box():
+    """代码块是专用主题色块:底色填充(code_block_bg) + 语言标签,不渲染字面 ```。"""
+    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=70)
+    app = RichApp(output=con)
+    con.print(app._render_message_block(AssistantItem(text="```python\nx = 1\n```", complete=True)))
+    out = con.file.getvalue()
+    assert "48;2;28;28;40" in out                # code_block_bg #1c1c28 填充
+    assert "python" in _plain(out)               # 语言标签(无 ``` 围栏)
+    assert "```" not in _plain(out)
+
     import types
     from nanocode.tui.session_pages.fork import ForkModel
     e = types.SimpleNamespace(type="message", id="x", sessionId="abcdef1234",
