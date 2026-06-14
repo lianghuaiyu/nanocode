@@ -77,6 +77,20 @@ def test_no_menu_for_plain_text():
     assert app._ac_kind is None
 
 
+def test_slash_menu_enter_submits_fully_typed_arg_command():
+    """回归:带参命令(arg_hint 非空,如 /sandbox)全名键入后 Enter 应直接提交,而非只填充不跑。"""
+    app = _app_with_registry()
+    submitted = []
+    app._submit = lambda text: submitted.append(text)
+    for ch in "/sandbox":
+        app._editor.handle(ch)
+    app._update_autocomplete()
+    assert app._ac_kind == "command"
+    app._ac_accept(submit=True)                 # 模拟菜单激活时按 Enter
+    assert submitted == ["/sandbox"]
+    assert app._ac_kind is None
+
+
 # ── tool blocks ───────────────────────────────────────────────────────────
 def test_tool_box_success_has_diff():
     app = RichApp(output=_console())

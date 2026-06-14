@@ -754,25 +754,34 @@ class RichApp:
         else:
             self._set_ac(items, "path")
 
+    def _submit_current(self) -> None:
+        final = self._editor.text
+        self._editor.reset()
+        self._cancel_count = 0
+        if final.strip():
+            self._editor.add_history(final)
+            self._save_history(final)
+        self._submit(final)
+
     def _ac_accept(self, *, submit: bool) -> None:
         if not self._ac_items:
             self._set_ac([], None)
             return
         it = self._ac_items[self._ac_index]
+        # Enter 且已键入的正是该候选全名(如 "/sandbox")→ 直接提交当前文本,让 handler 决定 bare 行为,
+        # 不强制填充(否则带参命令 arg_hint 非空时 Enter 只填不跑,bare 命令永远无法用 Enter 执行)。
+        if submit and it["insert"].strip() == self._editor.text.strip():
+            self._set_ac([], None)
+            self._submit_current()
+            return
         start, end = it["replace"]
         text = self._editor.text
         prefix = text[:start] + it["insert"]
         self._editor.set_text(prefix + text[end:])
         self._editor.cursor = len(prefix)
         self._set_ac([], None)
-        if submit and it.get("submit"):
-            final = self._editor.text
-            self._editor.reset()
-            self._cancel_count = 0
-            if final.strip():
-                self._editor.add_history(final)
-                self._save_history(final)
-            self._submit(final)
+        if submit and it.get("submit"):       # 无参命令(arg_hint 空):Enter 接受即执行
+            self._submit_current()
         else:
             self._update_autocomplete()
 
