@@ -293,7 +293,7 @@ def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
     assert "Title" in out
     assert "bold" in out
     assert "code" in out
-    assert "- item" in plain          # marker 与文本分别着色 → 用去色文本断言
+    assert "• item" in plain          # 列表渲染为排版圆点 • (与源码 '-' 区分),marker 与文本分别着色
     assert "A │ B" in out
     assert "x │ y" in out
     assert "```" not in plain          # fenced code 围栏不外漏(只渲染高亮代码)

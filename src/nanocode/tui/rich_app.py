@@ -243,7 +243,7 @@ def _pi_markdown(text: str, width: int) -> Group:
             if list_stack:
                 list_stack[-1]["index"] += 1
                 depth = max(0, len(list_stack) - 1)
-                marker = f"{list_stack[-1]['index']}. " if list_stack[-1]["ordered"] else "- "
+                marker = f"{list_stack[-1]['index']}. " if list_stack[-1]["ordered"] else "• "
                 current_list_prefix = "  " * depth + marker
         elif typ == "list_item_close":
             current_list_prefix = None
