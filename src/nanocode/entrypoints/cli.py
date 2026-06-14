@@ -8,10 +8,6 @@ import os
 import sys
 from pathlib import Path
 
-from prompt_toolkit.history import FileHistory, InMemoryHistory
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import Completer, Completion, FuzzyCompleter
-
 from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
 from ..tui import print_welcome, print_error, print_info
 from ..session import get_latest_session_id
@@ -37,7 +33,6 @@ _SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
 # 内置斜杠命令的单一来源：从命令 registry 派生（取代旧的手维护列表，消除与 dispatch 的漂移）。
 # exit/quit 是裸词（无 /），不进 /-gated 菜单，故不在 registry。
 _REGISTRY = build_registry()
-_BUILTIN_COMMANDS = [(s.name, s.description) for s in _REGISTRY.specs() if not s.is_hidden]
 
 
 def _repl_commands_help() -> str:
@@ -51,34 +46,6 @@ def _repl_commands_help() -> str:
     lines.append(f'{"  /<skill-name>":<22} Invoke a skill (e.g. /commit "fix types")')
     lines.append(f'{"  !<command>":<22} Run a shell command directly (your own command; bypasses agent + permissions)')
     return "\n".join(lines) + "\n"
-
-
-class _CommandCompleter(Completer):
-    """Yield slash-command candidates (built-ins + user-invocable skills), each
-    with a right-aligned description (display_meta). Wrapped in FuzzyCompleter by
-    the session so '/cmt' matches '/commit' (subsequence fuzzy match).
-
-    Only fires when the buffer is a single token starting with '/'. Never raises
-    (skill discovery failures degrade to built-ins only)."""
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        if not text.startswith("/") or " " in text:
-            return
-        for name, desc in _BUILTIN_COMMANDS:
-            yield Completion(name, start_position=-len(text),
-                             display=name, display_meta=desc)
-        try:
-            for s in discover_skills():
-                if s.user_invocable:
-                    name = "/" + s.name
-                    yield Completion(name, start_position=-len(text), display=name,
-                                     display_meta=(s.description or "skill"))
-        except Exception:
-            pass
-
-
-
-
 
 
 async def _run_user_shell(command: str) -> str:
@@ -216,6 +183,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--map-tokens", type=int, default=None,
+                        help="Suggested tokens for repo map; use 0 to disable")
+    parser.add_argument("--map-refresh", choices=["auto", "always", "files", "manual"], default=None,
+                        help="Control how often the repo map is refreshed")
+    parser.add_argument("--map-multiplier-no-files", type=float, default=None,
+                        help="Repo map token multiplier when no files have been read/modified")
     parser.add_argument("--trajectory", action="store_true",
                         help="Project the canonical session tree into a trajectory (analysis/RL lane)")
     parser.add_argument("--trajectory-level", choices=["summary", "full"], default=None,
@@ -258,19 +231,14 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
     # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
     _runtime = AgentRuntime()
     _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
-    # docs/17 Phase 1 / docs/18：TUI 是挂在 runtime/session 上的订阅客户端——渲染从事件流派生。
-    # TuiApp（full_screen=False，保留 scrollback）持 footer/输入/modal/state；transcript 仍由
-    # TerminalClient 印到 scrollback（spinner=False：footer 的 running 态取代 spinner，且 spinner
-    # 线程的 \r 写会与 app 重绘区冲突）——经 render_event 注入 app，单订阅扇出 reduce + transcript。
+    # docs/18 Rich Live：交互客户端是挂在 runtime/session 上的订阅端（drop-in 换掉旧 prompt_toolkit
+    # TuiApp）。RichApp 用 Rich Live 在底部持重绘区（footer/输入/thinking spinner/流式/modal/selector），
+    # transcript 经 TerminalClient → tui.console（Live 绑定该 console）印到 Live 之上、进 scrollback。
+    # RichApp 自管历史（paths.history_file）；命令补全 v2 再接。input/output 是测试 seam（fd / Console）。
     from .terminal_client import TerminalClient
-    from ..tui.app import TuiApp
+    from ..tui.rich_app import RichApp
     _transcript = TerminalClient(spinner=False)
-    # docs/18 step 6：补回输入框的命令补全 + 持久历史 + auto-suggest（cutover 平价；非交互/测试用
-    # InMemoryHistory 避免写盘）。FuzzyCompleter 让 '/cmt' 子序列匹配 '/commit'。
-    _history = FileHistory(str(history_file())) if input is None else InMemoryHistory()
-    _app = TuiApp(render_event=_transcript.on_event, input=input, output=output,
-                  completer=FuzzyCompleter(_CommandCompleter(), pattern=r"^[a-zA-Z0-9_-]+"),
-                  history=_history, auto_suggest=AutoSuggestFromHistory())
+    _app = RichApp(render_event=_transcript.on_event, input=input, output=output)
     _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty(),
                         client=_app)
 
@@ -434,6 +402,10 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --map-tokens N      Suggested tokens for repo map; use 0 to disable
+  --map-refresh MODE  Repo map refresh: auto|always|files|manual (default: auto)
+  --map-multiplier-no-files N
+                      Repo map token multiplier before files are read (default: 2)
   --trajectory        Project the canonical session tree into a trajectory (analysis/RL lane)
   --trajectory-level {summary,full}
                       summary (default): drop heavy payloads, keep hash + summary.
@@ -467,6 +439,12 @@ Examples:
     permission_mode = _resolve_permission_mode(args)
     model = args.model or os.environ.get("NANOCODE_MODEL", "claude-opus-4-6")
     api_base = args.api_base
+    if args.map_tokens is not None:
+        os.environ["NANOCODE_MAP_TOKENS"] = str(args.map_tokens)
+    if args.map_refresh is not None:
+        os.environ["NANOCODE_MAP_REFRESH"] = args.map_refresh
+    if args.map_multiplier_no_files is not None:
+        os.environ["NANOCODE_MAP_MULTIPLIER_NO_FILES"] = str(args.map_multiplier_no_files)
 
     # Resolve API config
     resolved_api_base = api_base

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from prompt_toolkit.formatted_text import ANSI
 
 from ...session import tree as T
 from ...session import tree_view as TV
@@ -74,11 +73,11 @@ class SessionTreeModel(SelectorModel):
         help1 = (f"  {_DIM}↑↓ move · enter checkout · Ctrl+←/→ fold · Shift+L label · "
                  f"Ctrl+D/T/U/L/A filters · Ctrl+O cycle · type to search · q/esc{_RESET}")
         status = f"  {_ACCENT}{self.status}{_RESET}" if self.status else help1
-        return [ANSI(title), ANSI(status)]
+        return [title, status]
 
-    def search_line(self, width: int) -> Any:
-        return ANSI(f"  {_DIM}Type to search:{_RESET} {self._query}    "
-                    f"{_DIM}{len(self._rows)}/{self._base_count}{_RESET}")
+    def search_line(self, width: int) -> str:
+        return (f"  {_DIM}Type to search:{_RESET} {self._query}    "
+                f"{_DIM}{len(self._rows)}/{self._base_count}{_RESET}")
 
     def items(self) -> list:
         return self._rows
@@ -93,7 +92,7 @@ class SessionTreeModel(SelectorModel):
         content = _truncate(item.content, avail)
         if selected:
             line = f"{cursor}{prefix}{marker}{lbl}{content}{leaf}"
-            return ANSI(f"{_REV}{line[:width]:<{min(width, len(line) + 1)}}{_RESET}")
+            return f"{_REV}{line[:width]:<{min(width, len(line) + 1)}}{_RESET}"
         if content.startswith("user:"):
             head, _, rest = content.partition(":")
             shown = f"{_ACCENT}{head}:{_RESET}{rest}"
@@ -104,7 +103,7 @@ class SessionTreeModel(SelectorModel):
             shown = f"{_DIM}{content}{_RESET}"
         mk = f"{_ACCENT}{marker}{_RESET}" if marker else ""
         lblc = f"{_WARN}{lbl}{_RESET}" if lbl else ""
-        return ANSI(f"{cursor}{_DIM}{prefix}{_RESET}{mk}{lblc}{shown}{_ACCENT}{leaf}{_RESET}")
+        return f"{cursor}{_DIM}{prefix}{_RESET}{mk}{lblc}{shown}{_ACCENT}{leaf}{_RESET}"
 
     # ── live search ──────────────────────────────────────────
     def supports_query(self) -> bool:

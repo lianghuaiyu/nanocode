@@ -62,12 +62,22 @@ def _content(calls):
     return [c for c in calls if c[0] not in ("spinner_start", "spinner_stop")]
 
 
-def test_client_renders_assistant_delta_text_and_thinking(monkeypatch):
+def test_client_buffers_assistant_delta_until_completed(monkeypatch):
     calls = _capture_ui(monkeypatch)
     c = TerminalClient()
     c.on_event(_env(AssistantDelta(text="hello ")))
     c.on_event(_env(AssistantDelta(thinking="reasoning")))
-    assert _content(calls) == [("assistant_markdown", "hello "), ("thinking", "reasoning")]
+    assert _content(calls) == []
+    c.on_event(_env(AssistantMessageCompleted(
+        message={"role": "assistant"},
+        text="hello world",
+        thinking="reasoning",
+        tool_uses=[],
+        stop_reason="stop",
+        usage=None,
+        latency_ms=None,
+    )))
+    assert _content(calls) == [("thinking", "reasoning"), ("assistant_markdown", "hello world")]
 
 
 def test_client_renders_tool_call_and_result(monkeypatch):
@@ -123,6 +133,17 @@ def test_client_derives_spinner(monkeypatch):
     c.on_event(_env(AssistantDelta(text="hi")))
     spinner = [k[0] for k in calls if k[0].startswith("spinner")]
     assert spinner == ["spinner_start", "spinner_stop"]
+    assert _content(calls) == []
+
+    c.on_event(_env(AssistantMessageCompleted(
+        message={"role": "assistant"},
+        text="hi",
+        thinking="",
+        tool_uses=[],
+        stop_reason="stop",
+        usage=None,
+        latency_ms=None,
+    )))
     # spinner_stop 必须在渲染 markdown 之前
     assert calls.index(("spinner_stop",)) < calls.index(("assistant_markdown", "hi"))
 
@@ -137,13 +158,13 @@ def test_client_retry_does_not_stop_spinner(monkeypatch):
     assert ("retry", 1, 3, "boom") in calls
 
 
-def test_client_durable_only_events_are_ui_noop(monkeypatch):
+def test_client_renders_completed_assistant_message_once(monkeypatch):
     calls = _capture_ui(monkeypatch)
     c = TerminalClient()
     c.on_event(_env(AssistantMessageCompleted(
         message={"role": "assistant"}, text="hi", thinking="", tool_uses=[],
-        stop_reason="stop", usage=None, latency_ms=None)))   # 整段不重复渲染（流式已逐 block）
-    assert _content(calls) == []
+        stop_reason="stop", usage=None, latency_ms=None)))
+    assert _content(calls) == [("assistant_markdown", "hi")]
 
 
 # ─── Agent.emit live 接线（docs/17：事件经 _event_subscribers 推给订阅的 client）─────
@@ -164,10 +185,10 @@ def test_agent_emit_tool_call_requested_renders_via_client(monkeypatch):
     assert _content(calls) == [("tool_call", "run_shell", {"command": "ls"})]
 
 
-def test_agent_emit_assistant_delta_renders_text_and_thinking(monkeypatch):
+def test_agent_emit_assistant_delta_does_not_fragment_transcript(monkeypatch):
     from nanocode.agent.engine import Agent
     a = Agent(api_key="test", session_id="rtevt3", permission_mode="bypassPermissions")
     calls = _subscribed_client(a, monkeypatch)
     a.emit(AssistantDelta(text="hello "))
     a.emit(AssistantDelta(thinking="hmm"))
-    assert _content(calls) == [("assistant_markdown", "hello "), ("thinking", "hmm")]
+    assert _content(calls) == []

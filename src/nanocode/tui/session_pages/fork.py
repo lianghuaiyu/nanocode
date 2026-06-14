@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from prompt_toolkit.formatted_text import ANSI
 
 from ...session import tree as T
 from ..selector import Outcome, SelectorModel
@@ -59,13 +58,13 @@ class ForkModel(SelectorModel):
     def header_lines(self, width: int) -> list[Any]:
         sid = self.entries[0].sessionId[-8:] if self.entries else "?"
         return [
-            ANSI(f"  {_BOLD}Fork from user message{_RESET}{_DIM} · {sid}{_RESET}"),
-            ANSI(f"  {_DIM}↑↓ move · enter fork (new session before this message, prompt pre-filled) · "
-                 f"type to search · q/esc{_RESET}"),
+            f"  {_BOLD}Fork from user message{_RESET}{_DIM} · {sid}{_RESET}",
+            f"  {_DIM}↑↓ move · enter fork (new session before this message, prompt pre-filled) · "
+                 f"type to search · q/esc{_RESET}",
         ]
 
     def search_line(self, width: int) -> Any:
-        return ANSI(f"  {_DIM}Search:{_RESET} {self._query}    {_DIM}{len(self._rows)}/{len(self._users)}{_RESET}")
+        return f"  {_DIM}Search:{_RESET} {self._query}    {_DIM}{len(self._rows)}/{len(self._users)}{_RESET}"
 
     def items(self) -> list:
         return self._rows
@@ -74,8 +73,8 @@ class ForkModel(SelectorModel):
         cursor = "› " if selected else "  "
         text = _truncate(user_text(item) or "(empty)", max(12, width - len(cursor) - 2))
         if selected:
-            return ANSI(f"{_REV}{(cursor + text)[:width]}{_RESET}")
-        return ANSI(f"{cursor}{text}")
+            return f"{_REV}{(cursor + text)[:width]}{_RESET}"
+        return f"{cursor}{text}"
 
     def supports_query(self) -> bool:
         return True

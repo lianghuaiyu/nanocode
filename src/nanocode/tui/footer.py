@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from prompt_toolkit.utils import get_cwidth
+from rich.cells import cell_len as get_cwidth   # 显示宽度（CJK 双宽）；取代 prompt_toolkit.get_cwidth
 
 
 def format_tokens(count: int) -> str:

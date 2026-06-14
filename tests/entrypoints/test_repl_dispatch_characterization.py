@@ -25,11 +25,12 @@ monkeypatch cli.AgentSession 为录制替身（绕开真实 SessionContextBuilde
 """
 
 import asyncio
+import io
+import os
 import signal
 
 import pytest
-from prompt_toolkit.input.defaults import create_pipe_input
-from prompt_toolkit.output import DummyOutput
+from rich.console import Console
 
 from nanocode.entrypoints import cli
 
@@ -167,21 +168,28 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
 
     monkeypatch.setattr(tt, "task_stop", _fake_task_stop)
 
-    # 6) 跑 REPL：经 input/output 测试 seam 注入 pipe；逐行 send_text(line+"\r") 提交、末尾
-    #    \x04(Ctrl-D) 退出。run_repl 不再装/留 SIGINT handler（Ctrl-C 现由 TuiApp key binding 处理），
-    #    仍保守快照恢复 SIGINT。每行提交后让出事件循环，等其 submit task 跑完（REPL 串行——
-    #    各测试用例至多触发一次真 turn，其余为 exit/blank，故不会撞串行闸）。
+    # 6) 跑 REPL：RichApp 的 input/output 测试 seam —— input=os.pipe 读端（RichApp add_reader 读），
+    #    测试往写端逐行 send 字节 `line\r` 提交、末尾 `\x04`(Ctrl-D) 退出；output=StringIO Console
+    #    （force_terminal 让 Live 渲染但不进真终端）。各用例至多触发一次真 turn，不撞串行闸。
     prev = signal.getsignal(signal.SIGINT)
 
     async def _scenario():
-        with create_pipe_input() as pipe:
-            task = asyncio.ensure_future(cli.run_repl(agent, input=pipe, output=DummyOutput()))
-            await asyncio.sleep(0.05)
-            for ln in lines:
-                pipe.send_text(ln + "\r")
-                await asyncio.sleep(0.06)
-            pipe.send_text("\x04")  # Ctrl-D 空行退出
+        r, w = os.pipe()
+        console = Console(file=io.StringIO(), force_terminal=True, width=100)
+        task = asyncio.ensure_future(cli.run_repl(agent, input=r, output=console))
+        await asyncio.sleep(0.05)
+        for ln in lines:
+            os.write(w, (ln + "\r").encode("utf-8"))
+            await asyncio.sleep(0.06)
+        os.write(w, b"\x04")  # Ctrl-D 空行退出
+        try:
             await asyncio.wait_for(task, timeout=5)
+        finally:
+            os.close(w)
+            try:
+                os.close(r)
+            except OSError:
+                pass
 
     try:
         asyncio.run(_scenario())

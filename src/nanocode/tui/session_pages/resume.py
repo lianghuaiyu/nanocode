@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from prompt_toolkit.formatted_text import ANSI
 
 from ...session import listing as SL
 from ...session import search as SS
@@ -116,12 +115,12 @@ class ResumeSessionModel(SelectorModel):
             line2 = f"  {_DIM}Tab scope · re:<pattern> regex · \"phrase\" exact{_RESET}"
             path = "on" if self.show_path else "off"
             line3 = f"  {_DIM}Ctrl+S sort · Ctrl+N named · Ctrl+D delete · Ctrl+P path ({path}) · Ctrl+R rename{_RESET}"
-        return [ANSI(line1), ANSI(line2), ANSI(line3)]
+        return [line1, line2, line3]
 
     def search_line(self, width: int) -> Any:
         parsed = SS.parse_search_query(self._query)
         count = "regex error" if parsed.error else f"{len(self._flats)}/{self._scoped_count}"
-        return ANSI(f"  {_DIM}Search:{_RESET} {self._query}    {_DIM}{count}{_RESET}")
+        return f"  {_DIM}Search:{_RESET} {self._query}    {_DIM}{count}{_RESET}"
 
     def items(self) -> list:
         return self._flats
@@ -143,9 +142,9 @@ class ResumeSessionModel(SelectorModel):
         pad = max(1, width - len(cursor) - len(prefix) - len(t) - len(right) - 1)
         if selected:
             line = f"{cursor}{prefix}{t}{' ' * pad}{right} "
-            return ANSI(f"{_REV}{line[:width]}{_RESET}")
+            return f"{_REV}{line[:width]}{_RESET}"
         color = _YELLOW if info.name else (_ACCENT if info.sid == self.current_sid else "")
-        return ANSI(f"{cursor}{_DIM}{prefix}{_RESET}{color}{t}{_RESET}{' ' * pad}{_DIM}{right}{_RESET}")
+        return f"{cursor}{_DIM}{prefix}{_RESET}{color}{t}{_RESET}{' ' * pad}{_DIM}{right}{_RESET}"
 
     # ── live search ──────────────────────────────────────────
     def supports_query(self) -> bool:

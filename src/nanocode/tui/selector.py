@@ -12,8 +12,6 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from prompt_toolkit.formatted_text import AnyFormattedText
-
 WIDE_THRESHOLD = 90
 
 
@@ -44,16 +42,16 @@ class SelectorModel:
     def items(self) -> list:
         return []
 
-    def list_text(self, item: Any, selected: bool, width: int) -> AnyFormattedText:
+    def list_text(self, item: Any, selected: bool, width: int) -> str:
         """Render one full-width row (the app adds cursor margin + selected-row bg)."""
         return ""
 
     # ── header / chrome (model formats these Pi-faithfully; app frames in borders) ──
-    def header_lines(self, width: int) -> list[AnyFormattedText]:
+    def header_lines(self, width: int) -> list[str]:
         """Title + right-justified indicators + hint line(s); model owns confirm/status takeover."""
         return []
 
-    def search_line(self, width: int) -> AnyFormattedText | None:
+    def search_line(self, width: int) -> str | None:
         """The `Search: <q>` / `Type to search: <q>` line, or None for no search row."""
         return None
 

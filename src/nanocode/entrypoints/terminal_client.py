@@ -5,7 +5,8 @@
 全在订阅端——core 不再认识 rich / 终端 / spinner。
 
 事件 → 渲染映射：
-- assistant_delta        → markdown gutter / thinking（流式逐 block）
+- assistant_delta        → stop spinner only; transcript waits for assistant_message_completed
+- assistant_message_completed → markdown gutter / thinking once per completed assistant message
 - tool_call_requested    → 工具调用回显
 - tool_result_observed   → 工具结果摘要
 - notice_raised          → ℹ 通知（旧 sink.info）
@@ -32,7 +33,7 @@ from . import render
 # 不含 retry_raised——重试发生在同一 stream_fn 调用内、无后续 LlmRequestPrepared 重启 spinner，
 # 故重试期间保留 spinner（与旧 print_retry-during-spinner 行为一致）。
 _STOP_SPINNER_KINDS = frozenset({
-    "assistant_delta", "tool_call_requested", "tool_result_observed",
+    "assistant_delta", "assistant_message_completed", "tool_call_requested", "tool_result_observed",
     "turn_completed", "turn_aborted", "error_raised", "budget_exceeded",
     "notice_raised", "sub_agent_started", "approval_requested",
 })
@@ -65,10 +66,12 @@ class TerminalClient:
                 tui.stop_spinner()   # 渲染任何内容前先停 spinner，避免与 spinner 行交错（幂等）
 
         if kind == "assistant_delta":
-            if getattr(event, "text", ""):
-                tui.render_assistant_markdown(event.text)
+            return
+        elif kind == "assistant_message_completed":
             if getattr(event, "thinking", ""):
                 tui.render_thinking(event.thinking)
+            if getattr(event, "text", ""):
+                tui.render_assistant_markdown(event.text)
         elif kind == "tool_call_requested":
             render.print_tool_call(event.tool, event.input)      # 领域渲染（客户端侧）
         elif kind == "tool_result_observed":
