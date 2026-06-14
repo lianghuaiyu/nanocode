@@ -12,13 +12,67 @@ import sys
 import threading
 import time
 
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.markup import escape
-from rich.table import Table
-from rich.text import Text
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.markup import escape
+    from rich.table import Table
+    from rich.text import Text
+except ModuleNotFoundError:
+    import re
 
-console = Console(highlight=False)
+    def escape(value) -> str:
+        return str(value)
+
+    class Console:
+        def __init__(self, *args, **kwargs) -> None:
+            self.file = kwargs.get("file")
+
+        def print(self, *objects, **kwargs) -> None:
+            text = " ".join(str(o) for o in objects)
+            text = re.sub(r"\[/?[^\]]+\]", "", text)
+            if self.file is None:
+                print(text)
+            else:
+                print(text, file=self.file)
+
+    class Markdown:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def __str__(self) -> str:
+            return self.text
+
+    class Text:
+        def __init__(self, text: str, style: str | None = None) -> None:
+            self.text = text
+
+        def __str__(self) -> str:
+            return self.text
+
+    class _Grid:
+        def __init__(self, *args, **kwargs) -> None:
+            self.rows: list[tuple] = []
+
+        def add_column(self, *args, **kwargs) -> None:
+            return None
+
+        def add_row(self, *objects) -> None:
+            self.rows.append(objects)
+
+        def __str__(self) -> str:
+            return "\n".join(" ".join(str(o) for o in row) for row in self.rows)
+
+    class Table:
+        @staticmethod
+        def grid(*args, **kwargs):
+            return _Grid(*args, **kwargs)
+
+try:
+    from .theme import rich_theme as _rich_theme
+    console = Console(highlight=False, theme=_rich_theme())
+except Exception:
+    console = Console(highlight=False)
 
 BULLET = "⏺"
 CONNECTOR = "↳"

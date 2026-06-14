@@ -50,13 +50,15 @@ def restore(fd: int, saved) -> None:
 _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
 
-# 转义序列 → token（CSI / SS3 方向键与编辑键）。
+# 转义序列 → token（CSI / SS3 方向键与编辑键；SGR mouse wheel 在 _parse_escape 里单独解析）。
 _ESC_SEQS = {
     "[A": "up", "[B": "down", "[C": "right", "[D": "left",
     "OA": "up", "OB": "down", "OC": "right", "OD": "left",
     "[H": "home", "[F": "end", "OH": "home", "OF": "end",
     "[1~": "home", "[4~": "end", "[3~": "delete",
     "[5~": "pageup", "[6~": "pagedown",
+    # Shift+Enter 的多种终端编码(kitty CSI-u / xterm modifyOtherKeys)→ 插入换行
+    "[13;2u": "shift-enter", "[27;2;13~": "shift-enter",
 }
 
 # 控制字节 → token。
@@ -136,8 +138,30 @@ class KeyParser:
         if _PASTE_START.startswith(s[i:]):
             return None, 0, True
         c0 = rest[0]
+        if c0 in ("\r", "\n"):
+            return "shift-enter", 2, False               # ESC+CR(Alt/Shift+Enter)→ 换行
         if c0 not in "[O":
             return "escape", 1, False                    # 裸 Esc（consumed 仅 ESC 本身）
+        if rest.startswith("[<"):
+            end_m = rest.find("M")
+            end_l = rest.find("m")
+            candidates = [x for x in (end_m, end_l) if x != -1]
+            if not candidates:
+                return None, 0, True
+            end = min(candidates)
+            seq = rest[: end + 1]
+            consumed = 1 + len(seq)
+            try:
+                button = int(seq[2:].split(";", 1)[0])
+            except Exception:
+                return "escape", consumed, False
+            if button & 64:
+                direction = button & 3
+                if direction == 0:
+                    return "scrollup", consumed, False
+                if direction == 1:
+                    return "scrolldown", consumed, False
+            return "mouse", consumed, False
         # CSI/SS3：匹配最长已知序列
         for seq, tok in _ESC_SEQS.items():
             if rest.startswith(seq):
@@ -193,8 +217,12 @@ class LineEditor:
             return None
         t = token
         if t == "enter":
+            # 反斜杠续行:行尾 '\' + Enter → 换行(不提交)
+            if self.cursor > 0 and self.text[:self.cursor].endswith("\\"):
+                self.text = self.text[: self.cursor - 1] + "\n" + self.text[self.cursor:]
+                return None
             return "submit"
-        if t == "ctrl-j":
+        if t in ("ctrl-j", "shift-enter"):
             self._insert("\n")
             return None
         if t == "ctrl-c":
@@ -236,10 +264,16 @@ class LineEditor:
             self._delete_word()
             return None
         if t == "up":
-            self._history_prev()
+            if "\n" in self.text and self.text.rfind("\n", 0, self.cursor) != -1:
+                self._move_line(-1)               # 多行草稿:上移一视觉行(不劫持历史)
+            else:
+                self._history_prev()
             return None
         if t == "down":
-            self._history_next()
+            if "\n" in self.text and self.text.find("\n", self.cursor) != -1:
+                self._move_line(1)
+            else:
+                self._history_next()
             return None
         if isinstance(t, str) and len(t) == 1 and (t >= " " or t == "\t"):
             self._insert(t)
@@ -259,6 +293,28 @@ class LineEditor:
             i -= 1
         self.text = self.text[:i] + self.text[self.cursor:]
         self.cursor = i
+
+    def _move_line(self, delta: int) -> None:
+        """光标按逻辑行上/下移动,尽量保持列位(多行草稿编辑)。"""
+        ls = self.text.rfind("\n", 0, self.cursor) + 1   # 当前行起始
+        col = self.cursor - ls
+        if delta < 0:
+            if ls == 0:
+                return
+            prev_start = self.text.rfind("\n", 0, ls - 1) + 1
+            prev_len = (ls - 1) - prev_start
+            self.cursor = prev_start + min(col, prev_len)
+        else:
+            line_end = self.text.find("\n", self.cursor)
+            if line_end == -1:
+                return
+            next_start = line_end + 1
+            next_end = self.text.find("\n", next_start)
+            if next_end == -1:
+                next_end = len(self.text)
+            next_len = next_end - next_start
+            self.cursor = next_start + min(col, next_len)
+        self._hist_idx = None
 
     def _history_prev(self) -> None:
         if not self.history:

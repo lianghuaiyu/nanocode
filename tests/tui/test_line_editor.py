@@ -24,6 +24,12 @@ def test_arrow_escape_sequences():
     assert p.feed(b"\x1b[D") == ["left"]
 
 
+def test_sgr_mouse_wheel_sequences():
+    p = KeyParser()
+    assert p.feed(b"\x1b[<64;10;5M") == ["scrollup"]
+    assert p.feed(b"\x1b[<65;10;5M") == ["scrolldown"]
+
+
 def test_escape_sequence_split_across_feeds():
     p = KeyParser()
     assert p.feed(b"\x1b[") == []      # 不完整 → 暂存

@@ -10,20 +10,15 @@ from typing import Any
 
 
 from ...session import tree as T
-from ..selector import Outcome, SelectorModel
+from ..selector import Outcome, SelectorModel, cell_width, pad_cells, truncate_cells
+from ..theme import BOLD as _BOLD, DIM as _DIM, RESET as _RESET, fg as _fg
 
-_DIM = "\x1b[2m"
-_RESET = "\x1b[0m"
-_REV = "\x1b[7m"
-_BOLD = "\x1b[1m"
-_ACCENT = "\x1b[36m"
+_ACCENT = _fg("accent")
 
 
 def _truncate(text: str, width: int) -> str:
     text = text.replace("\n", " ").strip()
-    if width <= 1:
-        return ""
-    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+    return truncate_cells(text, width)
 
 
 def is_user_message(e: T.Entry) -> bool:
@@ -60,7 +55,7 @@ class ForkModel(SelectorModel):
         return [
             f"  {_BOLD}Fork from user message{_RESET}{_DIM} · {sid}{_RESET}",
             f"  {_DIM}↑↓ move · enter fork (new session before this message, prompt pre-filled) · "
-                 f"type to search · q/esc{_RESET}",
+                 f"type to search · esc cancel{_RESET}",
         ]
 
     def search_line(self, width: int) -> Any:
@@ -71,9 +66,9 @@ class ForkModel(SelectorModel):
 
     def list_text(self, item: T.Entry, selected: bool, width: int) -> Any:
         cursor = "› " if selected else "  "
-        text = _truncate(user_text(item) or "(empty)", max(12, width - len(cursor) - 2))
-        if selected:
-            return f"{_REV}{(cursor + text)[:width]}{_RESET}"
+        text = _truncate(user_text(item) or "(empty)", max(1, width - cell_width(cursor)))
+        if selected:                               # Pi:accent '› ' 游标 + bold(无反显)
+            return f"{_ACCENT}{cursor}{_RESET}{_BOLD}{text}{_RESET}"
         return f"{cursor}{text}"
 
     def supports_query(self) -> bool:

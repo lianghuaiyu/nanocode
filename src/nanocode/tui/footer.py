@@ -127,3 +127,95 @@ def render_footer(state: FooterState, width: int | None = None) -> list[str]:
     else:
         stats = f"{left}    {right}" if left else right
     return [pwd, stats]
+
+
+def key_hint(key: str, desc: str) -> str:
+    """ANSI 提示片段:键名走 dim、描述走 muted(对位 Pi keybinding-hints.keyHint)。"""
+    from . import theme as T
+    return f"{T.DIM}{key}{T.RESET}{T.fg('muted')} {desc}{T.RESET}"
+
+
+def hint_sep() -> str:
+    """提示片段分隔符(muted ' · ')。"""
+    from . import theme as T
+    return f"{T.fg('muted')} · {T.RESET}"
+
+
+def _truncate_cells(text: str, width: int) -> str:
+    """按显示宽度裁剪 + 省略号(footer 行裁剪)。"""
+    if width <= 0:
+        return ""
+    if get_cwidth(text) <= width:
+        return text
+    out, used, limit = [], 0, width - 1
+    for ch in text:
+        w = get_cwidth(ch)
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def render_footer_styled(state: "FooterState", width: int | None = None) -> list:
+    """Pi 式两行 footer 的**着色**版(供 Rich Live viewport):全 dim,ctx% 按阈值着色
+    (>90% error / >70% warning / else dim);model 右对齐。返回 list[rich.text.Text]。"""
+    from rich.text import Text
+
+    pwd = format_cwd(state.cwd, state.home)
+    if state.branch:
+        pwd = f"{pwd} ({state.branch})"
+    if state.session_name:
+        pwd = f"{pwd} • {state.session_name}"
+
+    left_parts: list[str] = []
+    if state.input_tokens:
+        left_parts.append(f"↑{format_tokens(state.input_tokens)}")
+    if state.output_tokens:
+        left_parts.append(f"↓{format_tokens(state.output_tokens)}")
+    if state.cost_usd:
+        left_parts.append(f"${state.cost_usd:.3f}")
+    left_str = "  ".join(left_parts)
+
+    pct_str, pct_style = "", "dim"
+    if state.context_window:
+        pct = state.context_used / state.context_window * 100
+        pct_str = f"{pct:.0f}%/{format_tokens(state.context_window)}"
+        pct_style = "error" if pct > 90 else ("warning" if pct > 70 else "dim")
+
+    right_parts = [state.model] if state.model else []
+    if state.thinking:
+        right_parts.append(state.thinking)
+    if state.activity:
+        right_parts.append(state.activity)
+    right = " • ".join(right_parts)
+
+    left_full_plain = "  ".join(s for s in (left_str, pct_str) if s)
+
+    if width and width > 0:
+        line1 = Text(_truncate_cells(pwd, width), style="dim")
+    else:
+        line1 = Text(pwd, style="dim")
+
+    line2 = Text()
+    if left_str:
+        line2.append(left_str, style="dim")
+    if pct_str:
+        if left_str:
+            line2.append("  ", style="dim")
+        line2.append(pct_str, style=pct_style)
+
+    if width and width > 0:
+        used = get_cwidth(left_full_plain) + get_cwidth(right)
+        if used + 2 > width:
+            avail = max(0, width - get_cwidth(left_full_plain) - 2)
+            right = _truncate_cells(right, avail)
+            spacing = 2 if avail > 0 else max(1, width - get_cwidth(left_full_plain))
+        else:
+            spacing = max(2, width - used)
+    else:
+        spacing = 4
+    line2.append(" " * spacing)
+    if right:
+        line2.append(right, style="dim")
+    return [line1, line2]

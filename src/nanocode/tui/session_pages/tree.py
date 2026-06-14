@@ -13,22 +13,17 @@ from typing import Any
 
 from ...session import tree as T
 from ...session import tree_view as TV
-from ..selector import KeyResult, Outcome, SelectorModel
+from ..selector import KeyResult, Outcome, SelectorModel, cell_width, pad_cells, truncate_cells
+from ..theme import BOLD as _BOLD, DIM as _DIM, RESET as _RESET, fg as _fg
 
-_DIM = "\x1b[2m"
-_RESET = "\x1b[0m"
-_REV = "\x1b[7m"
-_BOLD = "\x1b[1m"
-_ACCENT = "\x1b[36m"
-_WARN = "\x1b[33m"
-_GREEN = "\x1b[32m"
+_ACCENT = _fg("accent")
+_WARN = _fg("warning")
+_GREEN = _fg("success")
 
 
 def _truncate(text: str, width: int) -> str:
-    text = text.replace("\n", " ").strip()
-    if width <= 1:
-        return ""
-    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+    text = "".join(" " if (ord(ch) < 32 or ord(ch) == 127) else ch for ch in text).strip()
+    return truncate_cells(text, width)
 
 
 def _search_text(row: TV.Row) -> str:
@@ -67,32 +62,52 @@ class SessionTreeModel(SelectorModel):
         return max(5, height // 2)  # Pi tree-selector.ts:1169
 
     def header_lines(self, width: int) -> list[Any]:
-        sid = self.entries[0].sessionId[-8:] if self.entries else "?"
-        leaf = f" · leaf …{self.leaf_id[-8:]}" if self.leaf_id else ""
-        title = f"  {_BOLD}Session Tree{_RESET}{_DIM} · {sid}{leaf} · filter: {self.mode}{_RESET}"
-        help1 = (f"  {_DIM}↑↓ move · enter checkout · Ctrl+←/→ fold · Shift+L label · "
-                 f"Ctrl+D/T/U/L/A filters · Ctrl+O cycle · type to search · q/esc{_RESET}")
-        status = f"  {_ACCENT}{self.status}{_RESET}" if self.status else help1
-        return [title, status]
+        title = f"  {_BOLD}Session Tree{_RESET}"
+        help1 = (f"  {_DIM}↑/↓: move. ←/→: page. Ctrl+←/→: fold/branch. Shift+L: label. "
+                 f"Ctrl+D/T/U/L/A: filters (Ctrl+O cycle). type to search{_RESET}")
+        if self.status:
+            help1 = f"  {_ACCENT}{self.status}{_RESET}"
+        return [title, help1]
 
     def search_line(self, width: int) -> str:
-        return (f"  {_DIM}Type to search:{_RESET} {self._query}    "
-                f"{_DIM}{len(self._rows)}/{self._base_count}{_RESET}")
+        if self._query:
+            return f"  {_DIM}Type to search:{_RESET} {_ACCENT}{self._query}{_RESET}"
+        return f"  {_DIM}Type to search:{_RESET}"
+
+    def body_border_after_search(self) -> bool:
+        return True
+
+    def status_suffix(self) -> str:
+        labels = {
+            "no-tools": " [no-tools]",
+            "user-only": " [user]",
+            "labeled-only": " [labeled]",
+            "all": " [all]",
+        }
+        return labels.get(self.mode, "")
+
+    def position_line(self, index: int, total: int, visible_start: int, visible_end: int, width: int) -> str | None:
+        shown = index + 1 if total else 0
+        return f"  ({shown}/{total}){self.status_suffix()}"
+
+    def empty_text(self, width: int) -> str:
+        return "  No entries found"
 
     def items(self) -> list:
         return self._rows
 
     def list_text(self, item: TV.Row, selected: bool, width: int) -> Any:
         prefix = item.prefix
-        marker = "⊞ " if (item.folded and "⊞" not in prefix) else ("• " if item.on_active_path else "")
+        marker = ("⊞ " if (item.folded and "⊞" not in prefix) else "") + ("• " if item.on_active_path else "")
         lbl = f"[{item.label}] " if item.label else ""
-        leaf = "  ◀" if item.is_leaf else ""
-        cursor = "› " if selected else "  "
-        avail = max(12, width - len(cursor) - len(prefix) - len(marker) - len(lbl) - len(leaf) - 2)
+        leaf = "  <" if item.is_leaf else ""
+        cursor = "› " if selected else "  "        # plain(供宽度计算)
+        avail = max(1, width - cell_width(cursor) - cell_width(prefix) - cell_width(marker)
+                    - cell_width(lbl) - cell_width(leaf))
         content = _truncate(item.content, avail)
-        if selected:
-            line = f"{cursor}{prefix}{marker}{lbl}{content}{leaf}"
-            return f"{_REV}{line[:width]:<{min(width, len(line) + 1)}}{_RESET}"
+        if selected:                               # Pi:accent '› ' 游标 + bold 行(无反显)
+            cur = f"{_ACCENT}{cursor}{_RESET}"
+            return f"{cur}{_BOLD}{prefix}{marker}{lbl}{content}{leaf}{_RESET}"
         if content.startswith("user:"):
             head, _, rest = content.partition(":")
             shown = f"{_ACCENT}{head}:{_RESET}{rest}"
@@ -109,12 +124,19 @@ class SessionTreeModel(SelectorModel):
     def supports_query(self) -> bool:
         return True
 
+    def wrap_navigation(self) -> bool:
+        return True
+
+    def escape_clears_query(self) -> bool:
+        return True
+
     def query(self) -> str:
         return self._query
 
     def set_query(self, query: str) -> None:
         self._query = query
         self.status = ""
+        self.folded.clear()
         self._recompute()
 
     # ── keys ─────────────────────────────────────────────────
@@ -124,6 +146,7 @@ class SessionTreeModel(SelectorModel):
     def _set_mode(self, mode: TV.FilterMode, label: str) -> KeyResult:
         self.mode = mode
         self.status = label
+        self.folded.clear()
         self._recompute()
         return KeyResult("refresh")
 
@@ -160,7 +183,7 @@ class SessionTreeModel(SelectorModel):
         return None
 
 
-async def run_tree(manager, *, host) -> dict | None:
+async def run_tree(manager, *, host, set_label=None) -> dict | None:
     """Run the tree page; returns ``{"action": "checkout", "entry_id": id}`` or None."""
 
     mode: TV.FilterMode = "default"
@@ -185,6 +208,9 @@ async def run_tree(manager, *, host) -> dict | None:
             cur = T.labels_by_id(entries).get(entry.id, "")
             text = await host.ask_text(f"label for …{entry.id[-8:]} (blank=clear) [{cur}]: ")
             if text is not None:
-                manager.append_label(entry.id, text.strip())
+                if set_label is None:
+                    status = "label operation unavailable"
+                    continue
+                set_label(entry.id, text.strip())
                 status = "label updated" if text.strip() else "label cleared"
             continue

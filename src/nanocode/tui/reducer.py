@@ -26,7 +26,11 @@ from .state import (
     TuiState,
 )
 
-_RESULT_EXCERPT_CHARS = 240
+_RESULT_EXCERPT_CHARS = 4000
+
+
+def _looks_like_error(result: str) -> bool:
+    return (result or "").startswith(("Error", "Command failed", "Command timed out"))
 
 
 def _g(event: Any, name: str, default: Any = None) -> Any:
@@ -90,12 +94,18 @@ def reduce(state: TuiState, env: dict) -> TuiState:
         # 收尾末尾未完成的 assistant/thinking 项；无增量但有文本时补建一条完成项。
         a = _open_item(state, AssistantItem)
         t = _open_item(state, ThinkingItem)
+        final_text = _g(event, "text", "") or ""
+        final_thinking = _g(event, "thinking", "") or ""
         if a is not None:
+            if final_text:
+                a.text = final_text
             a.complete = True
         if t is not None:
+            if final_thinking:
+                t.text = final_thinking
             t.complete = True
-        if a is None and (_g(event, "text") or ""):
-            state.timeline.append(AssistantItem(text=_g(event, "text", ""), complete=True))
+        if a is None and final_text:
+            state.timeline.append(AssistantItem(text=final_text, complete=True))
 
     elif kind == "tool_call_requested":
         tid = _g(event, "tool_use_id", "") or ""
@@ -107,10 +117,12 @@ def reduce(state: TuiState, env: dict) -> TuiState:
     elif kind == "tool_result_observed":
         item = _find_tool(state, _g(event, "tool_use_id", "") or "")
         if item is not None:
+            result = _g(event, "result", "") or ""
+            # 观测点即终态判定(headless 客户端也据结果文本判错);completed(is_error) 为兜底。
             if item.status == "running":
-                item.status = "done"
+                item.status = "error" if _looks_like_error(result) else "done"
             item.chars = _g(event, "chars", 0) or 0
-            item.result_excerpt = (_g(event, "result", "") or "")[:_RESULT_EXCERPT_CHARS]
+            item.result_excerpt = result[:_RESULT_EXCERPT_CHARS]
             state.active_tools.pop(item.id, None)
 
     elif kind == "tool_result_completed":
@@ -186,6 +198,10 @@ def reduce(state: TuiState, env: dict) -> TuiState:
     elif kind == "turn_aborted":
         state.mode = "idle"
         state.modal = None
+        # 中断时仍在跑的工具标记 denied,使其成终态(可被提交进 scrollback,不卡 live)。
+        for item in state.timeline:
+            if isinstance(item, ToolItem) and item.status == "running":
+                item.status = "denied"
         state.timeline.append(NoticeItem(text="Interrupted — back to prompt.", level="warn"))
         state.active_tools.clear()
 

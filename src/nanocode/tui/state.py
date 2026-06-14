@@ -107,6 +107,7 @@ class StatusSnapshot:
     model: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    context_used: int = 0
     cost_usd: float | None = None
     context_window: int = 0
     thinking: str | None = None
@@ -122,6 +123,7 @@ class StatusSnapshot:
             model=d.get("model", ""),
             input_tokens=d.get("input_tokens", 0),
             output_tokens=d.get("output_tokens", 0),
+            context_used=d.get("context_used", 0),
             cost_usd=d.get("cost_usd"),
             context_window=d.get("context_window", 0),
             thinking=d.get("thinking"),

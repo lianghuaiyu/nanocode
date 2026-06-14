@@ -12,7 +12,37 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from rich.cells import cell_len
+
 WIDE_THRESHOLD = 90
+
+
+def cell_width(text: str) -> int:
+    """Terminal cell width for selector layout, including CJK double-width text."""
+    return cell_len(text)
+
+
+def truncate_cells(text: str, width: int) -> str:
+    """Truncate to a terminal-cell budget with an ellipsis."""
+    if width <= 1:
+        return ""
+    if cell_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    limit = width - 1
+    for ch in text:
+        w = cell_width(ch)
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def pad_cells(text: str, width: int) -> str:
+    """Right-pad a plain string to a terminal-cell width."""
+    return text + " " * max(0, width - cell_width(text))
 
 
 @dataclass
@@ -59,6 +89,25 @@ class SelectorModel:
         """Trailing label appended to the app's `(i/total)` indicator (e.g. ` [no-tools]`)."""
         return ""
 
+    def body_border_after_search(self) -> bool:
+        """Pi tree selector has a divider between search chrome and body; session selector does not."""
+        return False
+
+    def border_accent(self) -> bool:
+        """True → 边框用 accent(teal),False → 中性 border(蓝,Pi 默认 DynamicBorder 色)。
+
+        Pi 仅 session/trust 选择器用 accent;tree/fork 用默认 border。"""
+        return False
+
+    def position_line(self, index: int, total: int, visible_start: int, visible_end: int, width: int) -> str | None:
+        """Optional muted position/scroll line below the visible rows."""
+        if total <= 0:
+            return None
+        return f"  ({index + 1}/{total}){self.status_suffix()}"
+
+    def empty_text(self, width: int) -> str:
+        return "  (no entries)"
+
     def max_visible(self, height: int) -> int:
         """How many list rows the panel shows (Pi: resume=10, tree=max(5, h//2))."""
         return max(5, height - 8)
@@ -73,6 +122,12 @@ class SelectorModel:
 
     def extra_keys(self) -> tuple[str, ...]:
         return ()
+
+    def wrap_navigation(self) -> bool:
+        return False
+
+    def escape_clears_query(self) -> bool:
+        return False
 
     # ── live search ──────────────────────────────────────────
     def supports_query(self) -> bool:

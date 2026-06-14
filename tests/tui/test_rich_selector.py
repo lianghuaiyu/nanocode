@@ -27,17 +27,21 @@ class _Thread:
 
 
 class _Model(SelectorModel):
-    def __init__(self, *, query=False):
+    def __init__(self, *, query=False, wrap=False, escape_clears=False):
         self._items = ["alpha", "beta", "gamma"]
         self.refreshed = 0
         self._q = ""
         self._query = query
+        self._wrap = wrap
+        self._escape_clears = escape_clears
     def header_lines(self, w): return ["pick one"]
     def items(self): return self._items
     def list_text(self, it, sel, w): return ("> " if sel else "  ") + it
     def extra_keys(self): return ("f", "l")
     def supports_query(self): return self._query
     def query(self): return self._q
+    def wrap_navigation(self): return self._wrap
+    def escape_clears_query(self): return self._escape_clears
     def set_query(self, q):
         self._q = q
         self._items = [x for x in ["alpha", "beta", "gamma"] if q.lower() in x] or ["alpha", "beta", "gamma"]
@@ -84,6 +88,11 @@ def test_arrow_down_navigates():
     assert outcome.kind == "done" and outcome.item == "beta"
 
 
+def test_mouse_wheel_down_navigates_selector():
+    outcome, _ = _drive_selector(_Model(), [b"\x1b[<65;10;5M", b"\r"])
+    assert outcome.kind == "done" and outcome.item == "gamma" and outcome.index == 2
+
+
 def test_q_cancels():
     outcome, _ = _drive_selector(_Model(), [b"q"])
     assert outcome.kind == "cancel"
@@ -103,6 +112,17 @@ def test_query_mode_filters_and_jkq_are_text():
     # 搜索态：j/k/q 当文本进 query（不导航/取消）；只 esc 取消
     outcome, model = _drive_selector(_Model(query=True), ["q".encode(), "j".encode(), "k".encode(), b"\x1b"])
     assert model.query() == "qjk"
+    assert outcome.kind == "cancel"
+
+
+def test_selector_wrap_navigation_hook():
+    outcome, _ = _drive_selector(_Model(wrap=True), [b"\x1b[A", b"\r"])  # up from first wraps to gamma
+    assert outcome.kind == "done" and outcome.item == "gamma" and outcome.index == 2
+
+
+def test_selector_escape_can_clear_query_before_cancel():
+    outcome, model = _drive_selector(_Model(query=True, escape_clears=True), [b"b", b"\x1b", b"\x1b"])
+    assert model.query() == ""
     assert outcome.kind == "cancel"
 
 

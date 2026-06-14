@@ -71,6 +71,17 @@ def test_completed_marks_open_items_complete():
     assert a.complete is True
 
 
+def test_completed_updates_open_item_with_final_text():
+    st = drive(E.AssistantDelta(text="partial"))
+    reducer.reduce(
+        st,
+        env(E.AssistantMessageCompleted(message={}, text="final answer", thinking="", tool_uses=[], stop_reason="end", usage=None, latency_ms=10)),
+    )
+    a = [i for i in st.timeline if isinstance(i, AssistantItem)][0]
+    assert a.text == "final answer"
+    assert a.complete is True
+
+
 def test_completed_without_deltas_synthesizes_item():
     st = TuiState()
     reducer.reduce(

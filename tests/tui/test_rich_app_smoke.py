@@ -21,7 +21,7 @@ def _env(event):
 
 
 class FakeThread:
-    def __init__(self, *, block: bool = False):
+    def __init__(self, *, block: bool = False, emit_delta: bool = True, final_text: str = "hi"):
         self._listeners = []
         self.is_processing = False
         self.session_id = "fake123"
@@ -29,13 +29,19 @@ class FakeThread:
         self.abort_calls = 0
         self._block = block
         self._abort_event: asyncio.Event | None = None
+        self.transcript_messages = []
+        self.emit_delta = emit_delta
+        self.final_text = final_text
 
     def status(self):
         return {"session_id": "fake123", "cwd": "/repo", "session_name": "Fake", "input_tokens": 0,
                 "output_tokens": 0, "cost_usd": 0.0, "context_window": 200000, "model": "m", "thinking": None}
 
     def state(self):
-        s = self.status(); s["is_processing"] = self.is_processing; s["messages"] = []
+        s = self.status()
+        s["is_processing"] = self.is_processing
+        s["messages"] = []
+        s["transcript_messages"] = self.transcript_messages
         return s
 
     def subscribe(self, l):
@@ -49,6 +55,7 @@ class FakeThread:
     async def run(self, prompt):
         self.run_calls.append(prompt)
         self.is_processing = True
+        self.emit(_env(E.UserMessageAccepted(text=prompt)))
         self.emit(_env(E.LlmRequestPrepared(model="m", message_count=1, messages_chars=1)))
         if self._block:
             self._abort_event = asyncio.Event()
@@ -58,8 +65,9 @@ class FakeThread:
                 self.is_processing = False
             self.emit(_env(E.TurnAborted(input_tokens=1, output_tokens=0, turns=1)))
             return
-        self.emit(_env(E.AssistantDelta(text="hi")))
-        self.emit(_env(E.AssistantMessageCompleted(message={}, text="hi", thinking="", tool_uses=[],
+        if self.emit_delta:
+            self.emit(_env(E.AssistantDelta(text=self.final_text)))
+        self.emit(_env(E.AssistantMessageCompleted(message={}, text=self.final_text, thinking="", tool_uses=[],
                                                     stop_reason="end", usage=None, latency_ms=1)))
         self.is_processing = False
         self.emit(_env(E.TurnCompleted(input_tokens=10, output_tokens=2, turns=1, cost_usd=0.001)))
@@ -70,8 +78,8 @@ class FakeThread:
             self._abort_event.set()
 
 
-def _console():
-    return Console(file=io.StringIO(), force_terminal=True, width=100)
+def _console(*, height: int | None = None, width: int = 100):
+    return Console(file=io.StringIO(), force_terminal=True, width=width, height=height)
 
 
 def test_submit_runs_turn_and_reduces():
@@ -96,8 +104,44 @@ def test_submit_runs_turn_and_reduces():
     app, thread = asyncio.run(scenario())
     assert thread.run_calls == ["hello"]
     from nanocode.tui.state import AssistantItem
-    assert any(isinstance(i, AssistantItem) and i.text == "hi" for i in app.state.timeline)
+    assert not any(isinstance(i, AssistantItem) and i.text == "hi" for i in app.state.timeline)
     assert app.state.status.input_tokens == 10
+
+
+def test_bind_thread_clears_live_timeline_residue():
+    from nanocode.tui.state import NoticeItem, SessionBoundaryItem
+
+    app = RichApp(output=_console())
+    app.bind_thread(FakeThread())
+    app.state.timeline.append(NoticeItem(text="old session warning", level="warn"))
+
+    app.bind_thread(FakeThread())
+
+    assert not any(isinstance(i, NoticeItem) for i in app.state.timeline)
+    assert any(isinstance(i, SessionBoundaryItem) for i in app.state.timeline)
+
+
+def test_session_switch_notice_commits_above_without_live_residue():
+    from nanocode.tui.state import NoticeItem
+
+    con = _console()
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.NoticeRaised(text="Session → abc12345 (34 messages).")))
+
+    out = con.file.getvalue()
+    assert "Session → abc12345 (34 messages)." in out
+    assert not any(isinstance(i, NoticeItem) and i.text.startswith("Session → ") for i in app.state.timeline)
+
+
+def test_regular_notice_stays_in_live_timeline():
+    from nanocode.tui.state import NoticeItem
+
+    app = RichApp(output=_console())
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.NoticeRaised(text="heads up")))
+
+    assert any(isinstance(i, NoticeItem) and i.text == "heads up" for i in app.state.timeline)
 
 
 def test_ctrl_c_aborts_running_turn_without_exit():
@@ -152,3 +196,180 @@ def test_chinese_input_then_submit():
 
     thread = asyncio.run(scenario())
     assert thread.run_calls == ["你好"]
+
+
+def test_completed_message_commits_to_scrollback_without_delta():
+    async def scenario():
+        r, w = os.pipe()
+        con = _console()
+        app = RichApp(input=r, output=con)
+        thread = FakeThread(emit_delta=False, final_text="final-only answer")
+        app.bind_thread(thread)
+        task = asyncio.create_task(app.run())
+        await asyncio.sleep(0.05)
+        os.write(w, "hello\r".encode())
+        await asyncio.sleep(0.15)
+        os.write(w, b"\x04")
+        await asyncio.wait_for(task, timeout=3)
+        os.close(w)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        return con
+
+    con = asyncio.run(scenario())
+    assert "final-only answer" in con.file.getvalue()
+
+
+def test_completed_message_is_committed_full_to_scrollback():
+    async def scenario():
+        r, w = os.pipe()
+        con = _console()
+        app = RichApp(input=r, output=con)
+        final_text = "\n\n".join(f"section {i}: detailed content" for i in range(12))
+        thread = FakeThread(emit_delta=True, final_text=final_text)
+        app.bind_thread(thread)
+        task = asyncio.create_task(app.run())
+        await asyncio.sleep(0.05)
+        os.write(w, "hello\r".encode())
+        await asyncio.sleep(0.15)
+        os.write(w, b"\x04")
+        await asyncio.wait_for(task, timeout=3)
+        os.close(w)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        return app, con
+
+    app, con = asyncio.run(scenario())
+    from nanocode.tui.state import AssistantItem
+
+    out = con.file.getvalue()
+    assert "section 0: detailed content" in out
+    assert "section 11: detailed content" in out
+    assert not any(isinstance(i, AssistantItem) for i in app.state.timeline)
+
+
+def test_completed_message_clears_tool_items_from_live_timeline():
+    from nanocode.tui.state import ToolItem
+
+    con = _console()
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.ToolCallRequested(tool="read_file", input={}, tool_use_id="tu1")))
+    app.on_event(_env(E.ToolResultObserved(tool="read_file", tool_use_id="tu1", chars=12, result="file body")))
+    app.on_event(_env(E.AssistantMessageCompleted(
+        message={}, text="final answer", thinking="", tool_uses=[],
+        stop_reason="end", usage=None, latency_ms=1,
+    )))
+
+    assert "final answer" in con.file.getvalue()
+    assert not any(isinstance(i, ToolItem) for i in app.state.timeline)
+
+
+def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
+    con = _console(width=48)
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.AssistantMessageCompleted(
+        message={},
+        text=(
+            "# Title\n\nSome **bold** and `code`\n\n---\n\n- item\n\n"
+            "| A | B |\n|---|---|\n| x | y |\n\n"
+            "```python\ndef foo():\n    return 1\n```"
+        ),
+        thinking="",
+        tool_uses=[],
+        stop_reason="end",
+        usage=None,
+        latency_ms=1,
+    )))
+
+    out = con.file.getvalue()
+    import re as _re
+    plain = _re.sub(r"\x1b\[[0-9;]*m", "", out)   # 去 SGR:代码经 Syntax 高亮后 token 间夹有色码
+    assert "Title" in out
+    assert "bold" in out
+    assert "code" in out
+    assert "- item" in plain          # marker 与文本分别着色 → 用去色文本断言
+    assert "A │ B" in out
+    assert "x │ y" in out
+    assert "```python" in out
+    assert "def foo():" in plain
+    assert "return 1" in plain
+    assert "─" * 80 not in out
+
+
+def test_streaming_long_assistant_keeps_full_live_output():
+    con = _console(height=12)
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.AssistantDelta(text="\n".join(f"line {i}" for i in range(30)))))
+    con.print(app)
+
+    out = con.file.getvalue()
+    assert "earlier response hidden while streaming" not in out
+    assert "line 0" in out
+    assert "line 29" in out
+
+
+def test_bind_thread_does_not_replay_persisted_transcript():
+    con = _console()
+    app = RichApp(output=con)
+    thread = FakeThread()
+    thread.transcript_messages = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "old answer"}]},
+    ]
+
+    app.bind_thread(thread)
+    con.print(app)
+
+    out = con.file.getvalue()
+    assert "old question" not in out
+    assert "old answer" not in out
+    assert "repo" in out          # footer cwd proves the bottom input/footer region rendered
+
+
+def test_long_resumed_transcript_is_not_replayed_into_prompt():
+    con = _console(height=12)
+    app = RichApp(output=con)
+    thread = FakeThread()
+    thread.transcript_messages = [
+        {"role": "user", "content": f"old question {i}"}
+        for i in range(20)
+    ]
+
+    app.bind_thread(thread)
+    con.print(app)
+
+    out = con.file.getvalue()
+    assert "old question" not in out
+    assert "repo" in out          # footer cwd proves the bottom input/footer region rendered
+
+
+def test_refresh_transcript_replays_full_history_to_scrollback():
+    con = _console(height=12)
+    app = RichApp(output=con)
+    thread = FakeThread()
+    thread.transcript_messages = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "\n\n".join(
+            f"section {i}: historical answer" for i in range(12)
+        )}]},
+        {"role": "toolResult", "toolName": "read_file", "content": "tool output"},
+    ]
+
+    app.bind_thread(thread)
+    app.refresh_transcript()
+    con.print(app)
+
+    out = con.file.getvalue()
+    assert "Session context" in out
+    assert "old question" in out
+    assert "section 0: historical answer" in out
+    assert "section 11: historical answer" in out
+    assert "read_file: tool output" in out
+    assert "repo" in out          # footer cwd proves the bottom input/footer region rendered
