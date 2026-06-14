@@ -43,6 +43,8 @@ def test_thread_resume_reloads_target_and_rebinds_session():
     a, rt, t, host = _host("CUR")
     a._session_mgr.append_message(T.user_message("current-q"))
     SessionManager.create("TGT").append_message(T.user_message("target-conversation"))
+    seen = []
+    host.current_thread.subscribe(seen.append)
     new_t = rt.thread_resume(host, "TGT")
     assert new_t is not None and host.current_thread is new_t
     assert a.session_id == "TGT"
@@ -50,6 +52,28 @@ def test_thread_resume_reloads_target_and_rebinds_session():
     assert "current-q" not in str(a.agent_session.build_request_messages())
     # docs/14 P2/P7：新 AgentSession 绑新 session（SessionContextBuilder 已退役，不再有 stale 缓存）
     assert host.current_thread.session.session_id == "TGT"
+    assert seen[0]["type"] == "session_shutdown"
+    assert seen[0]["event"]["reason"] == "resume"
+
+
+def test_thread_resume_rebuilds_cwd_bound_services(tmp_path):
+    cwd_a = tmp_path / "a"
+    cwd_b = tmp_path / "b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+    a = _agent("CWDA")
+    a._session_mgr = SessionManager.create("CWDA", cwd=str(cwd_a))
+    rt = AgentRuntime()
+    t = rt.adopt(a)
+    host = RuntimeHost(rt, t, registry=None)
+    SessionManager.create("CWDB", cwd=str(cwd_b)).append_message(T.user_message("target"))
+
+    new_t = rt.thread_resume(host, "CWDB")
+
+    assert new_t is not None
+    assert host.current_thread.services.cwd == str(cwd_b.resolve())
+    assert a._runtime_services.cwd == str(cwd_b.resolve())
+    assert a._memory_backend is host.current_thread.services.memory_backend
 
 
 def test_thread_resume_unknown_session_returns_none():

@@ -10,7 +10,11 @@ import sys
 import time
 
 from nanocode.agent.engine import Agent
+from nanocode.agent import AgentRuntime
+from nanocode.entrypoints.host import RuntimeHost
 from nanocode.entrypoints.rpc import run_rpc_mode
+from nanocode.session import tree as T
+from nanocode.session.manager import SessionManager
 
 
 class _FakeBlock:
@@ -71,6 +75,14 @@ def _run(agent, steps, monkeypatch):
     monkeypatch.setattr(sys, "stdin", _GatedStdin(steps, out))
     asyncio.run(run_rpc_mode(agent))
     # 还原 stdout 后再解析（避免解析期写日志又被捕获）
+    return [json.loads(l) for l in out]
+
+
+def _run_host(host, steps, monkeypatch):
+    out = []
+    monkeypatch.setattr(sys, "stdout", _CapStdout(out))
+    monkeypatch.setattr(sys, "stdin", _GatedStdin(steps, out))
+    asyncio.run(run_rpc_mode(host))
     return [json.loads(l) for l in out]
 
 
@@ -181,6 +193,32 @@ def test_rpc_get_state_returns_snapshot(monkeypatch):
     st = next(m for m in msgs if m.get("type") == "state")
     assert st["state"]["session_id"] == "rpcstate"
     assert "messages" in st["state"] and "model" in st["state"]
+
+
+def test_rpc_session_stats_messages_and_name(monkeypatch):
+    async def stream(*, model, system, tools, messages, thinking_mode, callbacks):
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a = _agent("rpcstats", stream)
+    mgr = SessionManager.create("rpcstats")
+    a._session_mgr = mgr
+    mgr.append_message(T.user_message("hello"))
+    rt = AgentRuntime()
+    thread = rt.adopt(a)
+    host = RuntimeHost(rt, thread, interactive=False)
+
+    msgs = _run_host(host, [
+        ('{"id":"m1","type":"get_messages"}', None),
+        ('{"id":"s1","type":"get_session_stats"}', "get_messages"),
+        ('{"id":"n1","type":"set_session_name","name":"named"}', "get_session_stats"),
+        ('{"cmd":"exit"}', "set_session_name"),
+    ], monkeypatch)
+
+    by_command = {m.get("command"): m for m in msgs if m.get("type") == "response"}
+    assert by_command["get_messages"]["data"]["messages"]
+    assert by_command["get_session_stats"]["data"]["session_id"] == "rpcstats"
+    assert by_command["set_session_name"]["success"] is True
+    assert mgr.name() == "named"
 
 
 def test_rpc_approval_denied_blocks_tool(monkeypatch):

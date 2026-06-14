@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="940" viewBox="0 0 1420 940" role="img" aria-labelledby="title desc">
+  <title id="title">Gemini CLI context strategy example</title>
+  <desc id="desc">A diagram showing Gemini CLI context management and classic chat compression paths.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .title { font: 700 34px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #4b5563; }
+      .section { font: 700 22px Arial, sans-serif; fill: #111827; }
+      .label { font: 700 16px Arial, sans-serif; fill: #111827; }
+      .text { font: 400 15px Arial, sans-serif; fill: #374151; }
+      .small { font: 400 13px Arial, sans-serif; fill: #4b5563; }
+      .tiny { font: 400 12px Arial, sans-serif; fill: #6b7280; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 8; }
+      .blue { fill: #e7f0ff; stroke: #8ab4f8; }
+      .green { fill: #eaf8ef; stroke: #72c48b; }
+      .orange { fill: #fff4e5; stroke: #f2a33a; }
+      .red { fill: #fff0f0; stroke: #f18080; }
+      .purple { fill: #f2edff; stroke: #a78bfa; }
+      .dark { fill: #172033; }
+      .darkText { font: 700 15px Arial, sans-serif; fill: #ffffff; }
+      .arrow { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 6 5; fill: none; marker-end: url(#arrow); }
+      .divider { stroke: #cbd5e1; stroke-width: 1; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1420" height="940"/>
+  <text class="title" x="48" y="58">Gemini CLI 上下文策略示例</text>
+  <text class="subtitle" x="48" y="88">同一轮请求会先判断是否启用 context-management；未启用时走 classic chat compression。</text>
+
+  <rect class="box blue" x="48" y="125" width="280" height="92"/>
+  <text class="label" x="72" y="158">用户新请求</text>
+  <text class="text" x="72" y="184">例：继续修改 repo，之前</text>
+  <text class="text" x="72" y="204">已经读过很多大文件和工具输出</text>
+
+  <rect class="box purple" x="386" y="125" width="310" height="92"/>
+  <text class="label" x="410" y="158">GeminiClient.sendMessageStream()</text>
+  <text class="text" x="410" y="184">读取配置：contextManagement.enabled</text>
+  <text class="tiny" x="410" y="206">client.ts:643-694</text>
+  <path class="arrow" d="M328 171 L386 171"/>
+
+  <rect class="box green" x="88" y="275" width="560" height="220"/>
+  <text class="section" x="112" y="310">路径 A：context-management 开启</text>
+  <text class="text" x="112" y="344">1. durable AgentChatHistory 同步成 graph nodes</text>
+  <text class="text" x="112" y="370">2. pending request 先预览，经过 new_message pipeline</text>
+  <text class="text" x="112" y="396">3. 等待 pipeline/hot-start，再触发 GC / distillation / normalization</text>
+  <text class="text" x="112" y="422">4. render() 输出 apiHistory 与 pendingApiHistory</text>
+  <text class="text" x="112" y="448">5. pending 请求只 late-bind 到本次 API，不直接污染 durable history</text>
+  <text class="tiny" x="112" y="474">contextManager.ts:90-260；client.ts:643-673</text>
+
+  <rect class="box orange" x="752" y="275" width="560" height="220"/>
+  <text class="section" x="776" y="310">路径 B：classic chat compression</text>
+  <text class="text" x="776" y="344">1. chat.getHistory(true) 取 curated history</text>
+  <text class="text" x="776" y="370">2. 未超过阈值则 NOOP；默认阈值为 token limit 的 50%</text>
+  <text class="text" x="776" y="396">3. functionResponse 先按 50k token 全局预算逆序截断</text>
+  <text class="text" x="776" y="422">4. 压旧的约 70%，保留新的约 30%</text>
+  <text class="text" x="776" y="448">5. 生成 state_snapshot，再二次验证；若 token 反涨则拒绝</text>
+  <text class="tiny" x="776" y="474">chatCompressionService.ts:37-52, 239-481</text>
+
+  <path class="dash" d="M540 217 L360 275"/>
+  <path class="dash" d="M565 217 L1032 275"/>
+
+  <line class="divider" x1="48" y1="535" x2="1372" y2="535"/>
+  <text class="section" x="48" y="575">classic compression 的具体历史改写例子</text>
+
+  <rect class="box" x="60" y="610" width="355" height="245"/>
+  <text class="label" x="84" y="642">压缩前 curated history</text>
+  <rect class="dark" x="84" y="666" width="58" height="28" rx="6"/>
+  <text class="darkText" x="101" y="685">旧</text>
+  <text class="small" x="158" y="686">user: 初始需求、约束</text>
+  <rect class="dark" x="84" y="704" width="58" height="28" rx="6"/>
+  <text class="darkText" x="101" y="723">旧</text>
+  <text class="small" x="158" y="724">model: 计划 + functionCall</text>
+  <rect class="dark" x="84" y="742" width="58" height="28" rx="6"/>
+  <text class="darkText" x="101" y="761">旧</text>
+  <text class="small" x="158" y="762">tool: read_file 大输出</text>
+  <rect class="dark" x="84" y="780" width="58" height="28" rx="6"/>
+  <text class="darkText" x="101" y="799">新</text>
+  <text class="small" x="158" y="800">user/model/tool 最近 30%</text>
+  <text class="tiny" x="84" y="832">例：lastPromptTokenCount 达到模型窗口 50% 以上</text>
+
+  <rect class="box orange" x="495" y="610" width="405" height="245"/>
+  <text class="label" x="519" y="642">压缩过程</text>
+  <text class="text" x="519" y="674">truncateHistoryToBudget()</text>
+  <text class="small" x="546" y="700">旧 functionResponse 超过 50k 预算时写入 temp file，</text>
+  <text class="small" x="546" y="722">上下文里留下 truncated placeholder</text>
+  <text class="text" x="519" y="758">findCompressSplitPoint()</text>
+  <text class="small" x="546" y="784">只在安全 user turn 前切；避免 function response 断裂</text>
+  <text class="text" x="519" y="820">summary + verification</text>
+  <text class="tiny" x="519" y="842">若 summary 后 token 更多：COMPRESSION_FAILED_INFLATED_TOKEN_COUNT</text>
+  <path class="arrow" d="M415 735 L495 735"/>
+
+  <rect class="box green" x="980" y="610" width="355" height="245"/>
+  <text class="label" x="1004" y="642">压缩后 newHistory</text>
+  <rect class="dark" x="1004" y="666" width="82" height="28" rx="6"/>
+  <text class="darkText" x="1018" y="685">user</text>
+  <text class="small" x="1102" y="686">&lt;state_snapshot&gt;...</text>
+  <rect class="dark" x="1004" y="704" width="82" height="28" rx="6"/>
+  <text class="darkText" x="1015" y="723">model</text>
+  <text class="small" x="1102" y="724">Got it. Thanks...</text>
+  <rect class="dark" x="1004" y="742" width="82" height="28" rx="6"/>
+  <text class="darkText" x="1018" y="761">tail</text>
+  <text class="small" x="1102" y="762">保留最近 30% 历史</text>
+  <text class="tiny" x="1004" y="800">GeminiClient 成功时 startChat(newHistory)</text>
+  <text class="tiny" x="1004" y="822">truncation-only 时 setHistory(newHistory)</text>
+  <path class="arrow" d="M900 735 L980 735"/>
+
+  <rect class="box red" x="48" y="878" width="1324" height="42"/>
+  <text class="small" x="72" y="904">要点：Gemini CLI 不是只做“摘要压缩”。它同时有 classic summary+tail、functionResponse 预算截断、summary 自校验、膨胀拒绝，以及开启 context-management 后的 graph/pipeline/late-bind 路线。</text>
+</svg>

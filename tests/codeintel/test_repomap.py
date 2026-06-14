@@ -1,6 +1,7 @@
 """docs/15 §9：RepoIndex + RepoMapProvider（symbols 抽取 / aider 排名 / 二分预算渲染）。"""
 
 import asyncio
+import subprocess
 
 from nanocode.codeintel import RepoIndex, RepoQuery, extract_symbols
 from nanocode.context.providers import RepoMapProvider, ContextRequest
@@ -11,6 +12,11 @@ def _write(tmp_path, rel, text):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text)
     return p
+
+
+def _git_repo(tmp_path):
+    subprocess.run(["git", "-C", str(tmp_path), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
 
 
 def test_extract_symbols_python(tmp_path):
@@ -81,6 +87,7 @@ def test_mtime_cache_skips_unchanged(tmp_path):
 
 def test_repomap_provider_emits_pack(tmp_path):
     _write(tmp_path, "svc.py", "def serve():\n    pass\nclass Server:\n    pass\n")
+    _git_repo(tmp_path)
     pack = asyncio.run(RepoMapProvider().collect(ContextRequest(cwd=str(tmp_path), include_repo_map=True)))
     assert pack is not None and pack.kind == "repo_map"
     assert "svc.py" in pack.as_text() and "serve" in pack.as_text()
@@ -92,14 +99,29 @@ def test_repomap_provider_none_when_repo_empty(tmp_path):
     assert pack is None                                            # 空仓库（无任何文件）→ 无 pack
 
 
+def test_repomap_provider_disabled_by_zero_tokens_does_not_scan(tmp_path, monkeypatch):
+    _write(tmp_path, "svc.py", "def serve():\n    pass\n")
+    _git_repo(tmp_path)
+    import nanocode.codeintel as codeintel
+    def fail_get_service(_root):
+        raise AssertionError("repo map service should not start when map tokens are 0")
+    monkeypatch.setattr(codeintel, "get_service", fail_get_service)
+    # 预算 0 是 Aider --map-tokens 0 语义：直接禁用，不应触发索引服务。
+    pack = asyncio.run(RepoMapProvider().collect(ContextRequest(
+        cwd=str(tmp_path), include_repo_map=True, map_tokens=0)))
+    assert pack is None
+
+
 def test_repomap_provider_lists_files_for_docs_only_repo(tmp_path):
     _write(tmp_path, "readme.md", "# hi\n")                        # 无源码符号 → aider 语义:裸文件清单
+    _git_repo(tmp_path)
     pack = asyncio.run(RepoMapProvider().collect(ContextRequest(cwd=str(tmp_path), include_repo_map=True)))
     assert pack is not None and "readme.md" in pack.as_text()
 
 
-def test_no_files_budget_x8_capped_by_context_window(tmp_path, monkeypatch):
+def test_no_files_budget_multiplier_capped_by_context_window(tmp_path, monkeypatch):
     _write(tmp_path, "svc.py", "def serve():\n    pass\n")
+    _git_repo(tmp_path)
     from nanocode.codeintel import reset_services
     reset_services()
     seen = {}
@@ -110,23 +132,29 @@ def test_no_files_budget_x8_capped_by_context_window(tmp_path, monkeypatch):
         return orig(self, query, budget_tokens=budget_tokens, refresh=refresh,
                     force_refresh=force_refresh)
     monkeypatch.setattr(CodeIntelService, "repo_map", spying)
-    # 无 personal 文件 + 知道窗口 → ×8（aider map_mul_no_files）
+    # 无 personal 文件 + 知道窗口 → 默认 ×2（aider CLI map-multiplier-no-files）
     asyncio.run(RepoMapProvider().collect(ContextRequest(
         cwd=str(tmp_path), include_repo_map=True,
-        repo_map_budget_tokens=1000, context_window_tokens=200_000)))
+        map_tokens=1000, context_window_tokens=200_000)))
+    assert seen["budget"] == 2000
+    # 可配置倍率仍保留 Aider RepoMap 类的放大语义。
+    asyncio.run(RepoMapProvider().collect(ContextRequest(
+        cwd=str(tmp_path), include_repo_map=True,
+        map_tokens=1000, context_window_tokens=200_000,
+        map_multiplier_no_files=8)))
     assert seen["budget"] == 8000
     # 窗口太小 → 封顶到 window − 4096（aider padding）
     asyncio.run(RepoMapProvider().collect(ContextRequest(
         cwd=str(tmp_path), include_repo_map=True,
-        repo_map_budget_tokens=1000, context_window_tokens=6000)))
+        map_tokens=1000, context_window_tokens=6000)))
     assert seen["budget"] == 6000 - 4096
     # 有 personal 文件 → 不放大；mentions 不影响放大（aider 条件只看 chat files）
     asyncio.run(RepoMapProvider().collect(ContextRequest(
         cwd=str(tmp_path), include_repo_map=True, files_read=[str(tmp_path / "svc.py")],
-        repo_map_budget_tokens=1000, context_window_tokens=200_000)))
+        map_tokens=1000, context_window_tokens=200_000)))
     assert seen["budget"] == 1000
     asyncio.run(RepoMapProvider().collect(ContextRequest(
         cwd=str(tmp_path), include_repo_map=True, user_prompt="look at serve",
-        repo_map_budget_tokens=1000, context_window_tokens=200_000)))
-    assert seen["budget"] == 8000
+        map_tokens=1000, context_window_tokens=200_000)))
+    assert seen["budget"] == 2000
     reset_services()

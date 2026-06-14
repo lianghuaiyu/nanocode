@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from nanocode.agent import AgentRuntime, AgentSession
 from nanocode.agent.engine import Agent
@@ -15,7 +16,15 @@ from nanocode.session import listing as SM
 from nanocode.session import search as SS
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
+from nanocode.tui.selector import cell_width
 from nanocode.tui.session_pages.resume import ResumeSessionModel
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text)
 
 
 def _info(sid, parent=None, origin="root", modified=0.0, name=None, cwd="/x", n=1):
@@ -83,6 +92,8 @@ def test_search_invalid_regex_returns_empty():
 def test_resume_model_pi_style_ctrl_keys():
     model = ResumeSessionModel([_info("alpha", name="A")], None, "/x", "current", 1000)
     item = model.items()[0]
+    assert model.search_line(80) == "> "
+    assert model.position_line(0, 1, 0, 1, 80) is None
     assert "c-s" in model.extra_keys() and "r" not in model.extra_keys()
     model.on_key("c-s", item, 0)
     assert model.sort_mode == "recent"
@@ -91,6 +102,59 @@ def test_resume_model_pi_style_ctrl_keys():
     model.on_key("c-p", item, 0)
     assert model.show_path is True
     assert model.on_key("c-r", item, 0).edit_action == "rename"
+
+
+def test_resume_model_rows_use_pi_cursor_and_cell_width_alignment():
+    model = ResumeSessionModel([
+        _info("alpha", name="中文标题很长很长", modified=1000, n=12),
+    ], "alpha", "/x", "current", 1000)
+
+    raw = model.list_text(model.items()[0], True, 36)
+    selected = _plain(raw)
+    idle = _plain(model.list_text(model.items()[0], False, 36))
+
+    assert selected.startswith("› ")          # Pi accent 游标(U+203A)
+    assert "\x1b[7m" not in raw               # 无反显
+    assert cell_width(selected) == 36
+    assert cell_width(idle) == 36
+    assert selected.rstrip().endswith("12 now")
+
+
+def test_resume_model_child_rows_use_spacious_box_prefix():
+    infos = [
+        _info("root", modified=100),
+        _info("child_a", parent="root", origin="fork", modified=90),
+        _info("child_b", parent="root", origin="fork", modified=80),
+        _info("grand", parent="child_a", origin="fork", modified=70),
+    ]
+    model = ResumeSessionModel(infos, None, "/x", "current", 1000)
+    child = next(i for i in model.items() if i.info.sid == "child_b")
+    grand = next(i for i in model.items() if i.info.sid == "grand")
+
+    child_rendered = _plain(model.list_text(child, False, 48))
+    grand_rendered = _plain(model.list_text(grand, False, 48))
+
+    assert "└─  " in child_rendered or "├─  " in child_rendered
+    assert "│   └─  " in grand_rendered or "│   ├─  " in grand_rendered
+    assert "-> " not in child_rendered + grand_rendered
+    assert cell_width(child_rendered) == 48
+    assert cell_width(grand_rendered) == 48
+
+
+def test_resume_model_pi_scroll_indicator_only_when_needed():
+    infos = [_info(f"s{i}", modified=float(i)) for i in range(11)]
+    model = ResumeSessionModel(infos, None, "/x", "current", 1000)
+    assert model.position_line(0, 10, 0, 10, 80) is None
+    assert model.position_line(5, 11, 1, 11, 80) == "  (6/11)"
+
+
+def test_resume_model_pi_empty_messages():
+    current = ResumeSessionModel([], None, "/x", "current", 1000)
+    assert "No sessions in current folder" in current.empty_text(80)
+    all_scope = ResumeSessionModel([], None, "/x", "all", 1000)
+    assert all_scope.empty_text(80) == "  No sessions found"
+    named = ResumeSessionModel([], None, "/x", "current", 1000, name_filter="named")
+    assert "No named sessions in current folder" in named.empty_text(80)
 
 
 def test_resume_delete_confirm_and_protect_current(monkeypatch):
@@ -141,6 +205,22 @@ def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     assert "Resumable sessions" in out
     assert "ROOTSID"[-8:] in out and "CHILDSID"[-8:] in out
     assert "fork" in out
+
+
+def test_resume_current_session_requests_transcript_refresh():
+    sid = "CURRESUM"
+    mgr = SessionManager.create(sid)
+    mgr.append_message(T.user_message("current convo"))
+    mgr.close()
+
+    a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    a._session_mgr = SessionManager.open(sid)
+    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
+
+    res = asyncio.run(_resume(ctx, sid))
+
+    assert isinstance(res, Local)
+    assert res.refresh_transcript is True
 
 
 def test_session_shows_current_stats():

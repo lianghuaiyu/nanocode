@@ -22,18 +22,11 @@ pending future，stdin 的 approval_response 解决它（FIFO 即可：agent 循
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import sys
 
-from ..agent import AgentRuntime, ApprovalManager
-
-
-def _serialize_event(event) -> object:
-    """typed AgentEvent（frozen dataclass）→ JSON-able dict；边界事件已是 plain dict。"""
-    if dataclasses.is_dataclass(event) and not isinstance(event, type):
-        return dataclasses.asdict(event)
-    return event
+from ..agent import AgentRuntime, ApprovalManager, RuntimeApprovalBroker
+from .host import RuntimeHost
 
 
 def _emit_line(obj: dict) -> None:
@@ -41,39 +34,63 @@ def _emit_line(obj: dict) -> None:
     sys.stdout.flush()
 
 
-async def run_rpc_mode(agent, lease=None) -> None:
-    """在 agent 上跑 RPC 事件循环（stdin 命令 ↔ stdout 事件流）。"""
-    loop = asyncio.get_event_loop()
-    # 待审批 future（按 request_id 关联）。审批在 agent 循环内**串行**（turn 挂起等 confirm_fn），
-    # 同一时刻至多一个待审批；用 dict 仍便于按 id 精确应答 + FIFO 兜底。
-    pending: "dict[str, asyncio.Future]" = {}
-    approval_seq = [0]
+def _response(command: str, *, success: bool = True, data=None, error: str | None = None,
+              id_: str | None = None) -> dict:
+    out = {"type": "response", "command": command, "success": success}
+    if id_ is not None:
+        out["id"] = id_
+    if data is not None:
+        out["data"] = data
+    if error is not None:
+        out["error"] = error
+    return out
 
-    async def confirm_fn(message: str) -> bool:
-        # codex P1：confirm_fn **自带**审批请求往返——不依赖 ApprovalRequested 事件经订阅流到达
-        # 客户端。这点对前台子 agent 至关重要：子 agent 是独立 Agent，其事件发往子的 _event_subscribers
-        # （不连父 RuntimeThread 流），但它**继承父 confirm_fn**，故经此处自带的 approval_request 行
-        # 仍能让客户端看到并应答（否则危险子 agent 动作会让 turn 永久挂起）。
-        approval_seq[0] += 1
-        rid = f"appr-{approval_seq[0]}"
-        fut = loop.create_future()
-        pending[rid] = fut
-        _emit_line({"type": "approval_request", "request_id": rid, "message": message})
-        try:
-            return await fut
-        finally:
-            pending.pop(rid, None)
 
-    rt = AgentRuntime()
-    thread = rt.adopt(agent, approvals=ApprovalManager(confirm_fn=confirm_fn), lease=lease)
-    # 订阅事件流 → 逐条 JSON line 到 stdout（这是 core→client 的全部表现通道）。
-    thread.subscribe(lambda env: _emit_line({**env, "event": _serialize_event(env["event"])}))
+def _user_message_text(entry) -> str:
+    msg = (entry.data or {}).get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
+    """Run RPC against a runtime host.
+
+    The production boundary is RuntimeHost. A bare agent is accepted only as a
+    compatibility shim for older tests and immediately wrapped in a host.
+    """
+    if isinstance(runtime_host_or_agent, RuntimeHost):
+        host = runtime_host_or_agent
+        thread = host.current_thread
+    else:
+        rt = AgentRuntime()
+        thread = rt.adopt(runtime_host_or_agent, lease=lease)
+        host = RuntimeHost(rt, thread, interactive=False)
+    loop = asyncio.get_running_loop()
+
+    broker = RuntimeApprovalBroker(emit=_emit_line)
+    ApprovalManager(confirm_fn=broker.confirm).attach(thread.agent)
+    # 订阅事件流 → 逐条 JSON line 到 stdout。RuntimeThread 已保证 event 是 JSON-able。
+    unsubscribe = thread.subscribe(_emit_line)
+
+    async def _rebind_current_thread() -> None:
+        nonlocal thread, unsubscribe
+        unsubscribe()
+        thread = host.current_thread
+        ApprovalManager(confirm_fn=broker.confirm).attach(thread.agent)
+        unsubscribe = thread.subscribe(_emit_line)
 
     async def _run_turn(text: str) -> None:
         # codex P2：detached task——必须自己兜住异常并 emit 结构化结果，否则 thread.run() 抛错时
         # 任务静默死亡、客户端永远等不到协议承诺的 turn_result。
         try:
-            res = await thread.run(text)
+            res = await host.current_thread.run(text)
             _emit_line({"type": "turn_result", "status": res.status,
                         "final_response": res.final_response,
                         "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
@@ -99,7 +116,8 @@ async def run_rpc_mode(agent, lease=None) -> None:
             _emit_line({"type": "error", "message": f"bad json: {e}"})
             continue
 
-        kind = cmd.get("cmd")
+        kind = cmd.get("cmd") or cmd.get("type")
+        cid = cmd.get("id")
         if kind == "prompt":
             # codex P1：turn 串行——已有 turn 在跑时拒绝新 prompt（否则两 turn 共享同一 Agent 的
             # _current_task / token 计数 / _final_text_chunks / pending 审批，必然串台/丢状态）。
@@ -108,16 +126,79 @@ async def run_rpc_mode(agent, lease=None) -> None:
             else:
                 turn_task = asyncio.create_task(_run_turn(cmd.get("text", "")))
         elif kind == "cancel":
-            thread.cancel()
+            host.current_thread.cancel()
         elif kind == "get_state":
             # Pi get_state 对位：完整会话快照（status + messages）。
-            _emit_line({"type": "state", "state": thread.state()})
+            _emit_line({"type": "state", "state": host.current_thread.state()})
+        elif kind == "get_messages":
+            _emit_line(_response("get_messages", data={"messages": host.current_thread.messages()}, id_=cid))
+        elif kind == "get_session_stats":
+            _emit_line(_response("get_session_stats", data=host.current_thread.session_stats(), id_=cid))
+        elif kind == "set_session_name":
+            try:
+                host.current_thread.set_session_name((cmd.get("name") or "").strip())
+                _emit_line(_response("set_session_name", id_=cid))
+            except Exception as e:
+                _emit_line(_response("set_session_name", success=False, error=str(e), id_=cid))
+        elif kind == "compact":
+            try:
+                await host.current_thread.compact()
+                _emit_line(_response("compact", id_=cid))
+            except Exception as e:
+                _emit_line(_response("compact", success=False, error=str(e), id_=cid))
+        elif kind == "new_session":
+            ok, reason = host.can_switch()
+            if not ok:
+                _emit_line({"type": "error", "message": f"cannot switch sessions right now: {reason}"})
+            else:
+                host.runtime.thread_new(host)
+                await _rebind_current_thread()
+                _emit_line(_response("new_session", id_=cid))
+        elif kind == "resume":
+            ok, reason = host.can_switch()
+            if not ok:
+                _emit_line({"type": "error", "message": f"cannot switch sessions right now: {reason}"})
+            else:
+                sid = cmd.get("session_id") or cmd.get("sessionId")
+                if not sid or host.runtime.thread_resume(host, sid) is None:
+                    _emit_line({"type": "error", "message": f"cannot resume {sid!r}"})
+                else:
+                    await _rebind_current_thread()
+                    _emit_line(_response("resume", id_=cid))
+        elif kind == "fork":
+            ok, reason = host.can_switch()
+            if not ok:
+                _emit_line(_response("fork", success=False,
+                                     error=f"cannot switch sessions right now: {reason}", id_=cid))
+            else:
+                entry_id = cmd.get("entry_id") or cmd.get("entryId")
+                selected_text = ""
+                view = host.current_thread.readonly_session()
+                if view is not None:
+                    entry = next((e for e in view.entries() if e.id == entry_id), None)
+                    if entry is not None:
+                        selected_text = _user_message_text(entry)
+                if not entry_id or host.runtime.thread_fork(host, host.current_thread.session_id, entry_id) is None:
+                    _emit_line(_response("fork", success=False, error="fork failed", id_=cid))
+                else:
+                    await _rebind_current_thread()
+                    _emit_line(_response("fork", data={"text": selected_text}, id_=cid))
+        elif kind == "clone":
+            ok, reason = host.can_switch()
+            if not ok:
+                _emit_line(_response("clone", success=False,
+                                     error=f"cannot switch sessions right now: {reason}", id_=cid))
+            elif host.runtime.thread_clone(host, host.current_thread.session_id) is None:
+                _emit_line(_response("clone", success=False, error="clone failed", id_=cid))
+            else:
+                await _rebind_current_thread()
+                _emit_line(_response("clone", id_=cid))
+        elif kind == "shell":
+            result = await host.current_thread.execute_user_shell(cmd.get("command", ""))
+            _emit_line({"type": "shell_result", "output": result})
         elif kind == "approval_response":
             # 按 request_id 精确应答；缺 id 则 FIFO 解决最早一个待审批（串行下唯一）。
-            rid = cmd.get("request_id")
-            fut = pending.get(rid) if rid is not None else next(iter(pending.values()), None)
-            if fut is not None and not fut.done():
-                fut.set_result(bool(cmd.get("approved", False)))
+            broker.resolve(cmd.get("request_id"), bool(cmd.get("approved", False)))
         elif kind == "exit":
             break
         else:
@@ -125,3 +206,4 @@ async def run_rpc_mode(agent, lease=None) -> None:
 
     if turn_task is not None and not turn_task.done():
         turn_task.cancel()
+    unsubscribe()

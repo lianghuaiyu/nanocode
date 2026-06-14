@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.runtime import AgentRuntime, RuntimeThread, TurnResult, ApprovalManager, AgentConfig
+from nanocode.agent.events import NoticeRaised
 
 
 def _agent(**kw):
@@ -43,6 +45,21 @@ def test_thread_start_builds_and_registers_thread():
     assert th.thread_id == "tsid"
     assert rt.thread("tsid") is th
     assert th.agent.model == cfg.model
+    th.release_lease()
+
+
+def test_thread_start_new_session_uses_config_cwd(tmp_path):
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    rt = AgentRuntime()
+    cfg = AgentConfig(api_key="test", session_id="cwdstart", permission_mode="bypassPermissions",
+                      cwd=str(cwd))
+    th = rt.thread_start(cfg)
+    try:
+        assert th.services.cwd == str(cwd.resolve())
+        assert th.readonly_session()._cwd() == str(cwd.resolve())
+    finally:
+        th.release_lease()
 
 
 
@@ -123,6 +140,45 @@ def test_thread_messages_and_state_snapshot():
     assert "model" in state and "cost_usd" in state
 
 
+def test_runtime_thread_facade_does_not_expose_internal_state_managers():
+    rt = AgentRuntime()
+    a = Agent(api_key="test", session_id="facade_sid", permission_mode="bypassPermissions")
+    th = rt.adopt(a)
+    assert not hasattr(th, "session_manager")
+    assert not hasattr(th, "task_manager")
+    assert not hasattr(th, "background_tasks")
+
+
+def test_readonly_session_view_hides_mutation_methods():
+    from nanocode.session.manager import SessionManager
+    from nanocode.session import tree as T
+
+    rt = AgentRuntime()
+    a = Agent(api_key="test", session_id="readonly_sid", permission_mode="bypassPermissions")
+    mgr = SessionManager.create("readonly_sid")
+    a._session_mgr = mgr
+    user = mgr.append_message(T.user_message("hello"))
+    th = rt.adopt(a)
+
+    view = th.readonly_session()
+    assert view is not None
+    assert view.get_leaf() == user.id
+    assert not hasattr(view, "append_label")
+    th.set_entry_label(user.id, "mark")
+    assert mgr.labels()[user.id] == "mark"
+    mgr.close()
+
+
+def test_thread_event_boundary_is_jsonable():
+    rt = AgentRuntime()
+    a = _agent()
+    th = rt.adopt(a)
+    a.emit(NoticeRaised(text="hello"))
+    env = th.events()[-1]
+    assert env["event"] == {"text": "hello", "level": "info", "kind": "notice_raised"}
+    json.dumps(env)
+
+
 def test_final_response_derived_from_event_stream():
     """docs/17 Phase 0：TurnResult.final_response 从 agent 的 emit 流（AssistantDelta.text）派生，
     无需 capturing sink。"""
@@ -171,3 +227,14 @@ def test_approval_manager_none_leaves_defaults():
     before_confirm = a.confirm_fn
     AgentRuntime().adopt(a, approvals=ApprovalManager())  # both None
     assert a.confirm_fn is before_confirm   # 不动默认（None→阻塞 input 回退）
+
+
+def test_execute_user_shell_emits_audit_events():
+    rt = AgentRuntime()
+    a = _agent()
+    th = rt.adopt(a)
+    out = asyncio.run(th.execute_user_shell("echo runtime-shell"))
+    assert "runtime-shell" in out
+    types = [e["type"] for e in th.events()]
+    assert "user_shell_started" in types
+    assert "user_shell_completed" in types

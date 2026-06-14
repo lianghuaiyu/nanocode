@@ -53,8 +53,9 @@ def test_subpolicies_attach():
     p = AgentProfile(
         name="custom",
         permission=PermissionProfile(mode="plan", tools_deny={"run_shell"}, auto_deny_confirms=True),
-        context=ContextProfile(codeintel=False, repo_map=False),
+        context=ContextProfile(codeintel=False, map_tokens=0),
     )
     assert p.permission.mode == "plan"
     assert p.permission.auto_deny_confirms is True
     assert p.context.codeintel is False
+    assert p.context.map_tokens == 0

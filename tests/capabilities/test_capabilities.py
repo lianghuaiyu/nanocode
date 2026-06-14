@@ -9,6 +9,7 @@ from nanocode.capabilities import (
     Capability, PermissionContext, classify_capability, decide,
     is_always_allowed_meta, router_allowlist_blocks,
 )
+from nanocode.capabilities.router import CapabilityRouter
 
 
 # ─── PermissionContext（不可变,decouple from Agent）──────────────────────────
@@ -71,3 +72,32 @@ def test_is_always_allowed_meta():
     assert is_always_allowed_meta("exit_plan_mode")
     assert not is_always_allowed_meta("memory")
     assert not is_always_allowed_meta("agent")
+
+
+def test_router_task_meta_uses_service_methods_without_task_manager():
+    class Host:
+        session_id = "s"
+        is_sub_agent = False
+
+        def tool_blocked_by_allowlist(self, name): return False
+        def emit(self, event): return True
+        async def spawn_background_shell(self, command, timeout_ms): return "tid"
+        def list_tasks(self, status=None, kind=None): return f"tasks:{status}:{kind}"
+        def task_output(self, task_id, tail_bytes=8000): return f"output:{task_id}:{tail_bytes}"
+        async def stop_task(self, task_id): return "stopped"
+        async def recall_memory_semantic(self, query, limit): return ""
+        async def spawn_memory_consolidate(self): return ""
+        async def execute_plan_mode_tool(self, name): return ""
+        async def execute_agent_tool(self, inp): return ""
+        async def execute_skill_tool(self, inp): return ""
+        async def run_real_tool(self, name, inp): return ""
+        def hooks_suppressed(self): return True
+        def has_active_hooks(self): return False
+        def matching_hooks(self, event, tool): return []
+        async def run_hook(self, hook, name, inp, result): return True, ""
+
+    import asyncio
+    router = CapabilityRouter()
+    assert not hasattr(Host(), "task_manager")
+    assert asyncio.run(router.dispatch(Host(), "task_list", {"status": "running"})) == "tasks:running:None"
+    assert asyncio.run(router.dispatch(Host(), "task_output", {"task_id": "t1", "tail_bytes": 3})) == "output:t1:3"

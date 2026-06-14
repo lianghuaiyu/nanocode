@@ -15,7 +15,7 @@ class BudgetPolicy:
     """上下文预算策略。total = 全部 context packs 的 token 上限;per-kind 给关键来源单独封顶。"""
 
     total_tokens: int = 16000
-    repo_map_tokens: int = 1024
+    map_tokens: int = 1024
     memory_tokens: int = 4000
     skill_listing_tokens: int = 2000
 
@@ -25,14 +25,14 @@ class BudgetPolicy:
         total = max(4000, int(effective_window * 0.08))
         return cls(
             total_tokens=total,
-            repo_map_tokens=max(512, int(effective_window * 0.005)),
+            map_tokens=max(512, int(effective_window * 0.005)),
             memory_tokens=max(2000, int(effective_window * 0.02)),
             skill_listing_tokens=max(2000, int(effective_window * 0.02)),
         )
 
     def cap_for_kind(self, kind: str) -> int | None:
         return {
-            "repo_map": self.repo_map_tokens,
+            "repo_map": self.map_tokens,
             "memory": self.memory_tokens,
             "memory_static": self.memory_tokens,
             "skill_listing": self.skill_listing_tokens,

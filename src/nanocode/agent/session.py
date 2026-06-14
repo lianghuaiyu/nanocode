@@ -68,9 +68,10 @@ class AgentSession:
         a._ensure_session_lease()               # lease prologue（runtime 已注入则 no-op）
         from ..context import ContextLedger
         a._context_ledger = ContextLedger()     # per-turn 全量记账（/context 可见性，docs/16 #6）
+        a._turn_context_plan = None             # clear previous turn's volatile tail before any render/compact
         await self.inject_session_context()     # 项目指令/memory 作 session-context 包
+        a.emit(_events.UserMessageAccepted(text=prompt))   # S1：先回显/落树，耗时 repo-map 不遮住提交反馈
         a._turn_context_plan = await self._collect_turn_volatile(prompt)   # date/git/repo-map 等 per-turn volatile
-        a.emit(_events.UserMessageAccepted(text=prompt))   # S1：user 消息先落树（请求从树渲染）
         await self.check_and_compact()
         memory_prefetch = self.start_memory_prefetch(prompt)
 
@@ -192,26 +193,35 @@ class AgentSession:
         a = self.agent
         if a.is_sub_agent:
             return None
-        import os
         from ..context import BudgetPolicy, ContextRequest, ContextRuntime
         from ..context.providers import EnvProvider, GitSnapshotProvider, RepoMapProvider
+        from ..context.model_policy import model_uses_repo_map
         from ..tools.permissions import load_context_config
+        from .runtime import _push_cwd
+        services = getattr(a, "_runtime_services", None)
+        cwd = services.cwd if services is not None else os.getcwd()
         budget = BudgetPolicy.for_window(a.effective_window)
-        cfg = load_context_config()
-        req = ContextRequest(cwd=os.getcwd(), is_sub_agent=False,
+        with _push_cwd(cwd):
+            cfg = load_context_config()
+        configured_map_tokens = cfg["map_tokens"]
+        map_tokens = (1024 if configured_map_tokens is None and model_uses_repo_map(a.model)
+                      else (configured_map_tokens or 0))
+        req = ContextRequest(cwd=cwd, is_sub_agent=False,
                              include_env=True, include_git=True,
-                             include_repo_map=cfg["repo_map"],
+                             include_repo_map=map_tokens > 0,
                              user_prompt=prompt,
                              files_read=sorted(a._files_read),
                              files_modified=sorted(a._files_modified),
-                             repo_map_budget_tokens=budget.repo_map_tokens,
+                             map_tokens=map_tokens,
                              context_window_tokens=a.effective_window,
-                             repo_map_refresh=cfg["repo_map_refresh"],
+                             map_refresh=cfg["map_refresh"],
+                             map_multiplier_no_files=cfg["map_multiplier_no_files"],
                              include_project_instructions=False, include_memory=False,
                              include_skills=False, include_agents=False,
                              include_deferred_tools=False)
         try:
-            plan = await ContextRuntime(providers=[EnvProvider(), GitSnapshotProvider(),
+            git_source = services.context_sources.git if services is not None else None
+            plan = await ContextRuntime(providers=[EnvProvider(), GitSnapshotProvider(git_source),
                                                    RepoMapProvider()],
                                         budget=budget).collect(req)
         except Exception as e:
@@ -545,14 +555,19 @@ class AgentSession:
         if present >= self._SESSION_CONTEXT_KINDS:        # 全部 kind 已在渲染上下文 → 无需注入
             return
         from ..context import BudgetPolicy, ContextRequest, ContextRuntime
+        services = getattr(a, "_runtime_services", None)
+        cwd = services.cwd if services is not None else os.getcwd()
         req = ContextRequest(
-            cwd=os.getcwd(), is_sub_agent=False,
+            cwd=cwd, is_sub_agent=False,
             include_project_instructions=True, include_memory=True,
             include_env=False, include_git=False, include_skills=False,
             include_agents=False, include_deferred_tools=False,
         )
         try:
-            plan = await ContextRuntime(budget=BudgetPolicy.for_window(a.effective_window)).collect(req)
+            plan = await ContextRuntime(
+                budget=BudgetPolicy.for_window(a.effective_window),
+                sources=(services.context_sources if services is not None else None),
+            ).collect(req)
         except Exception as e:
             a.emit(_events.NoticeRaised(text=f"[context] session-context collect failed: {e}"))
             return

@@ -54,6 +54,7 @@ class Local:
     """
     output: str | None = None
     exit_repl: bool = False
+    refresh_transcript: bool = False
 
 
 @dataclass(frozen=True)

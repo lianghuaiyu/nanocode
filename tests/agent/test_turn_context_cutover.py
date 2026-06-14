@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import subprocess
 from datetime import date
 
 from nanocode.agent.engine import Agent
@@ -36,7 +37,7 @@ class _FakeResp:
 def _agent(sid):
     a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
     a._mcp_initialized = True
-    a.model = "claude-x"
+    a.model = "claude-opus-4-6"
     return a
 
 
@@ -73,6 +74,26 @@ def test_turn_requests_carry_volatile_tail_and_tree_stays_clean(monkeypatch):
     entries = SessionManager.open("ctx6_live").entries()
     blob = str([e.to_dict() for e in entries])
     assert "Per-turn context" not in blob and "feature-x" not in blob
+
+
+def test_user_message_is_recorded_before_volatile_collect(monkeypatch):
+    a = _agent("ctx6_order")
+    seen = {}
+
+    async def fake_collect(self, prompt=""):
+        entries = SessionManager.open("ctx6_order").entries()
+        seen["user_visible"] = "hello" in str([e.to_dict() for e in entries])
+        return None
+
+    async def fake_stream(**_kw):
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    monkeypatch.setattr("nanocode.agent.session.AgentSession._collect_turn_volatile",
+                        fake_collect)
+    a._provider.stream = fake_stream
+    asyncio.run(a.chat("hello"))
+
+    assert seen["user_visible"]
 
 
 def test_git_subprocess_runs_once_per_turn(monkeypatch):
@@ -154,6 +175,8 @@ def _repo_with_code(tmp_path, monkeypatch):
     (tmp_path / "applib.py").write_text("def unique_marker_fn():\n    pass\n")
     (tmp_path / "caller.py").write_text("from applib import unique_marker_fn\n"
                                         "def use():\n    unique_marker_fn()\n")
+    subprocess.run(["git", "-C", str(tmp_path), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -196,7 +219,7 @@ def test_repo_map_settings_escape_hatch(tmp_path, monkeypatch):
     _repo_with_code(tmp_path, monkeypatch)
     from nanocode.tools import reset_permission_cache
     (tmp_path / ".nanocode").mkdir(exist_ok=True)
-    (tmp_path / ".nanocode" / "settings.json").write_text('{"context": {"repo_map": false}}')
+    (tmp_path / ".nanocode" / "settings.json").write_text('{"context": {"map_tokens": 0}}')
     reset_permission_cache()
     a = _agent("ctx6_rmap3")
     captured = {}

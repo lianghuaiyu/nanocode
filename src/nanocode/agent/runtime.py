@@ -15,9 +15,13 @@ token 计数）收敛到一个稳定的、面向外部调用方的句柄。本�
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
-from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Literal
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Literal
 
 from .session import AgentSession
 from collections import deque
@@ -55,6 +59,68 @@ class AgentResult:
     tokens: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SkillInvocation:
+    """Result of a user-invoked skill crossing the runtime boundary."""
+
+    handled: bool
+    prompt: str | None = None
+    notice: str | None = None
+    error: str | None = None
+
+
+class ReadOnlySessionView:
+    """Read-only projection of the active canonical session tree."""
+
+    def __init__(self, manager) -> None:
+        self._manager = manager
+        self.session_id = manager.session_id
+
+    def entries(self):
+        return self._manager.entries()
+
+    def get_leaf(self):
+        return self._manager.get_leaf()
+
+    def get_branch(self, leaf_id: str | None = None):
+        return self._manager.get_branch(leaf_id)
+
+    def build_context(self, leaf_id: str | None = None):
+        return self._manager.build_context(leaf_id)
+
+    def labels(self) -> dict[str, str]:
+        return self._manager.labels()
+
+    def name(self) -> str | None:
+        return self._manager.name()
+
+    def parent_session(self) -> dict | None:
+        return self._manager.parent_session()
+
+    def _cwd(self) -> str:
+        return self._manager._cwd()
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert runtime boundary values to JSON-able Python containers."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def serialize_event_envelope(env: dict) -> dict:
+    """Public runtime event schema: always JSON-able at the facade boundary."""
+    out = dict(env)
+    out["event"] = _jsonable(out.get("event"))
+    return out
+
+
 # ─── Bootstrap 配置 ───────────────────────────────────────────
 
 @dataclass
@@ -77,7 +143,9 @@ class AgentConfig:
     trajectory_level: str = "summary"
     workspace_trusted: bool = True
     memory_backend: object | None = None
+    memory_backend_choice: str | None = None
     session_id: str | None = None          # resume adopt 目标（None = 新 mint）
+    cwd: str | None = None
 
     def build_agent(self):
         from .engine import Agent
@@ -91,10 +159,141 @@ class AgentConfig:
         )
 
 
+@contextmanager
+def _push_cwd(cwd: str):
+    old = os.getcwd()
+    if old == cwd:
+        yield
+        return
+    os.chdir(cwd)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+
+@dataclass(frozen=True)
+class RuntimeServices:
+    """Cwd-bound services owned by the runtime host."""
+
+    cwd: str
+    agent_dir: str
+    workspace_trusted: bool
+    memory_backend: object | None
+    context_sources: object
+    diagnostics: tuple[str, ...] = ()
+
+    @classmethod
+    def create(cls, config: AgentConfig, *, cwd: str | None = None) -> "RuntimeServices":
+        resolved = str(Path(cwd or config.cwd or os.getcwd()).resolve())
+        from ..context import ContextSources
+        from ..paths import data_dir
+        from ..trust import is_trusted
+
+        def _in_cwd(fn):
+            def _wrapped(request):
+                with _push_cwd(resolved):
+                    return fn(request)
+            return _wrapped
+
+        def _git(_request):
+            from ..prompt import get_git_context
+            return get_git_context()
+
+        def _project(_request):
+            from ..prompt import load_project_instructions
+            return load_project_instructions()
+
+        def _memory(_request):
+            from ..memory import build_memory_prompt_section
+            return build_memory_prompt_section()
+
+        diagnostics: list[str] = []
+        backend = config.memory_backend
+        if backend is None:
+            try:
+                from ..memory import select_backend
+                with _push_cwd(resolved):
+                    backend = select_backend(config.memory_backend_choice)
+            except Exception as e:
+                backend = None
+                diagnostics.append(f"memory backend unavailable: {e}")
+
+        trusted = config.workspace_trusted if str(Path(config.cwd or resolved).resolve()) == resolved else is_trusted(Path(resolved))
+        return cls(
+            cwd=resolved,
+            agent_dir=str(data_dir()),
+            workspace_trusted=trusted,
+            memory_backend=backend,
+            context_sources=ContextSources(
+                git=_in_cwd(_git),
+                project_instructions=_in_cwd(_project),
+                memory_static=_in_cwd(_memory),
+            ),
+            diagnostics=tuple(diagnostics),
+        )
+
+
+def _apply_runtime_services(agent, services: RuntimeServices) -> None:
+    agent._runtime_services = services
+    agent._memory_backend = services.memory_backend
+    agent.workspace_trusted = services.workspace_trusted
+    with _push_cwd(services.cwd):
+        from ..prompt import build_system_prompt
+        agent._base_system_prompt = build_system_prompt()
+    agent._apply_permission_mode_prompt()
+
+
 # ─── 审批归口 ────────────────────────────────────────────────
 
 ConfirmFn = Callable[[str], Awaitable[bool]]
 PlanApprovalFn = Callable[[str], Awaitable[dict]]
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    """Runtime/UI approval protocol message."""
+
+    request_id: str
+    kind: str
+    message: str
+    metadata: dict = field(default_factory=dict)
+    timeout_ms: int | None = None
+
+
+class RuntimeApprovalBroker:
+    """Small request/response broker for mode adapters such as RPC/TUI."""
+
+    def __init__(self, *, emit: Callable[[dict], None], default: bool = False) -> None:
+        self._emit = emit
+        self._default = default
+        self._seq = 0
+        self._pending: dict[str, asyncio.Future] = {}
+
+    async def confirm(self, message: str, *, kind: str = "confirm",
+                      metadata: dict | None = None, timeout_ms: int | None = None) -> bool:
+        self._seq += 1
+        rid = f"appr-{self._seq}"
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending[rid] = fut
+        req = ApprovalRequest(rid, kind, message, metadata or {}, timeout_ms)
+        self._emit({"type": "approval_request", **_jsonable(req)})
+        try:
+            if timeout_ms is None:
+                return bool(await fut)
+            return bool(await asyncio.wait_for(fut, timeout=timeout_ms / 1000))
+        except asyncio.TimeoutError:
+            return self._default
+        finally:
+            self._pending.pop(rid, None)
+
+    def resolve(self, request_id: str | None, approved: bool) -> bool:
+        fut = self._pending.get(request_id) if request_id else next(iter(self._pending.values()), None)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(bool(approved))
+        return True
 
 
 class ApprovalManager:
@@ -131,10 +330,11 @@ class RuntimeThread:
     EVENT_LOG_MAX = 512
 
     def __init__(self, runtime: "AgentRuntime", agent, session: AgentSession,
-                 *, lease=None) -> None:
+                 *, lease=None, services: RuntimeServices | None = None) -> None:
         self._runtime = runtime
         self.agent = agent
         self.session = session
+        self.services = services
         # docs/16 #4（EVENT-P2）：typed AgentEvent push 流。tap 挂在 agent.emit 的订阅者扇出腿上，
         # 每条事件包成 {thread_id, session_id, seq, type, event} 信封（绝不携带 tree entry id，
         # docs/12 boundary 5）——ring buffer 留快照（events()），listeners 实时收推送。
@@ -160,8 +360,13 @@ class RuntimeThread:
     # ── typed 事件 push（docs/16 #4）────────────────────────────────────────────
     def _envelope(self, type_: str, event) -> dict:
         self._seq += 1
-        return {"thread_id": self.thread_id, "session_id": self.agent.session_id,
-                "seq": self._seq, "type": type_, "event": event}
+        return serialize_event_envelope({
+            "thread_id": self.thread_id,
+            "session_id": self.agent.session_id,
+            "seq": self._seq,
+            "type": type_,
+            "event": event,
+        })
 
     def _push(self, env: dict) -> None:
         self._event_log.append(env)
@@ -229,6 +434,9 @@ class RuntimeThread:
         **不** finalize tracer / 不动 Agent —— 那是 Agent.rebind_session（P2）的职责。in-place
         rebind 下 old/new thread 复用同一 Agent，dispose 只做 wrapper 级清理；unregister 按
         **对象身份** compare-and-delete，即便 old/new 共享同一 session_id 也不会误删 new。"""
+        if self._disposed:
+            return
+        self.push_boundary("thread_invalidated", reason="dispose")
         self._disposed = True
         self._runtime.unregister(self)
         # 摘除 emit 订阅 tap（old/new thread 复用同一 Agent：disposed thread 不再累积事件）。
@@ -262,10 +470,11 @@ class RuntimeThread:
         mode = getattr(a, "_thinking_mode", "disabled")
         return {
             "session_id": a.session_id,
-            "cwd": mgr._cwd() if mgr is not None else _os.getcwd(),
+            "cwd": self.services.cwd if self.services is not None else (mgr._cwd() if mgr is not None else _os.getcwd()),
             "session_name": (mgr.name() if mgr is not None else None),
             "input_tokens": a.total_input_tokens,
             "output_tokens": a.total_output_tokens,
+            "context_used": getattr(a, "last_input_token_count", 0),
             "cost_usd": a._get_current_cost_usd(),
             "context_window": getattr(a, "effective_window", 0),
             "model": a.model,
@@ -286,19 +495,71 @@ class RuntimeThread:
         except Exception:
             return []
 
+    def transcript_messages(self) -> list:
+        """当前 active branch 的真实对话消息，仅含 persisted MESSAGE entries。
+
+        与 messages() 不同，这里故意不包含 custom context、compaction synthetic
+        messages、repo-map volatile tail 等模型上下文材料；它是给 TUI/RPC 展示用户可见
+        transcript 用的。
+        """
+        mgr = getattr(self.agent, "_session_mgr", None)
+        if mgr is None:
+            return []
+        try:
+            from ..session import tree as _tree
+            out = []
+            for e in mgr.get_branch():
+                if e.type == _tree.MESSAGE:
+                    msg = (e.data or {}).get("message")
+                    if isinstance(msg, dict):
+                        out.append(msg)
+            return out
+        except Exception:
+            return []
+
     def state(self) -> dict:
         """完整会话快照（Pi `get_state` 对位）：status 字段 + is_processing + 中立 messages。
         供客户端重绘与 RPC get_state；on-demand 派生（含 messages 重建，勿当每帧热路径）。"""
         snap = self.status()
         snap["is_processing"] = self.is_processing
         snap["messages"] = self.messages()
+        snap["transcript_messages"] = self.transcript_messages()
         return snap
+
+    def session_stats(self) -> dict:
+        mgr = getattr(self.agent, "_session_mgr", None)
+        entries = mgr.entries() if mgr is not None else []
+        messages = [e for e in entries if getattr(e, "type", None) == "message"]
+        user_messages = 0
+        assistant_messages = 0
+        tool_results = 0
+        for e in messages:
+            msg = (e.data or {}).get("message") or {}
+            role = msg.get("role")
+            if role == "user":
+                user_messages += 1
+            elif role == "assistant":
+                assistant_messages += 1
+            elif role == "toolResult":
+                tool_results += 1
+        return {
+            "session_id": self.session_id,
+            "cwd": self.status()["cwd"],
+            "session_name": self.session_name(),
+            "message_count": len(messages),
+            "user_messages": user_messages,
+            "assistant_messages": assistant_messages,
+            "tool_results": tool_results,
+            "input_tokens": self.agent.total_input_tokens,
+            "output_tokens": self.agent.total_output_tokens,
+            "cost_usd": self.agent._get_current_cost_usd(),
+        }
 
     def events(self) -> list[dict]:
         """push 流的近期快照（docs/16 #4：ring buffer，最多 EVENT_LOG_MAX 条）。
 
-        每条是 {thread_id, session_id, seq, type, event} 信封：event 是 typed AgentEvent
-        （或边界 dict，如 session_switch）。实时消费用 subscribe(listener)。"""
+        每条是 {thread_id, session_id, seq, type, event} 信封；event 已在 runtime 边界转为
+        JSON-able dict。实时消费用 subscribe(listener)。"""
         return list(self._event_log)
 
     # ── 命令面稳定 API（docs/17 B-list）────────────────────────────────────────
@@ -312,21 +573,12 @@ class RuntimeThread:
         return self.agent.session_id
 
     @property
-    def session_manager(self):
-        """当前 active 写者租约的 SessionManager（无租约则 None）。命令的会话树读写经它。"""
-        return self.agent._session_mgr
-
-    @property
-    def task_manager(self):
-        return self.agent.task_manager
-
-    @property
-    def background_tasks(self):
-        return self.agent._background_tasks
-
-    @property
     def effective_window(self) -> int:
         return getattr(self.agent, "effective_window", 200000)
+
+    @property
+    def model(self) -> str:
+        return getattr(self.agent, "model", "")
 
     @property
     def is_sub_agent(self) -> bool:
@@ -351,6 +603,129 @@ class RuntimeThread:
     def child_session_id(self, name: str) -> "str | None":
         fn = getattr(self.agent, "child_session_id", None)
         return fn(name) if callable(fn) else None
+
+    def readonly_session(self):
+        """Read-only session tree view for command handlers.
+
+        Writes and lifecycle operations stay on RuntimeThread/AgentRuntime; the
+        returned object intentionally does not expose SessionManager mutation APIs.
+        """
+        mgr = getattr(self.agent, "_session_mgr", None)
+        return ReadOnlySessionView(mgr) if mgr is not None else None
+
+    def session_name(self) -> str | None:
+        mgr = getattr(self.agent, "_session_mgr", None)
+        return mgr.name() if mgr is not None else None
+
+    def set_session_name(self, name: str) -> None:
+        mgr = getattr(self.agent, "_session_mgr", None)
+        if mgr is None:
+            raise RuntimeError("No active session writer lease for this session.")
+        mgr.append_session_info(name)
+
+    def set_entry_label(self, entry_id: str, label: str) -> None:
+        mgr = getattr(self.agent, "_session_mgr", None)
+        if mgr is None:
+            raise RuntimeError("No active session writer lease for this session.")
+        mgr.append_label(entry_id, label)
+
+    def can_switch(self) -> "tuple[bool, str | None]":
+        if self.is_processing:
+            return False, "a turn is currently running"
+        tasks = getattr(self.agent, "_background_tasks", set())
+        if tasks:
+            return False, f"{len(tasks)} background task(s) still running"
+        busy = [s for s in self.agent.task_manager.list_subagents() if s.status in ("running", "idle")]
+        if busy:
+            return False, f"{len(busy)} sub-agent(s) still running/idle"
+        return True, None
+
+    def task_list(self, status=None, kind=None) -> str:
+        from ..tools.tasks_tool import list_tasks_text
+        return list_tasks_text(self.agent.task_manager, status, kind)
+
+    def task_output(self, task_id: str, tail_bytes: int = 8000) -> str:
+        from ..tools.tasks_tool import task_output_text
+        return task_output_text(self.agent.task_manager, task_id, tail_bytes)
+
+    async def task_stop(self, task_id: str) -> str:
+        from ..tools.tasks_tool import task_stop
+        return await task_stop(self.agent.task_manager, self.agent._background_tasks, task_id)
+
+    def agents_overview(self) -> str:
+        from ..tools.tasks_tool import agents_overview_text
+        return agents_overview_text(self.agent.task_manager)
+
+    def agent_definitions(self) -> str:
+        from ..tools.tasks_tool import list_agent_definitions_text
+        return list_agent_definitions_text(self.agent.task_manager)
+
+    def subagents(self) -> str:
+        from ..tools.tasks_tool import list_subagents_text
+        return list_subagents_text(self.agent.task_manager)
+
+    def agent_detail(self, name: str) -> str:
+        from ..tools.tasks_tool import agent_definition_detail_text, subagent_detail_text
+        detail = agent_definition_detail_text(name)
+        return detail if detail is not None else subagent_detail_text(
+            self.agent.task_manager, name, self.session_id)
+
+    async def execute_user_shell(self, command: str, *, timeout_ms: int = 120000,
+                                 exclude_from_context: bool = True) -> str:
+        """Run an explicit user shell command through the runtime audit boundary.
+
+        This is not a model tool call and does not use tool permission approval,
+        but it emits runtime events and uses the same structured shell runner.
+        """
+        from ..tools import run_shell
+        self.push_boundary("user_shell_started", command=command,
+                           exclude_from_context=exclude_from_context)
+        r = await asyncio.to_thread(run_shell.run_structured,
+                                    {"command": command, "timeout": timeout_ms})
+        self.push_boundary("user_shell_completed", command=command,
+                           timed_out=r.get("timed_out"),
+                           exit_code=r.get("exit_code"),
+                           error=r.get("error"),
+                           stdout_chars=len(r.get("stdout") or ""),
+                           stderr_chars=len(r.get("stderr") or ""),
+                           exclude_from_context=exclude_from_context)
+        if r["timed_out"]:
+            return f"$ {command}\n(timed out)"
+        if r["error"] is not None:
+            return f"$ {command}\nerror: {r['error']}"
+        out = (r["stdout"] or "").rstrip()
+        err = (r["stderr"] or "").rstrip()
+        parts = [f"$ {command}"]
+        if out:
+            parts.append(out)
+        if err:
+            parts.append(err)
+        if r["exit_code"] not in (0, None):
+            parts.append(f"(exit {r['exit_code']})")
+        return "\n".join(parts)
+
+    def invoke_skill(self, name: str, args: str) -> SkillInvocation:
+        """Resolve a user-invoked skill and return the prompt to run, if any."""
+        from ..skills import execute_skill, get_skill_by_name, resolve_skill_prompt
+        skill = get_skill_by_name(name)
+        if not skill or not skill.user_invocable:
+            return SkillInvocation(handled=False)
+        if getattr(skill, "hooks", None):
+            self.agent._register_skill_hooks(skill)
+        if skill.context == "fork":
+            result = execute_skill(skill.name, args)
+            if not result:
+                return SkillInvocation(handled=True, error=f"Unknown skill: {skill.name}")
+            return SkillInvocation(
+                handled=True,
+                notice=f"Invoking skill: {skill.name}",
+                prompt=f'Use the skill tool to invoke "{skill.name}" with args: {args or "(none)"}',
+            )
+        return SkillInvocation(
+            handled=True,
+            notice=f"Invoking skill: {skill.name}",
+            prompt=resolve_skill_prompt(skill, args),
+        )
 
     async def spawn_memory_consolidate(self) -> str:
         return await self.agent._spawn_memory_consolidate()
@@ -381,9 +756,10 @@ class AgentRuntime:
 
     def __init__(self) -> None:
         self._threads: dict[str, RuntimeThread] = {}
+        self._config: AgentConfig | None = None
 
     def adopt(self, agent, *, approvals: "ApprovalManager | None" = None,
-              lease=None) -> RuntimeThread:
+              lease=None, services: RuntimeServices | None = None) -> RuntimeThread:
         """把一个已构造的 Agent 纳管为 RuntimeThread（in-process 起点）。
 
         TurnResult.final_response 从 agent 的 emit 流派生（docs/17 Phase 0：agent.final_text()），
@@ -395,18 +771,50 @@ class AgentRuntime:
             approvals.attach(agent)
         if lease is not None:
             agent._session_mgr = lease.manager
+        if services is None:
+            config = self._config or AgentConfig(
+                permission_mode=getattr(agent, "_base_permission_mode", getattr(agent, "permission_mode", "default")),
+                model=getattr(agent, "model", "claude-opus-4-6"),
+                thinking=getattr(agent, "thinking", False),
+                max_cost_usd=getattr(agent, "max_cost_usd", None),
+                max_turns=getattr(agent, "max_turns", None),
+                workspace_trusted=getattr(agent, "workspace_trusted", True),
+                memory_backend=getattr(agent, "_memory_backend", None),
+                session_id=getattr(agent, "session_id", None),
+            )
+            cwd = lease.manager._cwd() if lease is not None else os.getcwd()
+            services = RuntimeServices.create(config, cwd=cwd)
+        _apply_runtime_services(agent, services)
         session = AgentSession(agent)
-        thread = RuntimeThread(self, agent, session, lease=lease)
+        thread = RuntimeThread(self, agent, session, lease=lease, services=services)
         return self.register(thread)
 
     def thread_start(self, config: "AgentConfig", *, approvals: "ApprovalManager | None" = None,
-                     lease=None) -> RuntimeThread:
+                     lease=None, validate_session: bool = True) -> RuntimeThread:
         """从 AgentConfig 构造一个全新 Agent 并 adopt 为首个 thread（docs/14 §3.1）。
 
         CLI / SDK / AppServer 的统一入口：config.build_agent() 造 Agent，再 adopt（attach 审批 +
         注入 lease + 注册）。live 切换（/new /resume…）走 thread_new/thread_resume
         （in-place rebind），不经此路径。"""
-        return self.adopt(config.build_agent(), approvals=approvals, lease=lease)
+        self._config = config
+        if lease is None:
+            from ..session.lease import SessionLease
+            lease = SessionLease.open_or_create(config.session_id or uuid.uuid4().hex[:8],
+                                                cwd=config.cwd)
+        services = RuntimeServices.create(config, cwd=lease.manager._cwd())
+        effective_config = replace(config, session_id=lease.manager.session_id, cwd=services.cwd,
+                                   memory_backend=services.memory_backend,
+                                   workspace_trusted=services.workspace_trusted)
+        self._config = effective_config
+        with _push_cwd(services.cwd):
+            agent = effective_config.build_agent()
+        if validate_session:
+            try:
+                lease.manager.build_context()
+            except BaseException:
+                lease.close()
+                raise
+        return self.adopt(agent, approvals=approvals, lease=lease, services=services)
 
     def register(self, thread: "RuntimeThread") -> RuntimeThread:
         """把 thread 纳入 registry（按 thread_id）。adopt / runtime 构造器（P2）/ host.replace_thread 共用入口。"""
@@ -431,7 +839,8 @@ class AgentRuntime:
     # ─── 生命周期替换：live switch via in-place rebind（docs/14 P2）────────────────
 
     def _switch_via_rebind(self, host, new_sid: str, *,
-                           parent_session: "dict | None" = None) -> RuntimeThread:
+                           parent_session: "dict | None" = None,
+                           reason: str = "replace") -> RuntimeThread:
         """把 host 当前 thread 的 Agent 原地 rebind 到 new_sid，建新 AgentSession+RuntimeThread
         包**同一** agent，经 host.replace_thread 切入（register 新 + dispose 旧）。返回新 thread。
 
@@ -447,14 +856,36 @@ class AgentRuntime:
             return host.current_thread
         from ..session.lease import SessionLease
         old_sid = agent.session_id
-        lease = SessionLease.open_or_create(new_sid, parent_session=parent_session)
+        current_services = getattr(host.current_thread, "services", None)
+        target_cwd = current_services.cwd if current_services is not None else None
+        lease = SessionLease.open_or_create(new_sid, parent_session=parent_session, cwd=target_cwd)
         try:
             lease.manager.build_context()       # 校验目标树可折叠（在 finalize 旧 session 之前）
+            config = self._config or AgentConfig(
+                permission_mode=getattr(agent, "_base_permission_mode", getattr(agent, "permission_mode", "default")),
+                model=getattr(agent, "model", "claude-opus-4-6"),
+                thinking=getattr(agent, "thinking", False),
+                max_cost_usd=getattr(agent, "max_cost_usd", None),
+                max_turns=getattr(agent, "max_turns", None),
+                workspace_trusted=getattr(agent, "workspace_trusted", True),
+                memory_backend=getattr(agent, "_memory_backend", None),
+                session_id=new_sid,
+            )
+            services = RuntimeServices.create(
+                replace(config, session_id=new_sid, cwd=lease.manager._cwd()),
+                cwd=lease.manager._cwd(),
+            )
+            host.current_thread.push_boundary("session_shutdown",
+                                              reason=reason, target_session=new_sid)
             agent.rebind_session(lease.manager)  # finalize 旧（close 旧锁）+ rebuild 新
+            _apply_runtime_services(agent, services)
+            self._config = replace(config, session_id=new_sid, cwd=services.cwd,
+                                   memory_backend=services.memory_backend,
+                                   workspace_trusted=services.workspace_trusted)
             # rebind 边界（docs/16 #4）：旧 thread 的订阅者得知流被切走，新 thread 的流以切换开篇。
             host.current_thread.push_boundary("session_switch",
                                               from_session=old_sid, to_session=new_sid)
-            new_thread = RuntimeThread(self, agent, AgentSession(agent), lease=lease)
+            new_thread = RuntimeThread(self, agent, AgentSession(agent), lease=lease, services=services)
             new_thread.push_boundary("session_switch", from_session=old_sid, to_session=new_sid)
             host.replace_thread(new_thread)
         except BaseException:
@@ -477,7 +908,7 @@ class AgentRuntime:
 
     def thread_new(self, host) -> RuntimeThread:
         """新建空**顶层** canonical session 并切入（/new；语义表：不带 parentSession）。"""
-        return self._switch_via_rebind(host, self._mint_session_id())
+        return self._switch_via_rebind(host, self._mint_session_id(), reason="new")
 
     def thread_resume(self, host, session_id: str) -> "RuntimeThread | None":
         """切到一个已存在的 session（/resume <id>）。docs/14 SessionLease：canonical 树是唯一权威——
@@ -486,7 +917,7 @@ class AgentRuntime:
         from ..session.manager import SessionManager
         if not SessionManager.exists(session_id):
             return None
-        return self._switch_via_rebind(host, session_id)
+        return self._switch_via_rebind(host, session_id, reason="resume")
 
     def thread_fork(self, host, source_sid: str, user_entry_id: str) -> "RuntimeThread | None":
         """pi /fork：复制 source 到选中 **user 消息**之前（其 parent 的 path-to-root）的新 session
@@ -512,12 +943,13 @@ class AgentRuntime:
             return self._switch_via_rebind(
                 host, self._mint_session_id(),
                 parent_session={"sessionId": source_sid, "entryId": cut,
-                                "forkedBeforeEntryId": user_entry_id})
+                                "forkedBeforeEntryId": user_entry_id},
+                reason="fork")
         try:
             child = src.clone(cut, parent_session_extra={"forkedBeforeEntryId": user_entry_id})
         except Exception:
             return None
-        return self._switch_via_rebind(host, child.session_id)
+        return self._switch_via_rebind(host, child.session_id, reason="fork")
 
     def thread_clone(self, host, source_sid: str, entry_id: "str | None" = None) -> "RuntimeThread | None":
         """跨文件 clone：复制 source 的 path-to-root（entry_id 缺省 = 当前 leaf）到新 session
@@ -532,4 +964,4 @@ class AgentRuntime:
             child = SessionManager.open(source_sid).clone(entry_id)
         except Exception:
             return None
-        return self._switch_via_rebind(host, child.session_id)
+        return self._switch_via_rebind(host, child.session_id, reason="fork")

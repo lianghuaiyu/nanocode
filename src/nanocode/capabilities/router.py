@@ -69,58 +69,54 @@ class CapabilityRouter:
 
     host-driven（host: ToolHost——typed port,docs/16 #5；Agent 结构性满足）。从 engine._execute_tool_call 逐字搬迁,行为不变。
     'agent'/'skill' 经 host 方法路由（**不 import engine**）——结构上消除 execute.py 注释提到的
-    tools↔agent 循环 import。allowlist 判定（host._tool_blocked_by_allowlist）仍是第一道、覆盖前台 +
+    tools↔agent 循环 import。allowlist 判定（host.tool_blocked_by_allowlist）仍是第一道、覆盖前台 +
     后台 run_shell 的单一 fail-closed 咽喉点（§5 风险#3）。
     """
 
     async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
         # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
-        if host._tool_blocked_by_allowlist(name):
+        if host.tool_blocked_by_allowlist(name):
             from ..agent.events import ToolBlocked   # lazy：避免 capabilities↔agent 包级 import 环
             host.emit(ToolBlocked(tool=name, reason="not_in_allowlist"))
             return f"Error: tool '{name}' is not permitted for this sub-agent."
         if name == "run_shell" and inp.get("run_in_background"):
-            tid = await host._spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
+            tid = await host.spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
             return (f"Started background shell task {tid}. It will report completion later. "
                     f"Use task_output with task_id={tid} to inspect progress.")
-        from ..tools import tasks_tool
         if name == "task_list":
-            return tasks_tool.list_tasks_text(host.task_manager, inp.get("status"), inp.get("kind"))
+            return host.list_tasks(inp.get("status"), inp.get("kind"))
         if name == "task_output":
-            return tasks_tool.task_output_text(host.task_manager, inp.get("task_id", ""),
-                                               int(inp.get("tail_bytes") or 8000))
+            return host.task_output(inp.get("task_id", ""), int(inp.get("tail_bytes") or 8000))
         if name == "task_stop":
-            return await tasks_tool.task_stop(
-                host.task_manager, host._background_tasks, inp.get("task_id", ""),
-                allow_orphan_cancel=not host.is_sub_agent)
+            return await host.stop_task(inp.get("task_id", ""))
         if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
-            return await host._recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
+            return await host.recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
         if name == "memory" and inp.get("action") == "consolidate":
             if host.is_sub_agent:
                 return ("Error: memory consolidation is a host/session operation and "
                         "is not available to sub-agents.")
-            return await host._spawn_memory_consolidate()
+            return await host.spawn_memory_consolidate()
         if name in ("enter_plan_mode", "exit_plan_mode"):
             if host.is_sub_agent:
                 return "Error: plan-mode tools are not available to sub-agents."
-            return await host._execute_plan_mode_tool(name)
+            return await host.execute_plan_mode_tool(name)
         if name == "agent":
-            return await host._execute_agent_tool(inp)
+            return await host.execute_agent_tool(inp)
         if name == "skill":
-            return await host._execute_skill_tool(inp)
+            return await host.execute_skill_tool(inp)
         # 真实工具(mcp/execute_tool)——受 hooks 约束(meta 工具上面已返回)。
         if name in ("run_shell", "sandbox_shell") and "_session_id" not in inp:
             inp = {**inp, "_session_id": host.session_id}
-        if host._suppress_hooks or not host._active_hooks:
-            return await host._run_real_tool(name, inp)
-        for h in host._matching_hooks("pre-tool-use", name):
-            ok, msg = await host._run_hook(h, name, inp, None)
+        if host.hooks_suppressed() or not host.has_active_hooks():
+            return await host.run_real_tool(name, inp)
+        for h in host.matching_hooks("pre-tool-use", name):
+            ok, msg = await host.run_hook(h, name, inp, None)
             if not ok:
                 return f"[blocked by skill hook {h['skill']} (pre-tool-use)] {msg}"
-        result = await host._run_real_tool(name, inp)
+        result = await host.run_real_tool(name, inp)
         warnings = []
-        for h in host._matching_hooks("post-tool-use", name):
-            ok, msg = await host._run_hook(h, name, inp, result)
+        for h in host.matching_hooks("post-tool-use", name):
+            ok, msg = await host.run_hook(h, name, inp, result)
             if not ok:
                 warnings.append(f"[skill hook {h['skill']} (post-tool-use) warning] {msg}")
         if warnings:

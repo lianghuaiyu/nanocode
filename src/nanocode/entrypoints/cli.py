@@ -8,16 +8,12 @@ import os
 import sys
 from pathlib import Path
 
-from ..agent import Agent, AgentSession, AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
-from ..tui import print_welcome, print_error, print_info
+from ..agent import AgentRuntime, AgentSession, RuntimeThread, ApprovalManager, AgentConfig
 from ..session import get_latest_session_id
-from ..session import v2 as _session_v2
-from ..skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
 from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
     trajectory_level as _trajectory_level,
 )
-from .trajectory_cmd import run as _run_trajectory_cmd
 from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
@@ -26,8 +22,28 @@ from .commands.runner import dispatch, NOT_A_COMMAND
 from .host import RuntimeHost
 from .commands.builtin import build_registry
 
+def _run_trajectory_cmd(argv) -> int:
+    from .trajectory_cmd import run
+    return run(argv)
+
+
 # 子命令分发表：未来加命令只需在此加一行 name -> handler(argv)->int
 _SUBCOMMANDS = {"trajectory": _run_trajectory_cmd}
+
+
+def print_welcome(*args, **kwargs) -> None:
+    from ..tui import print_welcome as _print_welcome
+    _print_welcome(*args, **kwargs)
+
+
+def print_error(*args, **kwargs) -> None:
+    from ..tui import print_error as _print_error
+    _print_error(*args, **kwargs)
+
+
+def print_info(*args, **kwargs) -> None:
+    from ..tui import print_info as _print_info
+    _print_info(*args, **kwargs)
 
 
 # 内置斜杠命令的单一来源：从命令 registry 派生（取代旧的手维护列表，消除与 dispatch 的漂移）。
@@ -44,7 +60,7 @@ def _repl_commands_help() -> str:
         left = f"  {s.name}" + (f" {s.arg_hint}" if s.arg_hint else "")
         lines.append(f"{left:<22} {s.description}")
     lines.append(f'{"  /<skill-name>":<22} Invoke a skill (e.g. /commit "fix types")')
-    lines.append(f'{"  !<command>":<22} Run a shell command directly (your own command; bypasses agent + permissions)')
+    lines.append(f'{"  !<command>":<22} Run a shell command via runtime audit (not a model tool call)')
     return "\n".join(lines) + "\n"
 
 
@@ -217,7 +233,69 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None:
+def _make_file_completer():
+    """注入给 TUI 的文件搜索闭包——保持 TUI 嵌入式边界(TUI 不直接碰 fs/agent)。
+
+    `complete(token, mode)`:mode='mention' 仓库文件子串搜(@-提及);mode='path' 目录前缀补全(Tab)。
+    返回相对路径列表(目录带末尾 '/')。git ls-files 优先(尊重 .gitignore),否则 os.walk 兜底。
+    """
+    import os
+    import subprocess
+
+    cwd = os.getcwd()
+    _cache: dict = {}
+
+    def _repo_files(limit: int = 4000) -> list[str]:
+        if "files" in _cache:
+            return _cache["files"]
+        files: list[str] = []
+        try:
+            r = subprocess.run(["git", "ls-files"], cwd=cwd, capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                files = [f for f in r.stdout.split("\n") if f]
+        except Exception:
+            files = []
+        if not files:
+            _SKIP = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
+            for root, dirs, names in os.walk(cwd):
+                dirs[:] = [d for d in dirs if d not in _SKIP]
+                for n in names:
+                    files.append(os.path.relpath(os.path.join(root, n), cwd))
+                    if len(files) >= limit:
+                        break
+                if len(files) >= limit:
+                    break
+        _cache["files"] = files
+        return files
+
+    def complete(token: str, mode: str = "mention") -> list[str]:
+        token = token or ""
+        if mode == "path":
+            d, base = os.path.dirname(token), os.path.basename(token)
+            scan = os.path.join(cwd, d) if d else cwd
+            try:
+                out = []
+                for e in os.scandir(scan):
+                    if not e.name.startswith(base):
+                        continue
+                    if e.name.startswith(".") and not base.startswith("."):
+                        continue                      # 隐藏 dotfile,除非用户已键入前导 '.'
+                    rel = os.path.join(d, e.name) if d else e.name
+                    out.append(rel + ("/" if e.is_dir() else ""))
+                out.sort(key=lambda x: (not x.endswith("/"), x.lower()))
+                return out[:50]
+            except Exception:
+                return []
+        q = token.lower()
+        files = _repo_files()
+        if not q:
+            return files[:50]
+        return [f for f in files if q in f.lower()][:50]
+
+    return complete
+
+
+async def run_repl(agent_or_thread, lease=None, *, input=None, output=None) -> None:
     """Interactive REPL loop.
 
     docs/14 SessionLease：`lease` 是 main() 在 welcome 前激活的会话写者租约（已注入 agent._session_mgr）。
@@ -229,16 +307,20 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
     # 永远对 host.current_thread 操作、不缓存 agent/session。这里显式构造 session+thread（保留
     # AgentSession 这个可注入 seam）并注册进 registry——而非 adopt（adopt 在 runtime 内部建 session，
     # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
-    _runtime = AgentRuntime()
-    _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
+    if isinstance(agent_or_thread, RuntimeThread):
+        _thread = agent_or_thread
+        _runtime = _thread._runtime
+        agent = _thread.agent
+    else:
+        agent = agent_or_thread
+        _runtime = AgentRuntime()
+        _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
     # docs/18 Rich Live：交互客户端是挂在 runtime/session 上的订阅端（drop-in 换掉旧 prompt_toolkit
-    # TuiApp）。RichApp 用 Rich Live 在底部持重绘区（footer/输入/thinking spinner/流式/modal/selector），
-    # transcript 经 TerminalClient → tui.console（Live 绑定该 console）印到 Live 之上、进 scrollback。
+    # TuiApp）。RichApp 采用 Codex 式 inline viewport：流式内容留在 Live active cell，完成内容
+    # 由 RichApp 写入 Live 上方的终端 scrollback，保证答案完整可回看且输入框稳定在底部。
     # RichApp 自管历史（paths.history_file）；命令补全 v2 再接。input/output 是测试 seam（fd / Console）。
-    from .terminal_client import TerminalClient
     from ..tui.rich_app import RichApp
-    _transcript = TerminalClient(spinner=False)
-    _app = RichApp(render_event=_transcript.on_event, input=input, output=output)
+    _app = RichApp(input=input, output=output, registry=_REGISTRY, completer=_make_file_completer())
     _host = RuntimeHost(_runtime, _thread, registry=_REGISTRY, interactive=sys.stdout.isatty(),
                         client=_app)
 
@@ -252,6 +334,11 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
 
     def _err(text) -> None:
         _app.print_above(str(text), error=True)
+
+    def _refresh_transcript() -> None:
+        refresh = getattr(_app, "refresh_transcript", None)
+        if callable(refresh):
+            refresh()
 
     async def _drive_turn(prompt: str) -> None:
         await _host.current_thread.run(prompt)
@@ -271,27 +358,34 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
             # pi /clone：复制当前 active branch 到当前 leaf → 新 session；编辑器为空。
             if host.runtime.thread_clone(host, payload.get("sourceSid")) is None:
                 _err("clone failed (no canonical tree / nothing to clone).")
+            else:
+                _refresh_transcript()
         elif action == "replace_thread" and payload.get("kind") == "fork":
             # pi /fork：复制到选中 user 消息**之前** → 新 session；该 prompt 放回编辑器（app 输入框）。
             if host.runtime.thread_fork(host, payload.get("sourceSid"),
                                         payload.get("userEntryId")) is None:
                 _err("fork failed (no canonical tree / unknown entry).")
             else:
+                _refresh_transcript()
                 _app.input_buffer.text = payload.get("prefill") or ""
         elif action == "resume":
             sid = payload.get("sessionId")
             if sid == host.current_thread.thread_id:
-                _say(f"Already on session {sid}.")
+                _refresh_transcript()
                 return
             if payload.get("fork"):
                 # --fork：把目标 clone 成新 session 切入（绝不做第二个 writer，docs/14 §5.2）
                 if host.runtime.thread_clone(host, sid) is None:
                     _err(f"cannot fork-resume '{sid}'.")
+                else:
+                    _refresh_transcript()
                 return
             from ..session.tree import SessionBusyError
             try:
                 if host.runtime.thread_resume(host, sid) is None:
                     _err(f"cannot resume '{sid}' (no canonical tree).")
+                else:
+                    _refresh_transcript()
             except SessionBusyError:
                 _err(f"session '{sid}' is busy (another writer holds it). "
                      f"Use `/resume {sid} --fork` to fork it into a new session.")
@@ -321,7 +415,7 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
         if inp.startswith("!"):
             cmd = inp[1:].strip()
             if cmd:
-                _say(await _run_user_shell(cmd))
+                _say(await _host.current_thread.execute_user_shell(cmd))
             return
 
         # REPL slash 命令 —— 经 registry 分发（most-specific-first；非命令回退 skill/chat）。
@@ -332,6 +426,8 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
             elif isinstance(_result, Local):
                 if _result.output:
                     _say(_result.output)
+                if getattr(_result, "refresh_transcript", False):
+                    _refresh_transcript()
                 if _result.exit_repl:
                     _app.request_exit()
             elif isinstance(_result, Control):
@@ -343,22 +439,19 @@ async def run_repl(agent: Agent, lease=None, *, input=None, output=None) -> None
             space_idx = inp.find(" ")
             cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
             cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
-            skill = get_skill_by_name(cmd_name)
-            if skill and skill.user_invocable:
-                _say(f"Invoking skill: {skill.name}")
-                try:
-                    if skill.hooks:
-                        agent._register_skill_hooks(skill)
-                    if skill.context == "fork":
-                        result = execute_skill(skill.name, cmd_args)
-                        if result:
-                            await _drive_turn(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
-                    else:
-                        resolved = resolve_skill_prompt(skill, cmd_args)
-                        await _drive_turn(resolved)
-                except Exception as e:
-                    if "abort" not in str(e).lower():
-                        _err(str(e))
+            try:
+                invocation = _host.current_thread.invoke_skill(cmd_name, cmd_args)
+            except Exception as e:
+                if "abort" not in str(e).lower():
+                    _err(str(e))
+                return
+            if invocation.handled:
+                if invocation.notice:
+                    _say(invocation.notice)
+                if invocation.error:
+                    _err(invocation.error)
+                elif invocation.prompt:
+                    await _drive_turn(invocation.prompt)
                 return
 
         # Normal chat
@@ -491,20 +584,12 @@ Examples:
         if adopt_sid is None:
             print_info("No previous sessions found.")
 
-    # Long-term memory backend (CLI > env > auto). auto silently degrades to
-    # markdown when no embeddings endpoint is configured; explicit --memory-backend
-    # simplemem warns on degradation.
-    from ..memory import select_backend
-    mem_backend = select_backend(args.memory_backend, on_warning=print_info)
-
     # trajectory 采集（canonical 树的 DERIVED 投影 / RL 分析专用）：
     # 显式 flag 或 NANOCODE_TRAJECTORY 环境变量开启；level 非法/缺省退回 "summary"。
     traj_on = _trajectory_enabled(args.trajectory)
     traj_lvl = _trajectory_level(args.trajectory_level)
 
-    # docs/14 P2：Agent 构造收敛到 AgentConfig（CLI/SDK/AppServer 共用 bootstrap 数据载体）。
-    # main() 仍负责交互 I/O（trust gate / memory backend 选择 / resume 解析），把结果灌进 config。
-    agent = AgentConfig(
+    cfg = AgentConfig(
         permission_mode=permission_mode,
         model=model,
         thinking=args.thinking,
@@ -517,8 +602,9 @@ Examples:
         trajectory_level=traj_lvl,
         workspace_trusted=workspace_trusted,
         session_id=adopt_sid,
-        memory_backend=mem_backend,
-    ).build_agent()
+        memory_backend_choice=args.memory_backend,
+        cwd=str(Path.cwd()),
+    )
 
     if traj_on:
         if traj_lvl == "full":
@@ -532,33 +618,28 @@ Examples:
         print_info("note: --trajectory-level has no effect without --trajectory "
                    "(or NANOCODE_TRAJECTORY=1)")
 
-    # docs/14 SessionLease：在 welcome / 任何 turn 之前激活会话写者租约（runtime 拥有 active writer）。
-    # new：open_or_create 建空树 + 持锁；--resume：open 已有树 + 持锁。busy/corrupt → fail-closed 退出。
-    from ..session.lease import SessionLease
+    runtime = AgentRuntime()
     from ..session.tree import SessionBusyError, SessionTreeError
     try:
-        _lease = SessionLease.open_or_create(agent.session_id)
+        thread = runtime.thread_start(cfg)
     except SessionBusyError:
-        print_error(f"session '{agent.session_id}' is busy — another nanocode process holds its "
+        sid = adopt_sid or "(new)"
+        print_error(f"session '{sid}' is busy — another nanocode process holds its "
                     f"writer lock. Start a new session, or resume a different one.")
         sys.exit(1)
-    try:
-        _built = _lease.manager.build_context()      # 校验树可折叠（corrupt → 退出，不静默）
     except SessionTreeError as e:
-        _lease.close()
-        print_error(f"corrupt session tree for '{agent.session_id}': {e}")
+        print_error(f"corrupt session tree: {e}")
         sys.exit(1)
-    agent._session_mgr = _lease.manager              # 请求按轮从树重渲染（docs/16 #3c），无需预装载
     if adopt_sid is not None:
-        agent._reload_task_state(_session_v2.read_state(adopt_sid)
-                                 if _session_v2.is_v2_session(adopt_sid) else None)
-        print_info(f"Session resumed: {adopt_sid} ({len(_built.messages)} messages).")
+        print_info(f"Session resumed: {adopt_sid} ({len(thread.messages())} messages).")
+    for diag in getattr(thread.services, "diagnostics", ()):
+        print_info(diag)
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
     def _finish_session() -> None:
         try:
-            cleanup_persist_sandbox(agent.session_id)
+            cleanup_persist_sandbox(thread.session_id)
         except Exception:
             pass
 
@@ -566,12 +647,9 @@ Examples:
         # Headless RPC mode（docs/17 Phase 5b）：JSON-lines over stdio 驱动同一 session,无 TUI。
         from .rpc import run_rpc_mode
         try:
-            asyncio.run(run_rpc_mode(agent, _lease))
+            asyncio.run(run_rpc_mode(RuntimeHost(runtime, thread, registry=_REGISTRY, interactive=False)))
         finally:
-            try:
-                _lease.close()
-            except Exception:
-                pass
+            thread.release_lease()
             _finish_session()
     elif prompt:
         # One-shot mode —— docs/15 Phase 7：headless 路径同样**仅**经 RuntimeThread.run,不绕过 runtime
@@ -579,9 +657,8 @@ Examples:
 
         async def _one_shot() -> None:
             from .terminal_client import TerminalClient
-            th = AgentRuntime().adopt(agent, lease=_lease)
-            th.subscribe(TerminalClient().on_event)   # docs/17 Phase 1：headless 也经订阅客户端渲染
-            await th.run(prompt)
+            thread.subscribe(TerminalClient().on_event)   # docs/17 Phase 1：headless 也经订阅客户端渲染
+            await thread.run(prompt)
 
         try:
             asyncio.run(_one_shot())
@@ -589,15 +666,12 @@ Examples:
             print_error(str(e))
             sys.exit(1)
         finally:
-            try:
-                _lease.close()                 # 释放会话写锁（一次性模式结束）
-            except Exception:
-                pass
+            thread.release_lease()
             _finish_session()
     else:
         # Interactive REPL
         try:
-            asyncio.run(run_repl(agent, _lease))
+            asyncio.run(run_repl(thread))
         finally:
             _finish_session()                  # run_repl 退出时已 release 当前 thread 的 lease
 

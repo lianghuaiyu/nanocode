@@ -144,9 +144,12 @@ def test_rebind_emits_session_switch_boundary():
     old_thread.subscribe(old_seen.append)
 
     new_thread = rt.thread_new(_Host(old_thread))
-    # docs/17 Phase 2：rebind 的 "Session → N messages" 提示现为 NoticeRaised 事件（在 session_switch
-    # 边界之前于旧 thread 流上发出），随后是 session_switch 边界。
-    assert [e["type"] for e in old_seen] == ["notice_raised", "session_switch"]
-    assert old_seen[-1]["event"]["from_session"] == "swold"
+    # Pi-style replacement：旧 thread 先发 shutdown 边界，rebind 提示作为 NoticeRaised，
+    # 随后发 session_switch，最后旧 wrapper 被 invalidated。
+    assert [e["type"] for e in old_seen] == [
+        "session_shutdown", "notice_raised", "session_switch", "thread_invalidated"
+    ]
+    assert old_seen[0]["event"]["reason"] == "new"
+    assert old_seen[2]["event"]["from_session"] == "swold"
     assert new_thread.events()[0]["type"] == "session_switch"
     assert new_thread.events()[0]["event"]["to_session"] == a.session_id

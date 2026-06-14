@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1460" height="980" viewBox="0 0 1460 980" role="img" aria-labelledby="title desc">
+  <title id="title">Claude Code context and compaction strategy</title>
+  <desc id="desc">A diagram showing Claude Code query projection, microcompact, autocompact, prompt-too-long retry, and post-compact rehydration.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font: 700 34px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #4b5563; }
+      .section { font: 700 21px Arial, sans-serif; fill: #111827; }
+      .label { font: 700 16px Arial, sans-serif; fill: #111827; }
+      .text { font: 400 15px Arial, sans-serif; fill: #374151; }
+      .small { font: 400 13px Arial, sans-serif; fill: #4b5563; }
+      .tiny { font: 400 12px Arial, sans-serif; fill: #6b7280; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 8; }
+      .blue { fill: #e9f2ff; stroke: #7ba7ef; }
+      .green { fill: #eaf8ef; stroke: #6fbe89; }
+      .orange { fill: #fff4e6; stroke: #efa340; }
+      .purple { fill: #f2edff; stroke: #a78bfa; }
+      .red { fill: #fff0f0; stroke: #f08080; }
+      .dark { fill: #172033; }
+      .darkText { font: 700 14px Arial, sans-serif; fill: #ffffff; }
+      .arrow { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 6 5; fill: none; marker-end: url(#arrow); }
+      .divider { stroke: #cbd5e1; stroke-width: 1; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1460" height="980"/>
+  <text class="title" x="48" y="58">Claude Code 上下文策略示例</text>
+  <text class="subtitle" x="48" y="88">一次请求不是直接发送完整 messages，而是先过 budget、microcompact、collapse、autocompact，再重新拼 post-compact 上下文。</text>
+
+  <rect class="box blue" x="48" y="125" width="250" height="86"/>
+  <text class="label" x="72" y="157">完整 REPL messages</text>
+  <text class="small" x="72" y="183">包含历史、工具结果、附件、</text>
+  <text class="small" x="72" y="202">compact boundary 等</text>
+
+  <rect class="box purple" x="350" y="125" width="275" height="86"/>
+  <text class="label" x="374" y="157">slice after compact boundary</text>
+  <text class="small" x="374" y="183">getMessagesAfterCompactBoundary()</text>
+  <text class="tiny" x="374" y="203">query.ts:380</text>
+
+  <rect class="box orange" x="677" y="125" width="275" height="86"/>
+  <text class="label" x="701" y="157">tool-result budget</text>
+  <text class="small" x="701" y="183">聚合工具输出先做预算替换</text>
+  <text class="tiny" x="701" y="203">query.ts:384-409</text>
+
+  <rect class="box green" x="1004" y="125" width="330" height="86"/>
+  <text class="label" x="1028" y="157">microcompact / cache edit</text>
+  <text class="small" x="1028" y="183">time-based 清旧 tool result 或 cached MC</text>
+  <text class="tiny" x="1028" y="203">microCompact.ts:253-395</text>
+
+  <path class="arrow" d="M298 168 L350 168"/>
+  <path class="arrow" d="M625 168 L677 168"/>
+  <path class="arrow" d="M952 168 L1004 168"/>
+
+  <rect class="box purple" x="174" y="275" width="350" height="124"/>
+  <text class="label" x="198" y="307">context collapse projection</text>
+  <text class="text" x="198" y="334">feature 开启时先投影 collapse view</text>
+  <text class="text" x="198" y="360">如果 collapse 已降到阈值以下，</text>
+  <text class="text" x="198" y="386">autocompact 通常就不会触发</text>
+  <text class="tiny" x="198" y="407">query.ts:443-462</text>
+
+  <rect class="box red" x="610" y="275" width="420" height="124"/>
+  <text class="label" x="634" y="307">autocompact threshold</text>
+  <text class="text" x="634" y="334">effective window = model context - min(max output, 20k)</text>
+  <text class="text" x="634" y="360">auto threshold = effective window - 13k buffer</text>
+  <text class="text" x="634" y="386">连续失败 3 次后 circuit breaker</text>
+  <text class="tiny" x="634" y="407">autoCompact.ts:28-90, 241-351</text>
+
+  <path class="dash" d="M1169 211 C1169 250 350 240 350 275"/>
+  <path class="arrow" d="M524 337 L610 337"/>
+
+  <rect class="box orange" x="1108" y="275" width="252" height="124"/>
+  <text class="label" x="1132" y="307">session memory first</text>
+  <text class="text" x="1132" y="334">自动压缩先尝试</text>
+  <text class="text" x="1132" y="360">session-memory compaction</text>
+  <text class="tiny" x="1132" y="386">autoCompact.ts:287-310</text>
+  <path class="arrow" d="M1030 337 L1108 337"/>
+
+  <line class="divider" x1="48" y1="454" x2="1412" y2="454"/>
+  <text class="section" x="48" y="494">full compactConversation() 具体流程</text>
+
+  <rect class="box" x="60" y="528" width="310" height="260"/>
+  <text class="label" x="84" y="560">压缩前清理</text>
+  <text class="text" x="84" y="592">PreCompact hooks</text>
+  <text class="text" x="84" y="620">strip images/documents</text>
+  <text class="text" x="84" y="648">strip skill discovery/listing</text>
+  <text class="text" x="84" y="676">summaryRequest = compact prompt</text>
+  <text class="tiny" x="84" y="708">compact.ts:145-223, 411-443</text>
+  <rect class="dark" x="84" y="734" width="95" height="28" rx="6"/>
+  <text class="darkText" x="101" y="753">输入</text>
+  <text class="small" x="194" y="754">messagesToSummarize</text>
+
+  <rect class="box red" x="440" y="528" width="340" height="260"/>
+  <text class="label" x="464" y="560">summary loop</text>
+  <text class="text" x="464" y="592">streamCompactSummary()</text>
+  <text class="text" x="464" y="620">如果 compact 请求本身 prompt-too-long：</text>
+  <text class="text" x="464" y="648">按 API round group 丢最老 head</text>
+  <text class="text" x="464" y="676">assistant-first 时补 synthetic user marker</text>
+  <text class="text" x="464" y="704">最多重试，然后失败给用户错误</text>
+  <text class="tiny" x="464" y="734">compact.ts:243-291, 445-491</text>
+  <path class="arrow" d="M370 658 L440 658"/>
+
+  <rect class="box green" x="850" y="528" width="500" height="260"/>
+  <text class="label" x="874" y="560">post-compact rehydration</text>
+  <text class="text" x="874" y="592">清 readFile cache / nested memory state</text>
+  <text class="text" x="874" y="620">恢复最多 5 个文件，总预算 50k，每文件 5k</text>
+  <text class="text" x="874" y="648">恢复 async agents、plan、plan-mode、invoked skills</text>
+  <text class="text" x="874" y="676">重新广播 deferred tools / agent listing / MCP instructions</text>
+  <text class="text" x="874" y="704">执行 SessionStart hooks</text>
+  <text class="tiny" x="874" y="734">compact.ts:517-595</text>
+  <path class="arrow" d="M780 658 L850 658"/>
+
+  <rect class="box blue" x="196" y="842" width="1068" height="90"/>
+  <text class="label" x="220" y="874">压缩后消息顺序</text>
+  <rect class="dark" x="220" y="894" width="138" height="26" rx="6"/>
+  <text class="darkText" x="234" y="912">boundaryMarker</text>
+  <rect class="dark" x="382" y="894" width="144" height="26" rx="6"/>
+  <text class="darkText" x="397" y="912">summaryMessages</text>
+  <rect class="dark" x="550" y="894" width="122" height="26" rx="6"/>
+  <text class="darkText" x="566" y="912">messagesToKeep</text>
+  <rect class="dark" x="696" y="894" width="104" height="26" rx="6"/>
+  <text class="darkText" x="714" y="912">attachments</text>
+  <rect class="dark" x="824" y="894" width="112" height="26" rx="6"/>
+  <text class="darkText" x="842" y="912">hookResults</text>
+  <text class="tiny" x="972" y="912">buildPostCompactMessages(): compact.ts:325-338</text>
+
+  <path class="dash" d="M1100 788 C1100 840 846 842 846 842"/>
+
+  <rect class="box orange" x="60" y="806" width="520" height="30"/>
+  <text class="small" x="84" y="827">telemetry: preCompactTokenCount / truePostCompactTokenCount / compaction usage / willRetriggerNextTurn</text>
+
+  <rect class="box red" x="790" y="806" width="560" height="30"/>
+  <text class="small" x="814" y="827">cache safety: prompt-cache sharing, cached microcompact, prompt-cache break notification</text>
+</svg>

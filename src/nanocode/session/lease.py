@@ -36,13 +36,15 @@ class SessionLease:
         return self.manager.session_id
 
     @classmethod
-    def open_or_create(cls, session_id: str, *, parent_session: dict | None = None) -> "SessionLease":
+    def open_or_create(cls, session_id: str, *, parent_session: dict | None = None,
+                       cwd: str | None = None) -> "SessionLease":
         """取得一个写者 lease：已存在树 → open(lock=True)；否则 create(lock=True) 写 root 并持锁。
 
         目标被其它进程占用 → `SessionBusyError`；树损坏（非末行 torn）→ `SessionTreeError`。
         二者都由调用方处理（fail-closed：startup 退出 / `/resume` 提示 `--fork`）。"""
         mgr = (SessionManager.open(session_id, lock=True) if SessionManager.exists(session_id)
-               else SessionManager.create(session_id, parent_session=parent_session, lock=True))
+               else SessionManager.create(session_id, cwd=cwd,
+                                          parent_session=parent_session, lock=True))
         return cls(mgr)
 
     def close(self) -> None:

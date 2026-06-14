@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from .budgets import BudgetPolicy
 from .ledger import ContextLedger
 from .packs import ContextPack
-from .providers import ContextProvider, ContextRequest, default_providers
+from .providers import ContextProvider, ContextRequest, ContextSources, default_providers
 
 
 @dataclass
@@ -32,8 +32,9 @@ class ContextRuntime:
     """组装上下文计划。无状态;providers 可注入（测试/profile 定制）。"""
 
     def __init__(self, providers: "list[ContextProvider] | None" = None,
+                 sources: "ContextSources | None" = None,
                  budget: "BudgetPolicy | None" = None) -> None:
-        self.providers = providers if providers is not None else default_providers()
+        self.providers = providers if providers is not None else default_providers(sources)
         self.budget = budget or BudgetPolicy()
 
     async def collect(self, request: ContextRequest) -> ContextPlan:

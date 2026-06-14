@@ -169,14 +169,50 @@ def test_context_config_exposes_refresh(tmp_path, monkeypatch):
     from nanocode.tools.permissions import load_context_config
     (tmp_path / ".nanocode").mkdir()
     (tmp_path / ".nanocode" / "settings.json").write_text(
-        '{"context": {"repo_map_refresh": "files"}}')
+        '{"context": {"map_refresh": "files"}}')
     monkeypatch.chdir(tmp_path)
     reset_permission_cache()
-    assert load_context_config()["repo_map_refresh"] == "files"
+    assert load_context_config()["map_refresh"] == "files"
     reset_permission_cache()
     # 非法值 → auto
     (tmp_path / ".nanocode" / "settings.json").write_text(
-        '{"context": {"repo_map_refresh": "nope"}}')
+        '{"context": {"map_refresh": "nope"}}')
     reset_permission_cache()
-    assert load_context_config()["repo_map_refresh"] == "auto"
+    assert load_context_config()["map_refresh"] == "auto"
+    reset_permission_cache()
+
+
+def test_context_config_map_tokens_default_is_unspecified(tmp_path, monkeypatch):
+    from nanocode.tools import reset_permission_cache
+    from nanocode.tools.permissions import load_context_config
+    monkeypatch.chdir(tmp_path)
+    reset_permission_cache()
+    assert load_context_config()["map_tokens"] is None
+    reset_permission_cache()
+
+
+def test_context_config_exposes_map_tokens_and_multiplier(tmp_path, monkeypatch):
+    from nanocode.tools import reset_permission_cache
+    from nanocode.tools.permissions import load_context_config
+    (tmp_path / ".nanocode").mkdir()
+    (tmp_path / ".nanocode" / "settings.json").write_text(
+        '{"context": {"map_tokens": 0, "map_multiplier_no_files": 4}}')
+    monkeypatch.chdir(tmp_path)
+    reset_permission_cache()
+    cfg = load_context_config()
+    assert cfg["map_tokens"] == 0
+    assert cfg["map_multiplier_no_files"] == 4.0
+    reset_permission_cache()
+
+
+def test_context_config_env_overrides_map_tokens(tmp_path, monkeypatch):
+    from nanocode.tools import reset_permission_cache
+    from nanocode.tools.permissions import load_context_config
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NANOCODE_MAP_TOKENS", "0")
+    monkeypatch.setenv("NANOCODE_MAP_REFRESH", "files")
+    reset_permission_cache()
+    cfg = load_context_config()
+    assert cfg["map_tokens"] == 0
+    assert cfg["map_refresh"] == "files"
     reset_permission_cache()

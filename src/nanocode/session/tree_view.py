@@ -140,7 +140,7 @@ def flatten_tree(roots: list[TreeNode], leaf_id: str | None, multiple_roots: boo
                       multiple_roots, is_last, [], multiple_roots))
 
     while stack:
-        node, indent, _just_branched, show_connector, is_last, gutters, is_vrc = stack.pop()
+        node, indent, just_branched, show_connector, is_last, gutters, is_vrc = stack.pop()
         children = order_active_first(node.children)
         foldable = len(children) > 0
         is_folded = foldable and node.entry.id in folded
@@ -150,7 +150,12 @@ def flatten_tree(roots: list[TreeNode], leaf_id: str | None, multiple_roots: boo
             continue  # 折叠：不展开子节点
 
         multi = len(children) > 1
-        child_indent = indent + 1 if multi else indent
+        if multi:
+            child_indent = indent + 1
+        elif just_branched and indent > 0:
+            child_indent = indent + 1
+        else:
+            child_indent = indent
 
         connector_displayed = show_connector and not is_vrc
         cur_display_indent = max(0, indent - 1) if multiple_roots else indent

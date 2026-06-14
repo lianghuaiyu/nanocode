@@ -16,7 +16,8 @@ import platform
 import sys
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Protocol, runtime_checkable
+from pathlib import Path
+from typing import Callable, Protocol, runtime_checkable
 
 from .packs import ContextPack
 
@@ -44,9 +45,19 @@ class ContextRequest:
     files_modified: list[str] = field(default_factory=list)
     mentioned_files: list[str] = field(default_factory=list)
     mentioned_identifiers: list[str] = field(default_factory=list)
-    repo_map_budget_tokens: int = 1024
-    context_window_tokens: int = 0         # 模型上下文窗（repo map ×8 放大的封顶基准）
-    repo_map_refresh: str = "auto"         # aider refresh 档（map 结果缓存策略）
+    map_tokens: int = 1024
+    context_window_tokens: int = 0         # 模型上下文窗（repo map no-files 放大的封顶基准）
+    map_refresh: str = "auto"              # aider refresh 档（map 结果缓存策略）
+    map_multiplier_no_files: float = 2.0
+
+
+@dataclass(frozen=True)
+class ContextSources:
+    """Injectable context data sources owned by runtime/services."""
+
+    git: Callable[[ContextRequest], str] | None = None
+    project_instructions: Callable[[ContextRequest], str] | None = None
+    memory_static: Callable[[ContextRequest], str] | None = None
 
 
 @runtime_checkable
@@ -77,9 +88,11 @@ class GitSnapshotProvider:
     id = "git"
     enable_attr = "include_git"
 
+    def __init__(self, source: Callable[[ContextRequest], str] | None = None) -> None:
+        self.source = source or _default_git_source
+
     async def collect(self, request):
-        from ..prompt import get_git_context
-        text = get_git_context()
+        text = self.source(request)
         if not text.strip():
             return None
         return ContextPack(id="git", kind="git", content=text, lifecycle="turn",
@@ -91,9 +104,11 @@ class ProjectInstructionsProvider:
     id = "project_instructions"
     enable_attr = "include_project_instructions"
 
+    def __init__(self, source: Callable[[ContextRequest], str] | None = None) -> None:
+        self.source = source or _default_project_instructions_source
+
     async def collect(self, request):
-        from ..prompt import load_project_instructions
-        text = load_project_instructions()
+        text = self.source(request)
         if not text.strip():
             return None
         # session 生命周期 + survives compaction（§8.4：root 项目指令 compaction 后重载为 session pack）。
@@ -106,9 +121,11 @@ class MemoryStaticProvider:
     id = "memory_static"
     enable_attr = "include_memory"
 
+    def __init__(self, source: Callable[[ContextRequest], str] | None = None) -> None:
+        self.source = source or _default_memory_static_source
+
     async def collect(self, request):
-        from ..memory import build_memory_prompt_section
-        text = build_memory_prompt_section()
+        text = self.source(request)
         if not text.strip():
             return None
         return ContextPack(id="memory_static", kind="memory_static", content=text,
@@ -164,19 +181,26 @@ class RepoMapProvider:
 
     经 codeintel.get_service（进程级 per-root 缓存索引，跨 turn 复用——不再每次重建）。
     aider 语义：personal 文件（已读/已改）是排名**种子、不渲染**；无 personal 文件（首 turn）
-    预算 ×4 给全局定向（aider map_mul_no_files 的保守版）。lifecycle=turn,不入树(persist=none)。
+    按 map_multiplier_no_files 放大。lifecycle=turn,不入树(persist=none)。
     """
 
     id = "repo_map"
     enable_attr = "include_repo_map"
 
-    NO_FILES_BUDGET_MULTIPLIER = 8          # aider map_mul_no_files=8
+    NO_FILES_BUDGET_MULTIPLIER = 2.0        # aider CLI --map-multiplier-no-files default
     CONTEXT_WINDOW_PADDING = 4096           # aider get_repo_map 的 padding
 
     async def collect(self, request):
         import os
+        budget = request.map_tokens
+        if budget <= 0:
+            return None
+        repo = self._repo_files(request.cwd or os.getcwd())
+        if repo is None:
+            return None
+        repo_root, _tracked_files = repo
         from ..codeintel import RepoQuery, get_service
-        svc = get_service(request.cwd or os.getcwd())
+        svc = get_service(str(repo_root))
         # 提及提取（aider get_ident_mentions/get_file_mentions 同款）：当前用户输入分词 ∩
         # 已知 def 名/文件名——×10 ident 加权与文件 personalization 的主要触发器。
         m_idents, m_files = svc.extract_mentions(request.user_prompt)
@@ -184,15 +208,15 @@ class RepoMapProvider:
             files_read=request.files_read, files_modified=request.files_modified,
             mentioned_files=list(request.mentioned_files) + m_files,
             mentioned_identifiers=list(request.mentioned_identifiers) + m_idents)
-        budget = request.repo_map_budget_tokens
         # aider get_repo_map:120-132 语义：无 chat（personal）文件即放大——mentions 不影响；
         # 须知道上下文窗才放大，且按 window − padding 封顶。
         if not (request.files_read or request.files_modified) and request.context_window_tokens:
-            target = min(budget * self.NO_FILES_BUDGET_MULTIPLIER,
+            multiplier = request.map_multiplier_no_files or self.NO_FILES_BUDGET_MULTIPLIER
+            target = min(int(budget * multiplier),
                          request.context_window_tokens - self.CONTEXT_WINDOW_PADDING)
             if target > 0:
                 budget = target
-        result = svc.repo_map(query, budget_tokens=budget, refresh=request.repo_map_refresh)
+        result = svc.repo_map(query, budget_tokens=budget, refresh=request.map_refresh)
         if not result.text:
             return None
         prov = {"source": "RepoMapProvider", "files": result.files}
@@ -202,16 +226,65 @@ class RepoMapProvider:
                            cache_policy="volatile_tail", persist_policy="none", priority=30,
                            provenance=prov)
 
+    @staticmethod
+    def _repo_files(cwd: str) -> "tuple[Path, set[Path]] | None":
+        import subprocess
+        try:
+            top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                                 capture_output=True, timeout=10)
+            if top.returncode != 0:
+                return None
+            root = Path(top.stdout.decode().strip()).resolve()
+            files = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                                   capture_output=True, timeout=15)
+            if files.returncode != 0:
+                return None
+        except Exception:
+            return None
+        tracked = {
+            (root / rel).resolve()
+            for rel in files.stdout.decode("utf-8", errors="replace").split("\0")
+            if rel
+        }
+        return (root, tracked) if tracked else None
 
-def default_providers() -> list:
+    @staticmethod
+    def _personal_abs_files(repo_root: Path, request: ContextRequest) -> set[Path]:
+        out: set[Path] = set()
+        for name in request.files_read + request.files_modified:
+            try:
+                p = Path(name)
+                out.add((p if p.is_absolute() else repo_root / p).resolve())
+            except Exception:
+                continue
+        return out
+
+
+def _default_git_source(request: ContextRequest) -> str:
+    from ..prompt import get_git_context
+    return get_git_context()
+
+
+def _default_project_instructions_source(request: ContextRequest) -> str:
+    from ..prompt import load_project_instructions
+    return load_project_instructions()
+
+
+def _default_memory_static_source(request: ContextRequest) -> str:
+    from ..memory import build_memory_prompt_section
+    return build_memory_prompt_section()
+
+
+def default_providers(sources: ContextSources | None = None) -> list:
     """build_system_prompt 今天烤进的 10 个动态来源,逐个 provider 化（顺序 = 优先级高→低组装）。"""
+    sources = sources or ContextSources()
     return [
-        ProjectInstructionsProvider(),
-        MemoryStaticProvider(),
+        ProjectInstructionsProvider(sources.project_instructions),
+        MemoryStaticProvider(sources.memory_static),
         SkillGuidanceProvider(),
         AgentDescriptionsProvider(),
         EnvProvider(),
-        GitSnapshotProvider(),
+        GitSnapshotProvider(sources.git),
         DeferredToolsProvider(),
         RepoMapProvider(),
     ]

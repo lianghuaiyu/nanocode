@@ -98,7 +98,7 @@ def test_anthropic_adapter_parses_text_thinking_tool():
                          thinking_block=thinks.append, tool_block=tools.append)
     res = asyncio.run(ad.stream(model="claude-x", system="S", tools=[], messages=[],
                                 thinking_mode="disabled", callbacks=cb))
-    assert texts == ["hello"]
+    assert texts == ["hel", "lo"]
     assert thinks == ["reason"]
     assert tools == [{"type": "tool_use", "id": "t1", "name": "read_file", "input": {"p": "a"}}]
     assert spins  # spinner stopped before first text/thinking block
@@ -186,7 +186,7 @@ def test_openai_adapter_assembles_text_and_tool_calls():
     texts = []
     res = asyncio.run(ad.stream(model="gpt-x", system=None, tools=[], messages=[],
                                 thinking_mode="disabled", callbacks=StreamCallbacks(text_block=texts.append)))
-    assert texts == ["hello"]
+    assert texts == ["he", "llo"]
     msg = res["choices"][0]["message"]
     assert msg["content"] == "hello"
     assert msg["tool_calls"][0]["function"] == {"name": "run", "arguments": '{"x":1}'}

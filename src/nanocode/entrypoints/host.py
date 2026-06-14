@@ -13,6 +13,8 @@ Agent/AgentSession/RuntimeThread，而 handler 无需缓存它们。
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .commands.types import CommandContext
 
 
@@ -22,6 +24,7 @@ class RuntimeHost:
         self._current_thread = thread
         self._registry = registry
         self._interactive = interactive
+        self._before_thread_invalidate = None
         # docs/17 Phase 1：TUI 客户端（订阅事件流渲染）。host 持有它并在 thread 替换（/new /resume
         # /clone /fork）时重新订阅新 thread——保证渲染跨 lifecycle 切换不断。None = 无渲染客户端
         # （测试 / headless）。
@@ -46,10 +49,18 @@ class RuntimeHost:
     def current_thread(self):
         return self._current_thread
 
+    @property
+    def services(self):
+        return getattr(self._current_thread, "services", None)
+
+    def set_before_thread_invalidate(self, callback) -> None:
+        self._before_thread_invalidate = callback
+
     def context(self) -> CommandContext:
         """每次 dispatch 重新生成——handler 永远经 current_thread 的稳定命令面操作，
         替换 thread 后无需通知任何 handler（它们不缓存句柄）。"""
-        return CommandContext(thread=self._current_thread,
+        cwd = Path(self._current_thread.services.cwd) if getattr(self._current_thread, "services", None) is not None else Path.cwd()
+        return CommandContext(thread=self._current_thread, cwd=cwd,
                               registry=self._registry, interactive=self._interactive,
                               selector_host=self._client)
 
@@ -68,19 +79,12 @@ class RuntimeHost:
         if self._client is not None and new_thread is not None:
             self._bind_client(new_thread)
         if old is not None and old is not new_thread:
+            if self._before_thread_invalidate is not None:
+                self._before_thread_invalidate()
             old.dispose()
 
     def can_switch(self) -> "tuple[bool, str | None]":
         """lifecycle 切换前的 fail-closed 闸。返回 (允许?, 拒绝原因)。
 
-        直接读 agent 状态、不吞异常——本闸的全部价值在于 fail-CLOSED；若 list_subagents 等
-        抛错，宁可让它炸成响亮的 bug，也绝不静默 default 成"无子 agent → 允许切"（fail-open）。"""
-        a = self._current_thread.agent
-        if a.is_processing:
-            return False, "a turn is currently running"
-        if a._background_tasks:
-            return False, f"{len(a._background_tasks)} background task(s) still running"
-        busy = [s for s in a.task_manager.list_subagents() if s.status in ("running", "idle")]
-        if busy:
-            return False, f"{len(busy)} sub-agent(s) still running/idle"
-        return True, None
+        生命周期判断归 RuntimeThread facade，host 不再 reach 进 Agent 私有字段。"""
+        return self._current_thread.can_switch()

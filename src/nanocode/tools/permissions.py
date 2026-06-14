@@ -65,13 +65,14 @@ AGENTS_CONFIG_DEFAULTS: dict = {
 _cached_agents_config: dict | None = None
 
 # ─── Context engineering config (.nanocode/settings.json "context" section) ──
-# repo_map：是否在每 turn 的 volatile tail 注入 Aider-style repo map（默认开；
-# 陌生/超大仓库可设 false 逃生）。
-# repo_map_refresh：repo map 结果缓存档（aider 同名）——auto（默认,贵才缓存）/
+# map_tokens：Aider 同款预算开关；未指定则按模型默认决定，0 表示禁用。
+# map_refresh：repo map 结果缓存档（aider 同名）——auto（默认,贵才缓存）/
 # files（文件集不变即缓存）/always（每次重算）/manual（首算后固定）。
+# map_multiplier_no_files：无已读/已改文件时的预算倍率；Aider CLI 当前默认 2。
 CONTEXT_CONFIG_DEFAULTS: dict = {
-    "repo_map": True,
-    "repo_map_refresh": "auto",
+    "map_tokens": None,
+    "map_refresh": "auto",
+    "map_multiplier_no_files": 2,
 }
 
 _REPO_MAP_REFRESH_MODES = frozenset({"auto", "files", "always", "manual"})
@@ -92,13 +93,47 @@ def load_context_config() -> dict:
         for key in CONTEXT_CONFIG_DEFAULTS:
             if key in section:
                 merged[key] = section[key]
-    refresh = merged.get("repo_map_refresh", "auto")
+    if os.environ.get("NANOCODE_MAP_TOKENS") is not None:
+        merged["map_tokens"] = os.environ.get("NANOCODE_MAP_TOKENS")
+    if os.environ.get("NANOCODE_MAP_REFRESH") is not None:
+        merged["map_refresh"] = os.environ.get("NANOCODE_MAP_REFRESH")
+    if os.environ.get("NANOCODE_MAP_MULTIPLIER_NO_FILES") is not None:
+        merged["map_multiplier_no_files"] = os.environ.get("NANOCODE_MAP_MULTIPLIER_NO_FILES")
+    refresh = merged.get("map_refresh", "auto")
+    tokens = _coerce_optional_int(merged.get("map_tokens"))
+    multiplier = _coerce_positive_float(merged.get("map_multiplier_no_files"), 2.0)
     cfg = {
-        "repo_map": bool(merged.get("repo_map", True)),
-        "repo_map_refresh": refresh if refresh in _REPO_MAP_REFRESH_MODES else "auto",
+        "map_tokens": tokens,
+        "map_refresh": refresh if refresh in _REPO_MAP_REFRESH_MODES else "auto",
+        "map_multiplier_no_files": multiplier,
     }
     _cached_context_config = cfg
     return cfg
+
+
+def _coerce_nonnegative_int(value, default):
+    try:
+        out = int(value)
+    except (ValueError, TypeError):
+        return default
+    return out if out >= 0 else default
+
+
+def _coerce_optional_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_positive_float(value, default):
+    try:
+        out = float(value)
+    except (ValueError, TypeError):
+        return default
+    return out if out > 0 else default
 
 
 def _coerce_int(value, default):

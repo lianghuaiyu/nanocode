@@ -140,19 +140,24 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     monkeypatch.setattr(_builtin, "handle_eval_command",
                         lambda rest: (calls.append(("handle_eval_command", rest)) or "stub"))
     monkeypatch.setattr("nanocode.tools.sandbox_defaults", _FakeSandbox(calls))
-    async def _fake_shell(cmd):
-        calls.append(("shell", cmd))
+    # !shell 已迁入 RuntimeThread.execute_user_shell(不再走 cli._run_user_shell)→ patch 类方法
+    from nanocode.agent.runtime import RuntimeThread
+
+    async def _fake_exec_shell(self, command, **kwargs):
+        calls.append(("shell", command))
         return "shellout"
 
-    monkeypatch.setattr(cli, "_run_user_shell", _fake_shell)
+    monkeypatch.setattr(RuntimeThread, "execute_user_shell", _fake_exec_shell)
 
     def _lookup(name):
         calls.append(("get_skill_by_name", name))
         return skill_lookup(name) if skill_lookup else None
 
-    monkeypatch.setattr(cli, "get_skill_by_name", _lookup)
-    monkeypatch.setattr(cli, "resolve_skill_prompt", lambda skill, args: f"RESOLVED:{skill.name}:{args}")
-    monkeypatch.setattr(cli, "execute_skill",
+    # skill 派发已迁入 RuntimeThread.invoke_skill(call-time `from ..skills import ...`),
+    # 故 patch 源模块 nanocode.skills.*(与上面 discover_skills 同一 call-time-import 模式),不再 patch cli.*
+    monkeypatch.setattr("nanocode.skills.get_skill_by_name", _lookup)
+    monkeypatch.setattr("nanocode.skills.resolve_skill_prompt", lambda skill, args: f"RESOLVED:{skill.name}:{args}")
+    monkeypatch.setattr("nanocode.skills.execute_skill",
                         lambda name, args: (calls.append(("execute_skill", name, args)) or "ran"))
 
     # 5) tasks_tool 延迟 import（cli 在分支内 `from ..tools.tasks_tool import ...`）→ 在源模块打桩
@@ -347,7 +352,8 @@ def test_named_command_hits_expected_handler(monkeypatch, line, expected_call):
     ("/agents", "agents_overview_text"),
     ("/agents available", "list_agent_definitions_text"),
     ("/agents running", "list_subagents_text"),
-    ("/agent agent-001", "subagent_detail_text"),
+    # 重构后 /agent <arg> 经 RuntimeThread.agent_detail 统一路由(definition-aware):未知 id 落 agent 定义详情
+    ("/agent agent-001", "agent_definition_detail_text"),
 ])
 def test_tasks_family_hits_expected_handler(monkeypatch, line, expected_call):
     """演示延迟 import 命令族的打桩方式（在 nanocode.tools.tasks_tool 源模块 patch）。"""

@@ -34,11 +34,10 @@ class PermissionProfile:
 
 @dataclass
 class ContextProfile:
-    """profile 的 context 行为（§8 / §9.2）：codeintel 开关、repo-map 预算、是否注入 memory/skills。"""
+    """profile 的 context 行为（§8 / §9.2）：codeintel 开关、repo map 预算、是否注入 memory/skills。"""
 
     codeintel: bool = True
-    repo_map: bool = True
-    repo_map_budget_tokens: int = 1024
+    map_tokens: int = 1024
     inject_memory: bool = True
     inject_skills: bool = True
     inject_project_instructions: bool = True

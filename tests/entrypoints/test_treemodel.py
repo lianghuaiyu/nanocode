@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import re
+
 from nanocode.session import tree_view as TM
 from nanocode.session import tree as T
+from nanocode.tui.selector import cell_width
 from nanocode.tui.session_pages.tree import SessionTreeModel
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text)
 
 
 def _msg(eid, parent, role, text):
@@ -71,6 +81,24 @@ def test_connectors_present_at_branch():
     assert "├" in by["E"].prefix or "└" in by["E"].prefix
 
 
+def test_linear_parent_child_chain_is_flat_like_pi():
+    entries, leaf = _fork_tree()
+    rows = TM.build_rows(entries[:5], leaf)  # start -> A -> B -> C -> D, no side branch
+    assert [r.prefix for r in rows] == ["", "", "", ""]
+
+
+def test_branching_parent_child_chain_shows_tree_like_pi():
+    entries, leaf = _fork_tree()
+    rows = TM.build_rows(entries, leaf)
+    by = {r.entry.id: r for r in rows}
+    assert by["A"].prefix == ""
+    assert by["B"].prefix == ""
+    assert by["C"].prefix.startswith("├")
+    assert by["D"].prefix.startswith("│")
+    assert by["E"].prefix.startswith("└")
+    assert by["F"].prefix.startswith(" ")
+
+
 def test_filter_user_only():
     entries, leaf = _fork_tree()
     rows = TM.build_rows(entries, leaf, mode="user-only")
@@ -110,14 +138,39 @@ def test_tree_model_filter_chords_and_label():
     entries, leaf = _fork_tree()
     model = SessionTreeModel(entries, leaf, "default")
     item = model.items()[0]
+    header = "\n".join(model.header_lines(100))
+    assert "Session Tree" in header
+    assert "leaf" not in header and "filter:" not in header
+    assert model.search_line(80).endswith("Type to search:\x1b[0m")
+    assert model.body_border_after_search()
+    assert model.position_line(0, len(model.items()), 0, 5, 80) == f"  (1/{len(model.items())})"
+    assert model.wrap_navigation()
+    assert model.escape_clears_query()
     assert "c-u" in model.extra_keys() and "c-a" in model.extra_keys()
     model.on_key("c-u", item, 0)
     assert model.mode == "user-only"
+    assert model.status_suffix() == " [user]"
     model.on_key("c-u", item, 0)   # toggle back to default
     assert model.mode == "default"
     model.on_key("c-a", item, 0)
     assert model.mode == "all"
+    assert model.status_suffix() == " [all]"
     assert model.on_key("L", item, 0).edit_action == "label"
+
+
+def test_tree_model_rows_use_pi_cursor_and_cell_width():
+    entries, leaf = _fork_tree()
+    model = SessionTreeModel(entries, leaf, "default")
+    row = next(r for r in model.items() if r.entry.id == "D")
+
+    selected = _plain(model.list_text(row, True, 32))
+    nonsel = _plain(model.list_text(row, False, 32))
+
+    assert selected.startswith("› ")          # Pi accent 游标(U+203A),非 ASCII '>'
+    assert "\x1b[7m" not in model.list_text(row, True, 32)   # 无反显
+    assert selected.rstrip().endswith("<")
+    assert nonsel.startswith("  ")             # 非选中:两空格占位,cell 对齐
+    assert cell_width(nonsel) <= 32
 
 
 def test_tree_model_live_search_filters():
@@ -169,3 +222,18 @@ def test_fork_model_lists_user_messages_newest_first_and_searches():
     assert ids == ["E", "C", "A"]           # newest-first
     model.set_query("初始化")
     assert [e.id for e in model.items()] == ["A"]
+
+
+def test_fork_model_rows_use_pi_cursor_and_cell_width():
+    from nanocode.tui.session_pages.fork import ForkModel
+    entries, leaf = _fork_tree()
+    model = ForkModel(entries)
+
+    raw = model.list_text(model.items()[0], True, 18)
+    selected = _plain(raw)
+    nonsel = _plain(model.list_text(model.items()[0], False, 18))
+
+    assert selected.startswith("› ")          # Pi accent 游标
+    assert "\x1b[7m" not in raw                # 无反显
+    assert nonsel.startswith("  ")
+    assert cell_width(nonsel) <= 18

@@ -7,7 +7,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:  # optional for lightweight embedded imports
+    yaml = None
 
 
 @dataclass
@@ -46,16 +49,135 @@ def _quote_problematic_values(block: str) -> str:
     return "\n".join(out)
 
 
-def _flat_parse(block: str) -> dict:
-    """旧扁平解析器：最后兜底，绝不抛。"""
-    meta: dict[str, Any] = {}
-    for line in block.split("\n"):
-        idx = line.find(":")
-        if idx == -1:
+def _strip_scalar_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_scalar(value: str) -> Any:
+    value = value.strip()
+    if value in ("true", "True"):
+        return True
+    if value in ("false", "False"):
+        return False
+    if value in ("null", "Null", "none", "None", "~"):
+        return None
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_scalar(part.strip()) for part in inner.split(",")]
+    return _strip_scalar_quotes(value)
+
+
+def _split_key_value(text: str) -> tuple[str, str] | None:
+    key, sep, value = text.partition(":")
+    if not sep:
+        return None
+    return key.strip(), value.strip()
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _parse_map(lines: list[str], start: int, indent: int) -> tuple[dict, int]:
+    out: dict[str, Any] = {}
+    i = start
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.strip():
+            i += 1
             continue
-        key = line[:idx].strip()
-        if key:
-            meta[key] = line[idx + 1:].strip()
+        cur = _indent(raw)
+        if cur < indent:
+            break
+        if cur > indent:
+            i += 1
+            continue
+        pair = _split_key_value(raw.strip())
+        if pair is None:
+            i += 1
+            continue
+        key, value = pair
+        if value:
+            out[key] = _parse_scalar(value)
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines) or _indent(lines[j]) <= cur:
+            out[key] = ""
+            i += 1
+            continue
+        child_indent = _indent(lines[j])
+        if lines[j].lstrip().startswith("- "):
+            out[key], i = _parse_list(lines, j, child_indent)
+        else:
+            out[key], i = _parse_map(lines, j, child_indent)
+    return out, i
+
+
+def _parse_list(lines: list[str], start: int, indent: int) -> tuple[list, int]:
+    out: list[Any] = []
+    i = start
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.strip():
+            i += 1
+            continue
+        cur = _indent(raw)
+        if cur < indent:
+            break
+        if cur != indent or not raw.lstrip().startswith("- "):
+            break
+        item = raw.lstrip()[2:].strip()
+        pair = _split_key_value(item)
+        if pair is None:
+            out.append(_parse_scalar(item))
+            i += 1
+            continue
+        key, value = pair
+        obj: dict[str, Any] = {key: _parse_scalar(value) if value else ""}
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip():
+                i += 1
+                continue
+            nxt_indent = _indent(nxt)
+            if nxt_indent <= cur:
+                break
+            pair2 = _split_key_value(nxt.strip())
+            if pair2 is None:
+                i += 1
+                continue
+            k2, v2 = pair2
+            if v2:
+                obj[k2] = _parse_scalar(v2)
+                i += 1
+                continue
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and _indent(lines[j]) > nxt_indent and lines[j].lstrip().startswith("- "):
+                obj[k2], i = _parse_list(lines, j, _indent(lines[j]))
+            elif j < len(lines) and _indent(lines[j]) > nxt_indent:
+                obj[k2], i = _parse_map(lines, j, _indent(lines[j]))
+            else:
+                obj[k2] = ""
+                i += 1
+        out.append(obj)
+    return out, i
+
+
+def _flat_parse(block: str) -> dict:
+    """Small YAML subset parser used when PyYAML is unavailable or rejects input."""
+    lines = [line.rstrip() for line in block.split("\n") if line.strip() and not line.lstrip().startswith("#")]
+    meta, _ = _parse_map(lines, 0, 0)
     return meta
 
 
@@ -68,10 +190,13 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
     meta: Any = None
     for candidate in (block, None):
         text = block if candidate is block else _quote_problematic_values(block)
-        try:
-            loaded = yaml.safe_load(text)
-        except yaml.YAMLError:
+        if yaml is None:
             loaded = None
+        else:
+            try:
+                loaded = yaml.safe_load(text)
+            except yaml.YAMLError:
+                loaded = None
         if isinstance(loaded, dict):
             meta = loaded
             break

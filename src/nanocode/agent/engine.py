@@ -10,9 +10,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
-import anthropic
-import openai
-
 from ..tools import (
     tool_definitions,
     execute_tool,
@@ -244,9 +241,18 @@ class Agent(PlanModeMixin):
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
         self._apply_permission_mode_prompt()
 
-        # Initialize clients
+        # Initialize clients. Provider SDK imports are intentionally lazy so
+        # embedding/import-boundary users can construct runtime/test Agents
+        # without installing every provider package.
         if self.use_openai:
-            self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
+            try:
+                import openai
+            except ModuleNotFoundError:
+                openai = None
+            if openai is None:
+                self._openai_client = None
+            else:
+                self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
         else:
             kwargs: dict[str, Any] = {}
@@ -254,7 +260,12 @@ class Agent(PlanModeMixin):
                 kwargs["api_key"] = api_key
             if anthropic_base_url:
                 kwargs["base_url"] = anthropic_base_url
-            self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
+            try:
+                import anthropic
+            except ModuleNotFoundError:
+                anthropic = None
+            self._anthropic_client = (None if anthropic is None
+                                      else anthropic.AsyncAnthropic(**kwargs))
             self._openai_client = None
 
         # docs/15 STEP B：provider 流式 + capture 收敛到 ProviderAdapter（backend mixin 经 self._provider
@@ -648,6 +659,23 @@ class Agent(PlanModeMixin):
         task.add_done_callback(self._background_tasks.discard)
         return rec.id
 
+    async def spawn_background_shell(self, command: str, timeout_ms: int | None) -> str:
+        return await self._spawn_background_shell(command, timeout_ms)
+
+    def list_tasks(self, status=None, kind=None) -> str:
+        from ..tools.tasks_tool import list_tasks_text
+        return list_tasks_text(self.task_manager, status, kind)
+
+    def task_output(self, task_id: str, tail_bytes: int = 8000) -> str:
+        from ..tools.tasks_tool import task_output_text
+        return task_output_text(self.task_manager, task_id, tail_bytes)
+
+    async def stop_task(self, task_id: str) -> str:
+        from ..tools.tasks_tool import task_stop
+        return await task_stop(
+            self.task_manager, self._background_tasks, task_id,
+            allow_orphan_cancel=not self.is_sub_agent)
+
     def _tool_blocked_by_allowlist(self, name: str) -> bool:
         """P4 call-time allowlist 判定——委托给 PermissionEngine（单一决策来源）。
 
@@ -655,6 +683,9 @@ class Agent(PlanModeMixin):
         (_execute_tool_call) 与 hook-shell 路径 (_run_hook) 调用，二者即 fail-closed 兜底点。
         """
         return self.permission.allowlist_blocks(name)
+
+    def tool_blocked_by_allowlist(self, name: str) -> bool:
+        return self._tool_blocked_by_allowlist(name)
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         """工具派发 callgate（实现搬迁到 capabilities.CapabilityRouter.dispatch；以下为薄委托）。
@@ -671,6 +702,24 @@ class Agent(PlanModeMixin):
             self._on_file_touched(name, inp)
         return result
 
+    async def run_real_tool(self, name: str, inp: dict) -> str:
+        return await self._run_real_tool(name, inp)
+
+    async def recall_memory_semantic(self, query: str, limit: int = 5) -> str:
+        return await self._recall_memory_semantic(query, limit)
+
+    async def spawn_memory_consolidate(self) -> str:
+        return await self._spawn_memory_consolidate()
+
+    async def execute_plan_mode_tool(self, name: str) -> str:
+        return await self._execute_plan_mode_tool(name)
+
+    async def execute_agent_tool(self, inp: dict) -> str:
+        return await self._execute_agent_tool(inp)
+
+    async def execute_skill_tool(self, inp: dict) -> str:
+        return await self._execute_skill_tool(inp)
+
     # ─── 工具级 hooks：注册 / 匹配 / 执行 ──────────────────────
 
     def _register_skill_hooks(self, sk) -> None:
@@ -686,6 +735,15 @@ class Agent(PlanModeMixin):
         from ..skills.hooks import hook_matches
         return [h for h in self._active_hooks
                 if h["event"] == event and hook_matches(h["matcher"], tool_name)]
+
+    def hooks_suppressed(self) -> bool:
+        return self._suppress_hooks
+
+    def has_active_hooks(self) -> bool:
+        return bool(self._active_hooks)
+
+    def matching_hooks(self, event: str, tool_name: str) -> list[dict]:
+        return self._matching_hooks(event, tool_name)
 
     async def _run_hook(self, h: dict, tool_name: str, inp: dict, result):
         """执行一条 hook；返回 (ok, message)。命令走统一 check_permission：
@@ -741,6 +799,9 @@ class Agent(PlanModeMixin):
             out = (r["stderr"] or r["stdout"] or "").strip()[:500]
             return False, f"exit {r['exit_code']}: {out}"
         return True, ""
+
+    async def run_hook(self, h: dict, tool_name: str, inp: dict, result):
+        return await self._run_hook(h, tool_name, inp, result)
 
     # ─── Sub-agent factory (centralized permission inheritance) ──
 

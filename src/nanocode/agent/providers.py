@@ -101,8 +101,6 @@ class AnthropicAdapter(ProviderAdapter):
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             thinking_parts: list[str] = []
-            text_blocks: dict[int, list] = {}
-            thinking_blocks: dict[int, list] = {}
             tool_blocks_by_index: dict[int, dict] = {}
 
             async with self.client.messages.stream(**create_params) as stream:
@@ -116,31 +114,25 @@ class AnthropicAdapter(ProviderAdapter):
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         if hasattr(delta, "text"):
-                            text_blocks.setdefault(event.index, []).append(delta.text)
+                            callbacks.spinner_stop()
+                            callbacks.text_block(delta.text)
                         elif hasattr(delta, "thinking"):
                             thinking_parts.append(delta.thinking)
-                            thinking_blocks.setdefault(event.index, []).append(delta.thinking)
+                            callbacks.spinner_stop()
+                            callbacks.thinking_block(delta.thinking)
                         elif hasattr(delta, "partial_json"):
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
                                 tb["input_json"] += delta.partial_json
                     elif event.type == "content_block_stop":
-                        if event.index in text_blocks:
-                            callbacks.spinner_stop()
-                            callbacks.text_block("".join(text_blocks.pop(event.index)))
-                        elif event.index in thinking_blocks:
-                            buf = thinking_blocks.pop(event.index)
-                            callbacks.spinner_stop()
-                            callbacks.thinking_block("".join(buf))
-                        else:
-                            tb = tool_blocks_by_index.pop(event.index, None)
-                            if tb:
-                                try:
-                                    parsed = json.loads(tb["input_json"] or "{}")
-                                except Exception:
-                                    parsed = {}
-                                callbacks.tool_block({"type": "tool_use", "id": tb["id"],
-                                                      "name": tb["name"], "input": parsed})
+                        tb = tool_blocks_by_index.pop(event.index, None)
+                        if tb:
+                            try:
+                                parsed = json.loads(tb["input_json"] or "{}")
+                            except Exception:
+                                parsed = {}
+                            callbacks.tool_block({"type": "tool_use", "id": tb["id"],
+                                                  "name": tb["name"], "input": parsed})
 
                 final_message = await stream.get_final_message()
 
@@ -181,6 +173,8 @@ class OpenAIAdapter(ProviderAdapter):
                 delta = chunk.choices[0].delta
                 if delta and delta.content:
                     content += delta.content
+                    callbacks.spinner_stop()
+                    callbacks.text_block(delta.content)
                 if delta and delta.tool_calls:
                     for tc in delta.tool_calls:
                         existing = tool_calls.get(tc.index)
@@ -195,10 +189,6 @@ class OpenAIAdapter(ProviderAdapter):
                             }
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
-
-            if content:
-                callbacks.spinner_stop()
-                callbacks.text_block(content)
 
             assembled = None
             if tool_calls:
