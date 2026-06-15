@@ -5,11 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from .sandbox_backends.base import DEFAULT_PROTECTED_ROOTS
 from ..paths import data_dir, project_config_dir
 
 # ─── Permission modes ──────────────────────────────────────
@@ -211,7 +209,7 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict, *, is_allow: bool = Fal
         return True
 
     value = ""
-    if tool_name in ("run_shell", "sandbox_shell"):
+    if tool_name == "run_shell":
         value = inp.get("command", "")
     elif "file_path" in inp:
         value = inp["file_path"]
@@ -225,7 +223,7 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict, *, is_allow: bool = Fal
         # deny 规则保持激进（is_allow=False）；精确匹配 allow 不受影响。
         if (
             is_allow
-            and tool_name in ("run_shell", "sandbox_shell")
+            and tool_name == "run_shell"
             and any(c in _SHELL_COMPOSITION_CHARS for c in value)
         ):
             return False
@@ -244,66 +242,8 @@ def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
     return None
 
 
-# ─── Shell sandbox routing (实验性：NANOCODE_SHELL_SANDBOX=auto 开启) ──────────
-#
-# 只读且安全、可在宿主快速执行的命令前缀（按 token 前缀匹配，非整串 startswith，
-# 故 "git status && curl evil" 不会命中——含 && 的命令不进快速通道）。
-READONLY_SHELL_PREFIXES = (
-    "ls", "pwd", "cat", "head", "tail", "wc", "echo", "which", "whoami",
-    "grep", "rg", "tree", "stat", "file", "date", "printenv",
-    "du", "df", "uname", "hostname", "id", "ps", "true",
-    "git status", "git log", "git diff", "git show",
-    "git rev-parse", "git describe",
-    "python --version", "python3 --version", "pip --version",
-    "node --version", "npm --version",
-)
-
-# 命令组合 / 重定向 / 替换字符——出现即不进只读快速通道（fail-closed，安全方向）。
+# 命令组合 / 重定向 / 替换字符——allow 前缀规则遇之 fail-closed（不跨组合符延伸放行）。
 _SHELL_COMPOSITION_CHARS = set("|&;<>$`(){}\n")
-
-
-def shell_sandbox_mode() -> str:
-    """'off'（默认）| 'auto'（microVM 路由）| 'seatbelt'（原生 OS 沙盒）。
-    控制 run_shell 是否经沙盒路由及走哪种后端。"""
-    val = (os.environ.get("NANOCODE_SHELL_SANDBOX") or "off").strip().lower()
-    return val if val in ("off", "auto", "seatbelt") else "off"
-
-
-def is_readonly_command(command: str) -> bool:
-    """命令是否为已知只读、可安全在宿主直跑（按 token 前缀白名单匹配）。
-    含组合/重定向/替换字符或引号不平衡时一律返回 False（保守，落到沙盒）。"""
-    cmd = (command or "").strip()
-    if not cmd:
-        return False
-    if any(c in _SHELL_COMPOSITION_CHARS for c in cmd):
-        return False
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    prefixes = {tokens[0], " ".join(tokens[:2]), " ".join(tokens[:3])}
-    return any(p in prefixes for p in READONLY_SHELL_PREFIXES)
-
-
-def classify_shell_runtime(command: str) -> str:
-    """run_shell 命令的运行时归类：'host' 或 'sandbox'。
-    - 路由关闭（off）→ host（保持旧行为）。
-    - 只读白名单 → host（快速直跑）。
-    - 其余（含危险命令）→ sandbox（auto→microVM；seatbelt→原生 OS 沙盒）。
-
-    危险命令归类为 sandbox：default 下经 check_permission confirm（确认→进沙盒，受限），
-    bypass 下无确认仍进沙盒（受限），真要上宿主须走 escalate=true。闭合 seatbelt+bypass
-    下 `rm -rf .git` 在宿主裸跑的洞。"""
-    if shell_sandbox_mode() == "off":
-        return "host"
-    if not (command or "").strip():
-        return "host"
-    if is_readonly_command(command):
-        return "host"
-    return "sandbox"
-
 
 def _project_root(start: str | None = None) -> str:
     """向上walk找 .git 定位 git 项目根；没找到 .git → 回退 cwd。
@@ -339,11 +279,16 @@ def _is_protected_path(file_path: str) -> bool:
         abs_p = os.path.realpath(file_path)
     except Exception:
         return False
+    # docs/19：受保护根的解析（含 .git gitdir pointer target → worktree/submodule 真实元数据目录）
+    # 与 SandboxManager 共用单一逻辑（capabilities.sandbox.protected_roots_for_workspace），闭合
+    # write_file/edit_file 对 gitfile 指向的外部 .git/worktrees|modules 的保护缺口（review HIGH）。
+    # lazy import：capabilities 包 __init__ 会 import tools.permissions，顶层 import 成环。
+    from ..capabilities.sandbox import protected_roots_for_workspace
     anchors = {_project_root(), os.path.realpath(os.getcwd())}
     for root in anchors:
-        for pr in DEFAULT_PROTECTED_ROOTS:
-            p = os.path.join(root, pr)
-            if abs_p == p or abs_p.startswith(p + os.sep):
+        for p in protected_roots_for_workspace(Path(root)):
+            ps = str(p)
+            if abs_p == ps or abs_p.startswith(ps + os.sep):
                 return True
     return False
 
@@ -370,7 +315,13 @@ def check_permission(
 
     # escalate=true 是沙盒逃逸到宿主的边界跨越：先于 bypass 裁决（与 deny/protected 同属
     # 「bypass 越不过」的硬边界），否则 bypass 下 escalate=true 会无确认直接上宿主。
-    if tool_name == "run_shell" and shell_sandbox_mode() != "off" and inp.get("escalate"):
+    # docs/19：sandbox 默认常开（profile 投影），escalate 永远需要明确审批；非交互 → deny。
+    if tool_name == "run_shell" and inp.get("escalate"):
+        # 后台命令不支持宿主提权（spawn 后无法交互审批 + 无前台流）→ fail-closed deny，不静默降级受限。
+        if inp.get("run_in_background"):
+            return {"action": "deny", "message": (
+                "host escalation is not supported for background commands; "
+                "run it in the foreground (confined or escalated) instead")}
         if mode == "dontAsk":
             return {"action": "deny", "message": f"Auto-denied (dontAsk): escalate {inp.get('command', '')}"}
         return {"action": "confirm", "message": f"escalate to host (bypass sandbox): {inp.get('command', '')}"}
@@ -390,7 +341,7 @@ def check_permission(
             if plan_file_path and file_path == plan_file_path:
                 return {"action": "allow"}
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
-        if tool_name in ("run_shell", "sandbox_shell"):
+        if tool_name in ("run_shell",):
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
@@ -405,15 +356,6 @@ def check_permission(
     if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
         confirm_message = inp.get("command", "")
-    elif tool_name == "sandbox_shell" and inp.get("mount_workspace", False):
-        needs_confirm = True
-        confirm_message = f"sandbox workspace mount (host dir exposed read-write): {Path.cwd()}"
-    elif tool_name == "sandbox_shell" and inp.get("network", "none") != "none":
-        needs_confirm = True
-        confirm_message = f"sandbox network access: {inp.get('network', '')}"
-    elif tool_name == "sandbox_shell" and inp.get("deps", "reuse") == "install":
-        needs_confirm = True
-        confirm_message = "sandbox dependency install (writes shared deps volume)"
     elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
         needs_confirm = True
         confirm_message = f"write new file: {inp.get('file_path', '')}"

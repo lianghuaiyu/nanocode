@@ -63,11 +63,6 @@ def rebind_agent_session(agent, new_mgr, *, artifact_id: str = "main") -> None:
     agent.agent_session.auto_save()
     if old_mgr is not None and old_mgr is not new_mgr:
         old_mgr.close()
-    try:
-        from ..tools.sandbox_shell import cleanup_persist_sandbox
-        cleanup_persist_sandbox(old_sid)
-    except Exception:
-        pass
 
     agent.session_id = new_sid
     agent._tree_session_id = new_sid

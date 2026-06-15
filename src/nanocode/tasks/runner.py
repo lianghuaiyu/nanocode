@@ -1,12 +1,11 @@
-"""后台 shell 任务执行包装：把 run_shell.run_background 的结果落进 TaskManager。"""
+"""后台 shell 任务执行包装：把 SandboxManager.execute_background 的结果落进 TaskManager（docs/19）。
+
+后台 shell 与前台共用唯一规划点 SandboxManager；本模块只负责把结构化结果落库为任务状态。
+"""
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-
-# 注意：run_shell 在函数内惰性导入。顶层 `from ..tools import run_shell` 会触发
-# tools 包 __init__ → registry → tasks_tool → 回头 import 本模块的 tail_file，
-# 形成循环导入（单独 import nanocode.tasks.runner 时即崩）。惰性导入打断该环。
 
 _SUMMARY_CHARS = 500
 
@@ -40,23 +39,21 @@ def _summarize(stdout_path: str) -> str:
     return (lines[-1] if lines else tail)[:_SUMMARY_CHARS]
 
 
-async def run_shell_background_task(manager, task_id, command, stdout_path, stderr_path,
-                                    timeout_ms=None, session_id=None, cwd=None) -> None:
-    from ..tools import run_shell  # 惰性导入，打破 tools ↔ tasks 循环
-    inp = {"command": command}
-    if session_id:
-        inp["_session_id"] = session_id   # per-session 沙箱命名显式注入（env 回退已删，docs/16 #3c）
-    if cwd:
-        inp["_cwd"] = cwd
-    if timeout_ms is not None:
-        inp["timeout"] = timeout_ms
+async def run_shell_background_task(manager, sandbox, task_id, request, host, policy,
+                                    approval, stdout_path, stderr_path) -> None:
+    """后台 shell：经 SandboxManager.execute_background 流式执行并落库（docs/19）。
+
+    request/host/policy/approval 由 engine 在 spawn 时构造（HostContext(is_background=True)，
+    approval 不批——background 不支持 escalate）；microVM / 无后端 / deny → blocked（fail-closed）。
+    """
     try:
-        r = await run_shell.run_background(inp, stdout_path=stdout_path, stderr_path=stderr_path)
+        r = await sandbox.execute_background(
+            request, host, policy, approval, stdout_path=stdout_path, stderr_path=stderr_path)
     except asyncio.CancelledError:
         manager.update_task(task_id, status="cancelled", result_summary="(cancelled by task_stop)")
         raise
     if r.get("blocked"):
-        # fail-closed：后台命令无法关进沙盒（无原生后端 / auto microVM）→ 拒绝裸跑，落库为 blocked。
+        # fail-closed：后台命令无法关进沙盒（microVM / 无原生后端 / deny）→ 落库 blocked。
         manager.update_task(task_id, status="blocked", result_summary=r["blocked"])
         return
     status = classify_exit(r["exit_code"], r["timed_out"], r["cancelled"], r["error"])

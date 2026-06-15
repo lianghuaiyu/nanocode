@@ -1,10 +1,10 @@
 """本机 OS 沙盒后端包。当前实现：seatbelt（macOS）、bwrap（Linux）。
 
-提供单一真相源的后端解析器 `resolve_native_backend()`：唯一 shell planner
-`run_shell.plan_shell`（前台/后台/hook 共用）经它选后端，避免各入口各写一份选择逻辑。
+提供单一真相源的后端解析器 `resolve_native_backend()`：`SandboxManager`（docs/19，native-first /
+VM-on-demand 唯一规划点）经它选后端，避免各入口各写一份选择逻辑。
 
 周期安全：本包只 import 自己的 seatbelt/bwrap/base，**不** import
-run_shell/permissions/execute；resolve_native_backend 内部惰性 import 子模块。
+capabilities/run_shell/permissions/execute；resolve_native_backend 内部惰性 import 子模块。
 """
 
 from __future__ import annotations

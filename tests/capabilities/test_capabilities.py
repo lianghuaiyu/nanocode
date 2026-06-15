@@ -42,6 +42,14 @@ def test_from_profile_builds_context():
     assert router_allowlist_blocks("run_shell", ctx.allowed_tool_names) is True
 
 
+def test_decide_noninteractive_confirm_becomes_deny():
+    # docs/19 review：embedded 基底层——非交互上下文下 confirm 收敛为 deny（fail-closed）。
+    ctx_i = PermissionContext(mode="default", interactive=True)
+    assert decide(ctx_i, "run_shell", {"command": "x", "escalate": True}).action == "confirm"
+    ctx_n = PermissionContext(mode="default", interactive=False)
+    assert decide(ctx_n, "run_shell", {"command": "x", "escalate": True}).action == "deny"
+
+
 # ─── dispatch taxonomy ───────────────────────────────────────────────────────
 def test_classify_capability():
     assert classify_capability("task_list") is Capability.META

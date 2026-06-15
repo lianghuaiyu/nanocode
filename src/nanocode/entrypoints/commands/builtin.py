@@ -1,6 +1,6 @@
 """首批内置 slash 命令的 handler + registry 构造（CMD-P0，见 docs/11）。
 
-领域 helper（list_memories / discover_skills / sandbox_defaults / tasks_tool）用 call-time
+领域 helper（list_memories / discover_skills / tasks_tool）用 call-time
 import，使测试可在各自 source 模块打桩拦截；会话状态经 ctx.thread（RuntimeThread 稳定命令面，docs/17 B-list）。
 """
 
@@ -160,21 +160,29 @@ async def _skills(ctx: CommandContext, args: str) -> Local:
 
 
 async def _sandbox(ctx: CommandContext, args: str) -> Local:
-    from ...tools import sandbox_defaults
-    if not args:
-        d = sandbox_defaults.get_defaults()
-        lines = ["Sandbox session defaults:"]
-        lines.extend(f"    {k} = {v}" for k, v in d.items())
-        lines.append("Set with: /sandbox <persist|network|mount_workspace|deps> <value>")
-        return Local(output="\n".join(lines))
-    toks = args.split()
-    if len(toks) == 2:
+    """/sandbox —— 显示当前 sandbox 策略；`/sandbox <profile>` 切换 profile（docs/19）。
+
+    无 module-global 可变默认值——profile 是 runtime/session state，模型无法影响。
+    """
+    if args.strip():
         try:
-            newval = sandbox_defaults.set_default(toks[0], toks[1])
-            return Local(output=f"sandbox {toks[0]} = {newval}")
+            name = ctx.thread.set_sandbox_profile(args.strip())
         except ValueError as e:
             return _error(str(e))
-    return _error("Usage: /sandbox [<key> <value>]")
+        return Local(output=f"sandbox profile = {name}")
+    s = ctx.thread.sandbox_status()
+    lines = [
+        "Sandbox policy (active session):",
+        f"    profile          {s['profile']}",
+        f"    engine           {s['engine']}",
+        f"    network          {s['network']}",
+        f"    writable roots   {', '.join(s['writable_roots']) or '(none / read-only)'}",
+        f"    protected roots  {', '.join(s['protected_roots']) or '(none)'}",
+        f"    native backend   {'available' if s['native_available'] else 'unavailable'}",
+        f"    vm backend       {'available' if s['vm_available'] else 'unavailable'}",
+        "Switch with: /sandbox <default|read-only|strict|vm|danger-full-access>",
+    ]
+    return Local(output="\n".join(lines))
 
 
 async def _tasks(ctx: CommandContext, args: str) -> Local:
@@ -603,7 +611,7 @@ _BUILTINS = [
     ("/memory", _memory, "exact", "List saved memories", ""),
     ("/skills", _skills, "exact", "List available skills", ""),
     ("/sandbox", _sandbox, "exact_or_prefix",
-     "Show/set sandbox session defaults", "[<key> <value>]"),
+     "Show sandbox policy / switch profile", "[<profile>]"),
     ("/tasks", _tasks, "exact_or_prefix", "List background tasks", "[status]"),
     ("/task-stop", _task_stop, "prefix", "Stop a running background task", "<id>"),
     ("/task", _task, "prefix", "Show a background task's status & log", "<id>"),

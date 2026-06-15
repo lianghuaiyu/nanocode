@@ -261,20 +261,24 @@ def test_execute_user_shell_runs_in_runtime_cwd(tmp_path):
 
 
 def test_model_run_shell_receives_runtime_cwd(monkeypatch, tmp_path):
-    from nanocode.tools import execute
-
+    # docs/19：run_shell 经 SandboxManager；cwd 来自 HostContext（runtime cwd），非 tool input。
     cwd = tmp_path / "tool-cwd"
     cwd.mkdir()
     rt = AgentRuntime()
     cfg = AgentConfig(api_key="test", session_id="toolcwd",
                       permission_mode="bypassPermissions", cwd=str(cwd))
     th = rt.thread_start(cfg)
-    calls = []
-    monkeypatch.setattr(execute.run_shell, "run", lambda inp: calls.append(dict(inp)) or "ok")
+    captured = {}
+
+    async def fake_exec(request, host, policy, approval):
+        captured["cwd"] = str(host.cwd)
+        return "ok"
+
+    monkeypatch.setattr(th.agent._sandbox, "execute_shell", fake_exec)
     try:
         out = asyncio.run(th.agent._execute_tool_call("run_shell", {"command": "git status"}))
         assert out == "ok"
-        assert calls[-1]["_cwd"] == str(cwd.resolve())
+        assert captured["cwd"] == str(cwd.resolve())
     finally:
         th.release_lease()
 

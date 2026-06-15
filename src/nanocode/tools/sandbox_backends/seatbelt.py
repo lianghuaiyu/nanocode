@@ -124,61 +124,47 @@ def build_seatbelt_profile(
     return "\n".join(lines) + "\n"
 
 
-def build_argv(
-    command: str, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None
-) -> list[str]:
-    """纯函数：拼出 seatbelt 受限执行的 argv（前台/后台复用）。
+# ─── SandboxPlan 消费（docs/19 §4/§5：adapter 只吃 plan，不吃 raw dict）─────────
+#
+# 经 duck-typing 读 plan 属性（不 import capabilities.sandbox 的类型，避免 L0→L1 import 环）。
+# NetworkMode 是 str-Enum，与字符串字面量比较成立（mode == "full"）。
 
-    `cwd` 缺省取 os.getcwd()；danger-full-access 不应走这里（build_seatbelt_profile 会 raise）。
-    """
-    workdir = _real_abs(cwd or os.getcwd())
-    profile = build_seatbelt_profile(posture, workdir)
-    return [SANDBOX_EXEC, "-p", profile, "/bin/sh", "-c", command]
+def _plan_posture(plan):
+    writable = tuple(str(p) for p in plan.filesystem.writable_roots)
+    protected = tuple(str(p) for p in plan.filesystem.protected_roots)
+    allow_net = (plan.network.mode == "full")
+    posture = WORKSPACE_WRITE if writable else READ_ONLY
+    return posture, writable, protected, allow_net
 
 
-def run_structured(
-    inp: dict, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None
-) -> dict:
-    """在 seatbelt 沙盒内执行 inp['command']；返回与 run_shell.run_structured 同形 dict
-    （exit_code/stdout/stderr/timed_out/error）。danger-full-access 不应走这里。"""
+def build_argv_from_plan(plan) -> list[str]:
+    """SandboxPlan → seatbelt 受限 argv。writable/protected/network 全部来自 plan。"""
+    cwd = _real_abs(str(plan.cwd))
+    posture, writable, protected, allow_net = _plan_posture(plan)
+    if posture == WORKSPACE_WRITE:
+        profile = build_seatbelt_profile(
+            WORKSPACE_WRITE, cwd, writable_roots=writable,
+            protected_roots=protected, allow_network=allow_net)
+    else:
+        profile = build_seatbelt_profile(READ_ONLY, cwd, allow_network=allow_net)
+    return [SANDBOX_EXEC, "-p", profile, "/bin/sh", "-c", plan.command]
+
+
+def run_structured_plan(plan) -> dict:
+    """在 seatbelt 沙盒内执行 plan.command；返回结构化 dict（exit_code/stdout/stderr/timed_out/error）。"""
     out = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False, "error": None}
     try:
-        workdir = _real_abs(cwd or os.getcwd())
-        timeout_s = inp.get("timeout", 30000) / 1000
-        argv = build_argv(inp["command"], posture=posture, cwd=workdir)
+        workdir = _real_abs(str(plan.cwd))
+        argv = build_argv_from_plan(plan)
         env = dict(os.environ)
-        env["TMPDIR"] = os.environ.get("TMPDIR") or "/tmp"  # 确保指向 writable root
+        env["TMPDIR"] = os.environ.get("TMPDIR") or "/tmp"
         r = subprocess.run(
-            argv,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            input=inp.get("stdin"),
-            cwd=workdir,
-            env=env,
-        )
+            argv, shell=False, capture_output=True, text=True,
+            timeout=plan.timeout_ms / 1000, input=plan.stdin, cwd=workdir, env=env)
         out["exit_code"], out["stdout"], out["stderr"] = (
-            r.returncode,
-            r.stdout or "",
-            r.stderr or "",
-        )
+            r.returncode, r.stdout or "", r.stderr or "")
     except subprocess.TimeoutExpired:
         out["timed_out"] = True
     except Exception as e:
         out["error"] = str(e)
     return out
-
-
-def run(inp: dict, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None) -> str:
-    """文本输出包装：调 run_structured 后按与 run_shell.run 完全一致的格式返回文本。"""
-    r = run_structured(inp, posture=posture, cwd=cwd)
-    if r["timed_out"]:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
-    if r["error"] is not None:
-        return f"Error: {r['error']}"
-    if r["exit_code"] != 0:
-        stderr = f"\nStderr: {r['stderr']}" if r["stderr"] else ""
-        stdout = f"\nStdout: {r['stdout']}" if r["stdout"] else ""
-        return f"Command failed (exit code {r['exit_code']}){stdout}{stderr}"
-    return r["stdout"] or "(no output)"

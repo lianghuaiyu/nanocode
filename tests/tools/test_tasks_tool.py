@@ -66,12 +66,15 @@ def test_task_stop_already_terminal():
 
 def test_task_stop_cancels_running(tmp_path):
     from nanocode.tasks import runner
+    from .._helpers import sandbox_bg_args
     m = TaskManager(); t = m.create_task("shell", "sleep 5")
     out = str(tmp_path / "o.log"); err = str(tmp_path / "e.log")
     m.update_task(t.id, stdout_path=out, stderr_path=err)
+    sandbox, request, host, policy, approval = sandbox_bg_args("sleep 5", tmp_path)
     async def scenario():
         bg = set()
-        task = asyncio.create_task(runner.run_shell_background_task(m, t.id, "sleep 5", out, err))
+        task = asyncio.create_task(
+            runner.run_shell_background_task(m, sandbox, t.id, request, host, policy, approval, out, err))
         task._nanocode_task_id = t.id; bg.add(task)
         await asyncio.sleep(0.1)
         return await tt.task_stop(m, bg, t.id)

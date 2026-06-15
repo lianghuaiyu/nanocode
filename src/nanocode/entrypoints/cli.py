@@ -14,7 +14,6 @@ from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
     trajectory_level as _trajectory_level,
 )
-from ..tools.sandbox_shell import cleanup_persist_sandbox
 from ..paths import history_file
 from ..trust import is_trusted
 from .commands.types import Local, Prompt, Control
@@ -67,7 +66,7 @@ def _repl_commands_help() -> str:
 # Security: NO .env (repo-local OR user-level) may set nanocode's own security-sensitive
 # env vars, the dynamic-linker injection vars, or interpreter-injection vars. Mirrors Codex's
 # ILLEGAL_ENV_VAR_PREFIX ("CODEX_"). These belong to the operator's shell / CLI flags, not to
-# .env content — otherwise a .env could disable the sandbox (NANOCODE_SHELL_SANDBOX=off),
+# .env content — otherwise a .env could weaken the sandbox profile,
 # hijack the microVM launcher (NANOCODE_MSB_BIN / MSB_BIN), preload a shared object
 # (LD_PRELOAD / DYLD_INSERT_LIBRARIES), hijack PATH, or inject code into the interpreter
 # (PYTHONPATH / NODE_OPTIONS / BASH_ENV …). This is defense-in-depth that applies to ANY .env
@@ -201,6 +200,10 @@ def parse_args() -> argparse.Namespace:
                         help="Headless RPC mode: JSON-lines over stdio drive the same session (docs/17)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-turn token cost and MCP connection logs")
+    parser.add_argument("--sandbox-profile",
+                        choices=["default", "read-only", "strict", "vm", "danger-full-access"],
+                        default=None,
+                        help="Sandbox profile for run_shell (default: native-first workspace-write)")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     argv = sys.argv[1:]
     option_argv = argv[:argv.index("--")] if "--" in argv else argv
@@ -714,6 +717,7 @@ Examples:
         session_id=adopt_sid,
         memory_backend_choice=args.memory_backend,
         cwd=str(Path.cwd()),
+        sandbox_profile=args.sandbox_profile or "default",
     )
 
     if traj_on:
@@ -753,10 +757,6 @@ Examples:
     prompt = " ".join(args.prompt) if args.prompt else None
 
     def _finish_session() -> None:
-        try:
-            cleanup_persist_sandbox(thread.session_id)
-        except Exception:
-            pass
         if args.no_session:
             _cleanup_ephemeral_session(thread.session_id)
 

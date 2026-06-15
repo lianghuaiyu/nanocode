@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-_TAIL_KEEP_TOOLS = frozenset({"run_shell", "sandbox_shell"})
+_TAIL_KEEP_TOOLS = frozenset({"run_shell"})
 DEFAULT_SKIP_TOOLS = frozenset({"read_file"})
 
 

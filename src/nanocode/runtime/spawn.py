@@ -129,6 +129,9 @@ class SubAgentRunner:
             depth=host.depth + 1,
             agent_type=agent_type,
             agent_source=agent_source,
+            # docs/19 §8：子 agent 继承父 sandbox profile（收窄不放宽——同 profile 即不放宽，
+            # narrow_policy_for_context 再按 is_subagent/background/hook 上下文收紧）。
+            sandbox_profile=getattr(host, "_sandbox_profile", "default"),
         )
         if artifact_id and artifact_id != "main":
             from ..session.lease import SessionLease

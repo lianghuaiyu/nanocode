@@ -219,3 +219,18 @@ def test_protected_path_anchored_at_gitfile_root_from_subdir(monkeypatch, tmp_pa
     r = check_permission("write_file", {"file_path": fp}, "bypassPermissions")
     assert r["action"] == "confirm"
     assert "protected" in r["message"]
+
+
+def test_gitdir_pointer_target_protected(monkeypatch, tmp_path):
+    """docs/19 review HIGH：.git gitfile 指向的真实 gitdir（worktree/submodule 外部元数据）
+    在 write_file/edit_file 下也受保护（_is_protected_path 解析 gitdir pointer，与 SandboxPolicy 同源）。"""
+    real_gitdir = tmp_path / "mainrepo" / ".git" / "worktrees" / "wt"
+    real_gitdir.mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {real_gitdir}\n")
+    monkeypatch.chdir(wt)
+    target = str(real_gitdir / "config")
+    assert permissions._is_protected_path(target) is True
+    r = check_permission("write_file", {"file_path": target}, "bypassPermissions")
+    assert r["action"] == "confirm" and "protected" in r["message"]

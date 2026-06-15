@@ -7,7 +7,24 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from nanocode.session.manager import SessionManager
+
+
+def sandbox_bg_args(command: str, cwd, *, timeout_ms: int = 0, profile: str = "default"):
+    """docs/19：构造后台 shell 经 SandboxManager 所需的 (sandbox, request, host, policy, approval)。"""
+    from nanocode.capabilities.sandbox import (
+        SandboxManager, ShellRequest, HostContext, ApprovalDecision, policy_for_profile)
+    cwdp = Path(os.path.realpath(str(cwd)))
+    sandbox = SandboxManager()
+    request = ShellRequest(command=command, timeout_ms=timeout_ms, run_in_background=True)
+    host = HostContext(cwd=cwdp, session_id="s", workspace_roots=(cwdp,),
+                       temp_roots=(Path("/tmp"),), interactive=False, is_background=True)
+    # background 不支持 escalate → approval 恒不批。
+    return sandbox, request, host, policy_for_profile(profile, host), ApprovalDecision(approved=False)
+
 
 
 def leased_manager(session_id: str, **kw) -> SessionManager:

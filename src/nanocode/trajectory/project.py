@@ -29,9 +29,9 @@ from .schema import Step
 # TrajEvent 形状等价；下文类型注解沿用 ``TrajEvent`` 名以最小化 diff——别名指向 TrajEvent。
 
 # 风险启发（docs/10 risk_level）：中危工具（写盘 / 执行 shell）。
-_MEDIUM_RISK_TOOLS = frozenset({"write_file", "edit_file", "run_shell", "sandbox_shell"})
+_MEDIUM_RISK_TOOLS = frozenset({"write_file", "edit_file", "run_shell"})
 # 高危：执行 shell 类工具 + 危险命令模式时升到 high。
-_SHELL_TOOLS = frozenset({"run_shell", "sandbox_shell"})
+_SHELL_TOOLS = frozenset({"run_shell"})
 # 危险命令子串启发（粗粒度，宁可多标 high；这是只读分析标签，不影响 runtime）。
 _DANGEROUS_CMD_SUBSTRINGS = (
     "rm -rf", "rm -fr", "rm  -rf", ":(){", "mkfs", "dd if=", "> /dev/",
@@ -434,7 +434,7 @@ def _looks_dangerous(call_data: dict) -> bool:
         if isinstance(inp, str):
             text = inp
         elif isinstance(inp, dict):
-            # run_shell/sandbox_shell 的命令多在 command / cmd / script 键。
+            # run_shell 的命令多在 command / cmd / script 键。
             for k in ("command", "cmd", "script", "args"):
                 v = inp.get(k)
                 if v:

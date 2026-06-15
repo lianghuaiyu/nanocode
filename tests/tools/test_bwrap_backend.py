@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,19 @@ from nanocode.tools.sandbox_backends.base import (
     WORKSPACE_WRITE,
 )
 from nanocode.tools.sandbox_backends.bwrap import build_bwrap_argv
+from nanocode.capabilities.sandbox import (
+    FileSystemPolicy, NetworkMode, NetworkPolicy, SandboxBackend, SandboxPlan,
+    protected_roots_for_workspace)
+
+
+def _plan(command, cwd, *, timeout_ms=30000):
+    """docs/19：workspace-write SandboxPlan（adapter 只吃 plan）。"""
+    c = Path(os.path.realpath(str(cwd)))
+    fs = FileSystemPolicy(readable_roots=(), writable_roots=(c,),
+                          denied_roots=(), protected_roots=protected_roots_for_workspace(c))
+    return SandboxPlan(backend=SandboxBackend.NATIVE, command=command, cwd=c,
+                       timeout_ms=timeout_ms, filesystem=fs,
+                       network=NetworkPolicy(mode=NetworkMode.NONE), session_id="s")
 
 
 def _has(argv, *seq):
@@ -148,7 +162,7 @@ def test_build_argv_argv0_not_cwd_bwrap(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     try:
-        argv = bwrap.build_argv("echo hi", cwd=str(tmp_path))
+        argv = bwrap.build_argv_from_plan(_plan("echo hi", str(tmp_path)))
     except FileNotFoundError:
         return  # 可信目录无 bwrap → fail-closed，未生成 ./bwrap argv，符合预期
     assert argv[0] != "./bwrap"
@@ -164,7 +178,7 @@ def test_resolve_bwrap_bin_hits_trusted_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(bwrap, "_TRUSTED_BWRAP", (str(target),))
     assert bwrap._resolve_bwrap_bin() == str(target)
     # build_argv 用的就是这个可信绝对路径
-    argv = bwrap.build_argv("echo hi", cwd=str(tmp_path))
+    argv = bwrap.build_argv_from_plan(_plan("echo hi", str(tmp_path)))
     assert argv[0] == str(target)
 
 
@@ -173,7 +187,7 @@ def test_resolve_bwrap_bin_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(bwrap, "_TRUSTED_BWRAP", (str(tmp_path / "nope-bwrap"),))
     assert bwrap._resolve_bwrap_bin() is None
     with pytest.raises(FileNotFoundError):
-        bwrap.build_argv("echo hi", cwd=str(tmp_path))
+        bwrap.build_argv_from_plan(_plan("echo hi", str(tmp_path)))
 
 
 # ─── A (Fix A 旧测改). bwrap 用绝对路径 argv[0]（防 PATH 注入） ──────────────────
@@ -206,7 +220,7 @@ def test_run_structured_resolves_absolute_bwrap(monkeypatch, tmp_path):
         return _R()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    r = bwrap.run_structured({"command": "echo ok"}, cwd=str(tmp_path))
+    r = bwrap.run_structured_plan(_plan("echo ok", str(tmp_path)))
     assert r["error"] is None
     assert captured["argv"][0] == str(target)
 
@@ -221,7 +235,7 @@ def test_run_structured_fails_closed_when_bwrap_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(bwrap, "_TRUSTED_BWRAP", (str(tmp_path / "nope-bwrap"),))
     called = []
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: called.append(1))
-    r = bwrap.run_structured({"command": "echo ok"}, cwd=str(tmp_path))
+    r = bwrap.run_structured_plan(_plan("echo ok", str(tmp_path)))
     assert r["error"] == "bwrap not found in trusted paths"
     assert called == []  # fail-closed：不裸跑
 
@@ -254,9 +268,7 @@ _smoke = pytest.mark.skipif(
 
 @_smoke
 def test_smoke_write_inside_cwd_ok(tmp_path):
-    r = bwrap.run_structured(
-        {"command": "echo inside > a.txt && cat a.txt"}, cwd=str(tmp_path)
-    )
+    r = bwrap.run_structured_plan(_plan("echo inside > a.txt && cat a.txt", str(tmp_path)))
     assert r["error"] is None
     assert r["exit_code"] == 0, r
     f = tmp_path / "a.txt"
@@ -271,7 +283,7 @@ def test_smoke_write_outside_cwd_denied(tmp_path):
     if os.path.exists(outside):
         os.unlink(outside)
     try:
-        r = bwrap.run_structured({"command": f"echo x > {outside}"}, cwd=str(tmp_path))
+        r = bwrap.run_structured_plan(_plan(f"echo x > {outside}", str(tmp_path)))
         assert r["error"] is None
         assert r["exit_code"] != 0, r
         assert not os.path.exists(outside)
@@ -283,9 +295,7 @@ def test_smoke_write_outside_cwd_denied(tmp_path):
 @_smoke
 def test_smoke_write_dotgit_denied(tmp_path):
     (tmp_path / ".git").mkdir()
-    r = bwrap.run_structured(
-        {"command": "echo x > .git/HACK"}, cwd=str(tmp_path)
-    )
+    r = bwrap.run_structured_plan(_plan("echo x > .git/HACK", str(tmp_path)))
     assert r["error"] is None
     assert r["exit_code"] != 0, r
     assert not (tmp_path / ".git" / "HACK").exists()
@@ -295,9 +305,7 @@ def test_smoke_write_dotgit_denied(tmp_path):
 def test_smoke_network_denied(tmp_path):
     if os.environ.get("NANOCODE_HAS_NETWORK") == "0":
         pytest.skip("no network available to test denial against")
-    r = bwrap.run_structured(
-        {"command": "curl -sS --max-time 5 https://example.com", "timeout": 15000},
-        cwd=str(tmp_path),
-    )
+    r = bwrap.run_structured_plan(
+        _plan("curl -sS --max-time 5 https://example.com", str(tmp_path), timeout_ms=15000))
     assert r["error"] is None
     assert r["exit_code"] != 0, r

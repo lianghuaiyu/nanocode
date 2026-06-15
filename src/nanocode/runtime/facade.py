@@ -146,6 +146,9 @@ class AgentConfig:
     memory_backend_choice: str | None = None
     session_id: str | None = None          # resume adopt 目标（None = 新 mint）
     cwd: str | None = None
+    # docs/19：public sandbox profile（default/read-only/strict/vm/danger-full-access）。
+    # 投影为 SandboxPolicy；public API 只暴露 profile，不暴露 adapter argv / msb / mount。
+    sandbox_profile: str = "default"
 
     def build_agent(self):
         from ..agent.engine import Agent
@@ -156,6 +159,7 @@ class AgentConfig:
             trajectory_enabled=self.trajectory_enabled,
             trajectory_level=self.trajectory_level, workspace_trusted=self.workspace_trusted,
             session_id=self.session_id, memory_backend=self.memory_backend,
+            sandbox_profile=self.sandbox_profile,
         )
 
 
@@ -481,6 +485,34 @@ class RuntimeThread:
             "thinking": None if mode == "disabled" else mode,
         }
 
+    # ─── docs/19：sandbox profile/policy（public runtime API；不暴露 adapter argv）────────
+
+    def sandbox_status(self) -> dict:
+        """当前 sandbox 策略快照（profile + engine + fs/network + 后端可用性）。纯读。"""
+        a = self.agent
+        policy = a.sandbox_policy()
+        sb = a._sandbox
+        return {
+            "profile": getattr(a, "_sandbox_profile", "default"),
+            "engine": policy.engine.value,
+            "network": policy.network.mode.value,
+            "writable_roots": [str(p) for p in policy.filesystem.writable_roots],
+            "protected_roots": [str(p) for p in policy.filesystem.protected_roots],
+            "native_available": sb.native_available(),
+            "vm_available": sb.vm_available(),
+        }
+
+    def set_sandbox_profile(self, name: str) -> str:
+        """切换当前 session 的 sandbox profile（写入 runtime/agent state，非 module global）。
+
+        非法 profile → 抛 ValueError（调用方渲染错误）。返回设定后的 profile 名。
+        """
+        from ..capabilities.sandbox import PROFILES
+        if name not in PROFILES:
+            raise ValueError(f"unknown profile: {name} (valid: {', '.join(PROFILES)})")
+        self.agent._sandbox_profile = name
+        return name
+
     def messages(self) -> list:
         """当前 active branch 的中立 Message[] 快照（docs/17 #2：从 canonical 树 build_context 派生）。
 
@@ -688,12 +720,12 @@ class RuntimeThread:
         This is not a model tool call and does not use tool permission approval,
         but it emits runtime events and uses the same structured shell runner.
         """
-        from ..tools import run_shell
+        from ..capabilities.sandbox import exec_host_command
         cwd = self.services.cwd if self.services is not None else self.status()["cwd"]
         self.push_boundary("user_shell_started", command=command,
                            exclude_from_context=exclude_from_context, cwd=cwd)
-        r = await asyncio.to_thread(run_shell.run_structured,
-                                    {"command": command, "timeout": timeout_ms, "_cwd": cwd})
+        r = await asyncio.to_thread(exec_host_command, command,
+                                    cwd=cwd, timeout_ms=timeout_ms)
         self.push_boundary("user_shell_completed", command=command,
                            timed_out=r.get("timed_out"),
                            exit_code=r.get("exit_code"),

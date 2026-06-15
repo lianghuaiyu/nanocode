@@ -18,6 +18,7 @@ import json
 import time
 
 from ..tools import CONCURRENCY_SAFE_TOOLS
+from ..capabilities.validation import validate_tool_input
 from .events import (
     AssistantDelta,
     BudgetExceeded,
@@ -55,6 +56,10 @@ class AgentCore:
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
+                    # docs/19：validate 先于 permission（即便仅 allow-预判）——保持「validate→gate→exec」
+                    # 不变量，且不让早执行对未校验输入起跑（router.dispatch 仍会再校验一次）。
+                    if validate_tool_input(block["name"], block["input"]) is not None:
+                        return
                     if cfg.permission_check(block["name"], block["input"]).action == "allow":
                         early_started[block["id"]] = time.time()
                         task = asyncio.create_task(cfg.execute_tool(block["name"], block["input"]))

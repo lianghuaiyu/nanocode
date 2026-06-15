@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,25 @@ from nanocode.tools.sandbox_backends.base import (
     WORKSPACE_WRITE,
 )
 from nanocode.tools.sandbox_backends.seatbelt import build_seatbelt_profile
+from nanocode.capabilities.sandbox import (
+    FileSystemPolicy, NetworkMode, NetworkPolicy, SandboxBackend, SandboxPlan,
+    protected_roots_for_workspace)
+
+
+def _plan(command, cwd, *, timeout_ms=30000):
+    """docs/19：workspace-write SandboxPlan（adapter 只吃 plan）。"""
+    c = Path(os.path.realpath(str(cwd)))
+    writable = [c]
+    for cand in (os.environ.get("TMPDIR"), "/tmp"):
+        if cand and os.path.isdir(cand):
+            r = Path(os.path.realpath(cand))
+            if r not in writable:
+                writable.append(r)
+    fs = FileSystemPolicy(readable_roots=(), writable_roots=tuple(writable),
+                          denied_roots=(), protected_roots=protected_roots_for_workspace(c))
+    return SandboxPlan(backend=SandboxBackend.NATIVE, command=command, cwd=c,
+                       timeout_ms=timeout_ms, filesystem=fs,
+                       network=NetworkPolicy(mode=NetworkMode.NONE), session_id="s")
 
 
 # ─── A. 纯字符串测试（无 exec，全平台跑） ─────────────────────────────
@@ -148,9 +168,7 @@ _smoke = pytest.mark.skipif(
 
 @_smoke
 def test_smoke_write_inside_cwd_ok(tmp_path):
-    r = seatbelt.run_structured(
-        {"command": "echo inside > a.txt && cat a.txt"}, cwd=str(tmp_path)
-    )
+    r = seatbelt.run_structured_plan(_plan("echo inside > a.txt && cat a.txt", str(tmp_path)))
     assert r["error"] is None
     assert r["exit_code"] == 0, r
     f = tmp_path / "a.txt"
@@ -170,9 +188,7 @@ def test_smoke_write_outside_cwd_denied(tmp_path):
     if os.path.exists(outside):
         os.unlink(outside)
     try:
-        r = seatbelt.run_structured(
-            {"command": f"echo x > {outside}"}, cwd=str(tmp_path)
-        )
+        r = seatbelt.run_structured_plan(_plan(f"echo x > {outside}", str(tmp_path)))
         assert r["error"] is None
         assert r["exit_code"] != 0, r
         assert not os.path.exists(outside)
@@ -185,10 +201,8 @@ def test_smoke_write_outside_cwd_denied(tmp_path):
 def test_smoke_network_denied(tmp_path):
     if os.environ.get("NANOCODE_HAS_NETWORK") == "0":
         pytest.skip("no network available to test denial against")
-    r = seatbelt.run_structured(
-        {"command": "curl -sS --max-time 5 https://example.com", "timeout": 15000},
-        cwd=str(tmp_path),
-    )
+    r = seatbelt.run_structured_plan(
+        _plan("curl -sS --max-time 5 https://example.com", str(tmp_path), timeout_ms=15000))
     assert r["error"] is None
     assert r["exit_code"] != 0, r
 
@@ -197,9 +211,7 @@ def test_smoke_network_denied(tmp_path):
 def test_smoke_write_dotgit_denied_under_tmp(tmp_path):
     """E 集成：cwd 在 /tmp 下时（宽 root /private/tmp 也是 writable），写 cwd/.git 仍被拒。"""
     (tmp_path / ".git").mkdir()
-    r = seatbelt.run_structured(
-        {"command": "echo x > .git/HACK"}, cwd=str(tmp_path)
-    )
+    r = seatbelt.run_structured_plan(_plan("echo x > .git/HACK", str(tmp_path)))
     assert r["error"] is None
     assert r["exit_code"] != 0, r
     assert not (tmp_path / ".git" / "HACK").exists()

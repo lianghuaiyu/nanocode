@@ -49,37 +49,34 @@ def test_parse_rule():
     assert permissions._parse_rule("read_file") == {"tool": "read_file", "pattern": None}
 
 
-def test_plan_mode_blocks_sandbox_shell():
-    assert check_permission("sandbox_shell", {"command": "ls"}, "plan")["action"] == "deny"
+def test_plan_mode_blocks_run_shell():
+    assert check_permission("run_shell", {"command": "ls"}, "plan")["action"] == "deny"
 
 
-def test_sandbox_mount_workspace_confirm():
-    r = check_permission("sandbox_shell", {"command": "pytest", "mount_workspace": True}, "default")
-    assert r["action"] == "confirm"
-    assert "mount" in r["message"].lower()
+# docs/19：sandbox 默认常开，escalate 永远需明确审批（替代旧 sandbox_shell 参数确认）。
+def test_escalate_confirms_default():
+    r = check_permission("run_shell", {"command": "git status", "escalate": True}, "default")
+    assert r["action"] == "confirm" and "escalate" in r["message"] and "host" in r["message"]
 
 
-def test_sandbox_network_public_confirm():
-    r = check_permission("sandbox_shell", {"command": "x", "network": "public"}, "default")
-    assert r["action"] == "confirm"
-    assert "network" in r["message"].lower()
+def test_escalate_confirms_under_bypass():
+    r = check_permission("run_shell", {"command": "x", "escalate": True}, "bypassPermissions")
+    assert r["action"] == "confirm"          # bypass 越不过 escalate 边界
 
 
-def test_sandbox_deps_install_confirm():
-    r = check_permission("sandbox_shell", {"command": "pip install six", "deps": "install"}, "default")
-    assert r["action"] == "confirm"
-    assert "dep" in r["message"].lower()
-
-
-def test_sandbox_default_no_confirm():
-    r = check_permission("sandbox_shell", {"command": "echo hi"}, "default")
-    assert r["action"] == "allow"
-
-
-def test_dontask_denies_sandbox_confirm():
-    r = check_permission("sandbox_shell", {"command": "x", "network": "public"}, "dontAsk")
+def test_escalate_dontask_denies():
+    r = check_permission("run_shell", {"command": "x", "escalate": True}, "dontAsk")
     assert r["action"] == "deny"
 
 
-def test_parse_rule_sandbox_shell():
-    assert permissions._parse_rule("sandbox_shell(pytest *)") == {"tool": "sandbox_shell", "pattern": "pytest *"}
+def test_non_escalate_normal_command_allowed():
+    assert check_permission("run_shell", {"command": "echo hi"}, "default")["action"] == "allow"
+
+
+def test_dangerous_run_shell_confirms():
+    r = check_permission("run_shell", {"command": "rm -rf build"}, "default")
+    assert r["action"] == "confirm"
+
+
+def test_parse_rule_run_shell():
+    assert permissions._parse_rule("run_shell(pytest *)") == {"tool": "run_shell", "pattern": "pytest *"}

@@ -106,9 +106,8 @@ class _FakeSkill:
 
 
 class _FakeSandbox:
+    """docs/19：/sandbox 经 RuntimeThread.sandbox_status / set_sandbox_profile（见 _run_script patch）。"""
     def __init__(self, calls): self.calls = calls
-    def get_defaults(self): self.calls.append(("sandbox_get",)); return {"network": "off"}
-    def set_default(self, k, v): self.calls.append(("sandbox_set", k, v)); return v
 
 
 # ─── 驱动器 ──────────────────────────────────────────────────────
@@ -136,9 +135,21 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
                         lambda: (calls.append(("discover_skills",)) or []))
     monkeypatch.setattr(_builtin, "handle_eval_command",
                         lambda rest: (calls.append(("handle_eval_command", rest)) or "stub"))
-    monkeypatch.setattr("nanocode.tools.sandbox_defaults", _FakeSandbox(calls))
-    # !shell 经 RuntimeThread.execute_user_shell → patch runtime 类方法
+    # docs/19：/sandbox 经 RuntimeThread.sandbox_status（无参展示）/ set_sandbox_profile（切换）。
     from nanocode.agent.runtime import RuntimeThread
+
+    def _fake_sandbox_status(self):
+        calls.append(("sandbox_status",))
+        return {"profile": "default", "engine": "auto", "network": "none",
+                "writable_roots": [], "protected_roots": [],
+                "native_available": True, "vm_available": False}
+
+    def _fake_set_sandbox_profile(self, name):
+        calls.append(("sandbox_set_profile", name)); return name
+
+    monkeypatch.setattr(RuntimeThread, "sandbox_status", _fake_sandbox_status)
+    monkeypatch.setattr(RuntimeThread, "set_sandbox_profile", _fake_set_sandbox_profile)
+    # !shell 经 RuntimeThread.execute_user_shell → patch runtime 类方法
 
     async def _fake_exec_shell(self, command, **kwargs):
         calls.append(("shell", command))
@@ -337,7 +348,7 @@ def test_control_result_routes_to_apply_control_not_chat(monkeypatch):
     ("/memory optimize", "_spawn_memory_optimize"),
     ("/memory", "list_memories"),
     ("/skills", "discover_skills"),
-    ("/sandbox", "sandbox_get"),
+    ("/sandbox", "sandbox_status"),
 ])
 def test_named_command_hits_expected_handler(monkeypatch, line, expected_call):
     calls = _run_script(monkeypatch, [line])
@@ -361,9 +372,9 @@ def test_tasks_family_hits_expected_handler(monkeypatch, line, expected_call):
     assert expected_call in _names(calls)
 
 
-def test_sandbox_set_three_tokens(monkeypatch):
-    calls = _run_script(monkeypatch, ["/sandbox network on"])
-    assert ("sandbox_set", "network", "on") in calls
+def test_sandbox_switch_profile(monkeypatch):
+    calls = _run_script(monkeypatch, ["/sandbox read-only"])
+    assert ("sandbox_set_profile", "read-only") in calls
 
 
 # TODO(CMD-P0)：搬迁完成后，新增一份「跑同样 _KNOWN_COMMANDS 表 + 上述断言，但通过新

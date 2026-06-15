@@ -16,6 +16,8 @@ from ..tools import (
     PermissionEngine,
     ToolDef,
 )
+from ..capabilities.validation import validate_tool_input
+from ..capabilities.sandbox import SandboxManager
 from .events import (
     AssistantDelta,
     ApprovalRequested,
@@ -94,6 +96,7 @@ class Agent(PlanModeMixin):
         depth: int = 0,
         agent_type: str | None = None,
         agent_source: str | None = None,
+        sandbox_profile: str = "default",
     ):
         self.permission_mode = permission_mode
         # 构造时配置的 baseline permission_mode（plan toggle 前）：rebind_session 切 session 时
@@ -123,6 +126,10 @@ class Agent(PlanModeMixin):
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         self.workspace_trusted = workspace_trusted
+        # docs/19：sandbox profile（default/read-only/strict/vm/danger-full-access）+ 单一 SandboxManager。
+        # profile 是 public runtime config（AgentConfig.sandbox_profile）；模型无法影响。
+        self._sandbox_profile = sandbox_profile
+        self._sandbox = SandboxManager()
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = session_id or uuid.uuid4().hex[:8]
         # artifact_id：本 agent 全部产物（messages/meta/prompt/result）的目录键。
@@ -589,12 +596,16 @@ class Agent(PlanModeMixin):
         d = _session_v2.task_dir(self.session_id, rec.id)
         stdout_path = str(d / "stdout.log"); stderr_path = str(d / "stderr.log")
         self.task_manager.update_task(rec.id, stdout_path=stdout_path, stderr_path=stderr_path)
-        services = getattr(self, "_runtime_services", None)
-        cwd = services.cwd if services is not None else (
-            self._session_mgr._cwd() if self._session_mgr is not None else None)
+        # docs/19：后台 shell 也经唯一规划点 SandboxManager。HostContext(is_background=True) 在 spawn
+        # 时快照（cwd/session 固定）；microVM/无后端 → blocked（fail-closed，不裸跑）。
+        # background 不支持 escalate（permission 层已拒 run_in_background+escalate）→ approval 恒不批。
+        from ..capabilities.sandbox import ShellRequest, ApprovalDecision
+        request = ShellRequest(command=command, timeout_ms=timeout_ms or 0, run_in_background=True)
+        host = self.host_context(background=True)
+        policy = self.sandbox_policy(background=True)
         task = asyncio.create_task(run_shell_background_task(
-            self.task_manager, rec.id, command, stdout_path, stderr_path, timeout_ms,
-            session_id=self.session_id, cwd=cwd))
+            self.task_manager, self._sandbox, rec.id, request, host, policy,
+            ApprovalDecision(approved=False), stdout_path, stderr_path))
         task._nanocode_task_id = rec.id
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -602,6 +613,43 @@ class Agent(PlanModeMixin):
 
     async def spawn_background_shell(self, command: str, timeout_ms: int | None) -> str:
         return await self._spawn_background_shell(command, timeout_ms)
+
+    # ─── docs/19：HostContext / SandboxPolicy 提供面（runtime 注入,非模型）────────────
+
+    def _effective_cwd(self) -> str:
+        services = getattr(self, "_runtime_services", None)
+        if services is not None:
+            return services.cwd
+        if self._session_mgr is not None:
+            return self._session_mgr._cwd()
+        return os.getcwd()
+
+    def host_context(self, *, background: bool = False, hook: bool = False):
+        """构造 SandboxManager 规划所需的 HostContext。cwd/session/workspace/身份/interactive
+        全部由 runtime 决定，模型无法影响（docs/19 §4.1）。"""
+        from ..capabilities.sandbox import HostContext
+        cwd_p = Path(os.path.realpath(self._effective_cwd()))
+        temps: list[Path] = []
+        seen: set[str] = set()
+        for cand in (os.environ.get("TMPDIR"), "/tmp"):
+            if cand and os.path.isdir(cand):
+                rp = Path(os.path.realpath(cand))
+                if str(rp) not in seen and str(rp) != str(cwd_p):
+                    seen.add(str(rp))
+                    temps.append(rp)
+        return HostContext(
+            cwd=cwd_p, session_id=self.session_id, workspace_roots=(cwd_p,),
+            temp_roots=tuple(temps),
+            interactive=bool(self.confirm_fn) and not background,
+            is_subagent=self.is_sub_agent, is_background=background, is_hook=hook,
+            approval_mode=self.permission_mode)
+
+    def sandbox_policy(self, *, background: bool = False, hook: bool = False):
+        """据 profile + HostContext 投影 SandboxPolicy。子 agent / hook 只收窄不放宽（docs/19 §8）。"""
+        from ..capabilities.sandbox import policy_for_profile, narrow_policy_for_context
+        host = self.host_context(background=background, hook=hook)
+        policy = policy_for_profile(self._sandbox_profile, host)
+        return narrow_policy_for_context(policy, host)
 
     def list_tasks(self, status=None, kind=None) -> str:
         from ..tools.tasks_tool import list_tasks_text
@@ -638,12 +686,16 @@ class Agent(PlanModeMixin):
     async def _run_real_tool(self, name: str, inp: dict) -> str:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        if name == "run_shell" and "_cwd" not in inp:
-            services = getattr(self, "_runtime_services", None)
-            cwd = services.cwd if services is not None else (
-                self._session_mgr._cwd() if self._session_mgr is not None else None)
-            if cwd:
-                inp = {**inp, "_cwd": cwd}
+        if name == "run_shell":
+            # docs/19：run_shell 执行经唯一规划点 SandboxManager。cwd/session 来自 HostContext，
+            # 非 tool input（模型无法 spoof）；profile 投影为 SandboxPolicy。
+            # approval 显式构造：escalate 抵达此处 ⟹ _authorize_dispatch 已 gate 并批准
+            # （confirm；未批/非交互不会到这里）。SandboxManager 不自行从 escalate bit 推断。
+            from ..capabilities.sandbox import ShellRequest, ApprovalDecision
+            request = ShellRequest.from_tool_input(inp)
+            approval = ApprovalDecision(approved=request.escalate)
+            return await self._sandbox.execute_shell(
+                request, self.host_context(), self.sandbox_policy(), approval)
         result = await execute_tool(name, inp, self._read_file_state)
         if name in ("read_file", "write_file", "edit_file") and not result.startswith(("Error", "Warning")):
             self._on_file_touched(name, inp)
@@ -721,23 +773,21 @@ class Agent(PlanModeMixin):
         event = build_hook_event(h["event"], h["skill"], tool_name, inp,
                                  (result or "")[:2000] if result else None,
                                  str(Path.cwd()), self.session_id)
-        # 权限通过后，用统一 planner 决定执行方式：任何沙盒档（auto/seatbelt）下 hook 都在
-        # 原生 OS 沙盒内受限跑（写 workspace 受限、无网，宿主工具链在），无原生后端则 blocked；
-        # off 档 hook 仍宿主跑（off=不沙盒）。hook 绝不进 microVM、绝不裸跑沙盒归类的命令。
-        hook_inp = {"command": cmd, "timeout": h["timeout_ms"], "stdin": json.dumps(event),
-                    "_session_id": self.session_id}
-        kind, info = run_shell.plan_shell(hook_inp, context="hook")
+        # docs/19：hook 命令经唯一规划点 SandboxManager（HostContext(is_hook=True)）受限执行：
+        # 任何沙盒档下都在 native/VM 内跑（写 workspace 受限、无网，宿主工具链在），无后端则 blocked；
+        # hook 绝不裸跑宿主（narrow_policy_for_context 把 engine=host 收窄为 auto）。
+        from ..capabilities.sandbox import ShellRequest, ApprovalDecision
+        request = ShellRequest(command=cmd, timeout_ms=h["timeout_ms"] or 30000,
+                               stdin=json.dumps(event))
         self._suppress_hooks = True
         try:
-            if kind == "blocked":
-                return False, f"hook blocked: {info}"
-            if kind == "sandbox":
-                # info 是后端模块：run_structured 接受 stdin（hook event JSON）。
-                r = info.run_structured(hook_inp, posture="workspace-write", cwd=str(Path.cwd()))
-            else:  # host（off 档 / escalate）
-                r = run_shell.run_structured(hook_inp)
+            r = await self._sandbox.execute_structured(
+                request, self.host_context(hook=True), self.sandbox_policy(hook=True),
+                ApprovalDecision(approved=False))   # hook 永不 escalate
         finally:
             self._suppress_hooks = False
+        if r.get("blocked"):
+            return False, f"hook blocked: {r['blocked']}"
         if r["timed_out"]:
             return False, f"hook timed out after {h['timeout_ms']}ms"
         if r["error"] is not None:
@@ -1004,6 +1054,11 @@ class Agent(PlanModeMixin):
         **allowlist 不在此判**——它是 ``_execute_tool_call`` 的 fail-closed 兜底（保持子 agent
         拒绝消息 "Error: tool '…' is not permitted" 与 prompt-then-block 行为不变）。
         """
+        # docs/19 Phase 1：先 validate 再 permission——permission 必须看到 validated args。
+        verr = validate_tool_input(name, inp)
+        if verr is not None:
+            self.emit(ToolCallAuthorized(tool=name, action="deny", message=verr))
+            return False, f"Error: {verr}"
         d = self.permission.check(name, inp)
         self.emit(ToolCallAuthorized(tool=name, action=d.action, message=d.message))
         if d.action == "deny":

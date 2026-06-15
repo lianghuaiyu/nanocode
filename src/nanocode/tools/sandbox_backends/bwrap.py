@@ -1,14 +1,13 @@
 """Bubblewrap（Linux `bwrap`）后端：纯函数 argv builder + 受控 runner。
 
-Linux 默认原生层。与 seatbelt 镜像同一接口（`is_available` / 纯函数 builder /
-`run_structured` / 文本 `run`），planner（run_shell.plan_shell→resolve_native_backend）
-按平台二选一，签名一致。
+Linux 默认原生层。与 seatbelt 镜像同一 plan-shaped 接口（`is_available` / `build_argv_from_plan` /
+`run_structured_plan`），SandboxManager（resolve_native_backend）按平台二选一，签名一致。
 
 workspace-write 映射：整盘只读（`--ro-bind / /`）+ cwd 读写（`--bind cwd cwd`）+
 受保护目录重新 `--ro-bind` 覆盖回只读 + 无网络（`--unshare-net`）。read-only 只
 `--ro-bind / /` + tmpfs /tmp，不挂 cwd 读写。
 
-本模块**不接任何路由**，仅供 planner（run_shell.plan_shell）选中后调用与 skipif-linux 集成测试。
+本模块**不接任何路由**，仅供 SandboxManager 选中后调用与 skipif-linux 集成测试。
 
 关键坑（均在此处理）：
 1. realpath：subpath 必须用 realpath 解析后的真实路径（symlink cwd）。
@@ -118,66 +117,52 @@ def build_bwrap_argv(
     return argv
 
 
-def build_argv(
-    command: str, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None
-) -> list[str]:
-    """纯函数：拼出 bwrap 受限执行的 argv（前台/后台复用）。
+# ─── SandboxPlan 消费（docs/19 §4/§5：adapter 只吃 plan，不吃 raw dict）─────────
+#
+# 经 duck-typing 读 plan 属性（不 import capabilities.sandbox 的类型，避免 L0→L1 import 环）。
 
-    `cwd` 缺省取 os.getcwd()；`bwrap` 二进制用 `_resolve_bwrap_bin()` 在固定可信目录里解析的
-    绝对路径（完全不走 PATH），找不到则 fail-closed（raise FileNotFoundError），绝不裸跑宿主。
+def _plan_posture(plan):
+    writable = tuple(str(p) for p in plan.filesystem.writable_roots)
+    protected = tuple(str(p) for p in plan.filesystem.protected_roots)
+    allow_net = (plan.network.mode == "full")
+    posture = WORKSPACE_WRITE if writable else READ_ONLY
+    return posture, writable, protected, allow_net
+
+
+def build_argv_from_plan(plan) -> list[str]:
+    """SandboxPlan → bwrap 受限 argv。protected/network 来自 plan；bwrap 用可信绝对路径（不走 PATH）。
+
+    注意：bwrap 的 workspace-write 把 cwd 整体读写绑定。plan 的 writable_roots 第一项即 cwd；
+    cwd 之外的 temp roots 由 bwrap 默认的 `--tmpfs /tmp` 覆盖（与 seatbelt 的 $TMPDIR 写入对齐）。
     """
-    workdir = _real_abs(cwd or os.getcwd())
+    workdir = _real_abs(str(plan.cwd))
+    posture, writable, protected, _allow_net = _plan_posture(plan)
+    allow_network = (plan.network.mode == "full")
     bin_path = _resolve_bwrap_bin()
     if not bin_path:
         raise FileNotFoundError("bwrap not found in trusted paths")
-    return build_bwrap_argv(posture, workdir, command=command, bwrap_bin=bin_path)
+    return build_bwrap_argv(
+        posture, workdir, protected_roots=protected, allow_network=allow_network,
+        command=plan.command, bwrap_bin=bin_path)
 
 
-def run_structured(
-    inp: dict, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None
-) -> dict:
-    """在 bwrap 沙盒内执行 inp['command']；返回与 run_shell.run_structured 同形 dict
-    （exit_code/stdout/stderr/timed_out/error）。danger-full-access 不应走这里。"""
+def run_structured_plan(plan) -> dict:
+    """在 bwrap 沙盒内执行 plan.command；返回结构化 dict。找不到 bwrap → error（机制失败,不裸跑）。"""
     out = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False, "error": None}
     try:
-        workdir = _real_abs(cwd or os.getcwd())
+        workdir = _real_abs(str(plan.cwd))
         try:
-            argv = build_argv(inp["command"], posture=posture, cwd=workdir)
+            argv = build_argv_from_plan(plan)
         except FileNotFoundError:
-            # fail-closed：找不到 bwrap 绝不裸跑宿主，返回机制失败由路由层提示 escalate。
             out["error"] = "bwrap not found in trusted paths"
             return out
-        timeout_s = inp.get("timeout", 30000) / 1000
         r = subprocess.run(
-            argv,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            input=inp.get("stdin"),
-            cwd=workdir,
-        )
+            argv, shell=False, capture_output=True, text=True,
+            timeout=plan.timeout_ms / 1000, input=plan.stdin, cwd=workdir)
         out["exit_code"], out["stdout"], out["stderr"] = (
-            r.returncode,
-            r.stdout or "",
-            r.stderr or "",
-        )
+            r.returncode, r.stdout or "", r.stderr or "")
     except subprocess.TimeoutExpired:
         out["timed_out"] = True
     except Exception as e:
         out["error"] = str(e)
     return out
-
-
-def run(inp: dict, *, posture: str = WORKSPACE_WRITE, cwd: str | None = None) -> str:
-    """文本输出包装：调 run_structured 后按与 run_shell.run 完全一致的格式返回文本。"""
-    r = run_structured(inp, posture=posture, cwd=cwd)
-    if r["timed_out"]:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
-    if r["error"] is not None:
-        return f"Error: {r['error']}"
-    if r["exit_code"] != 0:
-        stderr = f"\nStderr: {r['stderr']}" if r["stderr"] else ""
-        stdout = f"\nStdout: {r['stdout']}" if r["stdout"] else ""
-        return f"Command failed (exit code {r['exit_code']}){stdout}{stderr}"
-    return r["stdout"] or "(no output)"

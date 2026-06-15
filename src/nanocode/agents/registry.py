@@ -372,7 +372,7 @@ def build_plan_profile(*, model: str | None = None) -> AgentProfile:
         name="plan", description="Read-only planning primary",
         mode="primary", model=model,
         tools_allow={"read_file", "list_files", "grep_search", "write_file", "edit_file"},
-        tools_deny={"run_shell", "sandbox_shell"},
+        tools_deny={"run_shell"},
         permission=PermissionProfile(mode="plan"),
         context=ContextProfile(),
         isolation=IsolationPolicy(own_session=True, can_spawn=True),

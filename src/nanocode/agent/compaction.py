@@ -19,7 +19,7 @@ import time
 from ..paths import tool_results_dir
 
 # 预览 tail-keep 的工具：输出尾部承载终态（exit code 前的报错/堆栈/失败断言）。
-_TAIL_KEEP_TOOLS = frozenset({"run_shell", "sandbox_shell"})
+_TAIL_KEEP_TOOLS = frozenset({"run_shell"})
 
 
 def persist_large_result(tool_name: str, result: str) -> str:

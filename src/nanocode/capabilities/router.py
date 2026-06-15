@@ -17,6 +17,7 @@ from ..tools.permissions import (
     ALWAYS_ALLOWED_META, AGENT_META_TOOL, allowlist_blocks,
 )
 from .host import ToolHost
+from .validation import validate_tool_input
 
 
 class Capability(str, Enum):
@@ -74,6 +75,11 @@ class CapabilityRouter:
     """
 
     async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
+        # docs/19 Phase 1：严格输入校验是真实执行前的第一道（覆盖流式早执行 + 直接/hook 调用）。
+        # 拒下划线键（封死 _cwd/_session_id spoof）/ unknown key / 缺 required / 类型不符。
+        verr = validate_tool_input(name, inp)
+        if verr is not None:
+            return f"Error: {verr}"
         # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
         if host.tool_blocked_by_allowlist(name):
             from ..agent.events import ToolBlocked   # lazy：避免 capabilities↔agent 包级 import 环
@@ -105,8 +111,7 @@ class CapabilityRouter:
         if name == "skill":
             return await host.execute_skill_tool(inp)
         # 真实工具(mcp/execute_tool)——受 hooks 约束(meta 工具上面已返回)。
-        if name in ("run_shell", "sandbox_shell") and "_session_id" not in inp:
-            inp = {**inp, "_session_id": host.session_id}
+        # cwd/session_id 不再注入 inp：它们是 HostContext（SandboxManager 经 host 取），非 tool input。
         if host.hooks_suppressed() or not host.has_active_hooks():
             return await host.run_real_tool(name, inp)
         for h in host.matching_hooks("pre-tool-use", name):

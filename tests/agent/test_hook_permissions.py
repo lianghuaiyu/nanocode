@@ -1,8 +1,9 @@
-"""Spec B: hook 命令走统一 check_permission（不再只靠 is_dangerous 黑名单直跑）。
+"""hook 命令的权限门 + SandboxManager 执行（docs/19）。
 
-deny 规则阻断、confirm 前台询问/后台自动拒、bypass 下危险命令硬底线阻断。
-关键：monkeypatch `run_shell.run_structured`（engine 内 `from ..tools import run_shell`
-持有的那个模块函数）为记录调用的 stub，使测试永不真正执行命令。"""
+hook 命令先过 check_permission（deny / confirm / 危险硬底线），再经唯一规划点
+SandboxManager.execute_structured（HostContext(is_hook=True)）受限执行。
+stub 掉 manager 的 execute_structured 以验证门控不真跑命令。
+"""
 
 import asyncio
 
@@ -10,7 +11,7 @@ import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.runtime.spawn import _auto_deny_confirm
-from nanocode.tools import run_shell, permissions, sandbox_shell
+from nanocode.tools import permissions
 
 
 def _agent(**kw):
@@ -22,16 +23,19 @@ def _hook(cmd):
             "command": cmd, "timeout_ms": 3000}
 
 
-@pytest.fixture
-def stub_run_structured(monkeypatch):
-    """记录调用并返回成功结果的 stub；确保命令永不真跑。"""
+def _stub_exec(a, *, exit_code=0, error=None, timed_out=False, blocked=None):
+    """记录 manager.execute_structured 调用并返回受控结果（命令永不真跑）。"""
     calls = []
 
-    def _stub(inp):
-        calls.append(inp)
-        return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False, "error": None}
+    async def fake(request, host, policy, approval):
+        calls.append({"request": request, "host": host, "policy": policy, "approval": approval})
+        d = {"exit_code": exit_code, "stdout": "ok", "stderr": "",
+             "timed_out": timed_out, "error": error}
+        if blocked is not None:
+            d["blocked"] = blocked
+        return d
 
-    monkeypatch.setattr(run_shell, "run_structured", _stub)
+    a._sandbox.execute_structured = fake
     return calls
 
 
@@ -43,166 +47,94 @@ async def _false_confirm(_command: str) -> bool:
     return False
 
 
-def test_normal_command_allowed(stub_run_structured):
-    """普通命令放行：echo hi / default / 无 confirm_fn → (True, "")，stub 被调用。"""
-    a = _agent()
-    a.confirm_fn = None
+# ─── 权限门（执行前）────────────────────────────────────────────
+
+def test_normal_command_allowed():
+    a = _agent(); a.confirm_fn = None
+    calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("echo hi"), "read_file", {"file_path": "x"}, None))
-    assert ok is True
-    assert msg == ""
-    assert len(stub_run_structured) == 1
-    assert stub_run_structured[0]["command"] == "echo hi"
+    assert ok is True and msg == ""
+    assert len(calls) == 1
+    assert calls[0]["request"].command == "echo hi"
+    assert calls[0]["host"].is_hook is True            # HostContext(is_hook=True)
 
 
-def test_deny_rule_blocks(stub_run_structured, monkeypatch):
-    """deny 规则阻断：注入 deny=["run_shell(echo *)"]，echo hi → (False,...)，stub 未调用。"""
+def test_deny_rule_blocks(monkeypatch):
     monkeypatch.setattr(
         permissions, "_cached_rules",
-        {"allow": [], "deny": [{"tool": "run_shell", "pattern": "echo *"}]},
-    )
-    a = _agent()
+        {"allow": [], "deny": [{"tool": "run_shell", "pattern": "echo *"}]})
+    a = _agent(); calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("echo hi"), "read_file", {"file_path": "x"}, None))
-    assert ok is False
-    assert "denied" in msg.lower()
-    assert stub_run_structured == []
+    assert ok is False and "denied" in msg.lower()
+    assert calls == []
 
 
-def test_dangerous_foreground_confirm_approved(stub_run_structured):
-    """危险命令前台确认→批准则执行：rm -rf /tmp/x / default / confirm_fn=True
-    → (True, "")，stub 被调用（确认 stub 拦住，未真跑 rm）。"""
-    a = _agent()
-    a.confirm_fn = _true_confirm
+def test_dangerous_foreground_confirm_approved():
+    a = _agent(); a.confirm_fn = _true_confirm
+    calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("rm -rf /tmp/x"), "read_file", {"file_path": "x"}, None))
-    assert ok is True
-    assert msg == ""
-    assert len(stub_run_structured) == 1
-    assert stub_run_structured[0]["command"] == "rm -rf /tmp/x"
+    assert ok is True and msg == ""
+    assert len(calls) == 1
 
 
-def test_dangerous_foreground_confirm_rejected(stub_run_structured):
-    """危险命令前台确认→拒绝则阻断：同上但 confirm_fn=False → (False,...)，stub 未调用。"""
-    a = _agent()
-    a.confirm_fn = _false_confirm
+def test_dangerous_foreground_confirm_rejected():
+    a = _agent(); a.confirm_fn = _false_confirm
+    calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("rm -rf /tmp/x"), "read_file", {"file_path": "x"}, None))
-    assert ok is False
-    assert "not approved" in msg.lower()
-    assert stub_run_structured == []
+    assert ok is False and "not approved" in msg.lower()
+    assert calls == []
 
 
-def test_bypass_dangerous_hard_backstop(stub_run_structured):
-    """bypassPermissions 下危险命令硬底线阻断：rm -rf / / bypass / confirm_fn=True
-    → (False, ...safety backstop...)，stub 未调用（证明 bypass 不放行危险 hook）。"""
-    a = _agent(permission_mode="bypassPermissions")
-    a.confirm_fn = _true_confirm
+def test_bypass_dangerous_hard_backstop():
+    a = _agent(permission_mode="bypassPermissions"); a.confirm_fn = _true_confirm
+    calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("rm -rf /"), "read_file", {"file_path": "x"}, None))
-    assert ok is False
-    assert "safety backstop" in msg.lower()
-    assert stub_run_structured == []
+    assert ok is False and "safety backstop" in msg.lower()
+    assert calls == []
 
 
-def test_background_auto_deny(stub_run_structured):
-    """后台自动拒绝：confirm_fn=_auto_deny_confirm（恒拒 async），危险命令
-    → (False,...)，stub 未调用。"""
-    a = _agent()
-    a.confirm_fn = _auto_deny_confirm
+def test_background_auto_deny():
+    a = _agent(); a.confirm_fn = _auto_deny_confirm
+    calls = _stub_exec(a)
     ok, msg = asyncio.run(a._run_hook(_hook("rm -rf /tmp/y"), "read_file", {"file_path": "x"}, None))
-    assert ok is False
-    assert "not approved" in msg.lower()
-    assert stub_run_structured == []
+    assert ok is False and "not approved" in msg.lower()
+    assert calls == []
 
 
-# ─── round-2 spec-2：hook 经统一 planner 受限（seatbelt 沙盒内跑；auto/off 宿主跑）─────
+# ─── SandboxManager 执行 ────────────────────────────────────────
 
-
-def test_hook_seatbelt_runs_confined(monkeypatch, stub_run_structured):
-    """seatbelt 档 + 非危险写文件 hook → 经 backend.run_structured（沙盒内，confined），
-    **不**走 run_shell.run_structured 宿主裸跑。"""
-    import nanocode.tools.sandbox_backends as sb
-
-    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "seatbelt")
-    backend_calls = []
-
-    class _FakeBackend:
-        @staticmethod
-        def run_structured(inp, *, posture="workspace-write", cwd=None):
-            backend_calls.append({"inp": inp, "posture": posture, "cwd": cwd})
-            return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False, "error": None}
-
-    monkeypatch.setattr(sb, "resolve_native_backend", lambda: _FakeBackend)
-    a = _agent()
-    a.confirm_fn = None
-    # 'touch out.txt' 归类 sandbox（非只读、非危险）→ seatbelt 后端受限跑。
+def test_hook_blocked_propagates():
+    """manager 返回 blocked（无后端 / VM 不可用）→ hook (False, 'hook blocked: ...')。"""
+    a = _agent(); a.confirm_fn = None
+    _stub_exec(a, blocked="no sandbox backend can enforce this policy")
     ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
-    assert ok is True
-    assert msg == ""
-    assert len(backend_calls) == 1
-    assert backend_calls[0]["inp"]["command"] == "touch out.txt"
-    assert backend_calls[0]["posture"] == "workspace-write"
-    # hook event JSON 经 stdin 传入沙盒 subprocess
-    assert backend_calls[0]["inp"]["stdin"]
-    assert stub_run_structured == []  # 未走宿主 run_structured
+    assert ok is False and "hook blocked" in msg.lower()
 
 
-def test_hook_seatbelt_no_backend_blocks(monkeypatch, stub_run_structured):
-    """seatbelt 档 + 无原生后端 → hook blocked（fail-closed），宿主 run_structured 未调用。"""
-    import nanocode.tools.sandbox_backends as sb
-
-    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "seatbelt")
-    monkeypatch.setattr(sb, "resolve_native_backend", lambda: None)
-    a = _agent()
-    a.confirm_fn = None
+def test_hook_failure_reports_exit():
+    a = _agent(); a.confirm_fn = None
+    _stub_exec(a, exit_code=3)
     ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
-    assert ok is False
-    assert "hook blocked" in msg.lower()
-    assert stub_run_structured == []
+    assert ok is False and "exit 3" in msg
 
 
-def test_hook_auto_runs_confined(monkeypatch, stub_run_structured):
-    """修复 2：auto 档 hook 改走原生后端受限（seatbelt/bwrap），不再裸跑宿主、不进 microVM。
-    planner 把 hook 提到 mode 分支之前，任何沙盒档（auto/seatbelt）都用原生后端。"""
-    import nanocode.tools.sandbox_backends as sb
-
-    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
-    monkeypatch.setattr(sandbox_shell, "_resolve_msb", lambda: "/fake/msb")
-    backend_calls = []
-
-    class _FakeBackend:
-        @staticmethod
-        def run_structured(inp, *, posture="workspace-write", cwd=None):
-            backend_calls.append({"inp": inp, "posture": posture, "cwd": cwd})
-            return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False, "error": None}
-
-    monkeypatch.setattr(sb, "resolve_native_backend", lambda: _FakeBackend)
-    a = _agent()
-    a.confirm_fn = None
-    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
-    assert ok is True
-    assert msg == ""
-    assert len(backend_calls) == 1  # 走原生后端受限，未裸跑宿主
-    assert backend_calls[0]["inp"]["command"] == "touch out.txt"
-    assert stub_run_structured == []  # 未走宿主 run_structured
+def test_hook_allowlist_fail_closed():
+    """子 agent 有效集不含 run_shell → hook 不得借 shell 旁路（allowlist fail-closed）。"""
+    a = _agent(is_sub_agent=True, allowed_tool_names={"read_file"})
+    calls = _stub_exec(a)
+    ok, msg = asyncio.run(a._run_hook(_hook("echo hi"), "read_file", {"file_path": "x"}, None))
+    assert ok is False and "not permitted" in msg.lower()
+    assert calls == []
 
 
-def test_hook_auto_no_backend_blocks(monkeypatch, stub_run_structured):
-    """修复 2：auto 档 hook 但无原生后端 → blocked（fail-closed），不退化为 microVM/裸跑。"""
-    import nanocode.tools.sandbox_backends as sb
-
-    monkeypatch.setenv("NANOCODE_SHELL_SANDBOX", "auto")
-    monkeypatch.setattr(sandbox_shell, "_resolve_msb", lambda: "/fake/msb")
-    monkeypatch.setattr(sb, "resolve_native_backend", lambda: None)
-    a = _agent()
-    a.confirm_fn = None
-    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
-    assert ok is False
-    assert "hook blocked" in msg.lower()
-    assert stub_run_structured == []
-
-
-def test_hook_off_runs_host(stub_run_structured):
-    """off 档（默认）hook → 宿主跑（零回归）。"""
-    a = _agent()
-    a.confirm_fn = None
-    ok, msg = asyncio.run(a._run_hook(_hook("touch out.txt"), "write_file", {"file_path": "out.txt"}, None))
-    assert ok is True
-    assert len(stub_run_structured) == 1
-    assert stub_run_structured[0]["command"] == "touch out.txt"
+def test_hook_runs_confined_real(tmp_path, monkeypatch):
+    """集成：默认 profile + 本机 native（seatbelt）→ hook 在沙盒内受限实跑（不裸跑宿主）。"""
+    from nanocode.tools.sandbox_backends import resolve_native_backend
+    if resolve_native_backend() is None:
+        pytest.skip("no native sandbox backend on this host")
+    monkeypatch.chdir(tmp_path)
+    a = _agent(session_id="hooksid"); a.confirm_fn = None
+    ok, msg = asyncio.run(a._run_hook(_hook("echo hooked > marker.txt"),
+                                      "write_file", {"file_path": "marker.txt"}, None))
+    assert ok is True, msg
+    assert (tmp_path / "marker.txt").read_text().strip() == "hooked"

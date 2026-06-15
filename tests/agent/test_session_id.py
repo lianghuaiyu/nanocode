@@ -1,4 +1,8 @@
-"""Task 1: Agent session_id 构造参数 + 子 agent 不覆盖 env + 工具注入。"""
+"""Agent session_id 构造参数 + 子 agent 不覆盖 env + HostContext 边界（docs/19）。
+
+docs/19：`_session_id` / `_cwd` 不再注入 tool input——它们经 HostContext 由 runtime 提供，
+模型无法 spoof（validator 拒下划线键）。本文件验证身份/边界，不再验证已删的注入机制。
+"""
 
 import asyncio
 import os
@@ -42,42 +46,33 @@ def test_confirmed_paths_default_empty():
     assert a._confirmed_paths == set()
 
 
-def test_execute_tool_call_injects_session_id_sandbox(monkeypatch):
-    a = _agent(session_id="injsid")
+# ─── docs/19：session_id / cwd 经 HostContext，不再注入 tool input ──────────────
+
+def test_host_context_carries_session_id():
+    a = _agent(session_id="hcsid")
+    assert a.host_context().session_id == "hcsid"
+
+
+def test_run_shell_input_has_no_injected_keys(monkeypatch, tmp_path):
+    """run_shell 抵达 SandboxManager 时，HostContext 持 cwd/session；inp 不被注入 _cwd/_session_id。"""
+    a = _agent(session_id="injsid", permission_mode="bypassPermissions")
     captured = {}
 
-    async def fake_run_real(name, inp):
-        captured["name"] = name
-        captured["inp"] = inp
+    async def fake_exec(request, host, policy, approval):
+        captured["request"] = request
+        captured["host"] = host
         return "ok"
 
-    monkeypatch.setattr(a, "_run_real_tool", fake_run_real)
-    asyncio.run(a._execute_tool_call("sandbox_shell", {"command": "echo hi"}))
-    assert captured["inp"]["_session_id"] == "injsid"
+    monkeypatch.setattr(a._sandbox, "execute_shell", fake_exec)
+    out = asyncio.run(a._execute_tool_call("run_shell", {"command": "echo hi"}))
+    assert out == "ok"
+    # ShellRequest 是 typed（无 _cwd/_session_id 字段）；session 来自 HostContext。
+    assert captured["request"].command == "echo hi"
+    assert captured["host"].session_id == "injsid"
 
 
-def test_execute_tool_call_injects_session_id_run_shell(monkeypatch):
-    a = _agent(session_id="injsid")
-    captured = {}
-
-    async def fake_run_real(name, inp):
-        captured["inp"] = inp
-        return "ok"
-
-    monkeypatch.setattr(a, "_run_real_tool", fake_run_real)
-    asyncio.run(a._execute_tool_call("run_shell", {"command": "echo hi"}))
-    assert captured["inp"]["_session_id"] == "injsid"
-
-
-def test_execute_tool_call_does_not_override_existing_session_id(monkeypatch):
-    a = _agent(session_id="injsid")
-    captured = {}
-
-    async def fake_run_real(name, inp):
-        captured["inp"] = inp
-        return "ok"
-
-    monkeypatch.setattr(a, "_run_real_tool", fake_run_real)
-    asyncio.run(a._execute_tool_call("sandbox_shell",
-                                     {"command": "x", "_session_id": "preset"}))
-    assert captured["inp"]["_session_id"] == "preset"
+def test_model_cannot_spoof_cwd():
+    # validator 在 permission 之前拒下划线键（_cwd/_session_id），不 silent strip。
+    a = _agent(session_id="s", permission_mode="bypassPermissions")
+    out = asyncio.run(a._execute_tool_call("run_shell", {"command": "pwd", "_cwd": "/"}))
+    assert "Error" in out and "_cwd" in out

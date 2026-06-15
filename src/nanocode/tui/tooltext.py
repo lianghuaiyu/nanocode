@@ -15,7 +15,6 @@ TOOL_TITLES = {
     "list_files": "ls",
     "grep_search": "grep",
     "run_shell": "$",
-    "sandbox_shell": "sandbox",
     "skill": "Skill",
     "agent": "Task",
 }
@@ -60,11 +59,6 @@ def tool_summary(name: str, inp: dict) -> str:
         timeout = inp.get("timeout")
         suffix = f" (timeout {timeout / 1000:g}s)" if isinstance(timeout, (int, float)) else ""
         return f"{cmd}{suffix}"
-    if name == "sandbox_shell":
-        cmd = inp.get("command", "")
-        image = inp.get("image", "python:3.12")
-        summary = cmd[:60] + "..." if len(cmd) > 60 else cmd
-        return f"[{image}] {summary}"
     if name == "skill":
         return inp.get("skill_name", "")
     if name == "agent":
@@ -108,7 +102,7 @@ def result_summary(name: str, result: str) -> str:
             return "empty directory"
         n = len([l for l in r.split("\n") if l and not l.startswith("[")])
         return f"{n} entries"
-    if name in ("run_shell", "sandbox_shell"):
+    if name in ("run_shell",):
         if r.strip() == "(no output)":
             return "(no output)"
         for l in r.split("\n"):
@@ -125,7 +119,7 @@ def suppress_success_result(name: str, result: str) -> bool:
 
 def preview_limit(name: str, *, is_error: bool = False) -> int | None:
     """Pi-style collapsed result line limits. None means hide result in collapsed mode."""
-    if name in ("run_shell", "sandbox_shell"):
+    if name in ("run_shell",):
         return 5
     if name == "list_files":
         return 20
@@ -138,7 +132,7 @@ def preview_limit(name: str, *, is_error: bool = False) -> int | None:
 
 def preview_from_tail(name: str) -> bool:
     """Bash-style output previews show the tail, matching Pi's visual truncation."""
-    return name in ("run_shell", "sandbox_shell")
+    return name in ("run_shell",)
 
 
 def output_lines(result: str, limit: int | None = 12, *, tail: bool = False) -> tuple[list[str], int]:
