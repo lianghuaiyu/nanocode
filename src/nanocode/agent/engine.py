@@ -589,9 +589,12 @@ class Agent(PlanModeMixin):
         d = _session_v2.task_dir(self.session_id, rec.id)
         stdout_path = str(d / "stdout.log"); stderr_path = str(d / "stderr.log")
         self.task_manager.update_task(rec.id, stdout_path=stdout_path, stderr_path=stderr_path)
+        services = getattr(self, "_runtime_services", None)
+        cwd = services.cwd if services is not None else (
+            self._session_mgr._cwd() if self._session_mgr is not None else None)
         task = asyncio.create_task(run_shell_background_task(
             self.task_manager, rec.id, command, stdout_path, stderr_path, timeout_ms,
-            session_id=self.session_id))
+            session_id=self.session_id, cwd=cwd))
         task._nanocode_task_id = rec.id
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -635,6 +638,12 @@ class Agent(PlanModeMixin):
     async def _run_real_tool(self, name: str, inp: dict) -> str:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
+        if name == "run_shell" and "_cwd" not in inp:
+            services = getattr(self, "_runtime_services", None)
+            cwd = services.cwd if services is not None else (
+                self._session_mgr._cwd() if self._session_mgr is not None else None)
+            if cwd:
+                inp = {**inp, "_cwd": cwd}
         result = await execute_tool(name, inp, self._read_file_state)
         if name in ("read_file", "write_file", "edit_file") and not result.startswith(("Error", "Warning")):
             self._on_file_touched(name, inp)

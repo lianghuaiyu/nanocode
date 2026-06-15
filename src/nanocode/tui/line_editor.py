@@ -54,6 +54,9 @@ _PASTE_END = "\x1b[201~"
 _ESC_SEQS = {
     "[A": "up", "[B": "down", "[C": "right", "[D": "left",
     "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+    "[1;5C": "c-right", "[1;5D": "c-left", "[5C": "c-right", "[5D": "c-left",
+    "[1;3C": "c-right", "[1;3D": "c-left", "[3C": "c-right", "[3D": "c-left",
+    "[c": "shift-right", "[d": "shift-left",
     "[H": "home", "[F": "end", "OH": "home", "OF": "end",
     "[1~": "home", "[4~": "end", "[3~": "delete",
     "[5~": "pageup", "[6~": "pagedown",
@@ -61,10 +64,31 @@ _ESC_SEQS = {
     "[13;2u": "shift-enter", "[27;2;13~": "shift-enter",
 }
 
+
+def _parse_int_prefix(value: str) -> int | None:
+    head = value.split(":", 1)[0]
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
+def _modified_arrow_token(final: str, modifier: int) -> str | None:
+    """Map terminal Ctrl/Alt left/right arrow encodings to tree branch keys."""
+    if modifier not in (3, 5):
+        return None
+    if final == "D":
+        return "c-left"
+    if final == "C":
+        return "c-right"
+    return None
+
 # 控制字节 → token。
 _CTRL = {
     "\r": "enter", "\n": "ctrl-j", "\x7f": "backspace", "\x08": "backspace",
     "\x03": "ctrl-c", "\x04": "ctrl-d", "\x01": "ctrl-a", "\x05": "ctrl-e",
+    "\x0c": "ctrl-l", "\x0e": "ctrl-n", "\x0f": "ctrl-o", "\x10": "ctrl-p",
+    "\x12": "ctrl-r", "\x13": "ctrl-s", "\x14": "ctrl-t",
     "\x15": "ctrl-u", "\x0b": "ctrl-k", "\x17": "ctrl-w", "\x09": "tab",
     "\x1b": "escape",
 }
@@ -140,6 +164,10 @@ class KeyParser:
         c0 = rest[0]
         if c0 in ("\r", "\n"):
             return "shift-enter", 2, False               # ESC+CR(Alt/Shift+Enter)→ 换行
+        if c0 in ("b", "B"):
+            return "c-left", 2, False                    # 常见 Alt+Left: ESC b
+        if c0 in ("f", "F"):
+            return "c-right", 2, False                   # 常见 Alt+Right: ESC f
         if c0 not in "[O":
             return "escape", 1, False                    # 裸 Esc（consumed 仅 ESC 本身）
         if rest.startswith("[<"):
@@ -166,6 +194,47 @@ class KeyParser:
         for seq, tok in _ESC_SEQS.items():
             if rest.startswith(seq):
                 return tok, 1 + len(seq), False
+        if c0 == "O" and len(rest) >= 3:
+            j = 1
+            while j < len(rest) and rest[j].isdigit():
+                j += 1
+            if j > 1 and j < len(rest) and rest[j] in ("C", "D"):
+                tok = _modified_arrow_token(rest[j], int(rest[1:j]))
+                if tok is not None:
+                    return tok, 1 + j + 1, False
+        if c0 == "O" and len(rest) >= 2 and rest[1] in ("c", "d"):
+            return ("c-right" if rest[1] == "c" else "c-left"), 3, False
+        if rest.startswith("["):
+            j = 1
+            while j < len(rest) and not (rest[j].isalpha() or rest[j] == "~"):
+                j += 1
+            if j < len(rest) and rest[j] in ("C", "D"):
+                body = rest[1:j]
+                parts = [p for p in body.split(";") if p != ""]
+                modifier = _parse_int_prefix(parts[-1]) if parts else 1
+                tok = _modified_arrow_token(rest[j], modifier or 1)
+                if tok is not None:
+                    return tok, 1 + j + 1, False
+            if j < len(rest) and rest[j] == "~":
+                body = rest[1:j]
+                parts = body.split(";")
+                if len(parts) == 3 and parts[0] == "27":
+                    modifier = _parse_int_prefix(parts[1])
+                    code = _parse_int_prefix(parts[2])
+                    if modifier == 5 and code is not None:
+                        ch = chr(code).lower() if code > 0 else ""
+                        if "a" <= ch <= "z":
+                            return f"ctrl-{ch}", 1 + j + 1, False
+            end = rest.find("u")
+            if end != -1:
+                body = rest[1:end]
+                parts = body.split(";")
+                code = _parse_int_prefix(parts[0]) or 0
+                modifier = _parse_int_prefix(parts[1]) if len(parts) > 1 else 1
+                if modifier == 5:
+                    ch = chr(code).lower() if code > 0 else ""
+                    if "a" <= ch <= "z":
+                        return f"ctrl-{ch}", 1 + end + 1, False
         # 可能是未完成的序列（如 "[" 后还没来字母/"~"）；若末尾未见终止符则等
         j = 1
         while j < len(rest) and not (rest[j].isalpha() or rest[j] == "~"):

@@ -14,6 +14,8 @@ def test_printable_and_controls():
     assert p.feed(b"\x7f") == ["backspace"]
     assert p.feed(b"\x03") == ["ctrl-c"]
     assert p.feed(b"\x04") == ["ctrl-d"]
+    assert p.feed(b"\x0f") == ["ctrl-o"]
+    assert p.feed(b"\x13") == ["ctrl-s"]
 
 
 def test_arrow_escape_sequences():
@@ -22,6 +24,29 @@ def test_arrow_escape_sequences():
     assert p.feed(b"\x1b[B") == ["down"]
     assert p.feed(b"\x1b[C") == ["right"]
     assert p.feed(b"\x1b[D") == ["left"]
+    assert p.feed(b"\x1b[1;5C") == ["c-right"]
+    assert p.feed(b"\x1b[1;5D") == ["c-left"]
+    assert p.feed(b"\x1b[1;3C") == ["c-right"]
+    assert p.feed(b"\x1b[1;3D") == ["c-left"]
+    assert p.feed(b"\x1b[;5C") == ["c-right"]
+    assert p.feed(b"\x1b[;5D") == ["c-left"]
+    assert p.feed(b"\x1b[1;5:2C") == ["c-right"]
+    assert p.feed(b"\x1b[1;5:2D") == ["c-left"]
+    assert p.feed(b"\x1bO5C") == ["c-right"]
+    assert p.feed(b"\x1bO5D") == ["c-left"]
+    assert p.feed(b"\x1b[c") == ["shift-right"]
+    assert p.feed(b"\x1b[d") == ["shift-left"]
+    assert p.feed(b"\x1bOc") == ["c-right"]
+    assert p.feed(b"\x1bOd") == ["c-left"]
+    assert p.feed(b"\x1bf") == ["c-right"]
+    assert p.feed(b"\x1bb") == ["c-left"]
+
+
+def test_csi_u_ctrl_letters():
+    p = KeyParser()
+    assert p.feed(b"\x1b[111;5u") == ["ctrl-o"]
+    assert p.feed(b"\x1b[111;5:2u") == ["ctrl-o"]
+    assert p.feed(b"\x1b[27;5;111~") == ["ctrl-o"]
 
 
 def test_sgr_mouse_wheel_sequences():

@@ -122,5 +122,5 @@ def test_subagent_detail_text_surfaces_artifact_paths():
     assert "Result:" in txt2 and "result.md" in txt2
     assert "Prompt:" in txt2
     assert "Wire:" not in txt2                          # wire 已退役，不再 surface
-    # without session_id (back-compat) no artifact lines
+    # artifact surfacing is session-bound; without a session id there are no artifact lines
     assert "Result:" not in tt.subagent_detail_text(m, a.id)

@@ -27,30 +27,36 @@ class _Thread:
 
 
 class _Model(SelectorModel):
-    def __init__(self, *, query=False, wrap=False, escape_clears=False):
-        self._items = ["alpha", "beta", "gamma"]
+    def __init__(self, *, query=False, wrap=False, escape_clears=False, initial=0, items=None):
+        self._items = list(items or ["alpha", "beta", "gamma"])
         self.refreshed = 0
         self._q = ""
         self._query = query
         self._wrap = wrap
         self._escape_clears = escape_clears
+        self._initial = initial
     def header_lines(self, w): return ["pick one"]
     def items(self): return self._items
+    def initial_index(self): return self._initial
     def list_text(self, it, sel, w): return ("> " if sel else "  ") + it
-    def extra_keys(self): return ("f", "l")
+    def extra_keys(self): return ("f", "l", "c-o")
     def supports_query(self): return self._query
     def query(self): return self._q
     def wrap_navigation(self): return self._wrap
     def escape_clears_query(self): return self._escape_clears
     def set_query(self, q):
         self._q = q
-        self._items = [x for x in ["alpha", "beta", "gamma"] if q.lower() in x] or ["alpha", "beta", "gamma"]
+        base = ["alpha", "beta", "gamma"]
+        self._items = [x for x in base if q.lower() in x] or base
     def on_key(self, k, it, i):
         if k == "f":
             self.refreshed += 1
             return KeyResult("refresh")
         if k == "l":
             return KeyResult("edit", edit_action="label")
+        if k == "c-o":
+            self.refreshed += 1
+            return KeyResult("refresh")
         return None
 
 
@@ -88,6 +94,11 @@ def test_arrow_down_navigates():
     assert outcome.kind == "done" and outcome.item == "beta"
 
 
+def test_selector_uses_model_initial_index():
+    outcome, _ = _drive_selector(_Model(initial=2), [b"\r"])
+    assert outcome.kind == "done" and outcome.item == "gamma" and outcome.index == 2
+
+
 def test_mouse_wheel_down_navigates_selector():
     outcome, _ = _drive_selector(_Model(), [b"\x1b[<65;10;5M", b"\r"])
     assert outcome.kind == "done" and outcome.item == "gamma" and outcome.index == 2
@@ -108,6 +119,11 @@ def test_extra_key_edit():
     assert outcome.kind == "edit" and outcome.edit_action == "label"
 
 
+def test_ctrl_letter_extra_key_is_normalized():
+    outcome, model = _drive_selector(_Model(), [b"\x0f", b"q"])  # Ctrl+O refresh, q cancel
+    assert model.refreshed == 1 and outcome.kind == "cancel"
+
+
 def test_query_mode_filters_and_jkq_are_text():
     # 搜索态：j/k/q 当文本进 query（不导航/取消）；只 esc 取消
     outcome, model = _drive_selector(_Model(query=True), ["q".encode(), "j".encode(), "k".encode(), b"\x1b"])
@@ -118,6 +134,12 @@ def test_query_mode_filters_and_jkq_are_text():
 def test_selector_wrap_navigation_hook():
     outcome, _ = _drive_selector(_Model(wrap=True), [b"\x1b[A", b"\r"])  # up from first wraps to gamma
     assert outcome.kind == "done" and outcome.item == "gamma" and outcome.index == 2
+
+
+def test_selector_page_navigation_clamps_even_when_move_wraps():
+    items = [f"item{i}" for i in range(10)]
+    outcome, _ = _drive_selector(_Model(wrap=True, initial=8, items=items), [b"\x1b[C", b"\r"])
+    assert outcome.kind == "done" and outcome.item == "item9" and outcome.index == 9
 
 
 def test_selector_escape_can_clear_query_before_cancel():

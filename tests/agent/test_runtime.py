@@ -63,10 +63,14 @@ def test_thread_start_new_session_uses_config_cwd(tmp_path):
 
 
 
-def test_adopt_returns_thread_and_registers():
+def test_runtime_does_not_expose_bare_agent_adopt_entrypoint():
+    assert not hasattr(AgentRuntime(), "adopt")
+
+
+def test_attach_agent_internal_registers_thread():
     rt = AgentRuntime()
     a = _agent()
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     assert isinstance(th, RuntimeThread)
     assert th.thread_id == a.session_id
     assert rt.thread(a.session_id) is th
@@ -81,7 +85,7 @@ def test_run_returns_turnresult_completed_with_tokens():
         a.total_input_tokens += 10
         a.total_output_tokens += 4
 
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     th.session.run_turn = fake_chat        # docs/16 #3c：turn 实现在 AgentSession.run_turn
     res = asyncio.run(th.run("hi"))
     assert isinstance(res, TurnResult)
@@ -98,7 +102,7 @@ def test_run_maps_aborted_to_cancelled_status():
     async def aborted_chat(prompt):
         a._aborted = True   # 模拟取消被吞
 
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     th.session.run_turn = aborted_chat
     res = asyncio.run(th.run("x"))
     assert res.status == "cancelled"   # 不是 completed
@@ -110,7 +114,7 @@ def test_cancel_delegates_to_abort_order():
     a = _agent()
     calls = []
     a.abort = lambda: calls.append("abort")
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     th.cancel()
     assert calls == ["abort"]
 
@@ -119,7 +123,7 @@ def test_thread_status_snapshot_exposes_session_state():
     """docs/17 Phase 5a：status() 是客户端（footer/RPC）读会话状态的稳定 API，不跨边界 reach 私有面。"""
     rt = AgentRuntime()
     a = _agent()
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     st = th.status()
     assert st["session_id"] == a.session_id
     assert st["model"] == a.model
@@ -131,7 +135,7 @@ def test_thread_messages_and_state_snapshot():
     """docs/17 #2：messages()/state() 是重绘 / RPC get_state 的视图地基（从 canonical 树派生）。"""
     rt = AgentRuntime()
     a = _agent()
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     # 无会话写者租约 → 空快照（不抛）
     assert th.messages() == []
     state = th.state()
@@ -143,7 +147,7 @@ def test_thread_messages_and_state_snapshot():
 def test_runtime_thread_facade_does_not_expose_internal_state_managers():
     rt = AgentRuntime()
     a = Agent(api_key="test", session_id="facade_sid", permission_mode="bypassPermissions")
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     assert not hasattr(th, "session_manager")
     assert not hasattr(th, "task_manager")
     assert not hasattr(th, "background_tasks")
@@ -158,7 +162,7 @@ def test_readonly_session_view_hides_mutation_methods():
     mgr = SessionManager.create("readonly_sid")
     a._session_mgr = mgr
     user = mgr.append_message(T.user_message("hello"))
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
 
     view = th.readonly_session()
     assert view is not None
@@ -172,7 +176,7 @@ def test_readonly_session_view_hides_mutation_methods():
 def test_thread_event_boundary_is_jsonable():
     rt = AgentRuntime()
     a = _agent()
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     a.emit(NoticeRaised(text="hello"))
     env = th.events()[-1]
     assert env["event"] == {"text": "hello", "level": "info", "kind": "notice_raised"}
@@ -188,7 +192,7 @@ def test_final_response_derived_from_event_stream():
     async def fake_chat(prompt):
         a._emit_block("hello world")
 
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     th.session.run_turn = fake_chat
     res = asyncio.run(th.run("q"))
     assert res.final_response == "hello world"
@@ -202,7 +206,7 @@ def test_final_response_resets_between_turns():
     async def fake_chat(prompt):
         a._emit_block(next(seq))
 
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     th.session.run_turn = fake_chat
     r1 = asyncio.run(th.run("a"))
     r2 = asyncio.run(th.run("b"))
@@ -217,7 +221,7 @@ def test_approval_manager_attaches_both_channels():
     async def pf(msg): return {"choice": "execute"}
 
     mgr = ApprovalManager(confirm_fn=cf, plan_approval_fn=pf)
-    AgentRuntime().adopt(a, approvals=mgr)
+    AgentRuntime()._attach_agent(a, approvals=mgr)
     assert a.confirm_fn is cf
     assert a._plan_approval_fn is pf
 
@@ -225,16 +229,70 @@ def test_approval_manager_attaches_both_channels():
 def test_approval_manager_none_leaves_defaults():
     a = _agent()
     before_confirm = a.confirm_fn
-    AgentRuntime().adopt(a, approvals=ApprovalManager())  # both None
+    AgentRuntime()._attach_agent(a, approvals=ApprovalManager())  # both None
     assert a.confirm_fn is before_confirm   # 不动默认（None→阻塞 input 回退）
 
 
 def test_execute_user_shell_emits_audit_events():
     rt = AgentRuntime()
     a = _agent()
-    th = rt.adopt(a)
+    th = rt._attach_agent(a)
     out = asyncio.run(th.execute_user_shell("echo runtime-shell"))
     assert "runtime-shell" in out
     types = [e["type"] for e in th.events()]
     assert "user_shell_started" in types
     assert "user_shell_completed" in types
+
+
+def test_execute_user_shell_runs_in_runtime_cwd(tmp_path):
+    cwd = tmp_path / "shell-cwd"
+    cwd.mkdir()
+    rt = AgentRuntime()
+    cfg = AgentConfig(api_key="test", session_id="shellcwd",
+                      permission_mode="bypassPermissions", cwd=str(cwd))
+    th = rt.thread_start(cfg)
+    try:
+        out = asyncio.run(th.execute_user_shell("pwd"))
+        assert str(cwd.resolve()) in out
+        done = next(e for e in th.events() if e["type"] == "user_shell_completed")
+        assert done["event"]["cwd"] == str(cwd.resolve())
+    finally:
+        th.release_lease()
+
+
+def test_model_run_shell_receives_runtime_cwd(monkeypatch, tmp_path):
+    from nanocode.tools import execute
+
+    cwd = tmp_path / "tool-cwd"
+    cwd.mkdir()
+    rt = AgentRuntime()
+    cfg = AgentConfig(api_key="test", session_id="toolcwd",
+                      permission_mode="bypassPermissions", cwd=str(cwd))
+    th = rt.thread_start(cfg)
+    calls = []
+    monkeypatch.setattr(execute.run_shell, "run", lambda inp: calls.append(dict(inp)) or "ok")
+    try:
+        out = asyncio.run(th.agent._execute_tool_call("run_shell", {"command": "git status"}))
+        assert out == "ok"
+        assert calls[-1]["_cwd"] == str(cwd.resolve())
+    finally:
+        th.release_lease()
+
+
+def test_set_session_name_emits_runtime_event():
+    from nanocode.session.manager import SessionManager
+
+    rt = AgentRuntime()
+    a = Agent(api_key="test", session_id="namesid", permission_mode="bypassPermissions")
+    mgr = SessionManager.create("namesid")
+    a._session_mgr = mgr
+    th = rt._attach_agent(a)
+    seen = []
+    th.subscribe(seen.append)
+
+    th.set_session_name("runtime name")
+
+    assert mgr.name() == "runtime name"
+    assert seen[-1]["type"] == "session_info_changed"
+    assert seen[-1]["event"]["name"] == "runtime name"
+    mgr.close()

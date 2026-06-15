@@ -48,8 +48,34 @@ def active_path_ids(entries: list[T.Entry], leaf_id: str | None) -> set[str]:
     return out
 
 
-def _node_passes(node: TreeNode, mode: FilterMode, labels: dict[str, str]) -> bool:
+def _is_settings_entry(e: T.Entry) -> bool:
+    return e.type in {
+        T.LABEL,
+        T.CUSTOM,
+        T.MODEL_CHANGE,
+        T.THINKING_LEVEL_CHANGE,
+        T.SESSION_INFO,
+    }
+
+
+def _assistant_without_visible_text(e: T.Entry) -> bool:
+    if e.type != T.MESSAGE:
+        return False
+    msg = e.data.get("message") or {}
+    if msg.get("role") != "assistant":
+        return False
+    if _normalize(_extract_text(msg.get("content"))):
+        return False
+    stop = msg.get("stopReason")
+    if stop and stop not in ("stop", "toolUse", "tool_use"):
+        return False
+    return not msg.get("errorMessage")
+
+
+def _node_passes(node: TreeNode, mode: FilterMode, labels: dict[str, str], leaf_id: str | None) -> bool:
     e = node.entry
+    if _assistant_without_visible_text(e) and e.id != leaf_id:
+        return False
     if mode == "all":
         return True
     if mode == "labeled-only":
@@ -57,21 +83,19 @@ def _node_passes(node: TreeNode, mode: FilterMode, labels: dict[str, str]) -> bo
     if mode == "user-only":
         return e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "user"
     if mode == "no-tools":
-        return not (e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "toolResult")
-    if e.type != T.MESSAGE:
-        return e.id in labels
-    role = (e.data.get("message") or {}).get("role")
-    if role == "toolResult":
-        return False
-    return True
+        return not _is_settings_entry(e) and not (
+            e.type == T.MESSAGE and (e.data.get("message") or {}).get("role") == "toolResult"
+        )
+    return not _is_settings_entry(e)
 
 
-def prune_tree(roots: list[TreeNode], mode: FilterMode, labels: dict[str, str]) -> list[TreeNode]:
+def prune_tree(roots: list[TreeNode], mode: FilterMode, labels: dict[str, str],
+               leaf_id: str | None) -> list[TreeNode]:
     def visit(node: TreeNode) -> list[TreeNode]:
         children: list[TreeNode] = []
         for c in node.children:
             children.extend(visit(c))
-        if _node_passes(node, mode, labels):
+        if _node_passes(node, mode, labels, leaf_id):
             return [TreeNode(node.entry, children)]
         return children
 
@@ -137,12 +161,12 @@ def flatten_tree(roots: list[TreeNode], leaf_id: str | None, multiple_roots: boo
     for i in range(len(ordered_roots) - 1, -1, -1):
         is_last = i == len(ordered_roots) - 1
         stack.append((ordered_roots[i], 1 if multiple_roots else 0, multiple_roots,
-                      multiple_roots, is_last, [], multiple_roots))
+                      multiple_roots, is_last, [], multiple_roots, True))
 
     while stack:
-        node, indent, just_branched, show_connector, is_last, gutters, is_vrc = stack.pop()
+        node, indent, just_branched, show_connector, is_last, gutters, is_vrc, is_segment_start = stack.pop()
         children = order_active_first(node.children)
-        foldable = len(children) > 0
+        foldable = len(children) > 0 and is_segment_start
         is_folded = foldable and node.entry.id in folded
         result.append(FlatNode(node, indent, is_last, gutters, show_connector, is_vrc,
                                foldable=foldable, folded=is_folded))
@@ -166,7 +190,7 @@ def flatten_tree(roots: list[TreeNode], leaf_id: str | None, multiple_roots: boo
         for i in range(len(children) - 1, -1, -1):
             child_is_last = i == len(children) - 1
             stack.append((children[i], child_indent, multi, multi, child_is_last,
-                          child_gutters, False))
+                          child_gutters, False, multi))
     return result
 
 
@@ -177,6 +201,7 @@ class Row:
     on_active_path: bool
     is_leaf: bool
     label: str | None
+    label_timestamp: str | None
     content: str
     foldable: bool = False
     folded: bool = False
@@ -227,6 +252,64 @@ def _tool_names(content) -> list[str]:
     return []
 
 
+def _tool_call_lookup(entries: list[T.Entry]) -> dict[str, tuple[str, dict]]:
+    out: dict[str, tuple[str, dict]] = {}
+    for e in entries:
+        if e.type != T.MESSAGE:
+            continue
+        msg = e.data.get("message") or {}
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            call_id = str(block.get("id") or "")
+            if not call_id:
+                continue
+            args = block.get("arguments")
+            out[call_id] = (str(block.get("name") or "tool"), args if isinstance(args, dict) else {})
+    return out
+
+
+def _labels_with_timestamps(entries: list[T.Entry]) -> dict[str, tuple[str, str | None]]:
+    out: dict[str, tuple[str, str | None]] = {}
+    for e in entries:
+        if e.type != T.LABEL:
+            continue
+        target = e.data.get("targetId")
+        if target is None:
+            continue
+        label = (e.data.get("label") or "").strip()
+        if label:
+            out[target] = (label, e.timestamp)
+        else:
+            out.pop(target, None)
+    return out
+
+
+def _shorten_tool_arg(value: object, limit: int = 50) -> str:
+    text = str(value).replace("\n", " ").replace("\t", " ").strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _format_tool_call(name: str, args: dict) -> str:
+    if "command" in args:
+        return f"[{name}: {_shorten_tool_arg(args.get('command'))}]"
+    path = args.get("path") or args.get("file_path")
+    if path:
+        return f"[{name}: {_shorten_tool_arg(path)}]"
+    if args:
+        try:
+            raw = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            raw = str(args)
+        return f"[{name}: {_shorten_tool_arg(raw, 40)}]"
+    return f"[{name}]"
+
+
 def _content_block_types(content) -> list[str]:
     if isinstance(content, list):
         return [str(b.get("type", "?")) for b in content if isinstance(b, dict)]
@@ -235,7 +318,7 @@ def _content_block_types(content) -> list[str]:
     return []
 
 
-def entry_content(e: T.Entry) -> str:
+def entry_content(e: T.Entry, tool_calls: dict[str, tuple[str, dict]] | None = None) -> str:
     if e.type == T.MESSAGE:
         msg = e.data.get("message") or {}
         role = msg.get("role")
@@ -245,13 +328,16 @@ def entry_content(e: T.Entry) -> str:
             txt = _normalize(_extract_text(msg.get("content")))
             if txt:
                 return "assistant: " + txt
-            tools = _tool_names(msg.get("content"))
-            if tools:
-                return "assistant: [" + ", ".join(tools) + "]"
             if msg.get("stopReason") == "aborted":
                 return "assistant: (aborted)"
+            if msg.get("errorMessage"):
+                return "assistant: " + _normalize(str(msg.get("errorMessage")))[:80]
             return "assistant: (no content)"
         if role == "toolResult":
+            call_id = str(msg.get("toolCallId") or "")
+            if tool_calls and call_id in tool_calls:
+                name, args = tool_calls[call_id]
+                return _format_tool_call(name, args)
             return "[" + str(msg.get("toolName") or "tool") + "]"
         return f"[{role}]"
     if e.type == T.COMPACTION:
@@ -348,12 +434,14 @@ def entry_detail_lines(row: "Row") -> list[str]:
 
 def build_rows(entries: list[T.Entry], leaf_id: str | None, mode: FilterMode = "default",
                folded: "set[str] | frozenset[str]" = frozenset()) -> list[Row]:
-    labels = T.labels_by_id(entries)
+    labels_with_time = _labels_with_timestamps(entries)
+    labels = {k: v[0] for k, v in labels_with_time.items()}
     roots = build_tree(entries)
-    pruned = prune_tree(roots, mode, labels)
+    pruned = prune_tree(roots, mode, labels, leaf_id)
     multiple_roots = len(pruned) > 1
     flat = flatten_tree(pruned, leaf_id, multiple_roots, folded)
     active = active_path_ids(entries, leaf_id)
+    tool_calls = _tool_call_lookup(entries)
     rows: list[Row] = []
     for fn in flat:
         e = fn.node.entry
@@ -363,7 +451,8 @@ def build_rows(entries: list[T.Entry], leaf_id: str | None, mode: FilterMode = "
             on_active_path=e.id in active,
             is_leaf=(e.id == leaf_id),
             label=labels.get(e.id),
-            content=entry_content(e),
+            label_timestamp=(labels_with_time.get(e.id) or (None, None))[1],
+            content=entry_content(e, tool_calls),
             foldable=fn.foldable,
             folded=fn.folded,
         ))

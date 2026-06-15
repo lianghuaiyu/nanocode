@@ -174,8 +174,9 @@ def test_run_background_host_uses_shell(monkeypatch, tmp_path):
         captured["exec"] = True
         return _fake_proc(0)
 
-    async def fake_shell(command, stdout=None, stderr=None):
+    async def fake_shell(command, stdout=None, stderr=None, cwd=None):
         captured["command"] = command
+        captured["cwd"] = cwd
         return _fake_proc(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -184,8 +185,30 @@ def test_run_background_host_uses_shell(monkeypatch, tmp_path):
     err = str(tmp_path / "e.log")
     r = asyncio.run(run_shell.run_background({"command": "echo bg"}, stdout_path=out, stderr_path=err))
     assert captured["command"] == "echo bg"
+    assert captured["cwd"] is None
     assert "exec" not in captured
     assert r["exit_code"] == 0
+
+
+def test_run_background_host_uses_explicit_cwd(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_shell, "plan_shell", lambda inp, *, context="foreground": ("host", None)
+    )
+    captured = {}
+
+    async def fake_shell(command, stdout=None, stderr=None, cwd=None):
+        captured["cwd"] = cwd
+        return _fake_proc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_shell)
+    out = str(tmp_path / "o.log")
+    err = str(tmp_path / "e.log")
+    workdir = str(tmp_path / "work")
+    (tmp_path / "work").mkdir()
+    r = asyncio.run(run_shell.run_background({"command": "echo bg", "_cwd": workdir},
+                                             stdout_path=out, stderr_path=err))
+    assert r["exit_code"] == 0
+    assert captured["cwd"] == workdir
 
 
 def test_run_background_blocked_does_not_spawn(monkeypatch, tmp_path):

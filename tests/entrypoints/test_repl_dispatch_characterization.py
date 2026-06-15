@@ -11,9 +11,9 @@
   6. !shell 直跑用户 shell（不进 chat）
 
 驱动方式（docs/18 cutover 后）：run_repl 的输入主循环已从 `_async_read_line` while-loop 改成
-`TuiApp`（full_screen=False）。本测试经 `run_repl(agent, input=pipe, output=DummyOutput())` 的测试
+`TuiApp`（full_screen=False）。本测试经 `run_repl(thread, input=pipe, output=DummyOutput())` 的测试
 seam 注入 prompt_toolkit pipe，逐行 `send_text(line + "\r")` 提交、末尾 `\x04`(Ctrl-D) 退出；
-monkeypatch cli.AgentSession 为录制替身（绕开真实 SessionContextBuilder / agent.chat）；把 run_repl
+fake agent 先显式包成 RuntimeThread（绕开真实 SessionContextBuilder / agent.chat）；把 run_repl
 触达的模块级 helper 与 tasks_tool 的延迟 import 全部换成录制 stub。所有 handler 命中都落到一个
 `calls` 列表，按输入断言「哪个分支触发」（命中语义跨 cutover 不变——逻辑搬进 `_submit` 闭包）。
 
@@ -121,9 +121,6 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     calls: list = []
     agent = _FakeAgent(calls)
 
-    # 1) 替身 session：绕开真实 SessionContextBuilder / agent.chat
-    monkeypatch.setattr(cli, "AgentSession", _RecordingSession)
-
     # 3) 静默欢迎语；info/error 记录但不打印
     monkeypatch.setattr(cli, "print_welcome", lambda *a, **k: None)
     monkeypatch.setattr(cli, "print_info", lambda *a, **k: calls.append(("print_info",)))
@@ -140,7 +137,7 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     monkeypatch.setattr(_builtin, "handle_eval_command",
                         lambda rest: (calls.append(("handle_eval_command", rest)) or "stub"))
     monkeypatch.setattr("nanocode.tools.sandbox_defaults", _FakeSandbox(calls))
-    # !shell 已迁入 RuntimeThread.execute_user_shell(不再走 cli._run_user_shell)→ patch 类方法
+    # !shell 经 RuntimeThread.execute_user_shell → patch runtime 类方法
     from nanocode.agent.runtime import RuntimeThread
 
     async def _fake_exec_shell(self, command, **kwargs):
@@ -181,7 +178,10 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     async def _scenario():
         r, w = os.pipe()
         console = Console(file=io.StringIO(), force_terminal=True, width=100)
-        task = asyncio.ensure_future(cli.run_repl(agent, input=r, output=console))
+        from nanocode.agent import AgentRuntime, RuntimeThread
+        rt = AgentRuntime()
+        thread = rt.register(RuntimeThread(rt, agent, _RecordingSession(agent)))
+        task = asyncio.ensure_future(cli.run_repl(thread, input=r, output=console))
         await asyncio.sleep(0.05)
         for ln in lines:
             os.write(w, (ln + "\r").encode("utf-8"))

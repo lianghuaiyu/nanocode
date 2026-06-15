@@ -146,16 +146,18 @@ def test_tree_model_filter_chords_and_label():
     assert model.position_line(0, len(model.items()), 0, 5, 80) == f"  (1/{len(model.items())})"
     assert model.wrap_navigation()
     assert model.escape_clears_query()
-    assert "c-u" in model.extra_keys() and "c-a" in model.extra_keys()
-    model.on_key("c-u", item, 0)
-    assert model.mode == "user-only"
-    assert model.status_suffix() == " [user]"
-    model.on_key("c-u", item, 0)   # toggle back to default
-    assert model.mode == "default"
-    model.on_key("c-a", item, 0)
-    assert model.mode == "all"
-    assert model.status_suffix() == " [all]"
+    assert model.extra_keys() == ("c-o", "c-left", "c-right", "L", "T")
+    model.on_key("c-o", item, 0)
+    assert model.mode == "no-tools"
+    assert model.status_suffix() == " [no-tools]"
     assert model.on_key("L", item, 0).edit_action == "label"
+    assert model.on_key("T", item, 0).kind == "refresh"
+
+
+def test_tree_model_initial_index_prefers_current_leaf():
+    entries, leaf = _fork_tree()
+    model = SessionTreeModel(entries, leaf, "default")
+    assert model.items()[model.initial_index()].entry.id == leaf
 
 
 def test_tree_model_rows_use_pi_cursor_and_cell_width():
@@ -168,7 +170,7 @@ def test_tree_model_rows_use_pi_cursor_and_cell_width():
 
     assert selected.startswith("› ")          # Pi accent 游标(U+203A),非 ASCII '>'
     assert "\x1b[7m" not in model.list_text(row, True, 32)   # 无反显
-    assert selected.rstrip().endswith("<")
+    assert selected.rstrip().endswith("◀ current")
     assert nonsel.startswith("  ")             # 非选中:两空格占位,cell 对齐
     assert cell_width(nonsel) <= 32
 
@@ -188,15 +190,38 @@ def test_tree_model_fold_hides_descendants():
     model = SessionTreeModel(entries, leaf, "default")
     rows = model.items()
     b = next(r for r in rows if r.entry.id == "B")
-    assert b.foldable                       # B 有两个子(C,E) → 可折叠
+    assert not b.foldable                   # Pi: branch point itself jumps to the segment start
+    jump = model.on_key("c-right", b, rows.index(b))
+    assert jump.result == rows.index(next(r for r in rows if r.entry.id == "C"))
+    c = next(r for r in rows if r.entry.id == "C")
+    assert c.foldable                       # C 是 B 分叉后的 segment start
     n_before = len(rows)
-    model.on_key("c-left", b, rows.index(b))   # 折叠 B
+    model.on_key("c-left", c, rows.index(c))   # 折叠 C
     ids = [r.entry.id for r in model.items()]
-    assert "B" in ids and "C" not in ids and "E" not in ids
-    b2 = next(r for r in model.items() if r.entry.id == "B")
-    assert b2.folded
-    model.on_key("c-right", b2, 0)             # 展开 B
+    assert "C" in ids and "D" not in ids and "E" in ids
+    c2 = next(r for r in model.items() if r.entry.id == "C")
+    assert c2.folded
+    model.on_key("c-right", c2, 0)             # 展开 C
     assert len(model.items()) == n_before
+
+
+def test_tree_model_foldability_recomputed_after_search():
+    start = T.Entry(type=T.SESSION_START, id="start", parentId=None, sessionId="s",
+                    timestamp="t", data={"cwd": "/x"})
+    a = _msg("A", "start", "user", "root")
+    b = _msg("B", "A", "assistant", "hidden")
+    c = _msg("C", "B", "user", "keep parent")
+    d = _msg("D", "C", "user", "keep child")
+    model = SessionTreeModel([start, a, b, c, d], "D", "default")
+
+    model.set_query("keep")
+    rows = model.items()
+    c_row = next(r for r in rows if r.entry.id == "C")
+    assert [r.entry.id for r in rows] == ["C", "D"]
+    assert c_row.foldable
+
+    model.on_key("c-left", c_row, rows.index(c_row))
+    assert [r.entry.id for r in model.items()] == ["C"]
 
 
 def test_render_text_has_current_marker():
@@ -222,6 +247,13 @@ def test_fork_model_lists_user_messages_newest_first_and_searches():
     assert ids == ["E", "C", "A"]           # newest-first
     model.set_query("初始化")
     assert [e.id for e in model.items()] == ["A"]
+
+
+def test_fork_model_initial_index_prefers_current_branch_user():
+    from nanocode.tui.session_pages.fork import ForkModel
+    entries, leaf = _fork_tree()
+    model = ForkModel(entries, leaf_id=leaf)
+    assert model.items()[model.initial_index()].id == "C"
 
 
 def test_fork_model_rows_use_pi_cursor_and_cell_width():

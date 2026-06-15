@@ -25,7 +25,7 @@ import asyncio
 import json
 import sys
 
-from ..agent import AgentRuntime, ApprovalManager, RuntimeApprovalBroker
+from ..runtime import ApprovalManager, RuntimeApprovalBroker
 from .host import RuntimeHost
 
 
@@ -59,19 +59,11 @@ def _user_message_text(entry) -> str:
     return ""
 
 
-async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
-    """Run RPC against a runtime host.
-
-    The production boundary is RuntimeHost. A bare agent is accepted only as a
-    compatibility shim for older tests and immediately wrapped in a host.
-    """
-    if isinstance(runtime_host_or_agent, RuntimeHost):
-        host = runtime_host_or_agent
-        thread = host.current_thread
-    else:
-        rt = AgentRuntime()
-        thread = rt.adopt(runtime_host_or_agent, lease=lease)
-        host = RuntimeHost(rt, thread, interactive=False)
+async def run_rpc_mode(host: RuntimeHost) -> None:
+    """Run RPC against a runtime host."""
+    if not isinstance(host, RuntimeHost):
+        raise TypeError("run_rpc_mode requires a RuntimeHost")
+    thread = host.current_thread
     loop = asyncio.get_running_loop()
 
     broker = RuntimeApprovalBroker(emit=_emit_line)
@@ -122,14 +114,15 @@ async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
             # codex P1：turn 串行——已有 turn 在跑时拒绝新 prompt（否则两 turn 共享同一 Agent 的
             # _current_task / token 计数 / _final_text_chunks / pending 审批，必然串台/丢状态）。
             if turn_task is not None and not turn_task.done():
-                _emit_line({"type": "error", "message": "a turn is already running; wait for turn_result"})
+                _emit_line(_response("prompt", success=False,
+                                     error="a turn is already running; wait for turn_result", id_=cid))
             else:
                 turn_task = asyncio.create_task(_run_turn(cmd.get("text", "")))
         elif kind == "cancel":
             host.current_thread.cancel()
         elif kind == "get_state":
             # Pi get_state 对位：完整会话快照（status + messages）。
-            _emit_line({"type": "state", "state": host.current_thread.state()})
+            _emit_line(_response("get_state", data=host.current_thread.state(), id_=cid))
         elif kind == "get_messages":
             _emit_line(_response("get_messages", data={"messages": host.current_thread.messages()}, id_=cid))
         elif kind == "get_session_stats":
@@ -149,7 +142,8 @@ async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
         elif kind == "new_session":
             ok, reason = host.can_switch()
             if not ok:
-                _emit_line({"type": "error", "message": f"cannot switch sessions right now: {reason}"})
+                _emit_line(_response("new_session", success=False,
+                                     error=f"cannot switch sessions right now: {reason}", id_=cid))
             else:
                 host.runtime.thread_new(host)
                 await _rebind_current_thread()
@@ -157,11 +151,13 @@ async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
         elif kind == "resume":
             ok, reason = host.can_switch()
             if not ok:
-                _emit_line({"type": "error", "message": f"cannot switch sessions right now: {reason}"})
+                _emit_line(_response("resume", success=False,
+                                     error=f"cannot switch sessions right now: {reason}", id_=cid))
             else:
                 sid = cmd.get("session_id") or cmd.get("sessionId")
                 if not sid or host.runtime.thread_resume(host, sid) is None:
-                    _emit_line({"type": "error", "message": f"cannot resume {sid!r}"})
+                    _emit_line(_response("resume", success=False,
+                                         error=f"cannot resume {sid!r}", id_=cid))
                 else:
                     await _rebind_current_thread()
                     _emit_line(_response("resume", id_=cid))
@@ -195,14 +191,14 @@ async def run_rpc_mode(runtime_host_or_agent, lease=None) -> None:
                 _emit_line(_response("clone", id_=cid))
         elif kind == "shell":
             result = await host.current_thread.execute_user_shell(cmd.get("command", ""))
-            _emit_line({"type": "shell_result", "output": result})
+            _emit_line(_response("shell", data={"output": result}, id_=cid))
         elif kind == "approval_response":
             # 按 request_id 精确应答；缺 id 则 FIFO 解决最早一个待审批（串行下唯一）。
             broker.resolve(cmd.get("request_id"), bool(cmd.get("approved", False)))
         elif kind == "exit":
             break
         else:
-            _emit_line({"type": "error", "message": f"unknown cmd: {kind!r}"})
+            _emit_line(_response(str(kind), success=False, error=f"unknown cmd: {kind!r}", id_=cid))
 
     if turn_task is not None and not turn_task.done():
         turn_task.cancel()

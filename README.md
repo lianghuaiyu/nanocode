@@ -196,7 +196,12 @@ nanocode [options] [prompt]
   --thinking          启用扩展思考（仅 Anthropic）
   --model, -m         指定模型（默认 claude-opus-4-6，或 NANOCODE_MODEL）
   --api-base URL      使用 OpenAI 兼容端点
-  --resume            恢复上次会话
+  -c, --continue      继续最近的 canonical session
+  -r                  浏览并选择历史 session
+  --session ID|PATH   使用指定 session ID、前缀或 session.jsonl 路径
+  --fork ID|PATH      fork 一个 canonical session 到新 session
+  --name, -n NAME     设置启动 session 名称
+  --no-session        临时 session，退出后删除本次生成的 session
   --max-cost USD      估算费用超过此值即停止
   --max-turns N       超过 N 轮即停止
   --help, -h          显示帮助

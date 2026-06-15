@@ -13,7 +13,7 @@ def _agent(sid):
 def _host(sid="h"):
     a = _agent(sid)
     rt = AgentRuntime()
-    t = rt.adopt(a)
+    t = rt._attach_agent(a)
     return a, rt, t, RuntimeHost(rt, t, registry=None)
 
 
@@ -31,7 +31,7 @@ def test_replace_thread_disposes_old_and_rebinds_registry():
     a1, rt, t1, host = _host("h2a")
     assert rt.thread(t1.thread_id) is t1
     a2 = _agent("h2b")
-    t2 = rt.adopt(a2)
+    t2 = rt._attach_agent(a2)
     host.replace_thread(t2)
     assert host.current_thread is t2
     assert rt.thread(t1.thread_id) is None       # 旧 thread 已注销

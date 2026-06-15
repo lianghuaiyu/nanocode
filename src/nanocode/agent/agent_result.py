@@ -3,8 +3,7 @@
 - build_agent_result：宿主派生文件事实 + 解析的 summary/findings（**不信任模型自述文件**）。
 - render_agent_result_envelope：有界、定形的父上下文信封（小文本直通 / 大文本截断 + 指针）。
 
-Agent 保留 `_build_agent_result` / `_render_agent_result_envelope` 薄 shim（tests 与内部调用方
-按方法名调用）。本模块**不 import engine**；parse_structured_result 在调用时 import（同原实现）。
+本模块**不 import engine**；parse_structured_result 在调用时 import（同原实现）。
 """
 
 from __future__ import annotations

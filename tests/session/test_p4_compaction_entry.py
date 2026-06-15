@@ -94,6 +94,30 @@ def test_compaction_cut_point_keeps_recent_user_within_budget(monkeypatch):
     assert "recent" not in str(seen["messages"])        # kept suffix 不进 summarizer
 
 
+def test_compaction_custom_instructions_reach_summarizer(monkeypatch):
+    import asyncio
+    a = Agent(api_key="test", session_id="s4prompt", permission_mode="bypassPermissions")
+    a.model = "claude-x"
+    mgr = SessionManager.create("s4prompt")
+    a._session_mgr = mgr
+    mgr.append_message(tree.user_message("old question"))
+    mgr.append_message(tree.assistant_message([tree.text_block("old answer")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+    mgr.append_message(tree.user_message("recent"))
+    seen = {}
+
+    async def _fake(messages=None, instructions=None):
+        seen["messages"] = messages
+        seen["instructions"] = instructions
+        return "S"
+
+    monkeypatch.setattr(a, "_compact_anthropic", _fake)
+    monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 5)
+    asyncio.run(a.agent_session.compact("focus on API decisions"))
+
+    assert seen["instructions"] == "focus on API decisions"
+
+
 def test_compaction_over_budget_falls_back_to_last_user(monkeypatch):
     # docs/16 #10 review fix：末条 user 自身已超预算 → 仍兜底取**最后一条 user**作 cut——
     # compaction 必须真正收缩（其前历史进 summary）且当前问题原文保留，绝不写出

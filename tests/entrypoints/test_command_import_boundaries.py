@@ -66,3 +66,9 @@ def test_agent_and_agent_profile_public_imports_are_light():
     proc = subprocess.run([sys.executable, "-c", code], env=env, text=True,
                           capture_output=True)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_cli_help_lists_runtime_shell_escape():
+    from nanocode.entrypoints import cli
+
+    assert "!<command>" in cli._repl_commands_help()

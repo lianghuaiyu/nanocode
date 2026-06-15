@@ -35,8 +35,9 @@ def user_text(e: T.Entry) -> str:
 
 
 class ForkModel(SelectorModel):
-    def __init__(self, entries: list[T.Entry], *, query: str = "") -> None:
+    def __init__(self, entries: list[T.Entry], *, leaf_id: str | None = None, query: str = "") -> None:
         self.entries = entries
+        self.leaf_id = leaf_id
         self._users = list(reversed([e for e in entries if is_user_message(e)]))  # newest first
         self._query = query
         self._rows: list[T.Entry] = []
@@ -64,6 +65,22 @@ class ForkModel(SelectorModel):
     def items(self) -> list:
         return self._rows
 
+    def initial_index(self) -> int:
+        if not self._rows or self.leaf_id is None:
+            return 0
+        try:
+            branch = T.get_branch(T.index_by_id(self.entries), self.leaf_id)
+        except Exception:
+            return 0
+        branch_users = [e.id for e in branch if is_user_message(e)]
+        if not branch_users:
+            return 0
+        target = branch_users[-1]
+        for i, row in enumerate(self._rows):
+            if row.id == target:
+                return i
+        return 0
+
     def list_text(self, item: T.Entry, selected: bool, width: int) -> Any:
         cursor = "› " if selected else "  "
         text = _truncate(user_text(item) or "(empty)", max(1, width - cell_width(cursor)))
@@ -85,11 +102,11 @@ class ForkModel(SelectorModel):
 async def run_fork(manager, *, host) -> dict | None:
     """Run the fork page; returns ``{"action": "fork", "entry_id": id}`` or None."""
 
-    index = 0
+    index: int | None = None
     query = ""
     while True:
         entries = manager.entries()
-        model = ForkModel(entries, query=query)
+        model = ForkModel(entries, leaf_id=manager.get_leaf(), query=query)
         outcome: Outcome = await host.run_selector(model, initial_index=index)
         query = model.query()
         index = outcome.index

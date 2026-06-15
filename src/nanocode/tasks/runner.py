@@ -41,11 +41,13 @@ def _summarize(stdout_path: str) -> str:
 
 
 async def run_shell_background_task(manager, task_id, command, stdout_path, stderr_path,
-                                    timeout_ms=None, session_id=None) -> None:
+                                    timeout_ms=None, session_id=None, cwd=None) -> None:
     from ..tools import run_shell  # 惰性导入，打破 tools ↔ tasks 循环
     inp = {"command": command}
     if session_id:
         inp["_session_id"] = session_id   # per-session 沙箱命名显式注入（env 回退已删，docs/16 #3c）
+    if cwd:
+        inp["_cwd"] = cwd
     if timeout_ms is not None:
         inp["timeout"] = timeout_ms
     try:

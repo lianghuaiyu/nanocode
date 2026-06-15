@@ -43,7 +43,7 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
    - To read files use read_file instead of cat, head, tail, or sed
    - To edit files use edit_file instead of sed or awk
    - To create files use write_file instead of cat with heredoc or echo redirection
-   - To search for files use list_files instead of find or ls
+   - To list directory contents use list_files instead of find or ls
    - To search the content of files, use grep_search instead of grep or rg
    - Reserve using the run_shell exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the run_shell tool for these if it is absolutely necessary.
    - sandbox_shell runs a command inside an isolated microVM (opt-in, requires the `msb` CLI). Prefer it over run_shell for untrusted commands, package installs, or tests that should not touch the host; run_shell remains the default execution backend. If `msb` is unavailable, fall back to run_shell.

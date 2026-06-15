@@ -73,7 +73,10 @@ def _run(agent, steps, monkeypatch):
     out = []
     monkeypatch.setattr(sys, "stdout", _CapStdout(out))
     monkeypatch.setattr(sys, "stdin", _GatedStdin(steps, out))
-    asyncio.run(run_rpc_mode(agent))
+    rt = AgentRuntime()
+    thread = rt._attach_agent(agent)
+    host = RuntimeHost(rt, thread, interactive=False)
+    asyncio.run(run_rpc_mode(host))
     # 还原 stdout 后再解析（避免解析期写日志又被捕获）
     return [json.loads(l) for l in out]
 
@@ -165,7 +168,10 @@ def test_rpc_rejects_overlapping_prompt(monkeypatch):
                     ('{"cmd": "approval_response", "approved": true}', "already running"),
                     ('{"cmd": "exit"}', "turn_result")], monkeypatch)
 
-    errs = [m for m in msgs if m.get("type") == "error" and "already running" in m.get("message", "")]
+    errs = [m for m in msgs if m.get("type") == "response"
+            and m.get("command") == "prompt"
+            and m.get("success") is False
+            and "already running" in m.get("error", "")]
     assert errs                                              # 第二个 prompt 被拒
     assert len([m for m in msgs if m.get("type") == "turn_result"]) == 1   # 只有一个 turn 跑过
 
@@ -188,11 +194,13 @@ def test_rpc_get_state_returns_snapshot(monkeypatch):
         return _FakeResp([_FakeBlock("text", text="ok")])
 
     a = _agent("rpcstate", stream)
-    msgs = _run(a, [('{"cmd": "get_state"}', None),
-                    ('{"cmd": "exit"}', "state")], monkeypatch)
-    st = next(m for m in msgs if m.get("type") == "state")
-    assert st["state"]["session_id"] == "rpcstate"
-    assert "messages" in st["state"] and "model" in st["state"]
+    msgs = _run(a, [('{"id":"g1","cmd": "get_state"}', None),
+                    ('{"cmd": "exit"}', "get_state")], monkeypatch)
+    st = next(m for m in msgs if m.get("type") == "response"
+              and m.get("command") == "get_state")
+    assert st["id"] == "g1"
+    assert st["data"]["session_id"] == "rpcstate"
+    assert "messages" in st["data"] and "model" in st["data"]
 
 
 def test_rpc_session_stats_messages_and_name(monkeypatch):
@@ -204,7 +212,7 @@ def test_rpc_session_stats_messages_and_name(monkeypatch):
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hello"))
     rt = AgentRuntime()
-    thread = rt.adopt(a)
+    thread = rt._attach_agent(a)
     host = RuntimeHost(rt, thread, interactive=False)
 
     msgs = _run_host(host, [
@@ -219,6 +227,20 @@ def test_rpc_session_stats_messages_and_name(monkeypatch):
     assert by_command["get_session_stats"]["data"]["session_id"] == "rpcstats"
     assert by_command["set_session_name"]["success"] is True
     assert mgr.name() == "named"
+
+
+def test_rpc_unknown_command_uses_response_envelope(monkeypatch):
+    async def stream(*, model, system, tools, messages, thinking_mode, callbacks):
+        return _FakeResp([_FakeBlock("text", text="ok")])
+
+    a = _agent("rpcunknown", stream)
+    msgs = _run(a, [('{"id":"u1","type":"does_not_exist"}', None),
+                    ('{"cmd":"exit"}', "does_not_exist")], monkeypatch)
+    resp = next(m for m in msgs if m.get("type") == "response"
+                and m.get("command") == "does_not_exist")
+    assert resp["id"] == "u1"
+    assert resp["success"] is False
+    assert "unknown" in resp["error"].lower()
 
 
 def test_rpc_approval_denied_blocks_tool(monkeypatch):

@@ -1,7 +1,7 @@
 """命令 pi 语义对齐 —— /name(session_info)、/clone(新 session：复制 active branch 到当前 leaf、
 编辑器空)、/fork(新 session：复制到选中 user 消息之前、该 prompt 预填编辑器)、/tree <entry>
-(同 session 内移 leaf)。/clone、/fork 经 Control→thread_clone/thread_fork 原子切换；
-/tree 是 in-file（经 AgentSession.move_to）。"""
+(同 session 内导航；选 user/custom 时切到 parent 并预填文本)。/clone、/fork 经 Control→
+thread_clone/thread_fork 原子切换；/tree 是 in-file（经 AgentSession.move_to）。"""
 
 import asyncio
 
@@ -26,8 +26,9 @@ def _host(sid):
     return a, rt, t, RuntimeHost(rt, t, registry=None)
 
 
-def _ctx(a):
-    return CommandContext(thread=AgentRuntime().adopt(a))
+def _ctx(a, *, interactive=False, selector_host=None):
+    return CommandContext(thread=AgentRuntime()._attach_agent(a), interactive=interactive,
+                          selector_host=selector_host)
 
 
 # ─── /name ─────────────────────────────────────────────────────────────────
@@ -155,9 +156,54 @@ def test_tree_entry_navigates_moves_leaf(capsys):
     a, rt, t, host = _host("TN")
     u1 = a._session_mgr.append_message(T.user_message("first"))
     a._session_mgr.append_message(T.user_message("second"))
-    asyncio.run(_tree(_ctx(a), u1.id[-8:]))               # /tree <entry> → move_to
-    assert a._session_mgr.get_leaf() == u1.id
-    assert "first" in str(a.agent_session.build_request_messages()) and "second" not in str(a.agent_session.build_request_messages())
+    res = asyncio.run(_tree(_ctx(a), u1.id[-8:]))         # user entry → parent + prefill
+    assert a._session_mgr.get_leaf() is None
+    assert res.prefill == "first"
+    assert a.agent_session.build_request_messages() == []
+
+
+def test_tree_assistant_entry_moves_to_that_entry():
+    a, rt, t, host = _host("TNA")
+    a._session_mgr.append_message(T.user_message("first"))
+    a1 = a._session_mgr.append_message(T.assistant_message([T.text_block("answer")], provider="anthropic",
+                                      api="anthropic", model="claude-x", stop_reason="stop"))
+    a._session_mgr.append_message(T.user_message("second"))
+    res = asyncio.run(_tree(_ctx(a), a1.id[-8:]))
+    assert a._session_mgr.get_leaf() == a1.id
+    assert res.prefill is None
+    live = str(a.agent_session.build_request_messages())
+    assert "first" in live and "answer" in live and "second" not in live
+
+
+def test_tree_user_checkout_can_attach_branch_summary(monkeypatch):
+    class _PromptHost:
+        async def ask_text(self, _prompt):
+            return "d"
+
+    async def _fake_summary(messages, prompt):
+        assert "q2" in str(messages) and "a2" in str(messages)
+        assert "abandoned branch" in prompt.lower()
+        return "BRANCH-SUMMARY"
+
+    a, rt, t, host = _host("TNSUM")
+    mgr = a._session_mgr
+    mgr.append_message(T.user_message("q1"))
+    a1 = mgr.append_message(T.assistant_message([T.text_block("a1")], provider="anthropic",
+                            api="anthropic", model="claude-x", stop_reason="stop"))
+    u2 = mgr.append_message(T.user_message("q2"))
+    old_leaf = mgr.append_message(T.assistant_message([T.text_block("a2")], provider="anthropic",
+                                  api="anthropic", model="claude-x", stop_reason="stop"))
+    monkeypatch.setattr(a, "_summarize_anthropic", _fake_summary)
+
+    res = asyncio.run(_tree(_ctx(a, interactive=True, selector_host=_PromptHost()), u2.id[-8:]))
+
+    summaries = [e for e in mgr.entries() if e.type == T.BRANCH_SUMMARY]
+    assert len(summaries) == 1
+    assert summaries[0].parentId == a1.id
+    assert summaries[0].data["fromId"] == old_leaf.id
+    assert summaries[0].data["summary"] == "BRANCH-SUMMARY"
+    assert mgr.get_leaf() == summaries[0].id
+    assert res.prefill == "q2"
 
 
 def test_fork_invalid_target_lists_user_message_candidates():

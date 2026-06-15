@@ -20,7 +20,13 @@ def _plain(s: str) -> str:
 
 
 def _console(width: int = 100):
-    return Console(file=io.StringIO(), force_terminal=True, width=width)
+    return Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        no_color=False,
+        width=width,
+    )
 
 
 def _render(app, renderable) -> str:
@@ -98,8 +104,8 @@ def test_tool_box_success_has_diff():
                     result_excerpt="Updated a.py\n+ new line\n- old line")
     out = _render(app, app._render_message_block(item))
     plain = _plain(out)
-    assert "Update" in plain and "a.py" in plain      # 标题行
-    assert "+1 -1" in plain                            # diff 统计
+    assert "edit" in plain and "a.py" in plain         # Pi-style tool title
+    assert "+1 -1" not in plain                        # Pi renders the diff, not a nanocode summary line
     assert "new line" in plain and "old line" in plain
     assert "48;2;40;50;40" in out                      # toolSuccessBg 背景填充
 
@@ -109,7 +115,99 @@ def test_tool_box_error_uses_error_bg():
     item = ToolItem(id="t2", name="run_shell", input={"command": "ls"}, status="error",
                     result_excerpt="Error: command failed")
     out = _render(app, app._render_message_block(item))
+    assert "$ ls" in _plain(out)
+    assert "Bash" not in _plain(out)
     assert "48;2;60;40;40" in out                      # toolErrorBg 背景填充
+
+
+def test_write_file_previews_input_and_hides_success_result():
+    app = RichApp(output=_console())
+    content = "\n".join(f"line {i}" for i in range(12))
+    item = ToolItem(
+        id="tw",
+        name="write_file",
+        input={"file_path": "out.txt", "content": content},
+        status="done",
+        result_excerpt="Successfully wrote to out.txt (12 lines)",
+    )
+
+    collapsed = _plain(_render(app, app._render_message_block(item)))
+    assert "write out.txt" in collapsed
+    assert "line 0" in collapsed and "line 9" in collapsed
+    assert "line 10" not in collapsed
+    assert "2 more lines, 12 total, Ctrl+O to expand" in collapsed
+    assert "Successfully wrote" not in collapsed
+
+    app._set_tools_expanded(True)
+    app._console.file.seek(0)
+    app._console.file.truncate(0)
+    expanded = _plain(_render(app, app._render_message_block(item)))
+    assert "line 10" in expanded and "line 11" in expanded
+    assert "Successfully wrote" not in expanded
+
+
+def test_ctrl_o_toggles_tool_output_expansion():
+    app = RichApp(output=_console())
+    item = ToolItem(id="t3", name="run_shell", input={"command": "seq 25"}, status="done",
+                    result_excerpt="\n".join(f"line {i}" for i in range(25)))
+
+    out = _plain(_render(app, app._render_message_block(item)))
+    assert "line 0" not in out
+    assert "line 19" not in out
+    assert "line 20" in out and "line 24" in out
+    assert "20 earlier lines, Ctrl+O to expand" in out
+
+    app._dispatch_main("ctrl-o")
+    app._console.file.seek(0)
+    app._console.file.truncate(0)
+    expanded = _plain(_render(app, app._render_message_block(item)))
+    assert "line 0" in expanded and "line 24" in expanded
+    assert "Ctrl+O to expand" not in expanded
+
+    app._dispatch_main("ctrl-o")
+    assert app._tools_expanded is False
+
+
+def test_bash_collapsed_preview_uses_pi_five_line_tail():
+    app = RichApp(output=_console())
+    result = "\n".join(
+        [
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/a.py",
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/b.py",
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/c.py",
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/d.py",
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/e.py",
+            "./experiments/.venv/lib/python3.14/site-packages/pkg/f.py",
+            "---",
+            "diagrams/",
+            "docs/",
+            "examples/",
+            "experiments/",
+            "glossary/",
+        ]
+    )
+    item = ToolItem(id="tb", name="run_shell", input={"command": "find ."}, status="done", result_excerpt=result)
+
+    collapsed = _plain(_render(app, app._render_message_block(item)))
+    assert "./experiments/.venv" not in collapsed
+    assert "docs/" in collapsed and "glossary/" in collapsed
+    assert "7 earlier lines, Ctrl+O to expand" in collapsed
+
+
+def test_read_file_result_is_hidden_until_tools_expand():
+    app = RichApp(output=_console())
+    item = ToolItem(id="t4", name="read_file", input={"file_path": "x.py"}, status="done",
+                    result_excerpt="line 1\nline 2")
+
+    collapsed = _plain(_render(app, app._render_message_block(item)))
+    assert "read" in collapsed and "x.py" in collapsed
+    assert "line 1" not in collapsed
+
+    app._set_tools_expanded(True)
+    app._console.file.seek(0)
+    app._console.file.truncate(0)
+    expanded = _plain(_render(app, app._render_message_block(item)))
+    assert "line 1" in expanded and "line 2" in expanded
 
 
 def test_user_message_is_filled_box_no_title():
@@ -124,7 +222,8 @@ def test_user_message_is_filled_box_no_title():
 def test_consecutive_tool_blocks_have_no_blank_gap():
     """回归:连续工具块之间不留无背景空行(否则背景「断层」)。"""
     import io
-    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=60)
+    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor",
+                  no_color=False, width=60)
     app = RichApp(output=con)
 
     class _T:
@@ -134,7 +233,7 @@ def test_consecutive_tool_blocks_have_no_blank_gap():
         def subscribe(self, l): return lambda: None
     app.thread = _T()
     app.state.timeline = [
-        ToolItem(id="1", name="list_files", input={"pattern": "*"}, status="done", result_excerpt="a\nb"),
+        ToolItem(id="1", name="list_files", input={"path": "."}, status="done", result_excerpt="a\nb"),
         ToolItem(id="2", name="read_file", input={"file_path": "x.py"}, status="done", result_excerpt="l1\nl2"),
     ]
     app._commit_all_timeline()
@@ -211,7 +310,7 @@ def test_tool_title_is_bold():
     item = ToolItem(id="t", name="read_file", input={"file_path": "x.py"}, status="done",
                     result_excerpt="line1\nline2")
     out = _render(app, app._render_message_block(item))
-    # 标题 "Read" 应带 bold(tool_title bundle 了 bold)
+    # 标题 "read" 应带 bold(tool_title bundle 了 bold)
     assert re.search(r"\x1b\[[0-9;]*1[;m]", out)
 
 
@@ -247,7 +346,8 @@ def test_h3_heading_has_no_literal_hashes():
 
 def test_code_block_lines_do_not_fold():
     """回归:代码块每条逻辑行占一行(不折行破坏结构);CJK 注释不被拆到悬挂续行。"""
-    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=72)
+    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor",
+                  no_color=False, width=72)
     app = RichApp(output=con)
     md = "```python\nif tc.arguments:\n    acc[i] += tc.arguments  # 拼参数\n```"
     con.print(app._render_message_block(AssistantItem(text=md, complete=True)))
@@ -260,7 +360,8 @@ def test_code_block_lines_do_not_fold():
 
 def test_code_block_is_dedicated_themed_box():
     """代码块是专用主题色块:底色填充(code_block_bg) + 语言标签,不渲染字面 ```。"""
-    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=70)
+    con = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor",
+                  no_color=False, width=70)
     app = RichApp(output=con)
     con.print(app._render_message_block(AssistantItem(text="```python\nx = 1\n```", complete=True)))
     out = con.file.getvalue()

@@ -37,6 +37,7 @@ def run_structured(inp: dict) -> dict:
     out = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False, "error": None}
     try:
         timeout_s = inp.get("timeout", 30000) / 1000
+        cwd = inp.get("_cwd")
         result = subprocess.run(
             inp["command"],
             shell=True,
@@ -44,6 +45,7 @@ def run_structured(inp: dict) -> dict:
             text=True,
             timeout=timeout_s,
             input=inp.get("stdin"),
+            cwd=cwd,
         )
         out["exit_code"] = result.returncode
         out["stdout"] = result.stdout or ""
@@ -175,10 +177,12 @@ async def run_background(inp: dict, *, stdout_path: str, stderr_path: str) -> di
             if kind == "sandbox":
                 # info 是后端模块：build_argv 拼受限 argv（杀外层 sandbox-exec/bwrap 会带走
                 # 子进程；bwrap 已 --die-with-parent）。
-                argv = info.build_argv(inp["command"], posture="workspace-write", cwd=os.getcwd())
+                workdir = inp.get("_cwd") or os.getcwd()
+                argv = info.build_argv(inp["command"], posture="workspace-write", cwd=workdir)
                 proc = await asyncio.create_subprocess_exec(*argv, stdout=fo, stderr=fe)
             else:  # kind == "host"
-                proc = await asyncio.create_subprocess_shell(inp["command"], stdout=fo, stderr=fe)
+                proc = await asyncio.create_subprocess_shell(
+                    inp["command"], stdout=fo, stderr=fe, cwd=inp.get("_cwd"))
             try:
                 if timeout_s is not None:
                     await asyncio.wait_for(proc.wait(), timeout=timeout_s)

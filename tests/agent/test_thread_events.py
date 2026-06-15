@@ -56,7 +56,7 @@ def _tool_turn_agent(sid):
 
 def test_turn_pushes_typed_envelopes_and_events_snapshot_matches():
     a = _tool_turn_agent("push1")
-    thread = AgentRuntime().adopt(a)
+    thread = AgentRuntime()._attach_agent(a)
     received = []
     unsubscribe = thread.subscribe(received.append)
     asyncio.run(thread.run("hello"))
@@ -80,7 +80,7 @@ def test_turn_pushes_typed_envelopes_and_events_snapshot_matches():
 
 def test_unsubscribe_stops_delivery_and_is_idempotent():
     a = _agent("push2")
-    thread = AgentRuntime().adopt(a)
+    thread = AgentRuntime()._attach_agent(a)
     got = []
     unsub = thread.subscribe(got.append)
     thread.push_boundary("session_switch", from_session="x", to_session="y")
@@ -94,7 +94,7 @@ def test_unsubscribe_stops_delivery_and_is_idempotent():
 
 def test_listener_exception_is_fire_and_forget():
     a = _agent("push3")
-    thread = AgentRuntime().adopt(a)
+    thread = AgentRuntime()._attach_agent(a)
     good = []
 
     def bad(_env):
@@ -108,7 +108,7 @@ def test_listener_exception_is_fire_and_forget():
 
 def test_ring_buffer_caps_snapshot():
     a = _agent("push4")
-    thread = AgentRuntime().adopt(a)
+    thread = AgentRuntime()._attach_agent(a)
     for i in range(thread.EVENT_LOG_MAX + 50):
         thread.push_boundary("session_switch", from_session=str(i), to_session=str(i + 1))
     evs = thread.events()
@@ -119,7 +119,7 @@ def test_ring_buffer_caps_snapshot():
 def test_dispose_detaches_tap_from_agent():
     a = _agent("push5")
     rt = AgentRuntime()
-    thread = rt.adopt(a)
+    thread = rt._attach_agent(a)
     assert thread._agent_tap in a._event_subscribers
     thread.dispose()
     assert thread._agent_tap not in a._event_subscribers     # disposed thread 不再累积事件
@@ -139,7 +139,7 @@ def test_rebind_emits_session_switch_boundary():
     a = _agent("swold")
     a._session_mgr = SessionManager.create("swold")
     rt = AgentRuntime()
-    old_thread = rt.adopt(a)
+    old_thread = rt._attach_agent(a)
     old_seen = []
     old_thread.subscribe(old_seen.append)
 

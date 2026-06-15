@@ -196,6 +196,7 @@ def _merge_params(inp: dict) -> dict:
         "trace": _bool(pick("trace", False), False),
         "trace_tag": None,  # 下面按 trace+persist 计算
         "_session_id": inp.get("_session_id"),  # 透传：显式 session_id 优先于 env
+        "_cwd": inp.get("_cwd"),
     }
     if result["trace"]:
         sid = _session_id_of(result)
@@ -217,7 +218,7 @@ def _common_resource_flags(p: dict) -> list[str]:
     if p["network"] == "none":
         args += ["--no-net"]
     if p["mount_workspace"]:
-        workspace = str(Path.cwd().resolve())
+        workspace = str(Path(p.get("_cwd") or Path.cwd()).resolve())
         args += ["--volume", f"{workspace}:{WORKSPACE_MOUNT}:rw"]
     if p["deps"] == "reuse":
         args += ["--volume", f"{DEPS_VOLUME}:{DEPS_MOUNT}:ro", "-e", f"PYTHONPATH={DEPS_MOUNT}"]

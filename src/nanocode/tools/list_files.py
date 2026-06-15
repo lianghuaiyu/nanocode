@@ -1,59 +1,98 @@
-"""list_files 工具：按 glob 模式查找文件路径（只返回文件，不含目录）。"""
+"""list_files 工具：对齐 Pi 的 `ls`，只列出目录的一层内容。"""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-# 单次返回的最大条目数；超出则截断并提示（可在测试中 monkeypatch）。
-MAX_RESULTS = 200
+# 单次返回的默认最大条目数；对齐 Pi 的 ls 默认 limit。
+DEFAULT_LIMIT = 500
 
 SCHEMA = {
     "name": "list_files",
     "description": (
-        "Find files by glob pattern. Returns FILE paths only (directories are not "
-        "listed) sorted by modification time, most recent first. Use recursive "
-        "patterns to explore a tree, e.g. '**/*.py' or 'src/**/*'. For broad, "
-        "open-ended exploration, prefer the agent tool."
+        "List directory contents. Returns entries sorted alphabetically, with '/' "
+        f"suffix for directories. Includes dotfiles. Defaults to {DEFAULT_LIMIT} entries."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": 'Glob pattern to match files (e.g., "**/*.py", "src/**/*")'},
-            "path": {"type": "string", "description": "Base directory to search from. Defaults to current directory."},
+            "path": {"type": "string", "description": "Directory to list. Defaults to current directory."},
+            "limit": {"type": "number", "description": f"Maximum number of entries to return. Defaults to {DEFAULT_LIMIT}."},
         },
-        "required": ["pattern"],
+        "required": [],
     },
 }
 
 
+def _legacy_pattern_prefix(pattern: str) -> str:
+    """Best-effort compatibility for older glob-shaped calls."""
+    normalized = pattern.replace("\\", "/").strip()
+    if not normalized:
+        return "."
+    absolute = normalized.startswith("/")
+    literal_parts: list[str] = []
+    for part in normalized.split("/"):
+        if part in ("", "."):
+            continue
+        if any(ch in part for ch in "*?["):
+            break
+        literal_parts.append(part)
+    if not literal_parts:
+        return os.sep if absolute else "."
+    prefix = os.path.join(*literal_parts)
+    return os.path.join(os.sep, prefix) if absolute else prefix
+
+
+def _requested_dir(inp: dict) -> Path:
+    base = Path(inp.get("path") or ".")
+    pattern = inp.get("pattern")
+    if not pattern:
+        return base
+    prefix = Path(_legacy_pattern_prefix(str(pattern)))
+    if prefix == Path("."):
+        return base
+    if prefix.is_absolute():
+        return prefix
+    return base / prefix
+
+
 def run(inp: dict) -> str:
     try:
-        base = Path(inp.get("path") or ".")
-        pattern = inp["pattern"]
-        matches: list[tuple[float, str]] = []
-        for p in base.glob(pattern):
-            if not p.is_file():
-                continue
-            rel = str(p.relative_to(base) if base != Path(".") else p)
-            # 跳过 node_modules 和 .git
-            if "node_modules" in rel or ".git" in rel.split(os.sep):
-                continue
+        dir_path = _requested_dir(inp)
+        raw_limit = inp.get("limit")
+        limit = int(DEFAULT_LIMIT if raw_limit is None else raw_limit)
+
+        if not dir_path.exists():
+            return f"Error: Path not found: {dir_path}"
+        if not dir_path.is_dir():
+            return f"Error: Not a directory: {dir_path}"
+
+        try:
+            entries = sorted(os.listdir(dir_path), key=lambda name: name.lower())
+        except OSError as e:
+            return f"Error: Cannot read directory: {e}"
+
+        results: list[str] = []
+        entry_limit_reached = False
+        for entry in entries:
+            if len(results) >= limit:
+                entry_limit_reached = True
+                break
+            full_path = dir_path / entry
+            suffix = ""
             try:
-                mtime = p.stat().st_mtime
+                if full_path.is_dir():
+                    suffix = "/"
             except OSError:
-                mtime = 0.0
-            matches.append((mtime, rel))
+                continue
+            results.append(entry + suffix)
 
-        if not matches:
-            return "No files found matching the pattern."
-
-        # 按修改时间排序，最新在前
-        matches.sort(key=lambda m: m[0], reverse=True)
-        shown = [rel for _, rel in matches[:MAX_RESULTS]]
-        result = "\n".join(shown)
-        if len(matches) > MAX_RESULTS:
-            result += f"\n... and {len(matches) - MAX_RESULTS} more (narrow your pattern or path)"
+        if not results:
+            return "(empty directory)"
+        result = "\n".join(results)
+        if entry_limit_reached:
+            result += f"\n\n[{limit} entries limit reached. Use limit={limit * 2} for more]"
         return result
     except Exception as e:
-        return f"Error listing files: {e}"
+        return f"Error: {e}"

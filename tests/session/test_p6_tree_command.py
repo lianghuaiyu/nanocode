@@ -11,7 +11,7 @@ from nanocode.session.manager import SessionManager
 
 
 def _ctx(a):
-    return CommandContext(thread=AgentRuntime().adopt(a))
+    return CommandContext(thread=AgentRuntime()._attach_agent(a))
 
 
 def _agent(sid):
@@ -21,6 +21,7 @@ def _agent(sid):
 def test_tree_command_prints_entries_and_leaf(capsys):
     a = _agent("treecmd")
     mgr = SessionManager.create("treecmd")
+    a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
     mgr.append_message(T.assistant_message([T.text_block("yo")], provider="anthropic",
                        api="anthropic", model="claude-x", stop_reason="stop"))
@@ -29,6 +30,23 @@ def test_tree_command_prints_entries_and_leaf(capsys):
     assert "session tree" in out
     assert "user: hi" in out and "assistant: yo" in out
     assert "◀ current" in out
+
+
+def test_tree_command_tool_rows_do_not_get_assistant_prefix():
+    a = _agent("treecmd-tools")
+    mgr = SessionManager.create("treecmd-tools")
+    a._session_mgr = mgr
+    mgr.append_message(T.user_message("run tests"))
+    mgr.append_message(T.assistant_message(
+        [T.tool_call_block("tc1", "run_shell", {"command": "pytest -q"})],
+        provider="anthropic", api="anthropic", model="claude-x", stop_reason="toolUse"))
+    mgr.append_message(T.tool_result_message(
+        tool_call_id="tc1", tool_name="run_shell", content="passed"))
+    res = asyncio.run(_tree(_ctx(a), ""))
+    out = res.output or ""
+    assert "[run_shell: pytest -q]" in out
+    assert "assistant: [run_shell" not in out
+    assert "assistant: (no content)" not in out
 
 
 def test_tree_command_no_tree():
@@ -53,9 +71,9 @@ def test_checkout_moves_leaf_and_reloads_context():
     res = asyncio.run(_checkout(_ctx(a), u1.id[-8:]))   # uuidv7 尾部唯一 handle
     out = res.output or ""
     assert "Checked out" in out
-    assert mgr.get_leaf() == u1.id
-    live = str(a.agent_session.build_request_messages())
-    assert "first" in live and "second" not in live   # 上下文回到 first 之处
+    assert mgr.get_leaf() is None
+    assert res.prefill == "first"
+    assert a.agent_session.build_request_messages() == []   # user 选择回到 parent，并把文本交回编辑器
 
 
 def test_checkout_bad_id_fails_closed():

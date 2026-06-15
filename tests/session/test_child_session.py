@@ -5,6 +5,7 @@ parentSession 血缘，artifacts 仍 parent-keyed）。children() 发现；/pare
 import asyncio
 
 from nanocode.agent import AgentRuntime, AgentSession
+from nanocode.agent.runtime import AgentConfig
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.types import CommandContext, Control
 from nanocode.session import tree as T
@@ -16,7 +17,7 @@ def _agent(sid, **kw):
 
 
 def _ctx(a):
-    return CommandContext(thread=AgentRuntime().adopt(a))
+    return CommandContext(thread=AgentRuntime()._attach_agent(a))
 
 
 def _sub_with_child(parent, agent_id, spawn_leaf):
@@ -83,6 +84,24 @@ def test_empty_subagent_leaves_headeronly_child_session():
     assert SessionManager.exists(child_sid)                          # 租约在 spawn 时建了 header
     child = SessionManager.open(child_sid)
     assert [e for e in child.entries() if e.type == T.MESSAGE] == []  # 但无任何 MESSAGE entry
+
+
+def test_build_subagent_child_session_uses_runtime_cwd(tmp_path):
+    cwd = tmp_path / "child-cwd"
+    cwd.mkdir()
+    rt = AgentRuntime()
+    th = rt.thread_start(AgentConfig(api_key="test", session_id="PCWD",
+                                     permission_mode="bypassPermissions",
+                                     cwd=str(cwd)))
+    parent = th.agent
+    try:
+        sub = parent._build_sub_agent(system_prompt="s", tools=[],
+                                      agent_type="coder", artifact_id="agent-cwd")
+        parent._close_child_session("agent-cwd", sub)
+        child = SessionManager.open(parent.child_session_id("agent-cwd"))
+        assert child._cwd() == str(cwd.resolve())
+    finally:
+        th.release_lease()
 
 
 def test_agent_id_navigates_to_child():

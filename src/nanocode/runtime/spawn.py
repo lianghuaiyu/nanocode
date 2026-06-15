@@ -136,8 +136,12 @@ class SubAgentRunner:
             sub._child_parent_session = {"sessionId": host.session_id,
                                          "entryId": host._subagent_spawn_leaf.get(artifact_id),
                                          "taskId": artifact_id, "agentId": artifact_id}
-            sub._session_mgr = SessionLease.open_or_create(
-                sub._tree_session_id, parent_session=sub._child_parent_session).manager
+            services = getattr(host, "_runtime_services", None)
+            cwd = services.cwd if services is not None else (
+                host._session_mgr._cwd() if host._session_mgr is not None else None)
+            sub._session_lease = SessionLease.open_or_create(
+                sub._tree_session_id, parent_session=sub._child_parent_session, cwd=cwd)
+            sub._session_mgr = sub._session_lease.manager
         return sub
 
     # ─── token 折叠 ───────────────────────────────────────────────────────────
@@ -154,8 +158,13 @@ class SubAgentRunner:
         """子 agent 运行结束：close child 写者租约。历史唯一权威是 child canonical 树
         （resume 经 child tree 重载），不再落 messages.json 副本（docs/16 C-1）。"""
         try:
-            if sub_agent._session_mgr is not None:
+            lease = getattr(sub_agent, "_session_lease", None)
+            if lease is not None:
+                lease.close()
+                sub_agent._session_lease = None
+            elif sub_agent._session_mgr is not None:
                 sub_agent._session_mgr.close()
+            sub_agent._session_mgr = None
         except Exception:
             pass
 
@@ -1020,4 +1029,3 @@ class SubAgentRunner:
                 task_id, status="failed", error=str(e),
                 result_summary=f"(optimize error: {e})")
             return
-

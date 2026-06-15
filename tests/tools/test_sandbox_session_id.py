@@ -15,7 +15,7 @@ def test_session_id_of_prefers_explicit(monkeypatch):
     assert ss._session_id_of({"_session_id": "EXPLICIT"}) == "EXPLICIT"
 
 
-def test_session_id_of_no_env_fallback(monkeypatch):
+def test_session_id_of_ignores_env(monkeypatch):
     # docs/16 C-2 随 #3：env 回退已删——缺显式注入即 "default"，绝不读进程环境。
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
     assert ss._session_id_of({}) == "default"
@@ -32,7 +32,7 @@ def test_sandbox_name_for_uses_explicit(monkeypatch):
     assert ss._sandbox_name_for({"_session_id": "EXPLICIT"}) == "nanocode-sbx-EXPLICIT"
 
 
-def test_sandbox_name_for_no_env_fallback(monkeypatch):
+def test_sandbox_name_for_ignores_env(monkeypatch):
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
     assert ss._sandbox_name_for({}) == "nanocode-sbx-default"
 
@@ -47,7 +47,7 @@ def test_trace_host_dir_for_uses_explicit(monkeypatch, tmp_path):
     assert d.endswith("sandbox/tag1")
 
 
-def test_trace_host_dir_for_no_env_fallback(monkeypatch, tmp_path):
+def test_trace_host_dir_for_ignores_env(monkeypatch, tmp_path):
     monkeypatch.setenv("NANOCODE_TRACE_DIR", str(tmp_path))
     monkeypatch.setenv("NANOCODE_SESSION_ID", "ENV")
     d = ss._trace_host_dir_for({}, "tag1")
@@ -71,5 +71,4 @@ def test_build_msb_command_persist_uses_explicit_session_id(monkeypatch):
     cmd = ss.build_msb_command({"command": "x", "persist": True, "deps": "none",
                                 "_session_id": "EXPLICIT"})
     assert "nanocode-sbx-EXPLICIT" in cmd
-
 

@@ -1,4 +1,4 @@
-"""docs/14 SessionLease：CLI `--resume` 解析 = `get_latest_session_id()`（canonical header），
+"""docs/14 SessionLease：CLI `-c/--continue` 解析 = `get_latest_session_id()`（canonical header），
 激活 = `SessionLease.open_or_create`（请求随后按轮从树重渲染，docs/16 #3c）。docs/16 C-3：
 legacy flat/v2 发现面已删——canonical 树是唯一 resume 权威，latest 必有树。
 """
@@ -20,7 +20,7 @@ def test_latest_resolves_canonical_session_for_resume():
 
 
 def test_resume_activation_loads_latest_canonical_into_agent():
-    # --resume 全链路：get_latest → lease open(lock) → 请求按轮从树重渲染。
+    # -c/--continue 全链路：get_latest → lease open(lock) → 请求按轮从树重渲染。
     m = SessionManager.create("radopt")
     m.append_message(T.user_message("resumed-content"))
     m.close()

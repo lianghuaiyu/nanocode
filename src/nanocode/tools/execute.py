@@ -63,7 +63,7 @@ def _route_run_shell(inp: dict) -> str:
         return f"[sandbox] {info}"
     if kind == "sandbox":
         # info 是后端模块：取结构化结果区分机制失败（error）/命令失败（exit≠0/超时）/成功。
-        r = info.run_structured(inp, posture="workspace-write", cwd=os.getcwd())
+        r = info.run_structured(inp, posture="workspace-write", cwd=inp.get("_cwd") or os.getcwd())
         if r["error"] is not None:
             # 机制失败（沙盒机器本身坏了）：不静默回退宿主，复用 escalate 让模型显式重试。
             return (
@@ -86,6 +86,8 @@ def _route_run_shell(inp: dict) -> str:
         sinp["timeout_ms"] = int(inp["timeout"])
     if inp.get("_session_id"):
         sinp["_session_id"] = inp["_session_id"]
+    if inp.get("_cwd"):
+        sinp["_cwd"] = inp["_cwd"]
     result = sandbox_shell.run(sinp)
     if result.startswith(("Command failed", "Command timed out")):
         return f"{_SANDBOX_FAIL_HINT}\n\n{result}"

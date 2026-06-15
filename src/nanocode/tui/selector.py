@@ -76,6 +76,10 @@ class SelectorModel:
         """Render one full-width row (the app adds cursor margin + selected-row bg)."""
         return ""
 
+    def initial_index(self) -> int:
+        """Default selected row when a selector first opens."""
+        return 0
+
     # ── header / chrome (model formats these Pi-faithfully; app frames in borders) ──
     def header_lines(self, width: int) -> list[str]:
         """Title + right-justified indicators + hint line(s); model owns confirm/status takeover."""

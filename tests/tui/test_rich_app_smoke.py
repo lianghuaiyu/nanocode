@@ -82,6 +82,13 @@ def _console(*, height: int | None = None, width: int = 100):
     return Console(file=io.StringIO(), force_terminal=True, width=width, height=height)
 
 
+def _render(app: RichApp, con: Console) -> str:
+    con.file.seek(0)
+    con.file.truncate(0)
+    con.print(app)
+    return con.file.getvalue()
+
+
 def test_submit_runs_turn_and_reduces():
     async def scenario():
         r, w = os.pipe()
@@ -104,7 +111,7 @@ def test_submit_runs_turn_and_reduces():
     app, thread = asyncio.run(scenario())
     assert thread.run_calls == ["hello"]
     from nanocode.tui.state import AssistantItem
-    assert not any(isinstance(i, AssistantItem) and i.text == "hi" for i in app.state.timeline)
+    assert any(isinstance(i, AssistantItem) and i.text == "hi" for i in app.state.timeline)
     assert app.state.status.input_tokens == 10
 
 
@@ -198,7 +205,7 @@ def test_chinese_input_then_submit():
     assert thread.run_calls == ["你好"]
 
 
-def test_completed_message_commits_to_scrollback_without_delta():
+def test_completed_message_renders_without_delta():
     async def scenario():
         r, w = os.pipe()
         con = _console()
@@ -222,7 +229,7 @@ def test_completed_message_commits_to_scrollback_without_delta():
     assert "final-only answer" in con.file.getvalue()
 
 
-def test_completed_message_is_committed_full_to_scrollback():
+def test_completed_message_remains_live_after_turn_finishes():
     async def scenario():
         r, w = os.pipe()
         con = _console()
@@ -246,13 +253,15 @@ def test_completed_message_is_committed_full_to_scrollback():
     app, con = asyncio.run(scenario())
     from nanocode.tui.state import AssistantItem
 
-    out = con.file.getvalue()
-    assert "section 0: detailed content" in out
+    out = _render(app, con)
     assert "section 11: detailed content" in out
-    assert not any(isinstance(i, AssistantItem) for i in app.state.timeline)
+    assert "section 0: detailed content" not in out
+    stored = [i for i in app.state.timeline if isinstance(i, AssistantItem)][-1]
+    assert "section 0: detailed content" in stored.text
+    assert "section 11: detailed content" in stored.text
 
 
-def test_completed_message_clears_tool_items_from_live_timeline():
+def test_completed_message_stays_live_across_next_user_message():
     from nanocode.tui.state import ToolItem
 
     con = _console()
@@ -265,8 +274,14 @@ def test_completed_message_clears_tool_items_from_live_timeline():
         stop_reason="end", usage=None, latency_ms=1,
     )))
 
-    assert "final answer" in con.file.getvalue()
-    assert not any(isinstance(i, ToolItem) for i in app.state.timeline)
+    assert "final answer" not in con.file.getvalue()
+    assert any(isinstance(i, ToolItem) for i in app.state.timeline)
+
+    app.on_event(_env(E.UserMessageAccepted(text="next prompt")))
+
+    assert "final answer" not in con.file.getvalue()
+    assert "next prompt" not in con.file.getvalue()
+    assert any(isinstance(i, ToolItem) for i in app.state.timeline)
 
 
 def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
@@ -286,6 +301,7 @@ def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
         usage=None,
         latency_ms=1,
     )))
+    con.print(app)
 
     out = con.file.getvalue()
     import re as _re
@@ -302,17 +318,60 @@ def test_completed_message_renders_pi_style_markdown_without_full_width_spam():
     assert "─" * 80 not in out
 
 
-def test_streaming_long_assistant_keeps_full_live_output():
-    con = _console(height=12)
+def test_streaming_long_assistant_uses_scrollable_transcript_viewport():
+    con = _console(height=12, width=80)
     app = RichApp(output=con)
     app.bind_thread(FakeThread())
-    app.on_event(_env(E.AssistantDelta(text="\n".join(f"line {i}" for i in range(30)))))
-    con.print(app)
+    app.on_event(_env(E.AssistantDelta(text="\n\n".join(f"section {i}" for i in range(30)))))
 
-    out = con.file.getvalue()
-    assert "earlier response hidden while streaming" not in out
-    assert "line 0" in out
-    assert "line 29" in out
+    out = _render(app, con)
+    assert "repo" in out
+    assert "section 29" in out
+    assert "section 0" not in out
+    assert "earlier transcript lines" in out
+
+    for _ in range(20):
+        app._dispatch_main("pageup")
+    out = _render(app, con)
+    assert "section 0" in out
+    assert "later transcript lines" in out
+
+    for _ in range(20):
+        app._dispatch_main("pagedown")
+    out = _render(app, con)
+    assert "section 29" in out
+    assert "repo" in out
+
+
+def test_completed_long_assistant_uses_scrollable_transcript_viewport():
+    con = _console(height=12, width=80)
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event(_env(E.AssistantMessageCompleted(
+        message={},
+        text="\n\n".join(f"section {i}" for i in range(30)),
+        thinking="",
+        tool_uses=[],
+        stop_reason="end",
+        usage=None,
+        latency_ms=1,
+    )))
+
+    out = _render(app, con)
+    assert "earlier transcript hidden" not in out
+    assert "section 29" in out
+    assert "section 0" not in out
+
+    for _ in range(20):
+        app._dispatch_main("pageup")
+    out = _render(app, con)
+    assert "section 0" in out
+    assert "later transcript lines" in out
+
+    from nanocode.tui.state import AssistantItem
+    stored = [i for i in app.state.timeline if isinstance(i, AssistantItem)][-1]
+    assert "section 0" in stored.text
+    assert "section 29" in stored.text
 
 
 def test_bind_thread_does_not_replay_persisted_transcript():

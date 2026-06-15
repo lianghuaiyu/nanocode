@@ -2,8 +2,8 @@
 
 取代 prompt_toolkit `TuiApp`。一个 `Live(console=tui.console, screen=False)` 持有底部 viewport
 （输入行 + footer + 正在流式变化的 active cell；modal；session 选择器面板），**自动刷新**→
-thinking 动画 + 流式丝滑。完成后的 transcript 由 RichApp 写入 Live 上方的终端 scrollback；
-`TuiState.timeline` 只保存当前 live viewport 中需要继续变化的项目。
+thinking 动画 + 流式丝滑。近期对话保留在 Live viewport 中以便像 Pi 一样重渲染可展开工具块；
+显式 session/branch 导航才把持久 transcript replay 到 Live 上方的终端 scrollback。
 
 嵌入式边界：本模块只 import `.{state,reducer,footer,selector,line_editor,primitives,theme,tooltext}`
 与 rich；**零** import agent/session/tools。消费的是 `on_event(AgentEvent 信封)` + 注入的
@@ -351,12 +351,13 @@ class RichApp:
         self._plan_future: asyncio.Future | None = None
         self._selector_future: asyncio.Future | None = None
         self._ask_future: asyncio.Future | None = None
-        self._cancel_count = 0
+        self._transcript_scroll = 0
         self._parser = KeyParser()
         self._esc_timer = None
         self._editor = LineEditor(history=self._load_history())
         self.input_buffer = _InputProxy(self._editor)
         self._spinner = Spinner("dots", text=Text(" Working…", style="dim"), style="accent")
+        self._tools_expanded = False
         self._turn_started: float | None = None
         self._live = None
         # ── autocomplete(斜杠命令 / @文件 / Tab 路径)状态 ──
@@ -508,11 +509,16 @@ class RichApp:
             self._refresh()
 
     # ── 选择器 / 文本输入（owner 协议）──────────────────────────────
-    async def run_selector(self, model, *, initial_index: int = 0):
+    async def run_selector(self, model, *, initial_index: int | None = None):
         loop = self._loop
         if loop is None:
-            return Outcome("cancel", index=initial_index)
+            return Outcome("cancel", index=initial_index or 0)
         items = model.items()
+        if initial_index is None:
+            try:
+                initial_index = int(model.initial_index())
+            except Exception:
+                initial_index = 0
         idx = 0 if not items else max(0, min(initial_index, len(items) - 1))
         self.state.selector = SelectorState(model=model, index=idx)
         self.state.mode = "selector"
@@ -641,6 +647,17 @@ class RichApp:
             self._resolve(self._ask_future, text)
 
     def _dispatch_main(self, tok) -> None:
+        if tok == "ctrl-o":
+            self._toggle_tool_output_expansion()
+            return
+        if tok in ("scrollup", "pageup"):
+            amount = 3 if tok == "scrollup" else max(1, self._transcript_height_budget() - 1)
+            self._scroll_transcript(amount)
+            return
+        if tok in ("scrolldown", "pagedown"):
+            amount = 3 if tok == "scrolldown" else max(1, self._transcript_height_budget() - 1)
+            self._scroll_transcript(-amount)
+            return
         # ── 补全菜单激活时优先吃导航/接受键 ──
         if self._ac_kind is not None and tok in ("up", "down", "tab", "enter", "escape"):
             if tok == "up":
@@ -666,7 +683,7 @@ class RichApp:
             text = self._editor.text
             self._editor.reset()
             self._set_ac([], None)
-            self._cancel_count = 0
+            self._transcript_scroll = 0
             if text.strip():
                 self._editor.add_history(text)
                 self._save_history(text)
@@ -674,22 +691,29 @@ class RichApp:
         elif action == "cancel":              # Ctrl-C
             self._set_ac([], None)
             if self._is_running():
-                self._cancel_count = 0
                 try:
                     self.thread.abort()
                 except Exception:
                     pass
             elif self._editor.text:
                 self._editor.reset()
-                self._cancel_count = 0
             else:
-                self._cancel_count += 1
-                if self._cancel_count >= 2:
-                    self.request_exit()
+                self.request_exit()
         elif action == "eof":                 # Ctrl-D on empty
             self.request_exit()
         else:                                 # 文本变化后重算补全候选
             self._update_autocomplete()
+
+    def _toggle_tool_output_expansion(self) -> None:
+        self._set_tools_expanded(not self._tools_expanded)
+
+    def _set_tools_expanded(self, expanded: bool) -> None:
+        self._tools_expanded = expanded
+        self._refresh()
+
+    def _scroll_transcript(self, delta: int) -> None:
+        self._transcript_scroll = max(0, self._transcript_scroll + delta)
+        self._refresh()
 
     # ── autocomplete(斜杠命令 / @文件 / Tab 路径)───────────────────────
     @staticmethod
@@ -770,7 +794,7 @@ class RichApp:
     def _submit_current(self) -> None:
         final = self._editor.text
         self._editor.reset()
-        self._cancel_count = 0
+        self._transcript_scroll = 0
         if final.strip():
             self._editor.add_history(final)
             self._save_history(final)
@@ -828,6 +852,14 @@ class RichApp:
             else:
                 s.index = max(0, min(s.index + delta, len(items) - 1))
 
+    def _sel_page(self, delta: int) -> None:
+        s = self.state.selector
+        if s is None or s.model.confirming():
+            return
+        items = s.model.items()
+        if items:
+            s.index = max(0, min(s.index + delta, len(items) - 1))
+
     def _sel_clamp(self) -> None:
         s = self.state.selector
         if s is None:
@@ -841,6 +873,7 @@ class RichApp:
             return
         m = s.model
         query = m.supports_query()
+        key = self._selector_key(tok)
         if m.confirming():
             if tok == "enter":
                 self._apply_keyresult(m.on_key("confirm", self._sel_current(), s.index), "confirm")
@@ -856,13 +889,13 @@ class RichApp:
         elif tok == "scrolldown":
             self._sel_move(3)
         elif tok == "pageup":
-            self._sel_move(-max(1, m.max_visible(self._term_h())))
+            self._sel_page(-max(1, m.max_visible(self._term_h())))
         elif tok == "pagedown":
-            self._sel_move(max(1, m.max_visible(self._term_h())))
+            self._sel_page(max(1, m.max_visible(self._term_h())))
         elif tok == "left":
-            self._sel_move(-max(1, m.max_visible(self._term_h())))
+            self._sel_page(-max(1, m.max_visible(self._term_h())))
         elif tok == "right":
-            self._sel_move(max(1, m.max_visible(self._term_h())))
+            self._sel_page(max(1, m.max_visible(self._term_h())))
         elif tok == "enter":
             if self._sel_current() is not None:
                 self._resolve(self._selector_future, Outcome("done", item=self._sel_current(), index=s.index))
@@ -882,8 +915,8 @@ class RichApp:
             if query and m.query():
                 m.set_query(m.query()[:-1])
                 self._sel_clamp()
-        elif tok in m.extra_keys():
-            self._apply_keyresult(m.on_key(tok, self._sel_current(), s.index), tok)
+        elif key in m.extra_keys():
+            self._apply_keyresult(m.on_key(key, self._sel_current(), s.index), key)
         elif isinstance(tok, str) and len(tok) == 1 and tok.isprintable() and query:
             m.set_query(m.query() + tok)
             self._sel_clamp()
@@ -900,6 +933,8 @@ class RichApp:
         if r.kind == "continue":
             return
         if r.kind == "refresh":
+            if s is not None and isinstance(r.result, int):
+                s.index = r.result
             self._sel_clamp()
         elif r.kind == "done":
             self._resolve(self._selector_future,
@@ -911,6 +946,12 @@ class RichApp:
             self._resolve(self._selector_future,
                           Outcome("edit", item=self._sel_current(), edit_action=r.edit_action or key,
                                   index=s.index if s else 0))
+
+    @staticmethod
+    def _selector_key(tok) -> str:
+        if isinstance(tok, str) and tok.startswith("ctrl-") and len(tok) > len("ctrl-"):
+            return "c-" + tok[len("ctrl-"):]
+        return tok
 
     @staticmethod
     def _copy_clipboard(text: str) -> None:
@@ -973,9 +1014,7 @@ class RichApp:
             parts.append(self._editor.render(self._term_w(), prompt=""))
             return Group(*parts)
         # normal: 流式助手(⏺) + thinking spinner + 开口输入框 + footer（col2 左轨）
-        transcript = self._render_timeline(
-            max_lines=None if self._has_open_assistant_text() else self._transcript_height_budget()
-        )
+        transcript = self._render_timeline(max_lines=self._transcript_height_budget())
         if transcript is not None:
             parts.append(transcript)
         if st.mode == "running" and not self._has_open_assistant_text():
@@ -1059,12 +1098,7 @@ class RichApp:
     def _commit_finalized_event(self, env: dict) -> None:
         kind = env.get("type")
         event = env.get("event")
-        if kind in ("user_message_accepted", "assistant_message_completed",
-                    "turn_completed", "turn_aborted"):
-            # 一个 assistant step / 一轮结束:此刻 live timeline 的内容(按序)均已终态——整体按
-            # 时间序提交进 scrollback,经同一 _render_message_block 渲染(消除 finalize 跳变)。
-            self._commit_all_timeline()
-        elif kind == "notice_raised":
+        if kind == "notice_raised":
             text = self._event_value(event, "text", "") or ""
             if text.startswith("Session → "):
                 self._above_console().print(Text(text, style="accent"))
@@ -1181,21 +1215,17 @@ class RichApp:
         items = [it for it in self.state.timeline if not isinstance(it, SessionBoundaryItem)]
         if not items:
             return None
-        max_items = max(8, min(40, self._term_h() - 6))
-        visible = items[-max_items:]
         parts = []
-        if len(items) > len(visible):
-            parts.append(Text(f"... {len(items) - len(visible)} earlier items hidden", style="dim"))
-        for item in visible:
+        for item in items:
             rendered = self._render_timeline_item(item)
             if rendered is not None:
                 parts.append(rendered)
         if not parts:
             return None
         group = Group(*parts)
-        return self._clip_renderable_lines(group, max_lines) if max_lines is not None else group
+        return self._viewport_renderable_lines(group, max_lines) if max_lines is not None else group
 
-    def _clip_renderable_lines(self, renderable, max_lines: int):
+    def _viewport_renderable_lines(self, renderable, max_lines: int):
         if max_lines <= 0:
             return None
         try:
@@ -1208,16 +1238,53 @@ class RichApp:
         except Exception:
             return renderable
         if len(lines) <= max_lines:
+            self._transcript_scroll = 0
             return renderable
-        clipped = lines[-max_lines:]
-        out = [Text("... earlier transcript hidden", style="dim")]
-        for line in (clipped[1:] if max_lines > 1 else []):
-            text = Text()
-            for segment in line:
-                if not segment.control:
-                    text.append(segment.text, style=segment.style)
-            out.append(text)
+
+        if max_lines <= 2:
+            max_scroll = max(0, len(lines) - max_lines)
+            scroll = max(0, min(self._transcript_scroll, max_scroll))
+            self._transcript_scroll = scroll
+            end = len(lines) - scroll
+            start = max(0, end - max_lines)
+            return Group(*(self._segments_to_text(line) for line in lines[start:end]))
+
+        # _transcript_scroll means "visual lines below the viewport". 0 follows the bottom.
+        top_body_capacity = max(1, max_lines - 1)
+        max_scroll = max(0, len(lines) - top_body_capacity)
+        scroll = max(0, min(self._transcript_scroll, max_scroll))
+        self._transcript_scroll = scroll
+        end = len(lines) - scroll
+        show_top = False
+        show_bottom = end < len(lines)
+        start = 0
+        for _ in range(3):
+            body_limit = max_lines - int(show_top) - int(show_bottom)
+            body_limit = max(1, body_limit)
+            start = max(0, end - body_limit)
+            new_show_top = start > 0
+            new_show_bottom = end < len(lines)
+            if new_show_top == show_top and new_show_bottom == show_bottom:
+                break
+            show_top, show_bottom = new_show_top, new_show_bottom
+
+        out = []
+        if show_top:
+            out.append(Text(f"... {start} earlier transcript lines (PageUp/scroll to view)", style="dim"))
+        out.extend(self._segments_to_text(line) for line in lines[start:end])
+        if show_bottom:
+            out.append(Text(f"... {len(lines) - end} later transcript lines (PageDown/scroll to bottom)", style="dim"))
         return Group(*out)
+
+    @staticmethod
+    def _segments_to_text(line) -> Text:
+        text = Text()
+        for segment in line:
+            if not segment.control:
+                value = segment.text.replace("\n", "")
+                if value:
+                    text.append(value, style=segment.style)
+        return text
 
     def _render_timeline_item(self, item):
         return self._render_message_block(item)
@@ -1257,19 +1324,34 @@ class RichApp:
         fill = {"running": "tool_pending", "error": "tool_error",
                 "denied": None, "done": "tool_success"}.get(status, "tool_success")
         head = Text()
-        head.append(title, style="tool_title")
-        if summary:
-            head.append(f" {summary}", style="tool_output")
+        if item.name == "run_shell":
+            head.append(f"$ {summary or '...'}", style="tool_title")
+        else:
+            head.append(title, style="tool_title")
+            if summary:
+                head.append(f" {summary}", style="tool_output")
         lines: list = [head]
+        preview, extra_preview, total_preview = _tt.input_preview_lines(
+            item.name, item.input, expanded=self._tools_expanded
+        )
+        for line in preview:
+            lines.append(Text(line, style="tool_output"))
+        if extra_preview > 0:
+            lines.append(
+                Text(
+                    f"... ({extra_preview} more lines, {total_preview} total, Ctrl+O to expand)",
+                    style="tool_output",
+                )
+            )
         result = item.result_excerpt or ""
         diff = _tt.parse_diff(item.name, result)
         if diff is not None:
-            adds, dels, raw = diff
-            lines.append(Text(f"+{adds} -{dels}", style="tool_output"))
+            _adds, _dels, raw = diff
             shown = 0
             nonempty = [l for l in raw if l.strip()]
+            max_lines = len(nonempty) if self._tools_expanded else 12
             for line in nonempty:
-                if shown >= 12:
+                if shown >= max_lines:
                     break
                 if line.startswith("+ "):
                     lines.append(Text(line, style="diff_added"))
@@ -1280,20 +1362,27 @@ class RichApp:
                 else:
                     lines.append(Text(line, style="diff_context"))
                 shown += 1
-            if len(nonempty) > shown:
-                lines.append(Text(f"… (+{len(nonempty) - shown} lines)", style="tool_output"))
+            if not self._tools_expanded and len(nonempty) > shown:
+                lines.append(Text(f"… (+{len(nonempty) - shown} lines, Ctrl+O to expand)", style="tool_output"))
         elif status == "denied":
             if item.result_summary:
                 lines.append(Text(item.result_summary, style="warning"))
-        elif status != "running" and result:
-            if _tt.wants_output_preview(item.name):
-                out, extra = _tt.output_lines(result, 12)
+        elif status != "running" and result and not _tt.suppress_success_result(item.name, result):
+            if self._tools_expanded:
+                out, _ = _tt.output_lines(result, None)
+                for l in out:
+                    lines.append(Text(l, style="tool_output"))
+            else:
+                limit = _tt.preview_limit(item.name, is_error=(status == "error"))
+                tail = _tt.preview_from_tail(item.name)
+                out, extra = _tt.output_lines(result, limit, tail=tail) if limit is not None else ([], 0)
                 for l in out:
                     lines.append(Text(l, style="tool_output"))
                 if extra > 0:
-                    lines.append(Text(f"… (+{extra} lines)", style="tool_output"))
-            else:
-                lines.append(Text(_tt.result_summary(item.name, result), style="tool_output"))
+                    hidden = "earlier" if tail else "more"
+                    lines.append(Text(f"… ({extra} {hidden} lines, Ctrl+O to expand)", style="tool_output"))
+                elif not out and item.name not in ("read_file",):
+                    lines.append(Text(_tt.result_summary(item.name, result), style="tool_output"))
         body = Group(*lines)
         if fill is None:                       # denied:warning 文,无背景填充
             return Padding(body, (0, 1))
@@ -1318,6 +1407,12 @@ class RichApp:
                     return isinstance(it, AssistantItem)
                 return False
         return False
+
+    def _has_uncommitted_response_text(self) -> bool:
+        return any(
+            isinstance(it, (AssistantItem, ThinkingItem)) and bool(it.text)
+            for it in self.state.timeline
+        )
 
     def _render_selector(self):
         s = self.state.selector
@@ -1404,6 +1499,19 @@ class RichApp:
                         except Exception:
                             pass
         finally:
+            if self._turn_task is not None and not self._turn_task.done():
+                try:
+                    if self.thread is not None:
+                        self.thread.abort()
+                except Exception:
+                    pass
+                self._turn_task.cancel()
+                try:
+                    await self._turn_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             self._live = None
             if fd is not None:
                 try:

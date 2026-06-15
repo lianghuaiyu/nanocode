@@ -9,7 +9,7 @@ from ..paths import sessions_dir
 
 def get_latest_session_id() -> str | None:
     """最近的 top-level canonical session（session.jsonl header timestamp 排序；child session——有
-    parentSession——不作 --resume-last 目标）。"""
+    parentSession——不作 latest resume 目标）。"""
     candidates: list[tuple[str, str]] = []
     d = sessions_dir()
     if d.exists():

@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from ..agent import AgentRuntime, AgentSession, RuntimeThread, ApprovalManager, AgentConfig
+from ..runtime import AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
 from ..session import get_latest_session_id
 from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
@@ -62,30 +62,6 @@ def _repl_commands_help() -> str:
     lines.append(f'{"  /<skill-name>":<22} Invoke a skill (e.g. /commit "fix types")')
     lines.append(f'{"  !<command>":<22} Run a shell command via runtime audit (not a model tool call)')
     return "\n".join(lines) + "\n"
-
-
-async def _run_user_shell(command: str) -> str:
-    """REPL 的 !<command>：用户直跑 shell，返回格式化输出。
-
-    在线程池里跑同步 run_structured（不阻塞事件循环 / 不冻结后台任务）。
-    不走权限系统——这是用户自己敲的命令，等同于在终端执行。
-    """
-    from ..tools import run_shell
-    r = await asyncio.to_thread(run_shell.run_structured, {"command": command, "timeout": 120000})
-    if r["timed_out"]:
-        return f"$ {command}\n(timed out)"
-    if r["error"] is not None:
-        return f"$ {command}\nerror: {r['error']}"
-    out = (r["stdout"] or "").rstrip()
-    err = (r["stderr"] or "").rstrip()
-    parts = [f"$ {command}"]
-    if out:
-        parts.append(out)
-    if err:
-        parts.append(err)
-    if r["exit_code"] not in (0, None):
-        parts.append(f"(exit {r['exit_code']})")
-    return "\n".join(parts)
 
 
 # Security: NO .env (repo-local OR user-level) may set nanocode's own security-sensitive
@@ -179,9 +155,6 @@ def _load_env_files() -> None:
     # 不信任 / 首见的 repo：其 ./.env 不读（一次性关掉 PATH/LD_*/NANOCODE_*/base_url 等整类）
 
 
-# `handle_eval_command` / `_fmt_eval_row` 已迁入 commands/builtin（CMD-P0）；
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="nanocode",
@@ -196,7 +169,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
-    parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("-c", "--continue", dest="continue_session", action="store_true",
+                        help="Continue the most recent session")
+    parser.add_argument("-r", "--resume-picker", action="store_true",
+                        help="Browse and select from past sessions at startup")
+    parser.add_argument("--session", metavar="ID_OR_PATH", default=None,
+                        help="Use a specific session ID, partial ID, or managed session.jsonl path")
+    parser.add_argument("--fork", dest="fork_session", metavar="ID_OR_PATH", default=None,
+                        help="Fork a session ID, partial ID, or managed session.jsonl path into a new session")
+    parser.add_argument("--name", "-n", dest="session_name", default=None,
+                        help="Set the session display name at startup")
+    parser.add_argument("--no-session", action="store_true",
+                        help="Ephemeral mode; delete this run's generated session on exit")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--map-tokens", type=int, default=None,
@@ -218,7 +202,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-turn token cost and MCP connection logs")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
-    return parser.parse_args()
+    argv = sys.argv[1:]
+    option_argv = argv[:argv.index("--")] if "--" in argv else argv
+    for arg in option_argv:
+        if arg == "--resume" or arg.startswith("--resume=") or arg == "--resume-last":
+            parser.error("--resume has been removed; use -c/--continue or --session <id>")
+    return parser.parse_args(argv)
 
 
 def _resolve_permission_mode(args: argparse.Namespace) -> str:
@@ -231,6 +220,89 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     if args.dont_ask:
         return "dontAsk"
     return "default"
+
+
+def _resolve_session_arg(value: str) -> tuple[str | None, str | None]:
+    """Resolve a startup session target from ID, unique prefix, or managed session path."""
+    import json
+    from ..session.manager import SessionManager, _scan_headers, session_file
+
+    raw = (value or "").strip()
+    if not raw:
+        return None, "empty session target"
+
+    p = Path(raw).expanduser()
+    if p.exists():
+        path = p / "session.jsonl" if p.is_dir() else p
+        try:
+            header = json.loads(path.open(encoding="utf-8").readline() or "{}")
+        except Exception as e:
+            return None, f"could not read session path {path}: {e}"
+        if header.get("type") != "session_start":
+            return None, f"unsupported session file format at {path}"
+        sid = header.get("sessionId") or (header.get("data") or {}).get("sessionId")
+        if not sid:
+            return None, f"session path {path} does not contain a sessionId"
+        try:
+            if path.resolve() != session_file(sid).resolve():
+                return None, f"session path {path} is outside nanocode's managed session store"
+        except Exception:
+            return None, f"session path {path} is outside nanocode's managed session store"
+        return sid, None
+
+    known = {sid for sid, _ps in _scan_headers()}
+    matches = ([sid for sid in known if sid == raw] or [sid for sid in known if sid.startswith(raw)])
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, f"ambiguous session '{raw}' ({len(matches)} matches); use a longer prefix"
+    if SessionManager.exists(raw):
+        return raw, None
+    return None, f"unknown session '{raw}'"
+
+
+async def _select_startup_session(cwd: str) -> str | None:
+    """Run the same session picker used by `/resume` before the main thread starts."""
+    from ..tui.rich_app import RichApp
+    from ..tui.session_pages.resume import run_sessions
+
+    app = RichApp(registry=_REGISTRY, completer=_make_file_completer())
+    selected: dict[str, str | None] = {"sid": None}
+
+    async def _drive_picker() -> None:
+        try:
+            res = await run_sessions(current_sid=None, cwd=cwd, host=app)
+            if res and res.get("action") == "resume":
+                selected["sid"] = res.get("sid")
+        finally:
+            app.request_exit()
+
+    task = asyncio.create_task(_drive_picker())
+    await app.run()
+    await task
+    return selected["sid"]
+
+
+def _cleanup_ephemeral_session(session_id: str) -> None:
+    """Best-effort removal for `--no-session` sessions created by this process."""
+    import shutil
+    from ..session.manager import children, session_root
+
+    stack = [session_id]
+    seen: set[str] = set()
+    while stack:
+        sid = stack.pop()
+        if sid in seen:
+            continue
+        seen.add(sid)
+        try:
+            stack.extend(children(sid))
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(session_root(sid), ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _make_file_completer():
@@ -295,29 +367,19 @@ def _make_file_completer():
     return complete
 
 
-async def run_repl(agent_or_thread, lease=None, *, input=None, output=None) -> None:
+async def run_repl(thread: RuntimeThread, *, input=None, output=None) -> None:
     """Interactive REPL loop.
 
-    docs/14 SessionLease：`lease` 是 main() 在 welcome 前激活的会话写者租约（已注入 agent._session_mgr）。
-    REPL 退出（任何 break / 双 Ctrl-C）时释放当前 thread 的租约；rebind（/new /resume /clone）会把旧租约
-    交接/关闭、新 thread 持新租约，故退出时只需释放 current_thread 的那把。"""
-
-    # docs/14 P1：会话宿主——把"当前 thread"从固定局部闭包解放出来。lifecycle 替换（/new /resume
-    # /clone /fork、子父导航）由 runtime 原子换掉整组 Agent/AgentSession/RuntimeThread，命令 handler
-    # 永远对 host.current_thread 操作、不缓存 agent/session。这里显式构造 session+thread（保留
-    # AgentSession 这个可注入 seam）并注册进 registry——而非 adopt（adopt 在 runtime 内部建 session，
-    # 会绕过测试对 cli.AgentSession 的替身）。lease 随 thread 持有，退出时 release。
-    if isinstance(agent_or_thread, RuntimeThread):
-        _thread = agent_or_thread
-        _runtime = _thread._runtime
-        agent = _thread.agent
-    else:
-        agent = agent_or_thread
-        _runtime = AgentRuntime()
-        _thread = _runtime.register(RuntimeThread(_runtime, agent, AgentSession(agent), lease=lease))
+    REPL 退出（任何 break / 双 Ctrl-C）时释放当前 thread 的租约；rebind（/new /resume /clone）
+    会把旧租约交接/关闭、新 thread 持新租约，故退出时只需释放 current_thread 的那把。"""
+    if not isinstance(thread, RuntimeThread):
+        raise TypeError("run_repl() requires a RuntimeThread")
+    _thread = thread
+    _runtime = _thread._runtime
+    agent = _thread.agent
     # docs/18 Rich Live：交互客户端是挂在 runtime/session 上的订阅端（drop-in 换掉旧 prompt_toolkit
-    # TuiApp）。RichApp 采用 Codex 式 inline viewport：流式内容留在 Live active cell，完成内容
-    # 由 RichApp 写入 Live 上方的终端 scrollback，保证答案完整可回看且输入框稳定在底部。
+    # TuiApp）。RichApp 采用 Codex 式 inline viewport：流式内容和刚完成的一轮先留在 Live active
+    # cell，下一轮开始时再写入 Live 上方的终端 scrollback，避免完成瞬间输入框跳位。
     # RichApp 自管历史（paths.history_file）；命令补全 v2 再接。input/output 是测试 seam（fd / Console）。
     from ..tui.rich_app import RichApp
     _app = RichApp(input=input, output=output, registry=_REGISTRY, completer=_make_file_completer())
@@ -428,6 +490,8 @@ async def run_repl(agent_or_thread, lease=None, *, input=None, output=None) -> N
                     _say(_result.output)
                 if getattr(_result, "refresh_transcript", False):
                     _refresh_transcript()
+                if getattr(_result, "prefill", None) is not None:
+                    _app.input_buffer.text = _result.prefill or ""
                 if _result.exit_repl:
                     _app.request_exit()
             elif isinstance(_result, Control):
@@ -492,7 +556,12 @@ Options:
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: claude-opus-4-6, or NANOCODE_MODEL env)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
-  --resume            Resume the last session
+  -c, --continue      Continue the most recent session
+  -r                  Browse and select from past sessions at startup
+  --session ID|PATH   Use a specific managed session ID, partial ID, or session.jsonl path
+  --fork ID|PATH      Fork a managed session into a new session and start there
+  --name, -n NAME     Set the session display name at startup
+  --no-session        Ephemeral mode; delete this run's generated session on exit
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --map-tokens N      Suggested tokens for repo map; use 0 to disable
@@ -518,7 +587,9 @@ Examples:
   nanocode --plan "how would you refactor this?"
   nanocode --max-cost 0.50 --max-turns 20 "implement feature X"
   OPENAI_API_KEY=sk-xxx nanocode --api-base https://aihubmix.com/v1 --model gpt-4o "hello"
-  nanocode --resume
+  nanocode -c
+  nanocode -r
+  nanocode --session <id>
   nanocode  # starts interactive REPL
 
   nanocode trajectory             # list sessions available as trajectories
@@ -575,14 +646,53 @@ Examples:
     _interactive = not bool(args.prompt) and sys.stdin.isatty()
     workspace_trusted = ensure_workspace_trust(Path.cwd(), interactive=_interactive)
 
-    # Resolve resume BEFORE constructing Agent (so we adopt the session_id).
-    # docs/14 SessionLease：--resume = 恢复最近的 canonical session（latest header）；无则保持新建。
+    startup_modes = [
+        bool(args.continue_session),
+        bool(args.resume_picker),
+        bool(args.session),
+        bool(args.fork_session),
+    ]
+    if sum(1 for x in startup_modes if x) > 1:
+        print_error("Choose only one of -c, -r, --session, or --fork.")
+        sys.exit(2)
+    if args.no_session and any(startup_modes):
+        print_error("--no-session cannot be combined with -c, -r, --session, or --fork.")
+        sys.exit(2)
+
+    runtime = AgentRuntime()
+
+    # Resolve startup session BEFORE constructing Agent (so we adopt the session_id).
     # canonical 树是唯一 resume 权威（docs/16 C-3：legacy flat/v2 发现面已删，latest 必有树）。
     adopt_sid = None
-    if args.resume:
+    if args.continue_session:
         adopt_sid = get_latest_session_id()
         if adopt_sid is None:
             print_info("No previous sessions found.")
+    elif args.session:
+        adopt_sid, err = _resolve_session_arg(args.session)
+        if err:
+            print_error(err)
+            sys.exit(1)
+    elif args.fork_session:
+        source_sid, err = _resolve_session_arg(args.fork_session)
+        if err:
+            print_error(err)
+            sys.exit(1)
+        adopt_sid, err = runtime.startup_fork_session(source_sid)
+        if err:
+            print_error(err)
+            sys.exit(1)
+    elif args.resume_picker:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print_error("-r requires an interactive terminal. Use --session <id> in non-interactive mode.")
+            sys.exit(2)
+        try:
+            adopt_sid = asyncio.run(_select_startup_session(str(Path.cwd().resolve())))
+        except KeyboardInterrupt:
+            sys.exit(130)
+        if adopt_sid is None:
+            print_info("No session selected.")
+            sys.exit(0)
 
     # trajectory 采集（canonical 树的 DERIVED 投影 / RL 分析专用）：
     # 显式 flag 或 NANOCODE_TRAJECTORY 环境变量开启；level 非法/缺省退回 "summary"。
@@ -618,7 +728,6 @@ Examples:
         print_info("note: --trajectory-level has no effect without --trajectory "
                    "(or NANOCODE_TRAJECTORY=1)")
 
-    runtime = AgentRuntime()
     from ..session.tree import SessionBusyError, SessionTreeError
     try:
         thread = runtime.thread_start(cfg)
@@ -632,6 +741,12 @@ Examples:
         sys.exit(1)
     if adopt_sid is not None:
         print_info(f"Session resumed: {adopt_sid} ({len(thread.messages())} messages).")
+    if args.session_name is not None:
+        try:
+            thread.set_session_name(args.session_name)
+        except RuntimeError as e:
+            print_error(str(e))
+            sys.exit(1)
     for diag in getattr(thread.services, "diagnostics", ()):
         print_info(diag)
 
@@ -642,6 +757,8 @@ Examples:
             cleanup_persist_sandbox(thread.session_id)
         except Exception:
             pass
+        if args.no_session:
+            _cleanup_ephemeral_session(thread.session_id)
 
     if args.rpc:
         # Headless RPC mode（docs/17 Phase 5b）：JSON-lines over stdio 驱动同一 session,无 TUI。

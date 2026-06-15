@@ -39,29 +39,43 @@ def test_edit_not_found(tmp_path):
 
 def test_list_files(tmp_path):
     (tmp_path / "f.py").write_text("x")
-    out = list_files.run({"pattern": "*.py", "path": str(tmp_path)})
+    out = list_files.run({"path": str(tmp_path)})
     assert "f.py" in out
 
 
-def test_list_files_sorted_by_mtime_newest_first(tmp_path):
-    import os
-    for i, name in enumerate(["old.py", "mid.py", "new.py"]):
-        p = tmp_path / name
-        p.write_text("x")
-        os.utime(p, (1000 + i * 100, 1000 + i * 100))  # 递增 mtime
-    out = list_files.run({"pattern": "*.py", "path": str(tmp_path)})
+def test_list_files_schema_matches_pi_style_ls():
+    props = list_files.SCHEMA["input_schema"]["properties"]
+    assert set(props) == {"path", "limit"}
+    assert list_files.SCHEMA["input_schema"]["required"] == []
+
+
+def test_list_files_sorted_alphabetically_with_directory_suffix(tmp_path):
+    (tmp_path / "Beta.txt").write_text("x")
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / ".env").write_text("x")
+    out = list_files.run({"path": str(tmp_path)})
     lines = [l for l in out.splitlines() if l.strip()]
-    assert lines == ["new.py", "mid.py", "old.py"]
+    assert lines == [".env", "alpha/", "Beta.txt"]
 
 
-def test_list_files_truncation_reports_overflow(tmp_path, monkeypatch):
-    monkeypatch.setattr(list_files, "MAX_RESULTS", 2)
+def test_list_files_limit_reports_overflow(tmp_path):
     for i in range(5):
         (tmp_path / f"f{i}.py").write_text("x")
-    out = list_files.run({"pattern": "*.py", "path": str(tmp_path)})
+    out = list_files.run({"path": str(tmp_path), "limit": 2})
     lines = [l for l in out.splitlines() if l.strip()]
-    assert len(lines) == 3          # 2 文件 + 1 截断提示
-    assert "3 more" in out          # 5 - 2 = 3
+    assert lines[:2] == ["f0.py", "f1.py"]
+    assert "[2 entries limit reached. Use limit=4 for more]" in out
+
+
+def test_list_files_legacy_recursive_glob_lists_prefix_only(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x")
+    (tmp_path / "src" / "pkg").mkdir()
+    (tmp_path / "src" / "pkg" / "deep.py").write_text("x")
+    out = list_files.run({"pattern": "src/**/*", "path": str(tmp_path)})
+    assert "a.py" in out
+    assert "pkg/" in out
+    assert "deep.py" not in out
 
 
 

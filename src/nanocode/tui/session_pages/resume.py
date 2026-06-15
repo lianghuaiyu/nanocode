@@ -78,8 +78,10 @@ def _justify(left_plain: str, left_ansi: str, right_plain: str, right_ansi: str,
 
 def _resume_prefix(flat: SL.FlatSession) -> str:
     prefix = SL.tree_prefix(flat)
+    if not prefix:
+        return ""
     parts = [prefix[i:i + 3] for i in range(0, len(prefix), 3)]
-    return "".join({
+    return "  " + "".join({
         "│  ": "│   ",
         "   ": "    ",
         "├─ ": "├─  ",
@@ -169,6 +171,14 @@ class ResumeSessionModel(SelectorModel):
 
     def items(self) -> list:
         return self._flats
+
+    def initial_index(self) -> int:
+        if self.current_sid is None:
+            return 0
+        for i, flat in enumerate(self._flats):
+            if flat.info.sid == self.current_sid:
+                return i
+        return 0
 
     def list_text(self, item: SL.FlatSession, selected: bool, width: int) -> Any:
         info = item.info
@@ -262,9 +272,9 @@ class ResumeSessionModel(SelectorModel):
         return KeyResult("refresh")
 
 
-def _write_name(sid: str, current_sid: str | None, current_mgr, text: str) -> str | None:
-    if sid == current_sid and current_mgr is not None:
-        current_mgr.append_session_info(text)
+def _write_name(sid: str, current_sid: str | None, text: str, rename_current=None) -> str | None:
+    if sid == current_sid and rename_current is not None:
+        rename_current(text)
         return None
     from ...session.manager import SessionManager
     from ...session.tree import SessionBusyError
@@ -280,11 +290,12 @@ def _write_name(sid: str, current_sid: str | None, current_mgr, text: str) -> st
     return None
 
 
-async def run_sessions(*, current_sid: str | None, cwd: str, current_mgr, host) -> dict | None:
+async def run_sessions(*, current_sid: str | None, cwd: str, host,
+                       rename_current=None) -> dict | None:
     """Run the resume page; returns ``{"action": "resume", "sid": id}`` or None."""
 
     scope = "current"
-    index = 0
+    index: int | None = None
     query = ""
     sort_mode: SS.SortMode = "threaded"
     name_filter: SS.NameFilter = "all"
@@ -309,7 +320,8 @@ async def run_sessions(*, current_sid: str | None, cwd: str, current_mgr, host) 
             info = outcome.item.info
             text = await host.ask_text(f"rename session {info.sid[-8:]} (blank=clear) [{info.name or ''}]: ")
             if text is not None:
-                err = _write_name(info.sid, current_sid, current_mgr, text.strip())
+                err = _write_name(info.sid, current_sid, text.strip(),
+                                  rename_current=rename_current)
                 status = (f"rename failed: {err}" if err
                           else ("session renamed" if text.strip() else "session name cleared"))
             continue

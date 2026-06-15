@@ -64,7 +64,7 @@ def test_thread_resume_rebuilds_cwd_bound_services(tmp_path):
     a = _agent("CWDA")
     a._session_mgr = SessionManager.create("CWDA", cwd=str(cwd_a))
     rt = AgentRuntime()
-    t = rt.adopt(a)
+    t = rt._attach_agent(a)
     host = RuntimeHost(rt, t, registry=None)
     SessionManager.create("CWDB", cwd=str(cwd_b)).append_message(T.user_message("target"))
 

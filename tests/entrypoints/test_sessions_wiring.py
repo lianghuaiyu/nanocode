@@ -17,7 +17,7 @@ from nanocode.session import search as SS
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 from nanocode.tui.selector import cell_width
-from nanocode.tui.session_pages.resume import ResumeSessionModel
+from nanocode.tui.session_pages.resume import ResumeSessionModel, _write_name
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -104,6 +104,12 @@ def test_resume_model_pi_style_ctrl_keys():
     assert model.on_key("c-r", item, 0).edit_action == "rename"
 
 
+def test_resume_model_initial_index_prefers_current_session():
+    infos = [_info("old", modified=10), _info("cur", modified=20), _info("new", modified=30)]
+    model = ResumeSessionModel(infos, "cur", "/x", "current", 1000, sort_mode="recent")
+    assert model.items()[model.initial_index()].info.sid == "cur"
+
+
 def test_resume_model_rows_use_pi_cursor_and_cell_width_alignment():
     model = ResumeSessionModel([
         _info("alpha", name="中文标题很长很长", modified=1000, n=12),
@@ -134,8 +140,8 @@ def test_resume_model_child_rows_use_spacious_box_prefix():
     child_rendered = _plain(model.list_text(child, False, 48))
     grand_rendered = _plain(model.list_text(grand, False, 48))
 
-    assert "└─  " in child_rendered or "├─  " in child_rendered
-    assert "│   └─  " in grand_rendered or "│   ├─  " in grand_rendered
+    assert child_rendered.startswith("    └─  ") or child_rendered.startswith("    ├─  ")
+    assert grand_rendered.startswith("    │   └─  ") or grand_rendered.startswith("    │   ├─  ")
     assert "-> " not in child_rendered + grand_rendered
     assert cell_width(child_rendered) == 48
     assert cell_width(grand_rendered) == 48
@@ -186,6 +192,15 @@ def test_resume_delete_abort_keeps_session():
     assert "OTH" in [i.info.sid for i in model.items()]
 
 
+def test_resume_current_rename_uses_runtime_callback():
+    calls = []
+
+    err = _write_name("CUR", "CUR", "new name", rename_current=calls.append)
+
+    assert err is None
+    assert calls == ["new name"]
+
+
 def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     # 建 root + fork 子 session,/resume 无参非交互 → 按 parent 嵌套的文本列表(render_sessions_text)
     root = SessionManager.create("ROOTSID")
@@ -198,7 +213,7 @@ def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
 
     a = Agent(api_key="test", session_id="ROOTSID", permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.open("ROOTSID")
-    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
+    ctx = CommandContext(thread=AgentRuntime()._attach_agent(a), interactive=False)
     res = asyncio.run(_resume(ctx, ""))
     out = res.output or ""                       # docs/18 step 5：命令返回结构化 output（不再 print）
     assert isinstance(res, Local)
@@ -215,7 +230,7 @@ def test_resume_current_session_requests_transcript_refresh():
 
     a = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
     a._session_mgr = SessionManager.open(sid)
-    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
+    ctx = CommandContext(thread=AgentRuntime()._attach_agent(a), interactive=False)
 
     res = asyncio.run(_resume(ctx, sid))
 
@@ -228,7 +243,7 @@ def test_session_shows_current_stats():
     mgr = SessionManager.create("CURSTAT")
     a._session_mgr = mgr
     mgr.append_message(T.user_message("hi"))
-    ctx = CommandContext(thread=AgentRuntime().adopt(a), interactive=False)
+    ctx = CommandContext(thread=AgentRuntime()._attach_agent(a), interactive=False)
     res = asyncio.run(_session(ctx, ""))
     out = res.output or ""
     assert isinstance(res, Local)
