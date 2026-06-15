@@ -1,9 +1,5 @@
 """首批内置 slash 命令的 handler + registry 构造（CMD-P0，见 docs/11）。
 
-逐字镜像 cli.run_repl 现有分支行为（1:1 抽取，不做合并/不改行为）：每个 handler 仍调用
-今天的同名函数；人面输出统一返回 `Local.output`，由 REPL client 决定如何渲染。
-`handle_eval_command` / `_fmt_eval_row` 从 cli 迁入此处（cli 顶部 re-export 以兼容直接调用它们的测试）。
-
 领域 helper（list_memories / discover_skills / sandbox_defaults / tasks_tool）用 call-time
 import，使测试可在各自 source 模块打桩拦截；会话状态经 ctx.thread（RuntimeThread 稳定命令面，docs/17 B-list）。
 """
@@ -18,7 +14,7 @@ def _error(text: str) -> Local:
     return Local(output=f"Error: {text}")
 
 
-# ─── /memory eval 渲染（自 cli 迁入；cli re-export 保 back-compat）──────────────
+# ─── /memory eval 渲染 ───────────────────────────────────────
 
 def _fmt_eval_row(c) -> str:
     """One-line summary of an eval candidate for REPL listing."""
@@ -119,7 +115,7 @@ async def _context(ctx: CommandContext, args: str) -> Local:
 
 async def _compact(ctx: CommandContext, args: str) -> Local:
     try:
-        await ctx.thread.compact()
+        await ctx.thread.compact(args.strip() or None)
     except Exception as e:
         return _error(str(e))
     return Local()
@@ -252,15 +248,14 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
 
 
 async def _tree(ctx: CommandContext, args: str) -> Local:
-    """/tree —— 无参:TTY 进交互树选择器(↑↓/enter checkout/l label/f filter/q);
+    """/tree —— 无参:TTY 进交互树选择器(↑↓/←→/Ctrl+O/Shift+L/Shift+T/enter/esc);
     非 TTY 打印文本树。/tree <entry>:把 active leaf 移到该 entry（in-file 导航）。"""
     if args.strip():
         return await _checkout(ctx, args)
-    from ...session.manager import SessionManager
     sid = ctx.thread.session_id
-    if not SessionManager.exists(sid):
+    mgr = ctx.thread.readonly_session()
+    if mgr is None:
         return Local(output="No canonical session tree yet for this session.")
-    mgr = ctx.thread.readonly_session() or SessionManager.open(sid)
     if not ctx.interactive:
         from ...session.tree_view import render_tree_text
         name = mgr.name() or "(unnamed)"
@@ -270,12 +265,10 @@ async def _tree(ctx: CommandContext, args: str) -> Local:
     from ...tui.session_pages.tree import run_tree
     res = await run_tree(mgr, host=ctx.selector_host, set_label=ctx.thread.set_entry_label)
     if res and res.get("action") == "checkout":
-        try:
-            msgs = ctx.thread.move_to(res["entry_id"])
-            return Local(output=f"Checked out …{res['entry_id'][-8:]} — context reloaded ({len(msgs)} messages).",
-                         refresh_transcript=True)
-        except ValueError as e:
-            return Local(output=f"Error: {e}")
+        entry = next((e for e in mgr.entries() if e.id == res["entry_id"]), None)
+        if entry is None:
+            return _error(f"entry '{res['entry_id']}' not found")
+        return await _move_tree_leaf(ctx, entry, resolved_label=f"…{entry.id[-8:]}")
     return Local()
 
 
@@ -284,22 +277,22 @@ async def _checkout(ctx: CommandContext, args: str) -> Local:
     target = args.strip()
     if not target:
         return _error("Usage: /tree <entry_id>  (run /tree to browse entry ids)")
-    from ...session.manager import SessionManager
-    sid = ctx.thread.session_id
-    if SessionManager.exists(sid):  # 解析：exact > suffix(尾部唯一) > prefix
-        ids = [e.id for e in SessionManager.open(sid).entries()]
-        matches = ([i for i in ids if i == target] or [i for i in ids if i.endswith(target)]
-                   or [i for i in ids if i.startswith(target)])
-        if len(matches) == 1:
-            target = matches[0]
-        elif len(matches) > 1:
-            return _error(f"ambiguous id '{target}' ({len(matches)} matches) — use a longer suffix")
-    try:
-        msgs = ctx.thread.move_to(target)
-        return Local(output=f"Checked out {target[:12]} — context reloaded ({len(msgs)} messages).",
-                     refresh_transcript=True)
-    except ValueError as e:
-        return _error(str(e))
+    mgr = ctx.thread.readonly_session()
+    if mgr is None:
+        return _error("No canonical session tree yet for this session.")
+    entry = None
+    entries = mgr.entries()
+    ids = [e.id for e in entries]
+    matches = ([i for i in ids if i == target] or [i for i in ids if i.endswith(target)]
+               or [i for i in ids if i.startswith(target)])
+    if len(matches) == 1:
+        target = matches[0]
+        entry = next((e for e in entries if e.id == target), None)
+    elif len(matches) > 1:
+        return _error(f"ambiguous id '{target}' ({len(matches)} matches) — use a longer suffix")
+    if entry is None:
+        return _error(f"entry '{target}' not found in session tree; session left unchanged")
+    return await _move_tree_leaf(ctx, entry, resolved_label=target[:12])
 
 
 async def _new(ctx: CommandContext, args: str) -> Control:
@@ -365,6 +358,68 @@ def _user_message_text(msg: dict) -> str:
     return ""
 
 
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _tree_checkout_target(entry):
+    """Pi `/tree` selection semantics: user/custom entries are edited from their parent."""
+    from ...session import tree as T
+    if _is_user_message(entry):
+        return entry.parentId, _user_message_text(entry.data.get("message"))
+    if entry.type == T.CUSTOM_MESSAGE:
+        return entry.parentId, _content_text(entry.data.get("content"))
+    return entry.id, None
+
+
+async def _branch_summary_focus(ctx: CommandContext, target_id: str | None) -> str | None | bool:
+    """Return False for no summary, None for default summary, or a custom focus string."""
+    if not ctx.interactive or ctx.selector_host is None:
+        return False
+    if not ctx.thread.branch_summary_available(target_id):
+        return False
+    text = await ctx.selector_host.ask_text(
+        "branch summary? [enter/n=no, d=default, or custom focus]: ")
+    if text is None:
+        return False
+    answer = text.strip()
+    if not answer or answer.lower() in ("n", "no", "none"):
+        return False
+    if answer.lower() in ("d", "default", "y", "yes"):
+        return None
+    return answer
+
+
+async def _move_tree_leaf(ctx: CommandContext, entry, *, resolved_label: str) -> Local:
+    target_id, prefill = _tree_checkout_target(entry)
+    focus = await _branch_summary_focus(ctx, target_id)
+    try:
+        if focus is False:
+            msgs = ctx.thread.move_to(target_id)
+            summary_note = ""
+        else:
+            msgs = await ctx.thread.move_to_with_branch_summary(
+                target_id, focus=(focus if isinstance(focus, str) else None))
+            summary_note = " with branch summary"
+        if prefill is not None:
+            return Local(
+                output=f"Checked out before {resolved_label}{summary_note} — "
+                       f"context reloaded ({len(msgs)} messages); prompt loaded.",
+                refresh_transcript=True,
+                prefill=prefill,
+            )
+        return Local(
+            output=f"Checked out {resolved_label}{summary_note} — context reloaded ({len(msgs)} messages).",
+            refresh_transcript=True,
+        )
+    except ValueError as e:
+        return _error(str(e))
+
+
 async def _fork(ctx: CommandContext, args: str) -> "Control | Local":
     """/fork [entry] —— pi 语义：选择一条历史 user 消息，**新建 session** 复制到该消息**之前**，
     并把该 prompt **放回编辑器**（预填下一次输入，可改可发）。原 session 保留（header 记 parentSession）。
@@ -408,12 +463,11 @@ async def _clone(ctx: CommandContext, args: str) -> "Control | Local":
     """/clone —— pi 语义：**新建 session**，复制当前 active branch 到**当前 leaf** 并切入；
     编辑器为空（docs/14 P4 / §5.5；header 记 parentSession 血缘，原 session 保留）。
     无参数——要在某条 user 消息之前分叉用 /fork，同 session 内移动 leaf 用 /tree <entry>。"""
-    from ...session.manager import SessionManager
     if args.strip():
         return _error("/clone takes no arguments (it copies the current branch to the current leaf). "
                       "Use /fork [entry] to branch before a user message.")
     sid = ctx.thread.session_id
-    if not SessionManager.exists(sid):
+    if ctx.thread.readonly_session() is None:
         return Local(output="No canonical session tree yet for this session.")
     return Control("replace_thread", {"kind": "clone", "sourceSid": sid})
 
@@ -462,7 +516,7 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
         resolved = cand[0] if len(cand) == 1 else (target if SessionManager.exists(target) else None)
         if resolved is None:
             return _error(f"unknown session '{target}'. Run /resume to list, or relaunch with "
-                          f"`nanocode --resume {target}`.")
+                          f"`nanocode --session {target}`.")
         if not fork and resolved == ctx.thread.session_id:
             return Local(refresh_transcript=True)
         return Control("resume", {"sessionId": resolved, "fork": fork})
@@ -473,8 +527,8 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
         mgr = ctx.thread.readonly_session()
         cwd = mgr._cwd() if mgr is not None else os.getcwd()
         from ...tui.session_pages.resume import run_sessions
-        res = await run_sessions(current_sid=sid, cwd=cwd, current_mgr=mgr,
-                                 host=ctx.selector_host)
+        res = await run_sessions(current_sid=sid, cwd=cwd, host=ctx.selector_host,
+                                 rename_current=ctx.thread.set_session_name)
         if res and res.get("action") == "resume" and res["sid"] != sid:
             return Control("resume", {"sessionId": res["sid"]})
         if res and res.get("action") == "resume" and res["sid"] == sid:
@@ -493,9 +547,8 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
 async def _session(ctx: CommandContext, args: str) -> Local:
     """/session —— 显示**当前** session 的信息与统计（Pi /session）。跨 session 浏览/切换用 /resume。"""
     from ...session import tree as _tree
-    from ...session.manager import SessionManager
     sid = ctx.thread.session_id
-    mgr = ctx.thread.readonly_session() or (SessionManager.open(sid) if SessionManager.exists(sid) else None)
+    mgr = ctx.thread.readonly_session()
     if mgr is None:
         return Local(output="No active session.")
     msgs = [e for e in mgr.entries() if e.type == _tree.MESSAGE]
@@ -537,7 +590,7 @@ _BUILTINS = [
     ("/plan", _plan, "exact", "Toggle plan mode (read-only)", ""),
     ("/cost", _cost, "exact", "Show token usage and cost", ""),
     ("/context", _context, "exact", "Show context packs, token budget & compaction survival", ""),
-    ("/compact", _compact, "exact", "Manually compact the conversation", ""),
+    ("/compact", _compact, "exact_or_prefix", "Manually compact the conversation", "[prompt]"),
     ("/memory consolidate", _memory_consolidate, "exact",
      "Run a curator pass to merge/rewrite/archive memories", ""),
     ("/memory eval generate", _memory_eval_generate, "exact",

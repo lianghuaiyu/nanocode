@@ -129,3 +129,59 @@ def test_injected_pack_does_not_mutate_user_message():
     msg_entries = [e for e in a._session_mgr.entries() if e.type == T.MESSAGE]
     first_user = msg_entries[0].data["message"]
     assert first_user["role"] == "user" and first_user["content"] == "hello world"   # §8.5：user 未被污染
+
+
+# ── docs/18 Phase 5：post-compact context restore ──────────────────────────────
+def test_compact_restores_session_context_same_turn(monkeypatch):
+    # compaction 把 cut 之前的 project_instructions 折掉 → restore 立即在 post-compaction leaf 重注入，
+    # 本 turn 余下迭代不丢项目指令（不必等下一 turn 的 inject_session_context）。
+    a = _agent("p5_restore")
+    mgr = SessionLease.open_or_create("p5_restore").manager
+    a._session_mgr = mgr
+    asyncio.run(a.agent_session.inject_session_context())     # 注入 project_instructions（仓库 CLAUDE.md）
+    assert "project_instructions" in a.agent_session._session_context_present_kinds()
+    mgr.append_message(T.user_message("old question " * 50))
+    mgr.append_message(T.assistant_message([T.text_block("a")],
+                       provider="anthropic", api="anthropic", model="claude-x", stop_reason="stop"))
+    mgr.append_message(T.user_message("recent"))
+
+    async def fake(messages=None, instructions=None):
+        return "S"
+
+    monkeypatch.setattr(a, "_compact_anthropic", fake)
+    monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 5)
+    asyncio.run(a.agent_session.compact())
+    # compaction 折掉旧 project_instructions，但 restore 重注入 → fold 中仍可见
+    assert "project_instructions" in a.agent_session._session_context_present_kinds()
+
+
+def test_compact_invokes_restore_hook(monkeypatch):
+    # 压缩成功即调用 _restore_context_after_compaction；无可压缩内容（空 prefix）则不调用。
+    a = _agent("p5_wire")
+    from nanocode.session.manager import SessionManager
+    mgr = SessionManager.create("p5_wire")
+    a._session_mgr = mgr
+    calls = {"n": 0}
+    orig = a.agent_session._restore_context_after_compaction
+
+    async def spy():
+        calls["n"] += 1
+        await orig()
+
+    monkeypatch.setattr(a.agent_session, "_restore_context_after_compaction", spy)
+
+    async def fake(messages=None, instructions=None):
+        return None if not messages else "S"
+
+    monkeypatch.setattr(a, "_compact_anthropic", fake)
+    # 空对话 → prefix 为空 → summary None → 不触发 restore
+    asyncio.run(a.agent_session.compact())
+    assert calls["n"] == 0
+    # 有可压缩内容 → restore 调用一次
+    mgr.append_message(T.user_message("old question " * 50))
+    mgr.append_message(T.assistant_message([T.text_block("a")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+    mgr.append_message(T.user_message("recent"))
+    monkeypatch.setattr(a.agent_session, "keep_recent_tokens", lambda: 5)
+    asyncio.run(a.agent_session.compact())
+    assert calls["n"] == 1

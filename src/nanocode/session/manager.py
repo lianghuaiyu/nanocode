@@ -174,18 +174,46 @@ class SessionManager:
     def append_compaction(self, *, summary: str, tokens_before=None,
                           first_kept_entry_id: str | None = None, parent_id: str | None = None,
                           kind: str | None = None, message_count_before: int | None = None,
-                          message_count_after: int | None = None) -> Entry:
+                          message_count_after: int | None = None,
+                          details: dict | None = None) -> Entry:
         """S4（docs/13）：append 一条 compaction entry（summary + firstKeptEntryId），供
         build_context 两区 fold（context.py：摘要顶替被覆盖史 + 保留 firstKeptEntryId 起的消息）。
 
-        kind / messageCountBefore / messageCountAfter（docs/14 Milestone B）：原只进 wire 的 compaction
-        细节落树，供 trajectory 派生（eval 的 before/after 详情）；缺省 None（旧会话 fallback tokensBefore）。"""
+        kind / messageCountBefore / messageCountAfter（docs/14 Milestone B）：compaction 细节落树，
+        供 trajectory 派生（eval 的 before/after 详情）；缺省 None。
+
+        details（docs/18 Phase 4）：可观测/可调试的压缩元数据（trigger/reason/cutEntryType/isSplitTurn/
+        retryCount/tokens/计数/readFiles/modifiedFiles），与 fold 无关（fold 只读 summary/firstKeptEntryId），
+        对 LLM 不可见。fold 容忍多余 data key，故 additive 安全。缺省 None。"""
         return self.append(tree.COMPACTION, {
             "summary": summary, "tokensBefore": tokens_before,
             "firstKeptEntryId": first_kept_entry_id,
             "kind": kind, "messageCountBefore": message_count_before,
             "messageCountAfter": message_count_after,
+            "details": details,
         }, parent_id=parent_id)
+
+    def append_branch_summary(self, *, summary: str, from_id: str | None = None,
+                              details: dict | None = None, parent_id: str | None = None,
+                              attach_to_root: bool = False) -> Entry:
+        """append 一条 branch_summary entry（docs/18 Phase 7）：summary + fromId(+details)，挂在
+        parent_id（=target）下成为新 leaf——使切换后的新 branch 只看到摘要、不看被离开 branch 的 raw
+        messages（fold 只读 summary/fromId；details 含 readFiles/modifiedFiles/commonAncestorId/
+        sourceLeafId/targetId/messageCount/focus，对 LLM 不可见）。
+
+        attach_to_root=True（target=root/None 时）：parentId 直接置 None **单次原子写入**——绝不能先
+        set_leaf(None) 再 append（review：若 append 抛出，leaf 已移到 root 却无 summary，旧 branch 被
+        孤立丢失）。普通 append(parent_id=None) 语义是"用当前 leaf"，无法表达"挂在 root"，故此处特办。
+        两种路径都经 _require_writer 写者租约闸。"""
+        data: dict = {"summary": summary, "fromId": from_id}
+        if details is not None:
+            data["details"] = details
+        if attach_to_root:
+            self._require_writer()
+            entry = Entry(type=tree.BRANCH_SUMMARY, id=tree.new_id("ent"), parentId=None,
+                          sessionId=self.session_id, timestamp=tree.now_iso(), data=data)
+            return self._persist_new(entry)
+        return self.append(tree.BRANCH_SUMMARY, data, parent_id=parent_id)
 
     def append_session_info(self, name: str) -> Entry:
         """Pi /name：写 session_info entry 设显示名（LWW，末个胜出、空则清空，见 tree.session_name）。

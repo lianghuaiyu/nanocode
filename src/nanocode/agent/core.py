@@ -296,6 +296,20 @@ class AgentCore:
     _SUMMARIZE_PROMPT = ("Summarize the conversation so far in a concise paragraph, "
                          "preserving key decisions, file paths, and context needed to continue the work.")
 
+    @classmethod
+    def _compact_prompt(cls, instructions: str | None = None, *, partial: bool = False) -> str:
+        """docs/18 Phase 3：结构化 no-tools + <analysis>/<summary> prompt（summary_prompts）。
+        instructions（来自 /compact [prompt]）进入 Additional Instructions section。partial=True（来自
+        prompt-too-long retry 丢弃最旧 round 后）走 partial_compact_prompt——告知模型这是被截断的部分视图。
+        原始一句话 _SUMMARIZE_PROMPT 仅作 import 失败时的保守兜底。"""
+        try:
+            from .summary_prompts import compact_prompt, partial_compact_prompt
+        except Exception:
+            instructions = (instructions or "").strip()
+            return cls._SUMMARIZE_PROMPT if not instructions else (
+                cls._SUMMARIZE_PROMPT + "\n\nCustom summary instructions: " + instructions)
+        return (partial_compact_prompt if partial else compact_prompt)(instructions)
+
     @staticmethod
     def _with_summary_request(messages: list, prompt_text: str) -> list:
         """把 summarize 指令接到 prefix 末尾。prefix 末条若是 user（render 保证列表内交替，
@@ -313,27 +327,60 @@ class AgentCore:
             msgs.append({"role": "user", "content": prompt_text})
         return msgs
 
-    async def _compact_anthropic(self, host, messages: "list | None") -> "str | None":
+    async def _compact_anthropic(self, host, messages: "list | None",
+                                 instructions: str | None = None) -> "str | None":
         if messages is None or len(messages) < 3:
             return None
+        prompt = self._compact_prompt(instructions, partial=getattr(host, "_summarizer_partial", False))
         summary_resp = await host._anthropic_client.messages.create(
             model=host.model,
-            max_tokens=2048,
-            system="You are a conversation summarizer. Be concise but preserve important details.",
-            messages=self._with_summary_request(messages, self._SUMMARIZE_PROMPT),
+            max_tokens=8192,
+            system="You are a coding-session summarizer. Follow the user's summary format exactly; be thorough but do not pad.",
+            messages=self._with_summary_request(messages, prompt),
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
         host.last_input_token_count = 0
         return summary_text
 
-    async def _compact_openai(self, host, messages: "list | None") -> "str | None":
+    async def _compact_openai(self, host, messages: "list | None",
+                              instructions: str | None = None) -> "str | None":
         if messages is None or len(messages) < 4:     # 含 render 注入的 system[0]
+            return None
+        prompt = self._compact_prompt(instructions, partial=getattr(host, "_summarizer_partial", False))
+        summary_resp = await host._openai_client.chat.completions.create(
+            model=host.model,
+            messages=[
+                {"role": "system", "content": "You are a coding-session summarizer. Follow the user's summary format exactly; be thorough but do not pad."},
+                *self._with_summary_request(messages[1:], prompt),
+            ],
+        )
+        summary_text = summary_resp.choices[0].message.content or "No summary available."
+        host.last_input_token_count = 0
+        return summary_text
+
+    async def _summarize_anthropic(self, host, messages: "list | None",
+                                   prompt_text: str) -> "str | None":
+        if not messages:
+            return None
+        summary_resp = await host._anthropic_client.messages.create(
+            model=host.model,
+            max_tokens=2048,
+            system="You summarize abandoned conversation branches for continuity.",
+            messages=self._with_summary_request(messages, prompt_text),
+        )
+        summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
+        host.last_input_token_count = 0
+        return summary_text
+
+    async def _summarize_openai(self, host, messages: "list | None",
+                                prompt_text: str) -> "str | None":
+        if not messages:
             return None
         summary_resp = await host._openai_client.chat.completions.create(
             model=host.model,
             messages=[
-                {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *self._with_summary_request(messages[1:], self._SUMMARIZE_PROMPT),
+                {"role": "system", "content": "You summarize abandoned conversation branches for continuity."},
+                *self._with_summary_request(messages, prompt_text),
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "No summary available."

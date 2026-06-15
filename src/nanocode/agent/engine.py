@@ -155,6 +155,17 @@ class Agent(PlanModeMixin):
         self._aborted = False
         self._current_task: asyncio.Task | None = None
 
+        # docs/18 Phase 1：auto-compaction 熔断状态（CompactionPolicy 阈值在 AgentSession）。
+        # _compacting：reentrancy 守卫（compaction 进行中 → check_and_compact 不重入）；
+        # _consecutive_compaction_failures：连续 auto-compaction 失败计数，达 policy.max 后跳过
+        # 本 session 后续 auto compact（手动 /compact 不受限）。会话维度状态 → rebind 时复位。
+        self._compacting = False
+        self._consecutive_compaction_failures = 0
+        # docs/18 Phase 6：per-message 聚合 tool-result 预算的替换决策（按 toolCallId 冻结，跨 turn
+        # 稳定，保护 prompt-cache 前缀）。请求局部投影，绝不改写树；会话维度 → rebind 复位。
+        from .tool_result_budget import ContentReplacementState
+        self._content_replacement = ContentReplacementState()
+
         # docs/16 #4：typed AgentEvent push 订阅者（RuntimeThread tap 等）。emit 的第三条扇出腿；
         # fire-and-forget——订阅者异常绝不影响 turn。
         self._event_subscribers: list = []
@@ -433,11 +444,19 @@ class Agent(PlanModeMixin):
     # docs/16 #3a：compaction 流程（阈值门 + entry 写入）归 AgentSession（turn shell / compaction
     # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（实现在 AgentCore，
     # summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走 agent_session.compact()。
-    async def _compact_anthropic(self, messages: "list | None") -> "str | None":
-        return await self._core._compact_anthropic(self, messages)
+    async def _compact_anthropic(self, messages: "list | None",
+                                 instructions: str | None = None) -> "str | None":
+        return await self._core._compact_anthropic(self, messages, instructions)
 
-    async def _compact_openai(self, messages: "list | None") -> "str | None":
-        return await self._core._compact_openai(self, messages)
+    async def _compact_openai(self, messages: "list | None",
+                              instructions: str | None = None) -> "str | None":
+        return await self._core._compact_openai(self, messages, instructions)
+
+    async def _summarize_anthropic(self, messages: "list | None", prompt_text: str) -> "str | None":
+        return await self._core._summarize_anthropic(self, messages, prompt_text)
+
+    async def _summarize_openai(self, messages: "list | None", prompt_text: str) -> "str | None":
+        return await self._core._summarize_openai(self, messages, prompt_text)
 
     # ─── Message-list ownership：已退役（docs/16 #3c）─────────────────────────
     # _anthropic_messages/_openai_messages/_active_messages/_load_messages/_dump_messages/

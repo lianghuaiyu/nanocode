@@ -141,6 +141,7 @@ class CompactionRequested:
     first_kept_entry_id: str | None = None
     message_count_before: int | None = None
     message_count_after: int | None = None
+    details: dict | None = None
     compaction_kind: str = "auto"
     kind: str = "compaction_requested"
 

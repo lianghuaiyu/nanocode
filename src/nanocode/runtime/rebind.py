@@ -83,6 +83,10 @@ def rebind_agent_session(agent, new_mgr, *, artifact_id: str = "main") -> None:
     agent.last_input_token_count = 0
     agent.current_turns = 0
     agent._aborted = False
+    agent._compacting = False
+    agent._consecutive_compaction_failures = 0
+    from ..agent.tool_result_budget import ContentReplacementState
+    agent._content_replacement = ContentReplacementState()
     _reset_working_sets(agent)
     _reset_session_mode(agent)
     agent.emit(NoticeRaised(text=f"Session → {new_sid} ({len(built.messages)} messages)."))
