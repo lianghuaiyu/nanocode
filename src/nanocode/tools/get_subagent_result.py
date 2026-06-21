@@ -3,8 +3,9 @@
 SCHEMA = {
     "name": "get_subagent_result",
     "description": (
-        "Read a sub-agent run result by child_session_id from its durable run record. "
-        "This does not parse task_output text or read the child transcript."
+        "Read a sub-agent run result by child_session_id from its durable run record when the user asks "
+        "or after the host reports completion. This does not parse task_output text or read the child "
+        "transcript. Do not repeatedly poll running background runs."
     ),
     "input_schema": {
         "type": "object",

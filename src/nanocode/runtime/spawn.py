@@ -30,7 +30,7 @@ from ..memory.maintenance import (
     parse_consolidation_plan,
 )
 from ..agent.subagent_manager import SubAgentManager
-from ..agent.events import SubAgentStarted, SubAgentEnded
+from ..agent.events import NoticeRaised, SubAgentStarted, SubAgentEnded
 from ..session import v2 as _session_v2
 from ..agents.permissions import effective_child_tools
 from ..agents.result import ResultEnvelope
@@ -249,6 +249,63 @@ class SubAgentRunner:
         if services is not None:
             sub_agent._runtime_services = replace(services, cwd=worktree_path)
 
+    def attach_run_record_projector(self, sub_agent, child_session_id: str) -> None:
+        """Project child UI events into the child-owned run sidecar.
+
+        This observer is intentionally a sidecar projection only. The canonical
+        child transcript remains ``session.jsonl`` via AgentSession.record_event.
+        """
+        def _project(event) -> None:
+            kind = getattr(event, "kind", None)
+            if kind == "tool_call_requested":
+                run_record.record_tool_started(
+                    child_session_id,
+                    tool=event.tool,
+                    tool_use_id=event.tool_use_id,
+                    tool_input=event.input,
+                )
+            elif kind == "tool_result_observed":
+                run_record.record_tool_finished(
+                    child_session_id,
+                    tool=event.tool,
+                    tool_use_id=event.tool_use_id,
+                    chars=event.chars,
+                    result=event.result,
+                )
+            elif kind == "tool_result_completed":
+                run_record.record_tool_finished(
+                    child_session_id,
+                    tool=event.tool,
+                    tool_use_id=event.tool_use_id,
+                    chars=len(event.content or ""),
+                    result=event.content,
+                    is_error=event.is_error,
+                    latency_ms=event.latency_ms,
+                )
+            elif kind == "turn_completed":
+                run_record.record_turn_completed(
+                    child_session_id,
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                    turns=event.turns,
+                    status="completed",
+                )
+            elif kind == "turn_aborted":
+                run_record.record_turn_completed(
+                    child_session_id,
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                    turns=event.turns,
+                    status="aborted",
+                )
+            elif kind == "compaction_requested":
+                run_record.record_compaction_requested(
+                    child_session_id,
+                    reason=event.reason,
+                )
+
+        sub_agent._event_subscribers.append(_project)
+
     def begin_run_record(self, host, *, sub_agent, agent_id: str, agent_type: str,
                          prompt: str, model: str, background: bool, context_mode: str,
                          isolation: str, worktree_path: str | None,
@@ -269,6 +326,7 @@ class SubAgentRunner:
             prompt=prompt,
             status=status,
         )
+        self.attach_run_record_projector(sub_agent, child_session_id)
         run_record.append_event(child_session_id, "session_ready")
         if status == "running":
             run_record.append_event(child_session_id, "started")
@@ -544,7 +602,7 @@ class SubAgentRunner:
             except Exception as e:
                 return f"Error: {e}"
             return (f"Started background sub-agent run {run_id}. "
-                    f"Use get_subagent_result with child_session_id={run_id} to inspect progress.")
+                    f"It will report completion later; do not poll for progress or duplicate its work.")
 
         # ── resume path ──
         if resume_id:
@@ -557,7 +615,7 @@ class SubAgentRunner:
                         f"and cannot be resumed via the agent tool.")
             if run.status == "running":
                 return (f"Error: sub-agent '{resume_id}' is still running; cannot resume an in-flight "
-                        f"sub-agent. Use run_output to check progress.")
+                        f"sub-agent. Send a steer message if you need to adjust it; otherwise wait for completion.")
             rec_provider = (run.model or {}).get("provider")
             rec_model = (run.model or {}).get("modelId")
             if rec_provider and rec_provider != host._current_provider():
@@ -582,6 +640,7 @@ class SubAgentRunner:
                     model=rec_model or current_eff_model, artifact_id=resume_id,
                     agent_source=profile.source)
                 host._spawn.materialize_child_session(sub_agent)
+                host._spawn.attach_run_record_projector(sub_agent, resume_id)
                 run_record.update_status(
                     resume_id, status="running", startedAt=_tree.now_iso(), endedAt=None,
                     error=None)
@@ -912,6 +971,9 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
                 host._close_child_session(agent_id, sub_agent)
+            host.emit(NoticeRaised(
+                text=f"Background sub-agent run {agent_id} cancelled: {description}",
+                level="warn"))
             host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             raise
         except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态,detached 任务不能悬挂 running
@@ -921,6 +983,9 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or f"(sub-agent error: {e})",
                     error=str(e))
                 host._close_child_session(agent_id, sub_agent)
+            host.emit(NoticeRaised(
+                text=f"Background sub-agent run {agent_id} failed: {description}",
+                level="warn"))
             host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
 
@@ -932,6 +997,9 @@ class SubAgentRunner:
                 result_text=text, error=None)
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
+            host.emit(NoticeRaised(
+                text=f"Background sub-agent run {agent_id} timed out: {description}",
+                level="warn"))
             host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
         if kind == "error":
@@ -942,6 +1010,9 @@ class SubAgentRunner:
                 result_text=text, error=str(payload))
             if sub_agent is not None:
                 host._close_child_session(agent_id, sub_agent)
+            host.emit(NoticeRaised(
+                text=f"Background sub-agent run {agent_id} failed: {description}",
+                level="warn"))
             host.emit(SubAgentEnded(agent_type=agent_type, description=description))
             return
 
@@ -955,6 +1026,8 @@ class SubAgentRunner:
             run_record.append_event(agent_id, "worktree_finalized",
                                     diffSummary=diff_summary(worktree_path))
         host._close_child_session(agent_id, sub_agent)
+        host.emit(NoticeRaised(
+            text=f"Background sub-agent run {agent_id} completed: {description}"))
         host.emit(SubAgentEnded(agent_type=agent_type, description=description))
 
     # ─── memory curator spawns（搬迁自 engine,host-driven;curator 是 subagent,§13.8）──────────

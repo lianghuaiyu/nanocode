@@ -26,7 +26,9 @@ class RunMetrics:
     usage: dict[str, int] = field(default_factory=dict)
     turn_count: int = 0
     compaction_count: int = 0
-    active_tools: list[str] = field(default_factory=list)
+    active_tools: list[dict[str, Any]] = field(default_factory=list)
+    current_tool: str | None = None
+    current_tool_started_at: str | None = None
     last_event_at: str | None = None
 
     @classmethod
@@ -39,6 +41,8 @@ class RunMetrics:
             turn_count=int(value.get("turnCount") or value.get("turn_count") or 0),
             compaction_count=int(value.get("compactionCount") or value.get("compaction_count") or 0),
             active_tools=list(value.get("activeTools") or value.get("active_tools") or []),
+            current_tool=value.get("currentTool"),
+            current_tool_started_at=value.get("currentToolStartedAt"),
             last_event_at=value.get("lastEventAt") or value.get("last_event_at"),
         )
 
@@ -49,6 +53,8 @@ class RunMetrics:
             "turnCount": self.turn_count,
             "compactionCount": self.compaction_count,
             "activeTools": list(self.active_tools),
+            "currentTool": self.current_tool,
+            "currentToolStartedAt": self.current_tool_started_at,
             "lastEventAt": self.last_event_at,
         }
 

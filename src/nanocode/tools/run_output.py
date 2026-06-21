@@ -2,7 +2,10 @@
 
 SCHEMA = {
     "name": "run_output",
-    "description": "Read sub-agent result/progress from durable run record.",
+    "description": (
+        "Read sub-agent output from its durable run record when the user asks or after a completion notice. "
+        "Do not repeatedly poll running background runs."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {

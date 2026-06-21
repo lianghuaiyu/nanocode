@@ -1,6 +1,7 @@
 import pytest
 
 from nanocode.agent.engine import Agent
+from nanocode.agent.events import ToolCallRequested, ToolResultObserved
 from nanocode.runs.ledger import RunLedger
 from nanocode.runs.runtime import AgentRunRuntime
 from nanocode.session import tree as T
@@ -79,6 +80,51 @@ def test_pending_steer_drains_through_child_agent_session_record_event():
         assert "narrow the search" in messages
         status = run_record.read_status("CHILD")
         assert status["pendingSteerCount"] == 0
+    finally:
+        lease.close()
+
+
+def test_run_record_tracks_tool_activity_projection():
+    parent = _agent("PARENT")
+    child, lease = _child(parent, "CHILD")
+    try:
+        run_record.create_run_record(
+            child_session_id="CHILD",
+            parent_session_id="PARENT",
+            spawn_entry_id=parent._session_mgr.get_leaf(),
+            tool_call_id=None,
+            agent_type="coder",
+            background=True,
+            context_mode="fresh",
+            isolation="shared",
+            worktree_path=None,
+            model={"provider": "anthropic", "modelId": "m"},
+            prompt="initial",
+        )
+        parent._spawn.attach_run_record_projector(child, "CHILD")
+
+        child.emit(ToolCallRequested(
+            tool="read_file",
+            input={"file_path": "src/nanocode/tasks/runner.py"},
+            tool_use_id="tu_read",
+        ))
+        running = run_record.read_status("CHILD")["metrics"]
+        assert running["toolUses"] == 1
+        assert running["currentTool"] == "read_file"
+        assert running["activeTools"][0]["toolUseId"] == "tu_read"
+
+        child.emit(ToolResultObserved(
+            tool="read_file",
+            tool_use_id="tu_read",
+            chars=12,
+            result="file body",
+        ))
+        done = run_record.read_status("CHILD")["metrics"]
+        assert done["toolUses"] == 1
+        assert done["activeTools"] == []
+        assert done["currentTool"] is None
+        events = run_record.read_events("CHILD")
+        assert [e["type"] for e in events][-2:] == ["tool_started", "tool_finished"]
     finally:
         lease.close()
 

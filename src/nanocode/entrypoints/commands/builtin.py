@@ -232,6 +232,8 @@ async def _agent(ctx: CommandContext, args: str) -> "Control | Local":
     from ...session.manager import SessionManager, children, parent_of, siblings
     sid = ctx.thread.session_id
     arg = args.strip()
+    if not arg:
+        return Local(output="Usage: /agent <id|name|next|prev>\nUse /agents for overview.")
     if arg in ("next", "prev"):
         # 当前在父：兄弟集 = children(sid)；当前在 child：兄弟集 = siblings + 自己（同父下）。
         if children(sid):
@@ -630,7 +632,7 @@ _BUILTINS = [
     ("/task", _task, "prefix", "Show a background task's status & log", "<id>"),
     ("/agents", _agents, "exact_or_prefix",
      "Agent definitions + running instances", "[available|running|show <name|id>]"),
-    ("/agent", _agent, "prefix", "Show a sub-agent instance's details", "<id>"),
+    ("/agent", _agent, "exact_or_prefix", "Show one sub-agent instance or definition", "<id|name|next|prev>"),
     ("/tree", _tree, "exact_or_prefix", "Browse the session tree (interactive), or /tree <entry> to checkout", "[entry_id]"),
     ("/new", _new, "exact", "Start a new empty session and switch to it", ""),
     ("/clone", _clone, "exact_or_prefix", "New session: copy the current branch up to the current leaf and switch (editor empty)", ""),

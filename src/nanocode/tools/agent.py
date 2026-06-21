@@ -33,7 +33,7 @@ SCHEMA = {
             "steer": {"type": "string", "description": "Queue a steering prompt for a running child session id without creating a new child."},
             "delivery": {"type": "string", "description": "For steer: steer or follow_up. Default: steer."},
             "wake": {"type": "boolean", "description": "For resume/steer: whether to wake an idle child. resume defaults true; steer defaults false."},
-            "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false)"},
+            "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false). The host reports completion later; do not sleep, poll, or proactively check progress."},
             "timeout_ms": {"type": "integer", "description": "Wall-clock timeout in ms for this sub-agent run. If omitted, the agent definition's timeout-ms (if any) is used; otherwise no wall-clock limit (a turn ceiling still bounds it)."},
             "steps": {
                 "type": "array",

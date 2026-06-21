@@ -7,6 +7,7 @@ import re
 import pytest
 
 from nanocode.agent.engine import Agent
+from nanocode.agent.events import ToolCallRequested, ToolResultObserved
 from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.subagents import run_record
@@ -149,6 +150,50 @@ def test_background_completes_and_fills_run_record_result():
     run_id, status = asyncio.run(scenario())
     assert status["status"] == "completed"
     assert "the bg output body" in run_record.read_result(run_id)
+
+
+def test_background_projects_child_tool_activity_to_run_record():
+    parent = _agent()
+
+    def _run_once(sub):
+        async def _ro(prompt: str) -> dict:
+            if sub._session_mgr is not None:
+                sub.agent_session.record_provider_messages({"role": "user", "content": prompt})
+            sub.emit(ToolCallRequested(
+                tool="read_file",
+                input={"file_path": "src/nanocode/subagents/run_record.py"},
+                tool_use_id="tu_read",
+            ))
+            sub.emit(ToolResultObserved(
+                tool="read_file",
+                tool_use_id="tu_read",
+                chars=9,
+                result="file body",
+            ))
+            if sub._session_mgr is not None:
+                sub.agent_session.record_provider_messages({"role": "assistant", "content": "done"})
+            return {"text": "done", "tokens": {"input": 3, "output": 2}}
+        return _ro
+
+    _spy_build_with_stub(parent, run_once=_run_once)
+
+    async def scenario():
+        res = await parent._execute_agent_tool(
+            {"type": "coder", "description": "d",
+             "prompt": "p", "run_in_background": True})
+        run_id = _run_id_from_started(res)
+        return run_id, await _wait_run_terminal(run_id)
+
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "completed"
+    metrics = status["metrics"]
+    assert metrics["toolUses"] == 1
+    assert metrics["activeTools"] == []
+    assert metrics["currentTool"] is None
+    assert metrics["turnCount"] == 0
+    events = run_record.read_events(run_id)
+    assert any(e["type"] == "tool_started" and e["tool"] == "read_file" for e in events)
+    assert any(e["type"] == "tool_finished" and e["toolUseId"] == "tu_read" for e in events)
 
 
 def test_background_sets_run_record_result_path():

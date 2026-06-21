@@ -242,7 +242,7 @@ _KNOWN_COMMANDS = [
     "/clear", "/plan", "/cost", "/compact",
     "/memory", "/memory consolidate", "/memory eval", "/memory eval generate",
     "/memory optimize", "/skills", "/sandbox",
-    "/tasks", "/task abc", "/task-stop abc", "/agents", "/agent agent-001",
+    "/tasks", "/task abc", "/task-stop abc", "/agents", "/agent", "/agent agent-001",
 ]
 
 

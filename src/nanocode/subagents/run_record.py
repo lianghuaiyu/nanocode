@@ -65,6 +65,56 @@ def _now() -> str:
     return tree.now_iso()
 
 
+def _compact_text(value: Any, limit: int = 500) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _metrics(status: dict[str, Any]) -> dict[str, Any]:
+    metrics = dict(status.get("metrics") or {})
+    metrics.setdefault("toolUses", 0)
+    metrics.setdefault("usage", {})
+    metrics.setdefault("turnCount", 0)
+    metrics.setdefault("compactionCount", 0)
+    metrics.setdefault("activeTools", [])
+    metrics.setdefault("currentTool", None)
+    metrics.setdefault("currentToolStartedAt", None)
+    metrics.setdefault("lastEventAt", None)
+    return metrics
+
+
+def _active_tool(
+    *,
+    tool: str,
+    tool_use_id: str,
+    started_at: str,
+    input_summary: str,
+) -> dict[str, Any]:
+    return {
+        "tool": tool,
+        "toolUseId": tool_use_id,
+        "startedAt": started_at,
+        "inputSummary": input_summary,
+    }
+
+
+def _set_current_tool(metrics: dict[str, Any]) -> None:
+    active = list(metrics.get("activeTools") or [])
+    if active:
+        current = active[-1]
+        metrics["currentTool"] = current.get("tool")
+        metrics["currentToolStartedAt"] = current.get("startedAt")
+    else:
+        metrics["currentTool"] = None
+        metrics["currentToolStartedAt"] = None
+
+
 def read_status(child_session_id: str) -> dict[str, Any]:
     return json.loads(status_path(child_session_id).read_text(encoding="utf-8"))
 
@@ -85,12 +135,127 @@ def append_event(child_session_id: str, event_type: str, **data: Any) -> dict[st
     _append_jsonl(events_path(child_session_id), event)
     try:
         status = read_status(child_session_id)
-        metrics = dict(status.get("metrics") or {})
+        metrics = _metrics(status)
         metrics["lastEventAt"] = event["timestamp"]
         status["metrics"] = metrics
         write_status(child_session_id, status)
     except FileNotFoundError:
         pass
+    return event
+
+
+def record_tool_started(
+    child_session_id: str,
+    *,
+    tool: str,
+    tool_use_id: str,
+    tool_input: dict[str, Any] | None,
+) -> dict[str, Any]:
+    input_summary = _compact_text(tool_input or {})
+    event = append_event(
+        child_session_id,
+        "tool_started",
+        tool=tool,
+        toolUseId=tool_use_id,
+        inputSummary=input_summary,
+    )
+    status = read_status(child_session_id)
+    metrics = _metrics(status)
+    active = [
+        item for item in list(metrics.get("activeTools") or [])
+        if item.get("toolUseId") != tool_use_id
+    ]
+    active.append(_active_tool(
+        tool=tool,
+        tool_use_id=tool_use_id,
+        started_at=event["timestamp"],
+        input_summary=input_summary,
+    ))
+    metrics["toolUses"] = int(metrics.get("toolUses") or 0) + 1
+    metrics["activeTools"] = active
+    metrics["lastEventAt"] = event["timestamp"]
+    _set_current_tool(metrics)
+    status["metrics"] = metrics
+    write_status(child_session_id, status)
+    return event
+
+
+def record_tool_finished(
+    child_session_id: str,
+    *,
+    tool: str,
+    tool_use_id: str,
+    chars: int | None = None,
+    result: str | None = None,
+    is_error: bool | None = None,
+    latency_ms: int | None = None,
+) -> dict[str, Any] | None:
+    status = read_status(child_session_id)
+    metrics = _metrics(status)
+    active = list(metrics.get("activeTools") or [])
+    kept = [item for item in active if item.get("toolUseId") != tool_use_id]
+    if len(kept) == len(active):
+        return None
+    event = append_event(
+        child_session_id,
+        "tool_finished",
+        tool=tool,
+        toolUseId=tool_use_id,
+        chars=chars,
+        resultSummary=_compact_text(result or ""),
+        isError=is_error,
+        latencyMs=latency_ms,
+    )
+    status = read_status(child_session_id)
+    metrics = _metrics(status)
+    metrics["activeTools"] = [
+        item for item in list(metrics.get("activeTools") or [])
+        if item.get("toolUseId") != tool_use_id
+    ]
+    metrics["lastEventAt"] = event["timestamp"]
+    _set_current_tool(metrics)
+    status["metrics"] = metrics
+    write_status(child_session_id, status)
+    return event
+
+
+def record_turn_completed(
+    child_session_id: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    turns: int,
+    status: str = "completed",
+) -> dict[str, Any]:
+    event = append_event(
+        child_session_id,
+        "turn_completed" if status == "completed" else "turn_aborted",
+        inputTokens=int(input_tokens),
+        outputTokens=int(output_tokens),
+        turns=int(turns),
+        status=status,
+    )
+    snapshot = read_status(child_session_id)
+    metrics = _metrics(snapshot)
+    metrics["turnCount"] = int(turns)
+    metrics["usage"] = {
+        "input": int(input_tokens),
+        "output": int(output_tokens),
+    }
+    metrics["lastEventAt"] = event["timestamp"]
+    snapshot["metrics"] = metrics
+    write_status(child_session_id, snapshot)
+    return event
+
+
+def record_compaction_requested(child_session_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    event = append_event(child_session_id, "compaction_requested", reason=reason)
+    snapshot = read_status(child_session_id)
+    metrics = _metrics(snapshot)
+    metrics["compactionCount"] = int(metrics.get("compactionCount") or 0) + 1
+    metrics["lastEventAt"] = event["timestamp"]
+    snapshot["metrics"] = metrics
+    write_status(child_session_id, snapshot)
     return event
 
 
@@ -188,6 +353,8 @@ def create_run_record(
             "turnCount": 0,
             "compactionCount": 0,
             "activeTools": [],
+            "currentTool": None,
+            "currentToolStartedAt": None,
             "lastEventAt": None,
         },
     }
@@ -214,6 +381,9 @@ def complete_run(
             "input": int(tokens.get("input") or 0),
             "output": int(tokens.get("output") or 0),
         }
+    metrics["activeTools"] = []
+    metrics["currentTool"] = None
+    metrics["currentToolStartedAt"] = None
     snapshot.update({
         "status": status,
         "endedAt": _now(),

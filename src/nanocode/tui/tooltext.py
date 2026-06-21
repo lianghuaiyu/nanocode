@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+
 # 工具名 → 显示标题。未登记的工具用原名。
 TOOL_TITLES = {
     "read_file": "read",
@@ -17,6 +19,12 @@ TOOL_TITLES = {
     "run_shell": "$",
     "skill": "Skill",
     "agent": "Task",
+    "run_list": "runs",
+    "run_status": "status",
+    "run_output": "output",
+    "get_subagent_result": "result",
+    "run_cancel": "cancel",
+    "run_send": "steer",
 }
 
 def tool_title(name: str) -> str:
@@ -63,6 +71,10 @@ def tool_summary(name: str, inp: dict) -> str:
         return inp.get("skill_name", "")
     if name == "agent":
         return f'[{inp.get("type", "general")}] {inp.get("description", "")}'
+    if name == "run_list":
+        return inp.get("status", "")
+    if name in ("run_status", "run_output", "get_subagent_result", "run_cancel", "run_send"):
+        return inp.get("child_session_id", "")
     return ""
 
 
@@ -90,6 +102,21 @@ def result_summary(name: str, result: str) -> str:
     first = r.split("\n", 1)[0].strip()
     if is_error_result(r):
         return first or "error"
+    if name == "run_list":
+        try:
+            runs = json.loads(r)
+        except Exception:
+            return first[:80] or "done"
+        if isinstance(runs, list):
+            return f"{len(runs)} runs"
+    if name == "run_status":
+        summary = _run_status_summary(r)
+        if summary:
+            return summary
+    if name in ("run_output", "get_subagent_result"):
+        summary = _run_output_summary(r)
+        if summary:
+            return summary
     if name == "read_file":
         return f"Read {(r.count(chr(10)) + 1) if r else 0} lines"
     if name == "grep_search":
@@ -110,6 +137,42 @@ def result_summary(name: str, result: str) -> str:
                 return l.strip()[:80]
         return "(no output)"
     return first[:80] or "done"
+
+
+def _run_status_summary(result: str) -> str:
+    try:
+        data = json.loads(result)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    status = data.get("status") or "unknown"
+    child = data.get("child_session_id") or data.get("run_id") or data.get("childSessionId") or ""
+    metrics = data.get("metrics") or {}
+    tools = metrics.get("toolUses")
+    active = metrics.get("currentTool")
+    parts = [str(child), str(status)]
+    if active:
+        parts.append(f"tool {active}")
+    elif tools is not None:
+        parts.append(f"{tools} tools")
+    return " · ".join(p for p in parts if p)
+
+
+def _run_output_summary(result: str) -> str:
+    try:
+        data = json.loads(result)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    status = data.get("status") or "unknown"
+    child = data.get("childSessionId") or data.get("runId") or ""
+    summary = (data.get("summary") or data.get("error") or "").strip()
+    parts = [str(child), str(status)]
+    if summary:
+        parts.append(summary[:80])
+    return " · ".join(p for p in parts if p)
 
 
 def suppress_success_result(name: str, result: str) -> bool:

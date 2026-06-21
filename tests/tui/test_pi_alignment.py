@@ -7,6 +7,7 @@ session 选择器选中行(accent '›' + bold,无反显)。纯单元,不开真 
 from __future__ import annotations
 
 import io
+import json
 import re
 
 from rich.console import Console
@@ -219,6 +220,26 @@ def test_read_file_result_is_hidden_until_tools_expand():
     app._console.file.truncate(0)
     expanded = _plain(_render(app, app._render_message_block(item)))
     assert "line 1" in expanded and "line 2" in expanded
+
+
+def test_run_status_tool_box_uses_child_id_and_status_summary():
+    app = RichApp(output=_console())
+    result = json.dumps({
+        "child_session_id": "sess_child123",
+        "status": "running",
+        "metrics": {"toolUses": 2, "currentTool": "read_file"},
+    })
+    item = ToolItem(
+        id="trun",
+        name="run_status",
+        input={"child_session_id": "sess_child123"},
+        status="done",
+        result_excerpt=result,
+    )
+
+    out = _plain(_render(app, app._render_message_block(item)))
+    assert "status sess_child123" in out
+    assert "sess_child123 · running · tool read_file" in out
 
 
 def test_user_message_is_filled_box_no_title():
