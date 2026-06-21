@@ -11,10 +11,9 @@ def test_render_task_reminder(tmp_path):
     assert "task-001" in txt and "completed" in txt and "pytest -q" in txt and "42 passed" in txt and str(out) in txt
 
 
-def test_render_task_reminder_subagent_surfaces_result_path(tmp_path):
-    """P3: sub-agent task (has result_path, no stdout) surfaces result_path + summary
-    and drops the meaningless empty stdout Output-tail."""
-    m = TaskManager(); t = m.create_task("subagent", "investigate parser")
+def test_render_task_reminder_host_job_surfaces_result_path(tmp_path):
+    """Host jobs with result_path surface result_path + summary and skip empty stdout."""
+    m = TaskManager(); t = m.create_task("memory_consolidate", "investigate parser")
     rp = tmp_path / "result.md"; rp.write_text("full transcript here")
     m.update_task(t.id, status="completed", result_path=str(rp),
                   result_summary="Found 2 bugs in the parser")
@@ -22,7 +21,7 @@ def test_render_task_reminder_subagent_surfaces_result_path(tmp_path):
     assert "<system-reminder>" in txt and "</system-reminder>" in txt
     assert str(rp) in txt
     assert "Found 2 bugs in the parser" in txt
-    # no empty stdout Output-tail noise for sub-agent kind
+    # no empty stdout Output-tail noise for result-backed host jobs
     assert "Output tail:" not in txt
     assert "(empty)" not in txt
 

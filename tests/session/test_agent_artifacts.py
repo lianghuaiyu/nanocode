@@ -1,38 +1,24 @@
-"""P2: session/v2 agent_dir helper + artifact writers (meta/prompt/result/wire)."""
-
-import json
+"""session/v2 stores host task state; subagent state lives under child run records."""
 
 from nanocode.session import v2
+from nanocode.subagents import run_record
 
 
-def test_agent_dir_path_shape():
-    d = v2.agent_dir("sA", "agent-001")
+def test_task_dir_path_shape():
+    d = v2.task_dir("sA", "task-001")
     assert d.is_dir()
-    assert d.name == "agent-001"
-    assert d.parent.name == "agents"
+    assert d.name == "task-001"
+    assert d.parent.name == "tasks"
     assert d.parent.parent.name == "sA"
-    # meta/prompt/result 同一目录（一条代码路径）。
-    assert v2.session_root("sA") / "agents" / "agent-001" == d
 
 
-def test_write_and_read_agent_meta():
-    assert v2.read_agent_meta("sC", "agent-001") is None
-    v2.write_agent_meta("sC", "agent-001", {"id": "agent-001", "status": "running"})
-    meta = v2.read_agent_meta("sC", "agent-001")
-    assert meta["status"] == "running"
-    p = v2.agent_dir("sC", "agent-001") / "meta.json"
-    assert json.loads(p.read_text())["id"] == "agent-001"
+def test_write_and_read_state():
+    v2.write_state("sB", {"session_id": "sB", "tasks": []})
+    assert v2.read_state("sB") == {"session_id": "sB", "tasks": []}
 
 
-def test_write_agent_prompt():
-    v2.write_agent_prompt("sD", "agent-001", "do the thing")
-    p = v2.agent_dir("sD", "agent-001") / "prompt.txt"
-    assert p.read_text(encoding="utf-8") == "do the thing"
-
-
-def test_write_agent_result_returns_path():
-    path = v2.write_agent_result("sE", "agent-001", "# final\nbody")
-    assert path.endswith("result.md")
-    assert "agent-001" in path
-    p = v2.agent_dir("sE", "agent-001") / "result.md"
-    assert p.read_text(encoding="utf-8") == "# final\nbody"
+def test_subagent_run_record_path_is_child_owned():
+    run_record.write_prompt("sess_child", "do the thing")
+    run_record.write_result("sess_child", "done")
+    assert run_record.prompt_path("sess_child").parts[-2:] == ("subagent-run", "prompt.md")
+    assert run_record.result_path("sess_child").read_text(encoding="utf-8") == "done"

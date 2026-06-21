@@ -236,7 +236,7 @@ class SubAgentEnded:
 @dataclass(frozen=True)
 class ApprovalRequested:
     """危险动作待审批（旧 self._sink.confirmation）——**显示**事件，订阅端据此渲染告警。
-    实际决策仍经注入的 confirm_fn 往返（interactive：读 y/n；RPC：stdout 请求 + stdin 响应）。
+    实际决策仍经注入的 confirm_fn 往返（interactive：TUI choice；RPC：stdout 请求 + stdin 响应）。
     request_id 为 RPC 关联键（interactive 不需要，默认空）。"""
 
     command: str

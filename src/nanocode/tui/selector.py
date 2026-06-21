@@ -65,6 +65,15 @@ class Outcome:
     index: int = 0
 
 
+@dataclass(frozen=True)
+class ChoiceItem:
+    """A fixed option for small Pi-style choice prompts."""
+
+    label: str
+    value: Any
+    description: str = ""
+
+
 class SelectorModel:
     """Page-owned model consumed by ``TuiApp.run_selector`` (Pi single-column layout)."""
 
@@ -142,6 +151,62 @@ class SelectorModel:
 
     def set_query(self, query: str) -> None:
         pass
+
+
+class ChoiceModel(SelectorModel):
+    """Generic single-column selector for small fixed choices.
+
+    This mirrors Pi's extension/trust selector shape: options are selected with
+    Up/Down or j/k, Enter confirms, and Esc cancels.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        choices: list[ChoiceItem],
+        *,
+        initial_index: int = 0,
+        hint: str | None = None,
+        accent: bool = True,
+    ) -> None:
+        self._title = title
+        self._choices = list(choices)
+        self._initial_index = initial_index
+        self._hint = hint
+        self._accent = accent
+
+    def items(self) -> list[ChoiceItem]:
+        return self._choices
+
+    def initial_index(self) -> int:
+        return self._initial_index
+
+    def header_lines(self, width: int) -> list[str]:
+        lines = [truncate_cells(self._title, max(1, width - 2))]
+        if self._hint:
+            lines.append("  " + truncate_cells(self._hint, max(1, width - 4)))
+        return lines
+
+    def list_text(self, item: ChoiceItem, selected: bool, width: int) -> str:
+        cursor = "› " if selected else "  "
+        text = cursor + item.label
+        if item.description:
+            text += "  " + item.description
+        return "  " + truncate_cells(text, max(1, width - 4))
+
+    def position_line(self, index: int, total: int, visible_start: int, visible_end: int, width: int) -> str | None:
+        if total <= 0:
+            return None
+        return "  ↑↓ navigate · Enter select · Esc cancel"
+
+    def empty_text(self, width: int) -> str:
+        return "  (no choices)"
+
+    def max_visible(self, height: int) -> int:
+        return min(10, max(3, height - 8))
+
+    def border_accent(self) -> bool:
+        return self._accent
 
 
 def terminal_width() -> int:

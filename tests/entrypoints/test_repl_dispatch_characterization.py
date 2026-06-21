@@ -38,8 +38,7 @@ from nanocode.entrypoints import cli
 # ─── 录制替身 ────────────────────────────────────────────────────
 
 class _FakeTaskManager:
-    """can_switch() 读 list_subagents()；dispatch 命令族的 tasks_tool 调用已被 monkeypatch 拦掉。"""
-    def list_subagents(self): return []
+    """dispatch 命令族的 host/facade 调用已被 monkeypatch 拦掉。"""
     def list_tasks(self, status=None): return []
 
 
@@ -149,6 +148,19 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
 
     monkeypatch.setattr(RuntimeThread, "sandbox_status", _fake_sandbox_status)
     monkeypatch.setattr(RuntimeThread, "set_sandbox_profile", _fake_set_sandbox_profile)
+
+    monkeypatch.setattr(
+        RuntimeThread, "agents_overview",
+        lambda self: (calls.append(("agents_overview_text",)) or "stub"))
+    monkeypatch.setattr(
+        RuntimeThread, "agent_definitions",
+        lambda self: (calls.append(("list_agent_definitions_text",)) or "stub"))
+    monkeypatch.setattr(
+        RuntimeThread, "subagents",
+        lambda self: (calls.append(("list_subagents_text",)) or "stub"))
+    monkeypatch.setattr(
+        RuntimeThread, "agent_detail",
+        lambda self, name: (calls.append(("agent_definition_detail_text",)) or "stub"))
     # !shell 经 RuntimeThread.execute_user_shell → patch runtime 类方法
 
     async def _fake_exec_shell(self, command, **kwargs):

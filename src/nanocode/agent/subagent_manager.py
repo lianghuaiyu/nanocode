@@ -23,15 +23,23 @@ class SubAgentManager:
         self.agent = agent
 
     def running_background_count(self) -> int:
-        """当前并发运行的后台子 agent 数：本 agent 持有的 detached task 中，回指一个
-        SubAgentRecord（owner_agent_id 非空）且 status=='running' 的 TaskRecord 计数。
+        """当前并发运行的后台子 agent 数。
 
-        以 owner_agent_id 而非 kind=='subagent' 判定，使 memory curator/eval/optimize
-        这些同样跑后台子 agent 的任务也计入上限——否则它们会绕过 max_threads。
-        shell 后台任务 owner_agent_id 为 None，不计。
-        以 TaskManager 的权威状态为准（detached 协程结束落终态），不靠 task.done()。"""
+        普通 background subagent 以 live coroutine 的 ``_nanocode_run_id`` 和 child-owned
+        run record 为准；memory curator/eval/optimize 这类内部后台 agent 仍是 host task，
+        继续按 owner_agent_id 计入。shell 后台任务 owner_agent_id 为 None，不计。
+        """
         n = 0
         for t in self.agent._background_tasks:
+            run_id = getattr(t, "_nanocode_run_id", None)
+            if run_id:
+                try:
+                    rec = self.agent._run_runtime.status(run_id)
+                except Exception:
+                    continue
+                if rec.status == "running":
+                    n += 1
+                continue
             tid = getattr(t, "_nanocode_task_id", None)
             if not tid:
                 continue

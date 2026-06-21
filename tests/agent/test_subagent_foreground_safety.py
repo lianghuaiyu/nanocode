@@ -1,6 +1,7 @@
 """P1: foreground sub-agent safety — wait_for timeout + max_turns ceiling + schema."""
 
 import asyncio
+import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
@@ -68,9 +69,8 @@ def test_foreground_timeout_returns_string_fresh():
     assert "timed out" in res.lower()
     assert "30" in res
     # the record exists and is marked timed_out (parent loop did not crash)
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub is not None
-    assert sub.status == "timed_out"
+    run = json.loads(parent.run_list())[0]
+    assert run["status"] == "timed_out"
 
 
 def test_foreground_timeout_does_not_propagate_exception():
@@ -97,7 +97,7 @@ def test_foreground_success_no_timeout_returns_text():
     # P3: bounded envelope — small text passes through as summary + points at result.md.
     assert "hello from sub" in res
     assert "result.md" in res
-    assert parent.task_manager.get_subagent("agent-001").status == "completed"
+    assert json.loads(parent.run_list())[0]["status"] == "completed"
 
 
 def test_manifest_timeout_used_when_tool_omits(tmp_path, monkeypatch):

@@ -39,6 +39,29 @@ def test_readonly_open_does_not_lock():
     m1.close()
 
 
+def test_new_lease_defers_file_until_assistant_message():
+    from nanocode.session import tree as T
+    from nanocode.session.lease import SessionLease
+
+    for sid, parent_session in (
+        ("defer_top", None),
+        ("defer_child", {"sessionId": "parent", "entryId": "spawn"}),
+    ):
+        lease = SessionLease.open_or_create(sid, parent_session=parent_session)
+        mgr = lease.manager
+        try:
+            assert not SessionManager.exists(sid)
+            mgr.append_message(T.user_message("hello"))
+            assert not SessionManager.exists(sid)
+            mgr.append_message(T.assistant_message([T.text_block("hi")], provider="anthropic",
+                               api="anthropic", model="claude-x", stop_reason="stop"))
+            assert SessionManager.exists(sid)
+            reopened = SessionManager.open(sid)
+            assert [e.type for e in reopened.entries()] == [T.SESSION_START, T.MESSAGE, T.MESSAGE]
+        finally:
+            lease.close()
+
+
 def test_thread_resume_to_busy_session_raises_busy():
     # 目标被另一 writer 持锁 → rebind pre-flight 取锁失败 → SessionBusyError（旧 session 不动）。
     a, rt, t, host = _host("curlk")

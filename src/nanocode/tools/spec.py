@@ -18,7 +18,8 @@ from typing import Callable
 from . import (
     read_file, write_file, edit_file, list_files, grep_search,
     run_shell, web_fetch, skill, agent, plan, tool_search,
-    tasks_tool, memory_tool,
+    tasks_tool, memory_tool, get_subagent_result, run_list, run_status,
+    run_output, run_cancel, run_send,
 )
 from .permissions import CONCURRENCY_SAFE_TOOLS
 
@@ -72,6 +73,12 @@ _ALL: list[ToolSpec] = [
     _spec(tasks_tool.LIST_SCHEMA),                  # host-routed：task 面板 meta（router 分发）
     _spec(tasks_tool.OUTPUT_SCHEMA),
     _spec(tasks_tool.STOP_SCHEMA),
+    _spec(get_subagent_result.SCHEMA),               # host-routed：child-owned run record 查询
+    _spec(run_list.SCHEMA),
+    _spec(run_status.SCHEMA),
+    _spec(run_output.SCHEMA),
+    _spec(run_cancel.SCHEMA),
+    _spec(run_send.SCHEMA),
     _spec(memory_tool.SCHEMA, memory_tool.run),     # recall-semantic/consolidate 分支由 router 先截
 ]
 

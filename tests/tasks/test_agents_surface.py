@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nanocode.tasks.manager import TaskManager
+from nanocode.runs.models import AgentRunRecord
 from nanocode.agents import registry as config
 from nanocode.tools import tasks_tool
 
@@ -10,6 +10,20 @@ from nanocode.tools import tasks_tool
 def _write(d, name, body):
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{name}.md").write_text(body)
+
+
+def _run_record(**kw):
+    data = {
+        "run_id": "sess-child",
+        "child_session_id": "sess-child",
+        "parent_session_id": "sess-parent",
+        "status": "completed",
+        "agent_type": "coder",
+        "model": {"provider": "anthropic", "modelId": "m"},
+        "summary": "look around",
+    }
+    data.update(kw)
+    return AgentRunRecord(**data)
 
 
 def test_list_agent_definitions_includes_builtins_and_custom(tmp_path, monkeypatch):
@@ -67,19 +81,16 @@ def test_agents_overview_has_both_sections(tmp_path, monkeypatch):
     _write(d, "rev", "---\nname: rev\ndescription: Reviewer\n---\nbody")
     monkeypatch.chdir(tmp_path)
     config.reset_agent_cache()
-    mgr = TaskManager()
-    a = mgr.create_subagent(type="explore", description="look around")
-    text = tasks_tool.agents_overview_text(mgr)
+    rec = _run_record(agent_type="explore")
+    text = tasks_tool.agents_overview_text([rec])
     assert "Available agent definitions:" in text
     assert "Running instances:" in text
     assert "rev" in text          # a definition
-    assert a.id in text           # a running instance
+    assert rec.child_session_id in text           # a running instance
 
 
 def test_subagent_detail_still_works_for_instance():
-    mgr = TaskManager()
-    a = mgr.create_subagent(type="coder", description="do a thing",
-                            model="m", provider="anthropic")
-    detail = tasks_tool.subagent_detail_text(mgr, a.id)
-    assert a.id in detail
-    assert "do a thing" in detail
+    rec = _run_record(summary="do a thing")
+    detail = tasks_tool.subagent_detail_text(rec)
+    assert rec.child_session_id in detail
+    assert "anthropic/m" in detail

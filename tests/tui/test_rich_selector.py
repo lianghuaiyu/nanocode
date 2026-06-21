@@ -173,3 +173,55 @@ def test_ask_text_submit_and_cancel():
         return r1, r2
     r1, r2 = asyncio.run(scenario())
     assert r1 == "hello" and r2 is None
+
+
+def test_approval_modal_arrow_selection():
+    async def scenario():
+        r, w = os.pipe()
+        app = RichApp(input=r, output=Console(file=io.StringIO(), force_terminal=True, width=100))
+        app.bind_thread(_Thread())
+        run_task = asyncio.create_task(app.run())
+        await asyncio.sleep(0.05)
+        deny_task = asyncio.create_task(app.confirm_fn("danger?"))
+        await asyncio.sleep(0.05)
+        os.write(w, b"\r")
+        denied = await asyncio.wait_for(deny_task, timeout=3)
+        allow_task = asyncio.create_task(app.confirm_fn("danger?"))
+        await asyncio.sleep(0.05)
+        os.write(w, b"\x1b[B\r")
+        allowed = await asyncio.wait_for(allow_task, timeout=3)
+        os.write(w, b"\x04")
+        await asyncio.wait_for(run_task, timeout=3)
+        os.close(w)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        return denied, allowed
+
+    denied, allowed = asyncio.run(scenario())
+    assert denied is False
+    assert allowed is True
+
+
+def test_plan_modal_arrow_selection():
+    async def scenario():
+        r, w = os.pipe()
+        app = RichApp(input=r, output=Console(file=io.StringIO(), force_terminal=True, width=100))
+        app.bind_thread(_Thread())
+        run_task = asyncio.create_task(app.run())
+        await asyncio.sleep(0.05)
+        task = asyncio.create_task(app.plan_approval_fn("plan"))
+        await asyncio.sleep(0.05)
+        os.write(w, b"\x1b[B\r")
+        result = await asyncio.wait_for(task, timeout=3)
+        os.write(w, b"\x04")
+        await asyncio.wait_for(run_task, timeout=3)
+        os.close(w)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        return result
+
+    assert asyncio.run(scenario()) == {"choice": "execute"}

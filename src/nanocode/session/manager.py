@@ -39,11 +39,12 @@ def session_file(session_id: str) -> Path:
 class SessionManager:
     """单一 session 的树存储 + 上下文构建。单写者（并发 lock 在 P5/§7.8，P1 不引入）。"""
 
-    def __init__(self, session_id: str, entries: list[Entry]) -> None:
+    def __init__(self, session_id: str, entries: list[Entry], *, flushed: bool = True) -> None:
         self.session_id = session_id
         self._entries: list[Entry] = entries
         self._by_id: dict[str, Entry] = tree.index_by_id(entries)
         self._lock_fd = None   # 持有则为单写者（docs/14 §6a）；read-only 打开不持锁
+        self._flushed = flushed
 
     # ── 单写者锁（docs/14 §4.6/§6a）─────────────────────────────────────────────
     def acquire_lock(self) -> None:
@@ -97,13 +98,15 @@ class SessionManager:
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     @classmethod
     def create(cls, session_id: str | None = None, *, cwd: str | None = None,
-               parent_session: dict | None = None, lock: bool = True) -> "SessionManager":
+               parent_session: dict | None = None, lock: bool = True,
+               defer_persist: bool = False) -> "SessionManager":
         # docs/14 SessionLease：create 默认 lock=True——「新建一个 session」即写者意图，理应持锁。
         # 例外是 bootstrap-then-handoff：clone() 复制 child 后交给 runtime lease 重新加锁打开，故
         # 那里显式传 lock=False（避免同进程 clone 持锁 → rebind 重开 LOCK_NB 自锁死）。read-only
-        # 打开走 open(lock=False)。
+        # 打开走 open(lock=False)。defer_persist 对齐 Pi：顶层新会话首个 assistant 前只在内存/锁中存在，
+        # 不写 session.jsonl，避免 /resume 被 header-only 空会话污染。
         sid = session_id or tree.new_id("sess")
-        mgr = cls(sid, [])
+        mgr = cls(sid, [], flushed=not defer_persist)
         if lock:
             mgr.acquire_lock()      # 建前先占锁——并发同 sid 创建时第二者 fail-closed
         root = Entry(
@@ -148,13 +151,33 @@ class SessionManager:
 
     # ── 写入 ────────────────────────────────────────────────────────────────
     def _persist_new(self, entry: Entry) -> Entry:
-        path = session_file(self.session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry.to_dict(), ensure_ascii=False, default=str) + "\n")
         self._entries.append(entry)
         self._by_id[entry.id] = entry
+        self._persist_entry(entry)
         return entry
+
+    def _has_assistant_message(self) -> bool:
+        for e in self._entries:
+            if e.type == tree.MESSAGE and (e.data.get("message") or {}).get("role") == "assistant":
+                return True
+        return False
+
+    def _persist_entry(self, entry: Entry) -> None:
+        path = session_file(self.session_id)
+        if self._flushed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry.to_dict(), ensure_ascii=False, default=str) + "\n")
+            return
+
+        if not self._has_assistant_message():
+            return
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as f:
+            for e in self._entries:
+                f.write(json.dumps(e.to_dict(), ensure_ascii=False, default=str) + "\n")
+        self._flushed = True
 
     def append(self, entry_type: str, data: dict | None = None, *, parent_id: str | None = None) -> Entry:
         """append 一条 entry（默认挂在当前 leaf 下）。返回该 entry。
@@ -319,6 +342,7 @@ class SessionManager:
             for e in self._entries:
                 f.write(json.dumps(e.to_dict(), ensure_ascii=False, default=str) + "\n")
         os.replace(tmp, path)
+        self._flushed = True
 
 
 # ─── 跨 session 导航（child 侧 session_start.parentSession 回指为权威，docs/13 §7.2/§11） ──

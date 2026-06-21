@@ -390,16 +390,29 @@ async def _branch_summary_focus(ctx: CommandContext, target_id: str | None) -> s
         return False
     if not ctx.thread.branch_summary_available(target_id):
         return False
-    text = await ctx.selector_host.ask_text(
-        "branch summary? [enter/n=no, d=default, or custom focus]: ")
-    if text is None:
-        return False
-    answer = text.strip()
-    if not answer or answer.lower() in ("n", "no", "none"):
-        return False
-    if answer.lower() in ("d", "default", "y", "yes"):
-        return None
-    return answer
+    from ...tui.selector import ChoiceItem, ChoiceModel
+
+    while True:
+        outcome = await ctx.selector_host.run_selector(
+            ChoiceModel(
+                "Summarize branch?",
+                [
+                    ChoiceItem("No summary", False),
+                    ChoiceItem("Summarize", None),
+                    ChoiceItem("Summarize with custom prompt", "custom"),
+                ],
+            )
+        )
+        if outcome.kind != "done":
+            return False
+        choice = getattr(outcome.item, "value", False)
+        if choice != "custom":
+            return choice
+        text = await ctx.selector_host.ask_text("Custom branch summary focus: ")
+        if text is None:
+            continue
+        answer = text.strip()
+        return answer if answer else False
 
 
 async def _move_tree_leaf(ctx: CommandContext, entry, *, resolved_label: str) -> Local:

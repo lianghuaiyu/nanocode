@@ -28,11 +28,17 @@ def test_thread_new_switches_to_empty_session_preserving_old():
     a, rt, t, host = _host("OLD")
     a._session_mgr.append_message(T.user_message("old-q"))
     new_t = rt.thread_new(host)
+    new_sid = a.session_id
     assert host.current_thread is new_t
     assert new_t.agent is a                              # 同一 Agent，原地 rebind
-    assert a.session_id != "OLD"                         # 切到新 mint 的 sid
-    assert SessionManager.exists(a.session_id)           # 新空 session 已建
+    assert new_sid != "OLD"                              # 切到新 mint 的 sid
+    assert not SessionManager.exists(new_sid)            # Pi 对齐：顶层空 session 首个 assistant 前不落盘
     assert a.agent_session.build_request_messages() == []   # 新 session 上下文为空
+    a.agent_session.record_provider_messages({"role": "user", "content": "new-q"})
+    assert not SessionManager.exists(new_sid)
+    a.agent_session.record_provider_messages(
+        {"role": "assistant", "content": [{"type": "text", "text": "new-a"}]})
+    assert SessionManager.exists(new_sid)
     # registry：新 thread 在、旧 thread 注销
     assert rt.thread(new_t.thread_id) is new_t and rt.thread("OLD") is None
     # 旧 session 树保留（可 /resume 回去）

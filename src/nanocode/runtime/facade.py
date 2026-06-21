@@ -678,9 +678,6 @@ class RuntimeThread:
         tasks = getattr(self.agent, "_background_tasks", set())
         if tasks:
             return False, f"{len(tasks)} background task(s) still running"
-        busy = [s for s in self.agent.task_manager.list_subagents() if s.status in ("running", "idle")]
-        if busy:
-            return False, f"{len(busy)} sub-agent(s) still running/idle"
         return True, None
 
     def task_list(self, status=None, kind=None) -> str:
@@ -697,21 +694,32 @@ class RuntimeThread:
 
     def agents_overview(self) -> str:
         from ..tools.tasks_tool import agents_overview_text
-        return agents_overview_text(self.agent.task_manager)
+        return agents_overview_text(self._subagent_records())
 
     def agent_definitions(self) -> str:
         from ..tools.tasks_tool import list_agent_definitions_text
-        return list_agent_definitions_text(self.agent.task_manager)
+        return list_agent_definitions_text()
 
     def subagents(self) -> str:
         from ..tools.tasks_tool import list_subagents_text
-        return list_subagents_text(self.agent.task_manager)
+        return list_subagents_text(self._subagent_records())
 
     def agent_detail(self, name: str) -> str:
         from ..tools.tasks_tool import agent_definition_detail_text, subagent_detail_text
         detail = agent_definition_detail_text(name)
-        return detail if detail is not None else subagent_detail_text(
-            self.agent.task_manager, name, self.session_id)
+        if detail is not None:
+            return detail
+        try:
+            record = self.agent._reconcile_run(name)
+        except Exception:
+            record = None
+        return subagent_detail_text(record)
+
+    def _subagent_records(self):
+        return self.agent._run_runtime.list(
+            self.session_id,
+            live_run_ids=self.agent._live_run_ids(),
+        )
 
     async def execute_user_shell(self, command: str, *, timeout_ms: int = 120000,
                                  exclude_from_context: bool = True) -> str:

@@ -457,7 +457,7 @@ async def run_repl(thread: RuntimeThread, *, input=None, output=None) -> None:
         else:
             _say(f"(control '{action}' is not wired yet — coming in a later phase)")
 
-    # docs/18：审批/plan 不再读一行，改成 TuiApp 的 modal future（confirm_fn → y/n modal；
+    # docs/18：审批/plan 不再读一行，改成 TuiApp 的 modal future（confirm_fn → choice modal；
     # plan_approval_fn → 1-4 modal）。
     ApprovalManager(confirm_fn=_app.confirm_fn, plan_approval_fn=_app.plan_approval_fn).attach(agent)
 
@@ -644,10 +644,15 @@ Examples:
         sys.exit(1)
 
     # 工作区信任闸：必须在构造 Agent（及其触发的项目侧配置加载）之前。
-    # 交互且不信任 → 弹 y/n（y 记住并继续，否则退出）；非交互 → 隐式信任。
+    # 交互且不信任 → 方向键确认（信任则记住并继续，否则退出）；非交互 → 隐式信任。
     from ..trust import ensure_workspace_trust
     _interactive = not bool(args.prompt) and sys.stdin.isatty()
-    workspace_trusted = ensure_workspace_trust(Path.cwd(), interactive=_interactive)
+    _choice_fn = None
+    if _interactive and sys.stdout.isatty():
+        from ..tui.choice_prompt import workspace_trust_choice
+        _choice_fn = workspace_trust_choice
+    workspace_trusted = ensure_workspace_trust(
+        Path.cwd(), interactive=_interactive, choice_fn=_choice_fn)
 
     startup_modes = [
         bool(args.continue_session),

@@ -122,7 +122,7 @@ def preview_limit(name: str, *, is_error: bool = False) -> int | None:
     if name in ("run_shell",):
         return 5
     if name == "list_files":
-        return 20
+        return 5
     if name == "grep_search":
         return 15
     if name == "read_file":

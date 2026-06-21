@@ -132,6 +132,19 @@ def test_ensure_interactive_untrusted_yes_persists(monkeypatch, tmp_path):
     assert trust.is_trusted(work) is True
 
 
+def test_ensure_interactive_choice_yes_persists(monkeypatch, tmp_path):
+    """交互+不信任+choice_fn 选择信任→True 且写盘。"""
+    trust = _isolate(monkeypatch, tmp_path)
+    work = tmp_path / "proj"
+    work.mkdir()
+
+    assert trust.ensure_workspace_trust(
+        work, interactive=True, input_fn=lambda _: "n", choice_fn=lambda cwd: True
+    ) is True
+    trust._session_trusted.clear()
+    assert trust.is_trusted(work) is True
+
+
 def test_ensure_interactive_untrusted_no_raises_systemexit(monkeypatch, tmp_path):
     """交互+不信任+输入 n→SystemExit。"""
     trust = _isolate(monkeypatch, tmp_path)
@@ -140,6 +153,18 @@ def test_ensure_interactive_untrusted_no_raises_systemexit(monkeypatch, tmp_path
 
     with pytest.raises(SystemExit):
         trust.ensure_workspace_trust(work, interactive=True, input_fn=lambda _: "n")
+
+
+def test_ensure_interactive_choice_no_raises_systemexit(monkeypatch, tmp_path):
+    """交互+不信任+choice_fn 拒绝→SystemExit。"""
+    trust = _isolate(monkeypatch, tmp_path)
+    work = tmp_path / "proj"
+    work.mkdir()
+
+    with pytest.raises(SystemExit):
+        trust.ensure_workspace_trust(
+            work, interactive=True, input_fn=lambda _: "y", choice_fn=lambda cwd: False
+        )
 
 
 def test_ensure_already_trusted_returns_true_without_prompt(monkeypatch, tmp_path):

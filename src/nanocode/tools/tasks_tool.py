@@ -49,7 +49,6 @@ def task_output_text(manager, task_id: str, tail_bytes: int = 8000) -> str:
              f"Description: {t.description}", f"Summary: {t.result_summary or '(none)'}"]
     if t.error:
         parts.append(f"Error: {t.error}")
-    # 子 agent 类 task：surface result.md 路径（含完整 transcript + findings + files touched）。
     if t.result_path:
         parts.append(f"Result: {t.result_path}")
     parts.append("\nstdout tail:\n" + (tail_file(t.stdout_path, tail_bytes) if t.stdout_path else "" or "(empty)"))
@@ -62,38 +61,30 @@ def task_output_text(manager, task_id: str, tail_bytes: int = 8000) -> str:
     return "\n".join(parts)
 
 
-def list_subagents_text(manager) -> str:
-    subs = manager.list_subagents()
-    if not subs:
-        return "No sub-agents in this session."
+def list_subagents_text(records) -> str:
+    if not records:
+        return "No sub-agent runs in this session."
     return "\n".join(
-        f"{a.id}  [{a.type}]  {a.status}  {a.description}"
-        for a in sorted(subs, key=lambda x: x.id))
+        f"{r.child_session_id}  [{r.agent_type}]  {r.status}  {r.summary or ''}".rstrip()
+        for r in sorted(records, key=lambda x: x.child_session_id))
 
 
-def subagent_detail_text(manager, agent_id: str, session_id: str | None = None) -> str:
-    a = manager.get_subagent(agent_id)
-    if a is None:
-        return f"Unknown sub-agent: {agent_id}"
+def subagent_detail_text(record) -> str:
+    if record is None:
+        return "Unknown sub-agent run."
     parts = [
-        f"Sub-agent {a.id} [{a.type}] status={a.status}",
-        f"Description: {a.description}",
-        f"Provider/model: {a.provider}/{a.model}",
-        f"Created: {a.created_at}  Updated: {a.updated_at}",
+        f"Sub-agent run {record.child_session_id} [{record.agent_type}] status={record.status}",
+        f"Parent session: {record.parent_session_id}",
+        f"Context/isolation: {record.context_mode}/{record.isolation}",
+        f"Provider/model: {(record.model or {}).get('provider')}/{(record.model or {}).get('modelId')}",
+        f"Created: {record.created_at}  Started: {record.started_at}  Ended: {record.ended_at}",
     ]
-    if a.message_path:
-        parts.append(f"Messages: {a.message_path}")
-    if a.task_id:
-        parts.append(f"Task: {a.task_id}")
-    # P2 artifacts: surface result.md / meta.json / prompt.txt paths if they exist on disk.
-    if session_id:
-        try:
-            from ..session import v2 as _v2
-            for label, p in _v2.agent_artifact_paths(session_id, a.id):
-                if p.exists():
-                    parts.append(f"{label}: {p}")
-        except Exception:
-            pass
+    if record.worktree_path:
+        parts.append(f"Worktree: {record.worktree_path}")
+    if record.result_path:
+        parts.append(f"Result: {record.result_path}")
+    if record.error:
+        parts.append(f"Error: {record.error}")
     return "\n".join(parts)
 
 
@@ -168,11 +159,11 @@ def agent_definition_detail_text(name: str) -> str | None:
     return "\n".join(parts)
 
 
-def agents_overview_text(manager) -> str:
+def agents_overview_text(records) -> str:
     """`/agents`（无参）总览：可用定义 + 运行实例两段。"""
-    return (list_agent_definitions_text(manager)
+    return (list_agent_definitions_text()
             + "\n\nRunning instances:\n"
-            + list_subagents_text(manager))
+            + list_subagents_text(records))
 
 
 async def task_stop(manager, background_tasks: set, task_id: str, grace_s: float = 3.0,

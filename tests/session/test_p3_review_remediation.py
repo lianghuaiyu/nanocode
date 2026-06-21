@@ -61,7 +61,11 @@ def test_fork_pre3a_first_message_yields_empty_new_session():
     assert a.session_id != "pre3a_fork"                      # 新 session
     assert a.agent_session.build_request_messages() == []    # 其前无内容 → 空上下文
     from nanocode.session.manager import children
-    assert a.session_id in children("pre3a_fork")            # 空前缀也记血缘（review P1）
+    new_sid = a.session_id
+    assert new_sid not in children("pre3a_fork")             # 空 fork 首个 assistant 前不污染 children()
+    a.agent_session.record_provider_messages({"role": "user", "content": "followup"})
+    a.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
+    assert new_sid in children("pre3a_fork")                 # materialize 后 lineage 可发现
 
 
 # docs/14 SessionLease：删除「空树回退 legacy」与「树仅 custom_message 回退 flat」两个用例——

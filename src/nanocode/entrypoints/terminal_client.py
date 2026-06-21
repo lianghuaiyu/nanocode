@@ -89,6 +89,6 @@ class TerminalClient:
         elif kind == "tool_call_authorized" and getattr(event, "action", None) == "deny":
             tui.print_info(f"Denied: {event.message}")
         elif kind == "approval_requested":
-            tui.print_confirmation(event.message)   # 显示告警；y/n 决策经注入的 confirm_fn
+            tui.print_confirmation(event.message)   # 显示告警；决策经注入的 confirm_fn
         elif kind == "turn_completed":
             tui.print_cost(event.input_tokens, event.output_tokens)

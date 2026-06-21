@@ -1,13 +1,14 @@
-"""Task 5: persistent subagent 注册 + 持久化 + agent 工具重写。
+"""Persistent subagent child sessions + run records.
 
-- fresh 路径：注册 SubAgentRecord（agent-001，type 归一，status running→completed），
-  messages 实时落 child canonical 树（{sid}.agent-001），token 累加到父。
+- fresh 路径：创建 child session id + run record，
+  messages 实时落 child canonical 树，token 累加到父。
 - resume 路径：reload 历史 + 追加新 prompt；unknown id 报错；provider mismatch 报错；
   model mismatch 报错；不新增记录。
-- run_in_background=True 返回未支持错误。
+- run_in_background=True 返回 child-session run id。
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -34,10 +35,16 @@ def _stub_run_once(agent, text="sub done", history=None):
     return _ro
 
 
+def _only_run_id(parent) -> str:
+    recs = json.loads(parent.run_list())
+    assert len(recs) == 1
+    return recs[0]["child_session_id"]
+
+
 # ─── fresh 路径：注册 + 持久化 + token 累加 ──────────────────
 
 
-def test_agent_tool_registers_subagent_record(monkeypatch):
+def test_agent_tool_registers_run_record(monkeypatch):
     parent = _agent()
     built = {}
 
@@ -58,12 +65,16 @@ def test_agent_tool_registers_subagent_record(monkeypatch):
     # also points at the persisted result.md — not the raw transcript verbatim.
     assert "sub done" in res
     assert "result.md" in res
-    recs = parent.task_manager.list_subagents()
+    recs = json.loads(parent.run_list())
     assert len(recs) == 1
     rec = recs[0]
-    assert rec.id == "agent-001"
-    assert rec.type == "coder"
-    assert rec.status == "completed"
+    assert rec["child_session_id"].startswith("sess_")
+    assert rec["agent_type"] == "coder"
+    assert rec["status"] == "completed"
+    out = json.loads(parent.run_output(rec["child_session_id"]))
+    assert out["childSessionId"] == rec["child_session_id"]
+    assert out["status"] == "completed"
+    assert "sub done" in out["result"]
 
 
 def test_agent_tool_persists_messages_to_v2(monkeypatch):
@@ -81,7 +92,7 @@ def test_agent_tool_persists_messages_to_v2(monkeypatch):
 
     from nanocode.session import tree as T
     from nanocode.session.manager import SessionManager
-    child = SessionManager.open("psid.agent-001")
+    child = SessionManager.open(_only_run_id(parent))
     contents = str([e.data for e in child.entries() if e.type == T.MESSAGE])
     assert "persisted body" in contents
 
@@ -117,8 +128,8 @@ def test_agent_tool_type_normalized(monkeypatch):
     monkeypatch.setattr(parent, "_build_sub_agent", _spy_build)
     asyncio.run(parent._execute_agent_tool(
         {"description": "d", "prompt": "p"}))  # no type → general → normalized coder
-    rec = parent.task_manager.list_subagents()[0]
-    assert rec.type == "coder"
+    rec = json.loads(parent.run_list())[0]
+    assert rec["agent_type"] == "coder"
 
 
 # ─── resume 路径 ─────────────────────────────────────────────
@@ -139,7 +150,8 @@ def test_resume_reloads_history_and_appends(monkeypatch):
         {"type": "coder", "description": "d", "prompt": "first prompt"}))
     from nanocode.session import tree as T
     from nanocode.session.manager import SessionManager
-    first_n = sum(1 for e in SessionManager.open("psid.agent-001").entries() if e.type == T.MESSAGE)
+    run_id = _only_run_id(parent)
+    first_n = sum(1 for e in SessionManager.open(run_id).entries() if e.type == T.MESSAGE)
     assert first_n >= 2
 
     # resume：reload 历史，追加新 prompt
@@ -161,12 +173,12 @@ def test_resume_reloads_history_and_appends(monkeypatch):
 
     monkeypatch.setattr(parent, "_build_sub_agent", _spy_build2)
     res = asyncio.run(parent._execute_agent_tool(
-        {"description": "d", "prompt": "second prompt", "resume": "agent-001"}))
+        {"description": "d", "prompt": "second prompt", "resume": run_id}))
     # P3: resume also returns the bounded envelope (summary passthrough + result_path).
     assert "second" in res
     assert "result.md" in res
     # resume 不新增记录
-    assert len(parent.task_manager.list_subagents()) == 1
+    assert len(json.loads(parent.run_list())) == 1
     # run_once 之前历史已 reload（>=2 条）
     assert reloaded["history_len_before_run"] >= 2
 
@@ -177,32 +189,49 @@ def test_resume_unknown_id_errors():
         {"description": "d", "prompt": "p", "resume": "agent-999"}))
     assert "agent-999" in res
     assert "unknown" in res.lower() or "not found" in res.lower()
-    assert parent.task_manager.list_subagents() == []
+    assert json.loads(parent.run_list()) == []
 
 
 def test_resume_provider_mismatch_errors(monkeypatch):
     parent = _agent()
-    # 注册一个 provider=openai 的记录，但父是 anthropic
-    rec = parent.task_manager.create_subagent(
-        type="coder", description="d", model=parent.model, provider="openai")
+    real_build = parent._build_sub_agent
+    def _spy_build(**kw):
+        sub = real_build(**kw)
+        sub.run_once = _stub_run_once(sub)
+        return sub
+    monkeypatch.setattr(parent, "_build_sub_agent", _spy_build)
+    asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "first"}))
+    run_id = _only_run_id(parent)
+    from nanocode.subagents import run_record
+    run_record.update_status(run_id, model={"provider": "openai", "modelId": parent.model})
     res = asyncio.run(parent._execute_agent_tool(
-        {"description": "d", "prompt": "p", "resume": rec.id}))
+        {"description": "d", "prompt": "p", "resume": run_id}))
     assert "provider" in res.lower()
     assert "mismatch" in res.lower() or "cannot" in res.lower()
 
 
 def test_resume_model_mismatch_errors(monkeypatch):
     parent = _agent()
-    rec = parent.task_manager.create_subagent(
-        type="coder", description="d", model="some-other-model",
-        provider=parent._current_provider())
+    real_build = parent._build_sub_agent
+    def _spy_build(**kw):
+        sub = real_build(**kw)
+        sub.run_once = _stub_run_once(sub)
+        return sub
+    monkeypatch.setattr(parent, "_build_sub_agent", _spy_build)
+    asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "first"}))
+    run_id = _only_run_id(parent)
+    from nanocode.subagents import run_record
+    run_record.update_status(
+        run_id, model={"provider": parent._current_provider(), "modelId": "some-other-model"})
     res = asyncio.run(parent._execute_agent_tool(
-        {"description": "d", "prompt": "p", "resume": rec.id}))
+        {"description": "d", "prompt": "p", "resume": run_id}))
     assert "model" in res.lower()
     assert "mismatch" in res.lower() or "cannot" in res.lower()
 
 
-# ─── run_in_background 现已支持（阶段 E）：立即返回 task_id ────
+# ─── run_in_background：立即返回 child-session run id ────
 
 
 def test_run_in_background_starts_task(monkeypatch):
@@ -218,10 +247,10 @@ def test_run_in_background_starts_task(monkeypatch):
     res = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "prompt": "p", "run_in_background": True}))
     assert "background" in res.lower()
-    assert "task-001" in res
-    # 立即注册 task + subagent（双向链）
-    assert parent.task_manager.get_task("task-001") is not None
-    assert parent.task_manager.get_subagent("agent-001") is not None
+    run_id = _only_run_id(parent)
+    assert run_id in res
+    assert parent.task_manager.get_task(run_id) is None
+    assert json.loads(parent.run_status(run_id))["child_session_id"] == run_id
 
 
 def test_run_in_background_with_resume_errors():
@@ -231,7 +260,7 @@ def test_run_in_background_with_resume_errors():
          "run_in_background": True, "resume": "agent-001"}))
     assert "resume" in res.lower()
     assert "run_in_background" in res.lower() or "background" in res.lower()
-    assert parent.task_manager.list_subagents() == []
+    assert json.loads(parent.run_list()) == []
 
 
 # ─── _current_provider 基础 ──────────────────────────────────
@@ -253,10 +282,18 @@ def test_resume_rejects_in_flight_subagent():
     # review medium：resume 一个仍 running/idle 的子 agent 会对其 child session 取第二把 flock
     # （同进程第二 fd）→ SessionBusyError + 误导消息。须先 fail-closed 拒绝、给清晰提示。
     parent = _agent()
-    rec = parent.task_manager.create_subagent(type="coder", description="d",
-                                              model=parent.model, provider="anthropic")
-    parent.task_manager.update_subagent(rec.id, status="running")
+    real_build = parent._build_sub_agent
+    def _spy_build(**kw):
+        sub = real_build(**kw)
+        sub.run_once = _stub_run_once(sub)
+        return sub
+    parent._build_sub_agent = _spy_build
+    asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "d", "prompt": "first"}))
+    run_id = _only_run_id(parent)
+    from nanocode.subagents import run_record
+    run_record.update_status(run_id, status="running")
     res = asyncio.run(parent._execute_agent_tool(
-        {"description": "d", "prompt": "p", "resume": rec.id}))
+        {"description": "d", "prompt": "p", "resume": run_id}))
     assert "running" in res.lower() and "cannot resume" in res.lower()
     assert "locked by another writer" not in res          # 不再是误导的锁错误

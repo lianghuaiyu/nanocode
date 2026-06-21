@@ -7,6 +7,8 @@ _STEP_PROPS = {
     "description": {"type": "string", "description": "Short description of this step."},
     "prompt": {"type": "string", "description": "Task instructions for this step."},
     "timeout_ms": {"type": "integer", "description": "Optional per-step wall-clock timeout in ms."},
+    "context": {"type": "object", "description": "Explicit context mode. Default: {'mode':'fresh'}."},
+    "isolation": {"type": "string", "description": "shared or worktree."},
 }
 
 SCHEMA = {
@@ -25,7 +27,12 @@ SCHEMA = {
             "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
             "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent (single-run mode; omit when using steps/tasks)"},
             "type": {"type": "string", "description": "Agent type. Built-ins: 'explore' (read-only), 'plan' (read-only planning), 'general'/'coder' (full tools). Custom agent types advertised in the system prompt (from .nanocode/agents or .agents/agents) may also be named. Default: general."},
-            "resume": {"type": "string", "description": "Resume a previously persisted sub-agent by its id; reloads its history and appends this prompt"},
+            "context": {"type": "object", "description": "Explicit context mode. Default: {'mode':'fresh'}; supported: fresh, fork_summary, branch_projection."},
+            "isolation": {"type": "string", "description": "Execution isolation: shared or worktree."},
+            "resume": {"type": "string", "description": "Resume a child-session sub-agent by child_session_id and append this prompt"},
+            "steer": {"type": "string", "description": "Queue a steering prompt for a running child session id without creating a new child."},
+            "delivery": {"type": "string", "description": "For steer: steer or follow_up. Default: steer."},
+            "wake": {"type": "boolean", "description": "For resume/steer: whether to wake an idle child. resume defaults true; steer defaults false."},
             "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false)"},
             "timeout_ms": {"type": "integer", "description": "Wall-clock timeout in ms for this sub-agent run. If omitted, the agent definition's timeout-ms (if any) is used; otherwise no wall-clock limit (a turn ceiling still bounds it)."},
             "steps": {
@@ -39,6 +46,6 @@ SCHEMA = {
                 "items": {"type": "object", "properties": _STEP_PROPS, "required": ["prompt"]},
             },
         },
-        "required": ["description"],
+        "required": [],
     },
 }

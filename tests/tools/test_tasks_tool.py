@@ -1,4 +1,5 @@
 import asyncio
+from nanocode.runs.models import AgentRunRecord
 from nanocode.tasks.manager import TaskManager
 from nanocode.tools import tasks_tool as tt
 
@@ -42,16 +43,14 @@ def test_task_output_unknown():
     assert "unknown" in tt.task_output_text(TaskManager(), "task-999", 10).lower()
 
 
-def test_task_output_text_prints_result_path_for_subagent(tmp_path):
-    """P3: sub-agent task surfaces result.md path (full transcript + findings)."""
-    m = TaskManager(); t = m.create_task("subagent", "scan repo")
+def test_task_output_text_prints_result_path_for_host_job(tmp_path):
+    m = TaskManager(); t = m.create_task("memory_consolidate", "scan memories")
     rp = tmp_path / "result.md"; rp.write_text("the full result body")
     m.update_task(t.id, status="completed", result_path=str(rp),
-                  result_summary="scanned 12 files")
+                  result_summary="scanned memories")
     txt = tt.task_output_text(m, t.id, tail_bytes=8000)
-    assert "completed" in txt
-    assert "scanned 12 files" in txt
     assert str(rp) in txt
+    assert "scanned memories" in txt
 
 
 def test_task_stop_unknown():
@@ -85,45 +84,53 @@ def test_task_stop_cancels_running(tmp_path):
 
 # ─── Stage D: subagent renderers ────────────────────────────
 
+def _run_record(**kw):
+    data = {
+        "run_id": "sess-child",
+        "child_session_id": "sess-child",
+        "parent_session_id": "sess-parent",
+        "status": "completed",
+        "agent_type": "coder",
+        "model": {"provider": "anthropic", "modelId": "claude-opus-4-6"},
+        "background": False,
+        "context_mode": "fresh",
+        "isolation": "shared",
+        "summary": "inspect parser",
+    }
+    data.update(kw)
+    return AgentRunRecord(**data)
+
+
 def test_list_subagents_text_empty():
-    assert "no sub-agent" in tt.list_subagents_text(TaskManager()).lower()
+    assert "no sub-agent" in tt.list_subagents_text([]).lower()
 
 
 def test_list_subagents_text_lists():
-    m = TaskManager()
-    m.create_subagent("coder", "inspect parser")
-    m.create_subagent("explore", "scan repo")
-    txt = tt.list_subagents_text(m)
-    assert "agent-001" in txt and "agent-002" in txt
-    assert "coder" in txt and "inspect parser" in txt
+    txt = tt.list_subagents_text([
+        _run_record(child_session_id="sess-a", run_id="sess-a"),
+        _run_record(child_session_id="sess-b", run_id="sess-b",
+                    agent_type="explore", summary="scan repo"),
+    ])
+    assert "sess-a" in txt and "sess-b" in txt
+    assert "coder" in txt and "scan repo" in txt
 
 
 def test_subagent_detail_text():
-    m = TaskManager()
-    a = m.create_subagent("coder", "inspect parser", model="claude-opus-4-6", provider="anthropic")
-    txt = tt.subagent_detail_text(m, a.id)
-    assert "agent-001" in txt and "coder" in txt and "inspect parser" in txt
+    txt = tt.subagent_detail_text(_run_record())
+    assert "sess-child" in txt and "coder" in txt
     assert "anthropic" in txt and "claude-opus-4-6" in txt
 
 
 def test_subagent_detail_text_unknown():
-    assert "unknown" in tt.subagent_detail_text(TaskManager(), "agent-999").lower()
+    assert "unknown" in tt.subagent_detail_text(None).lower()
 
 
-def test_subagent_detail_text_surfaces_artifact_paths():
-    # docs/14 Milestone B：wire.jsonl 已退役——artifact 只剩 Result/Meta/Prompt（无 Wire 行）。
-    from nanocode.session import v2
-    m = TaskManager()
-    a = m.create_subagent("coder", "d", model="claude-opus-4-6", provider="anthropic")
-    # no artifacts yet -> no Result line even with session_id
-    txt = tt.subagent_detail_text(m, a.id, "detsid")
-    assert "Result:" not in txt and "Wire:" not in txt
-    # write artifacts, then they should be surfaced
-    v2.write_agent_result("detsid", a.id, "done")
-    v2.write_agent_prompt("detsid", a.id, "task")
-    txt2 = tt.subagent_detail_text(m, a.id, "detsid")
-    assert "Result:" in txt2 and "result.md" in txt2
-    assert "Prompt:" in txt2
-    assert "Wire:" not in txt2                          # wire 已退役，不再 surface
-    # artifact surfacing is session-bound; without a session id there are no artifact lines
-    assert "Result:" not in tt.subagent_detail_text(m, a.id)
+def test_subagent_detail_text_surfaces_run_record_paths():
+    txt = tt.subagent_detail_text(_run_record(
+        result_path="/tmp/result.md",
+        worktree_path="/tmp/worktree",
+        error="boom",
+    ))
+    assert "Result: /tmp/result.md" in txt
+    assert "Worktree: /tmp/worktree" in txt
+    assert "Error: boom" in txt

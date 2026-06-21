@@ -52,6 +52,7 @@ class AgentLoopConfig:
     consume_context_break: Callable[[], bool]         # plan clear-and-execute 的 turn 内信号
     # ── turn-boundary 注入 ──
     inject_turn_context: Callable[[], None]           # finished_tasks + skill_listing
+    inject_follow_up: Callable[[], bool]              # child follow-up steer at natural stop
     inject_skill_bodies: Callable[[], None]
     poll_memory: Callable[[], None]                   # memory prefetch settle → ContextInjected
 

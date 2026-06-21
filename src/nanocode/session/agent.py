@@ -136,8 +136,17 @@ class AgentSession:
             return False
 
         def inject_turn_context() -> None:
+            if a.is_sub_agent:
+                from ..subagents.steer import drain_pending_steers
+                drain_pending_steers(a, delivery="steer")
             self.inject_finished_tasks()
             self.inject_skill_listing()
+
+        def inject_follow_up() -> bool:
+            if not a.is_sub_agent:
+                return False
+            from ..subagents.steer import drain_pending_steers
+            return drain_pending_steers(a, delivery="follow_up") > 0
 
         return AgentLoopConfig(
             provider=("openai" if a.use_openai else "anthropic"),
@@ -156,6 +165,7 @@ class AgentSession:
             compact=self._compact_on_overflow,
             consume_context_break=consume_context_break,
             inject_turn_context=inject_turn_context,
+            inject_follow_up=inject_follow_up,
             inject_skill_bodies=self.inject_pending_skill_bodies,
             poll_memory=lambda: self.consume_memory_prefetch(memory_prefetch),
         )
@@ -980,12 +990,10 @@ class AgentSession:
         a._pending_context_break = True
 
     def auto_save(self) -> None:
-        """v2 state.json（TaskManager/subagent 派生 cache）按需落盘——canonical 树是 resume 权威。
-        含 list_tasks：仅有后台 shell 任务、无 subagent 的 session 也要落 state（docs/14 P2 review）。"""
+        """v2 state.json（host task 派生 cache）按需落盘——canonical 树是 resume 权威。"""
         a = self.agent
         from . import v2 as _session_v2
-        if (_session_v2.is_v2_session(a.session_id) or a.task_manager.list_subagents()
-                or a.task_manager.list_tasks()):
+        if _session_v2.is_v2_session(a.session_id) or a.task_manager.list_tasks():
             a._persist_state()
 
     # ── in-file 导航（docs/14 P6）────────────────────────────────────────────

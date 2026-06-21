@@ -10,7 +10,7 @@ def test_printable_and_controls():
     p = KeyParser()
     assert p.feed(b"a") == ["a"]
     assert p.feed(b"\r") == ["enter"]
-    assert p.feed(b"\n") == ["ctrl-j"]
+    assert p.feed(b"\n") == ["enter"]
     assert p.feed(b"\x7f") == ["backspace"]
     assert p.feed(b"\x03") == ["ctrl-c"]
     assert p.feed(b"\x04") == ["ctrl-d"]
@@ -93,6 +93,15 @@ def test_insert_and_submit():
     _type(ed, "hello")
     assert ed.text == "hello" and ed.cursor == 5
     assert ed.handle("enter") == "submit"
+
+
+def test_lf_enter_submits():
+    p = KeyParser()
+    ed = LineEditor()
+    for token in p.feed(b"hello\n"):
+        action = ed.handle(token)
+    assert ed.text == "hello"
+    assert action == "submit"
 
 
 def test_backspace_and_cursor():

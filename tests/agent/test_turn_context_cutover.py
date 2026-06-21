@@ -81,7 +81,7 @@ def test_user_message_is_recorded_before_volatile_collect(monkeypatch):
     seen = {}
 
     async def fake_collect(self, prompt=""):
-        entries = SessionManager.open("ctx6_order").entries()
+        entries = self.agent._session_mgr.entries()
         seen["user_visible"] = "hello" in str([e.to_dict() for e in entries])
         return None
 

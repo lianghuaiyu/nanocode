@@ -85,7 +85,7 @@ def _modified_arrow_token(final: str, modifier: int) -> str | None:
 
 # 控制字节 → token。
 _CTRL = {
-    "\r": "enter", "\n": "ctrl-j", "\x7f": "backspace", "\x08": "backspace",
+    "\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace",
     "\x03": "ctrl-c", "\x04": "ctrl-d", "\x01": "ctrl-a", "\x05": "ctrl-e",
     "\x0c": "ctrl-l", "\x0e": "ctrl-n", "\x0f": "ctrl-o", "\x10": "ctrl-p",
     "\x12": "ctrl-r", "\x13": "ctrl-s", "\x14": "ctrl-t",

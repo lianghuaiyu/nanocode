@@ -13,7 +13,6 @@ import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.agent_result import build_agent_result, render_agent_result_envelope
-from nanocode.session import v2 as _session_v2
 
 
 def _agent(**kw):
@@ -184,13 +183,11 @@ def test_foreground_returns_envelope_not_raw_large_transcript():
     assert "Z" * 5000 not in res
     assert "result.md" in res
     assert "truncated" in res
-    # full transcript still recoverable on disk
-    from nanocode.session import v2 as _v2
-    assert (_v2.agent_dir("p3sid", "agent-001") / "result.md").read_text(
-        encoding="utf-8") == huge
-    # SubAgentRecord.last_result_path populated
-    rec = parent.task_manager.get_subagent("agent-001")
-    assert rec.last_result_path and rec.last_result_path.endswith("result.md")
+    # full transcript still recoverable from the run record sidecar
+    rec = json.loads(parent.run_list())[0]
+    assert rec["result_path"] and rec["result_path"].endswith("result.md")
+    from pathlib import Path
+    assert Path(rec["result_path"]).read_text(encoding="utf-8") == huge
 
 
 def test_foreground_envelope_surfaces_structured_findings():
@@ -254,11 +251,11 @@ def test_skill_fork_large_output_is_bounded_envelope(monkeypatch):
     assert len(res) < 6000              # bounded envelope, NOT the 20KB transcript
     assert huge not in res              # raw transcript not dumped
     assert "result.md" in res          # points to the on-disk full result
-    subs = [s for s in parent.task_manager.list_subagents() if s.type == "skill-fork"]
-    assert subs and subs[0].last_result_path and subs[0].last_result_path.endswith("result.md")
+    subs = [s for s in json.loads(parent.run_list()) if s["agent_type"] == "skill-fork"]
+    assert subs and subs[0]["result_path"] and subs[0]["result_path"].endswith("result.md")
     # full transcript recoverable on disk
-    d = _session_v2.agent_dir("p3sid", subs[0].id)
-    assert (d / "result.md").read_text(encoding="utf-8") == huge
+    from pathlib import Path
+    assert Path(subs[0]["result_path"]).read_text(encoding="utf-8") == huge
 
 
 def test_envelope_caps_verbose_model_summary():
@@ -344,6 +341,6 @@ def test_timed_out_subagent_envelope_surfaces_files_modified():
         {"type": "coder", "description": "d", "prompt": "p", "timeout_ms": 30}))
     assert "timed out" in res.lower()
     assert "touched.py" in res          # files_modified surfaced
-    # subagent record points at a persisted result.md
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.last_result_path and sub.last_result_path.endswith("result.md")
+    # run record points at a persisted result.md
+    sub = json.loads(parent.run_list())[0]
+    assert sub["result_path"] and sub["result_path"].endswith("result.md")

@@ -21,9 +21,6 @@ def _reload_task_state(agent, state) -> None:
     for t in agent.task_manager.list_tasks():
         if t.status not in TERMINAL_TASK_STATUSES:
             agent.task_manager.update_task(t.id, status="lost")
-    for a in agent.task_manager.list_subagents():
-        if a.status in ("running", "idle"):
-            agent.task_manager.update_subagent(a.id, status="lost")
 
 
 def _reset_working_sets(agent) -> None:

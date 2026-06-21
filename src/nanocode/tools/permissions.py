@@ -385,6 +385,7 @@ def reset_permission_cache() -> None:
 ALWAYS_ALLOWED_META = frozenset({
     "task_list", "task_output", "task_stop",
     "enter_plan_mode", "exit_plan_mode",
+    "get_subagent_result", "run_list", "run_status", "run_output", "run_cancel", "run_send",
 })
 AGENT_META_TOOL = "agent"  # 'agent' 元工具：子 agent 一律不可调用（独立 fail-closed 后备）
 

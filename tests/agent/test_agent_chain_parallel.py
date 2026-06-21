@@ -2,11 +2,12 @@
 
 - chain：按序独立子 agent；{previous} 替换为上一步 bounded envelope；abort 在步边界生效；
 - parallel：并发独立子 agent，按任务序聚合；
-- 每步/每任务 = 独立 SubAgentRecord + 独立 leased child session（审计可循）；
+- 每步/每任务 = 独立 child-session run record（审计可循）；
 - 与 resume / run_in_background / 彼此互斥；步数/任务数封顶。
 """
 
 import asyncio
+import json
 
 from nanocode.agent.engine import Agent
 
@@ -59,11 +60,12 @@ def test_chain_runs_steps_sequentially_with_previous_substitution():
     assert "ONE-OUT" in record[1]["prompt"]                            # {previous} 注入上一步 envelope
     assert "{previous}" not in record[1]["prompt"]
     assert "## Step 1/2 [explore] first" in out and "## Step 2/2 [coder] second" in out
-    # 每步独立 record（agent-001/agent-002）+ 独立 child session
-    recs = parent.task_manager.list_subagents()
-    assert [r.id for r in recs] == ["agent-001", "agent-002"]
-    assert {r["artifact_id"] for r in record} == {"agent-001", "agent-002"}
-    assert all(r.status == "completed" for r in recs)
+    # 每步独立 child-session run record
+    recs = json.loads(parent.run_list())
+    assert len(recs) == 2
+    assert all(r["child_session_id"].startswith("sess_") for r in recs)
+    assert {r["artifact_id"] for r in record} == {r["child_session_id"] for r in recs}
+    assert all(r["status"] == "completed" for r in recs)
 
 
 def test_chain_first_step_previous_placeholder_is_neutral():
@@ -118,8 +120,8 @@ def test_parallel_fans_out_and_gathers_in_task_order():
     i1 = out.index("## Task 1/3"); i2 = out.index("## Task 2/3"); i3 = out.index("## Task 3/3")
     assert i1 < i2 < i3                        # 聚合按任务序（与完成序无关）
     assert "RESULT<alpha" in out and "RESULT<beta" in out and "RESULT<gamma" in out
-    recs = parent.task_manager.list_subagents()
-    assert len(recs) == 3 and all(r.status == "completed" for r in recs)
+    recs = json.loads(parent.run_list())
+    assert len(recs) == 3 and all(r["status"] == "completed" for r in recs)
 
 
 def test_steps_tasks_mutual_exclusions():

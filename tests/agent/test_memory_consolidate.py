@@ -110,9 +110,11 @@ def test_applies_plan_and_sets_summary():
     mem = project_memory_dir()
     assert not (mem / "stale_note.md").exists()
     assert "Ship v3 by Q2" in (mem / "project_goals.md").read_text()
-    # subagent completed
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "completed"
+    # curator child run completed; task id remains a host job id
+    assert rec.owner_agent_id and rec.owner_agent_id.startswith("sess_")
+    run = json.loads(parent.run_status(rec.owner_agent_id))
+    assert run["status"] == "completed"
+    assert run["agent_type"] == MEMORY_CURATOR_TYPE
 
 
 # ─── 2. archives_not_hard_delete ─────────────────────────────
@@ -184,7 +186,7 @@ def test_no_memories_skips_no_task():
     assert "No memories to consolidate" in res
     # 不建 task / subagent
     assert parent.task_manager.list_tasks() == []
-    assert parent.task_manager.list_subagents() == []
+    assert json.loads(parent.run_list()) == []
 
 
 # ─── 6. finished_task_injected_with_summary ──────────────────
@@ -234,8 +236,9 @@ def test_curator_error_marks_failed():
     rec = asyncio.run(scenario())
     assert rec.status == "failed"
     assert "curator boom" in (rec.error or "")
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "failed"
+    run = json.loads(parent.run_status(rec.owner_agent_id))
+    assert run["status"] == "failed"
+    assert "curator boom" in (run["error"] or "")
 
 
 # ─── 8. memory_tool_consolidate_action_delegates ─────────────

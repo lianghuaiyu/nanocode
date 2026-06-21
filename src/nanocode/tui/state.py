@@ -138,16 +138,18 @@ class ApprovalModal:
     command: str
     message: str
     request_id: str = ""
+    selected_index: int = 0
 
 
 @dataclass
 class PlanModal:
-    """plan 审批 modal（对位 plan_approval_fn）：展示计划 + 1-4 选项。
+    """plan 审批 modal（对位 plan_approval_fn）：展示计划 + choice 选项。
 
-    1 clear+execute / 2 execute keep / 3 manual-execute / 4 keep-planning。feedback（选项 4）
+    clear+execute / execute keep / manual-execute / keep-planning。feedback（keep-planning）
     经文本输入回填属后续步骤——step 3 先返回无 feedback。"""
 
     plan_content: str
+    selected_index: int = 0
 
 
 @dataclass

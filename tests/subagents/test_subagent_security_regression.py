@@ -13,6 +13,7 @@ Codex cross-validation of Phase 1, so they cannot silently regress:
 from __future__ import annotations
 
 import asyncio
+import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
@@ -117,12 +118,33 @@ def test_background_subagent_gets_bounded_max_turns(monkeypatch):
 
 def test_resume_reserved_curator_record_is_rejected():
     parent = _agent()
-    # Simulate a curator record left behind by a /memory command.
-    rec = parent.task_manager.create_subagent(
-        type=config.MEMORY_CURATOR_TYPE, description="curate",
-        model=parent.model, provider=parent._current_provider())
+    from nanocode.session.lease import SessionLease
+    from nanocode.session.manager import SessionManager
+    from nanocode.subagents import run_record
+
+    parent._session_mgr = SessionManager.create(parent.session_id)
+    child_id = "sess_reserved_curator"
+    lease = SessionLease.open_or_create(
+        child_id, parent_session={"sessionId": parent.session_id,
+                                  "entryId": parent._session_mgr.get_leaf(),
+                                  "taskId": child_id, "agentId": child_id})
+    lease.manager.rewrite_file()
+    lease.close()
+    run_record.create_run_record(
+        child_session_id=child_id,
+        parent_session_id=parent.session_id,
+        spawn_entry_id=parent._session_mgr.get_leaf(),
+        tool_call_id=None,
+        agent_type=config.MEMORY_CURATOR_TYPE,
+        background=True,
+        context_mode="fresh",
+        isolation="shared",
+        worktree_path=None,
+        model={"provider": parent._current_provider(), "modelId": parent.model},
+        prompt="curate",
+    )
     res = asyncio.run(parent._execute_agent_tool(
-        {"description": "d", "prompt": "evil", "resume": rec.id}))
+        {"description": "d", "prompt": "evil", "resume": child_id}))
     assert isinstance(res, str)
     assert "reserved" in res.lower()
     assert "cannot be resumed" in res.lower()
@@ -156,7 +178,7 @@ def test_extends_cycle_fails_closed(tmp_path, monkeypatch):
     assert names <= config.READ_ONLY_TOOLS
 
 
-# ─── NEW-MED: effective model recorded on SubAgentRecord ────────
+# ─── NEW-MED: effective model recorded on run record ────────
 
 
 def test_fresh_record_stores_effective_manifest_model(tmp_path, monkeypatch):
@@ -182,8 +204,8 @@ def test_fresh_record_stores_effective_manifest_model(tmp_path, monkeypatch):
     parent._build_sub_agent = _spy
     asyncio.run(parent._execute_agent_tool(
         {"type": "fastagent", "description": "d", "prompt": "p"}))
-    # the sub-agent ran with the manifest model, and the RECORD stores it (not parent's)
+    # the sub-agent ran with the manifest model, and the run record stores it (not parent's)
     assert cap["model"] == "claude-haiku-4-5"
-    rec = parent.task_manager.get_subagent("agent-001")
-    assert rec.model == "claude-haiku-4-5"
-    assert rec.model != parent.model
+    rec = json.loads(parent.run_list())[0]
+    assert rec["model"]["modelId"] == "claude-haiku-4-5"
+    assert rec["model"]["modelId"] != parent.model

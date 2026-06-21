@@ -194,6 +194,17 @@ def test_bash_collapsed_preview_uses_pi_five_line_tail():
     assert "7 earlier lines, Ctrl+O to expand" in collapsed
 
 
+def test_list_files_collapsed_preview_uses_five_lines():
+    app = RichApp(output=_console())
+    result = "\n".join(f"entry-{i}" for i in range(12))
+    item = ToolItem(id="tl", name="list_files", input={"path": "."}, status="done", result_excerpt=result)
+
+    collapsed = _plain(_render(app, app._render_message_block(item)))
+    assert "entry-0" in collapsed and "entry-4" in collapsed
+    assert "entry-5" not in collapsed
+    assert "7 more lines, Ctrl+O to expand" in collapsed
+
+
 def test_read_file_result_is_hidden_until_tools_expand():
     app = RichApp(output=_console())
     item = ToolItem(id="t4", name="read_file", input={"file_path": "x.py"}, status="done",

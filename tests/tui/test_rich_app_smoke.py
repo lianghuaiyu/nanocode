@@ -92,7 +92,8 @@ def _render(app: RichApp, con: Console) -> str:
 def test_submit_runs_turn_and_reduces():
     async def scenario():
         r, w = os.pipe()
-        app = RichApp(input=r, output=_console())
+        con = _console()
+        app = RichApp(input=r, output=con)
         thread = FakeThread()
         app.bind_thread(thread)
         task = asyncio.create_task(app.run())
@@ -106,12 +107,12 @@ def test_submit_runs_turn_and_reduces():
             os.close(r)
         except OSError:
             pass
-        return app, thread
+        return app, thread, con
 
-    app, thread = asyncio.run(scenario())
+    app, thread, con = asyncio.run(scenario())
     assert thread.run_calls == ["hello"]
-    from nanocode.tui.state import AssistantItem
-    assert any(isinstance(i, AssistantItem) and i.text == "hi" for i in app.state.timeline)
+    assert "hi" in con.file.getvalue()
+    assert all(type(i).__name__ != "AssistantItem" for i in app.state.timeline)
     assert app.state.status.input_tokens == 10
 
 
@@ -229,7 +230,7 @@ def test_completed_message_renders_without_delta():
     assert "final-only answer" in con.file.getvalue()
 
 
-def test_completed_message_remains_live_after_turn_finishes():
+def test_completed_message_commits_to_scrollback_after_turn_finishes():
     async def scenario():
         r, w = os.pipe()
         con = _console()
@@ -251,14 +252,14 @@ def test_completed_message_remains_live_after_turn_finishes():
         return app, con
 
     app, con = asyncio.run(scenario())
-    from nanocode.tui.state import AssistantItem
+
+    scrollback = con.file.getvalue()
+    assert "section 0: detailed content" in scrollback
+    assert "section 11: detailed content" in scrollback
 
     out = _render(app, con)
-    assert "section 11: detailed content" in out
-    assert "section 0: detailed content" not in out
-    stored = [i for i in app.state.timeline if isinstance(i, AssistantItem)][-1]
-    assert "section 0: detailed content" in stored.text
-    assert "section 11: detailed content" in stored.text
+    assert "section 11: detailed content" not in out
+    assert all(type(i).__name__ != "AssistantItem" for i in app.state.timeline)
 
 
 def test_completed_message_stays_live_across_next_user_message():
@@ -328,13 +329,13 @@ def test_streaming_long_assistant_uses_scrollable_transcript_viewport():
     assert "repo" in out
     assert "section 29" in out
     assert "section 0" not in out
-    assert "earlier transcript lines" in out
+    assert "earlier transcript lines" not in out
 
     for _ in range(20):
         app._dispatch_main("pageup")
     out = _render(app, con)
     assert "section 0" in out
-    assert "later transcript lines" in out
+    assert "later transcript lines" not in out
 
     for _ in range(20):
         app._dispatch_main("pagedown")
@@ -366,7 +367,7 @@ def test_completed_long_assistant_uses_scrollable_transcript_viewport():
         app._dispatch_main("pageup")
     out = _render(app, con)
     assert "section 0" in out
-    assert "later transcript lines" in out
+    assert "later transcript lines" not in out
 
     from nanocode.tui.state import AssistantItem
     stored = [i for i in app.state.timeline if isinstance(i, AssistantItem)][-1]

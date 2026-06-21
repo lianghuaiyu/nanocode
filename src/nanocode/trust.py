@@ -7,6 +7,7 @@
   优先 git toplevel，否则 `resolve(cwd)`。
 - HOME 特例：cwd==Path.home() 仅记内存、不落盘（贴 CC，下次重问）。
 - 非交互（one-shot / 非 TTY）→ 隐式信任（贴 CC）。
+- 交互确认优先走方向键选择；无选择器注入时退回文本输入。
 """
 from __future__ import annotations
 
@@ -82,17 +83,23 @@ def record_trust(cwd: Path) -> None:
     _save_store(store)
 
 
-def ensure_workspace_trust(cwd: Path, *, interactive: bool, input_fn=input) -> bool:
+def ensure_workspace_trust(cwd: Path, *, interactive: bool, input_fn=input, choice_fn=None) -> bool:
     """工作区信任闸：返回 True 表示可继续构造 Agent，否则 raise SystemExit(1)。
 
     - 已信任 → True（不弹对话）。
     - 不信任 + 非交互 → True（隐式信任，贴 CC -p/SDK/非 TTY）。
-    - 不信任 + 交互 → 弹 y/n：y 则 record_trust 并返回 True，否则 raise SystemExit(1)。
+    - 不信任 + 交互 → 方向键选择确认；信任则 record_trust 并返回 True，否则 raise SystemExit(1)。
     """
     if is_trusted(cwd):
         return True
     if not interactive:
         return True
+
+    if choice_fn is not None:
+        if choice_fn(cwd):
+            record_trust(cwd)
+            return True
+        raise SystemExit(1)
 
     print(
         "⚠ 工作区信任确认\n"

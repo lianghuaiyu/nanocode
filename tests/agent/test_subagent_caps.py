@@ -9,6 +9,9 @@ import json
 import pytest
 
 from nanocode.agent.engine import Agent
+from nanocode.session import tree as T
+from nanocode.session.manager import SessionManager
+from nanocode.subagents import run_record
 from nanocode.tools import permissions
 from nanocode.paths import data_dir
 
@@ -27,17 +30,35 @@ def _set_agents_settings(monkeypatch, tmp_path, obj):
 
 
 def _stub_running_bg_subagent(parent):
-    """Register a running background subagent (record + task + a fake asyncio task in
-    _background_tasks) so _subagents.running_background_count() sees it as live."""
-    sub_rec = parent.task_manager.create_subagent(type="coder", description="bg")
-    task_rec = parent.task_manager.create_task("subagent", "bg", owner_agent_id=sub_rec.id)
-    parent.task_manager.update_task(task_rec.id, status="running")
+    """Register a running background subagent run record and a fake live task."""
+    if parent._session_mgr is None:
+        parent._session_mgr = SessionManager.create(parent.session_id)
+    run_id = T.new_id("sess")
+    child = SessionManager.create(
+        run_id,
+        parent_session={"sessionId": parent.session_id, "entryId": None,
+                        "taskId": run_id, "agentId": run_id},
+    )
+    child.close()
+    run_record.create_run_record(
+        child_session_id=run_id,
+        parent_session_id=parent.session_id,
+        spawn_entry_id=None,
+        tool_call_id=None,
+        agent_type="coder",
+        background=True,
+        context_mode="fresh",
+        isolation="shared",
+        worktree_path=None,
+        model={"provider": parent._current_provider(), "modelId": parent.model},
+        prompt="bg",
+    )
 
     async def _never():
         await asyncio.sleep(3600)
 
     t = asyncio.ensure_future(_never())
-    t._nanocode_task_id = task_rec.id
+    t._nanocode_run_id = run_id
     parent._background_tasks.add(t)
     return t
 
@@ -45,7 +66,7 @@ def _stub_running_bg_subagent(parent):
 # ─── max_threads: background spawn cap ───────────────────────────
 
 
-def test_max_threads_exceeded_returns_error_and_does_not_spawn(monkeypatch, tmp_path):
+def test_max_threads_exceeded_queues_background_run(monkeypatch, tmp_path):
     _set_agents_settings(monkeypatch, tmp_path, {"max_threads": 1})
 
     async def scenario():
@@ -55,14 +76,15 @@ def test_max_threads_exceeded_returns_error_and_does_not_spawn(monkeypatch, tmp_
         res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d", "prompt": "p", "run_in_background": True})
         after = len(parent._background_tasks)
+        run_id = res.split("run ", 1)[1].split(".", 1)[0]
+        status = run_record.read_status(run_id)["status"]
         t.cancel()
-        return res, before, after
+        return res, before, after, status
 
-    res, before, after = asyncio.run(scenario())
-    assert "max concurrent sub-agents" in res.lower()
-    assert "1" in res
-    # no new background task was spawned
-    assert after == before
+    res, before, after, status = asyncio.run(scenario())
+    assert "background sub-agent run" in res.lower()
+    assert status == "queued"
+    assert after == before + 1
 
 
 def test_under_max_threads_spawns(monkeypatch, tmp_path):
@@ -73,9 +95,9 @@ def test_under_max_threads_spawns(monkeypatch, tmp_path):
     async def scenario():
         parent = _agent()
 
-        async def _fake_spawn(*, agent_type, description, prompt, timeout_ms=None):
+        async def _fake_spawn(*, agent_type, description, prompt, timeout_ms=None, **_kw):
             spawned["called"] = True
-            return "task-999"
+            return "sess_fake"
 
         parent._spawn_background_subagent = _fake_spawn
         res = await parent._execute_agent_tool(
@@ -84,7 +106,7 @@ def test_under_max_threads_spawns(monkeypatch, tmp_path):
 
     res = asyncio.run(scenario())
     assert spawned.get("called") is True
-    assert "task-999" in res
+    assert "sess_fake" in res
 
 
 def test_running_count_only_counts_running_subagent_tasks(monkeypatch, tmp_path):
@@ -95,8 +117,9 @@ def test_running_count_only_counts_running_subagent_tasks(monkeypatch, tmp_path)
         t1 = _stub_running_bg_subagent(parent)
         t2 = _stub_running_bg_subagent(parent)
         # mark one completed -> should drop out of the live count
-        tid = t2._nanocode_task_id
-        parent.task_manager.update_task(tid, status="completed")
+        run_record.complete_run(
+            t2._nanocode_run_id, status="completed", result="done",
+            result_entry_id=None, prompt_entry_id=None)
         n = parent._subagents.running_background_count()
         t1.cancel(); t2.cancel()
         return n
@@ -189,9 +212,9 @@ def test_background_timeout_from_settings(monkeypatch, tmp_path):
     async def scenario():
         parent = _agent()
 
-        async def _fake_spawn(*, agent_type, description, prompt, timeout_ms=None):
+        async def _fake_spawn(*, agent_type, description, prompt, timeout_ms=None, **_kw):
             captured["timeout_ms"] = timeout_ms
-            return "task-1"
+            return "sess_fake"
 
         parent._spawn_background_subagent = _fake_spawn
         await parent._execute_agent_tool(
@@ -229,9 +252,9 @@ def test_tool_timeout_beats_settings(monkeypatch, tmp_path):
 def _stub_running_curator(parent):
     """A running background curator (kind='memory_consolidate') with owner_agent_id —
     it runs a real sub-agent and must count toward max_threads."""
-    sub_rec = parent.task_manager.create_subagent(type="memory-curator", description="curate")
+    child_id = T.new_id("sess")
     task_rec = parent.task_manager.create_task(
-        "memory_consolidate", "curate", owner_agent_id=sub_rec.id)
+        "memory_consolidate", "curate", owner_agent_id=child_id)
     parent.task_manager.update_task(task_rec.id, status="running")
 
     async def _never():
@@ -286,8 +309,8 @@ def test_skill_fork_blocked_for_subagents(monkeypatch, tmp_path):
     assert sub.depth == 1
     res = asyncio.run(sub._execute_skill_tool({"skill_name": "s", "args": "a"}))
     assert "not available to sub-agents" in res.lower()
-    # no skill-fork sub-agent record was created
-    assert [s for s in sub.task_manager.list_subagents() if s.type == "skill-fork"] == []
+    # no skill-fork run record was created
+    assert [s for s in json.loads(parent.run_list()) if s["agent_type"] == "skill-fork"] == []
     # the MAIN agent can still fork (subject to depth cap)
     main_res = asyncio.run(parent._execute_skill_tool({"skill_name": "s", "args": "a"}))
     assert "not available to sub-agents" not in main_res.lower()
@@ -309,9 +332,9 @@ def test_memory_consolidate_respects_max_threads(monkeypatch, tmp_path):
         parent = _agent()
         t1 = _stub_running_bg_subagent(parent)   # fills the single slot
         res = await parent._spawn_memory_consolidate()
-        # no new curator subagent record was created
-        curators = [s for s in parent.task_manager.list_subagents()
-                    if s.type == "memory-curator"]
+        # no new curator run record was created
+        curators = [s for s in json.loads(parent.run_list())
+                    if s["agent_type"] == "memory-curator"]
         t1.cancel()
         return res, curators
 

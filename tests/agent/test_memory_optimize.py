@@ -8,6 +8,7 @@ evolve_config.json。失败 → task failed 且旧 config 原样保留。
 """
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -115,8 +116,8 @@ def test_runs_optimize_and_saves_config(monkeypatch):
     # 真落 evolve_config.json
     cfg = maintenance.load_evolve_config()
     assert cfg is not None and cfg.get("k_kw") == 7 and cfg.get("evolved") is True
-    # 不注册 subagent
-    assert parent.task_manager.list_subagents() == []
+    # 不注册 child run
+    assert json.loads(parent.run_list()) == []
 
 
 def test_below_threshold_skipped(monkeypatch):

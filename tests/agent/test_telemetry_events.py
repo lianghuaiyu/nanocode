@@ -113,7 +113,7 @@ def test_tool_blocked_event_enriched_with_agent_identity():
     a.artifact_id = "agent-1"
     a._ensure_session_lease()
     a.emit(ToolBlocked(tool="run_shell", reason="not_in_allowlist"))
-    e = _entries("tel2_blocked", T.TOOL_BLOCKED)[0]
+    e = [e for e in a._session_mgr.entries() if e.type == T.TOOL_BLOCKED][0]
     assert e.data == {"tool": "run_shell", "reason": "not_in_allowlist",
                       "agentType": "coder", "artifactId": "agent-1"}
 
@@ -124,5 +124,5 @@ def test_context_injected_emit_returns_write_result_for_dedup():
     assert a.emit(ContextInjected(custom_type="memory", content="m1")) is False
     a._ensure_session_lease()
     assert a.emit(ContextInjected(custom_type="memory", content="m1")) is True
-    cm = _entries("tel2_ctx", T.CUSTOM_MESSAGE)
+    cm = [e for e in a._session_mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert [e.data["customType"] for e in cm] == ["memory"]

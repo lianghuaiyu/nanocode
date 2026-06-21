@@ -34,11 +34,19 @@ class Capability(str, Enum):
 _PLAN_MODE_TOOLS = frozenset({"enter_plan_mode", "exit_plan_mode"})
 # 后台任务面板 meta（只读,无持久副作用）。
 _TASK_META_TOOLS = frozenset({"task_list", "task_output", "task_stop"})
+_RUN_META_TOOLS = frozenset({
+    "get_subagent_result",
+    "run_list",
+    "run_status",
+    "run_output",
+    "run_cancel",
+    "run_send",
+})
 
 
 def classify_capability(name: str) -> Capability:
     """工具名 → 派发类别（与 engine._execute_tool_call 的分支顺序语义一致）。"""
-    if name in _PLAN_MODE_TOOLS or name in _TASK_META_TOOLS:
+    if name in _PLAN_MODE_TOOLS or name in _TASK_META_TOOLS or name in _RUN_META_TOOLS:
         return Capability.META
     if name == AGENT_META_TOOL:
         return Capability.AGENT
@@ -95,6 +103,31 @@ class CapabilityRouter:
             return host.task_output(inp.get("task_id", ""), int(inp.get("tail_bytes") or 8000))
         if name == "task_stop":
             return await host.stop_task(inp.get("task_id", ""))
+        if name == "get_subagent_result":
+            return host.run_output(
+                inp.get("child_session_id", ""),
+                bool(inp.get("include_events")),
+                int(inp.get("tail_events") or 20),
+            )
+        if name == "run_list":
+            return host.run_list(inp.get("status"))
+        if name == "run_status":
+            return host.run_status(inp.get("child_session_id", ""))
+        if name == "run_output":
+            return host.run_output(
+                inp.get("child_session_id", ""),
+                bool(inp.get("include_events")),
+                int(inp.get("tail_events") or 20),
+            )
+        if name == "run_cancel":
+            return await host.run_cancel(inp.get("child_session_id", ""))
+        if name == "run_send":
+            return host.run_send(
+                inp.get("child_session_id", ""),
+                inp.get("prompt", ""),
+                delivery=inp.get("delivery") or "steer",
+                wake=bool(inp.get("wake")),
+            )
         if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
             return await host.recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
         if name == "memory" and inp.get("action") == "consolidate":

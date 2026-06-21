@@ -62,6 +62,7 @@ def test_subagent_child_tree_accumulates_across_runs():
     parent._session_mgr = SessionManager.create("PARENT2")
     sub1 = _sub_with_child(parent, "a1", None)
     sub1.agent_session.record_provider_messages({"role": "user", "content": "one"})
+    sub1.agent_session.record_provider_messages({"role": "assistant", "content": "done"})
     parent._close_child_session("a1", sub1)
     sub2 = _sub_with_child(parent, "a1", None)
     sub2.agent_session.record_provider_messages({"role": "user", "content": "two"})
@@ -69,21 +70,17 @@ def test_subagent_child_tree_accumulates_across_runs():
     child = SessionManager.open(parent.child_session_id("a1"))
     assert sum(1 for e in child.entries() if e.type == T.SESSION_START) == 1          # 单 header
     msgs = [e.data["message"]["content"] for e in child.entries() if e.type == T.MESSAGE]
-    assert msgs == ["one", "two"]                                                     # 累积
+    assert msgs == ["one", [{"type": "text", "text": "done"}], "two"]                  # 累积
 
 
-def test_empty_subagent_leaves_headeronly_child_session():
-    # docs/14 SessionLease：spawn 即给子 agent 注入一把 child 写者租约（open_or_create 建 child 树 header）。
-    # 子从未写消息（空/取消运行）→ child 树仅 header、无 MESSAGE。/resume 隐藏 child（有 parentSession），
-    # 不污染顶层 resume 列表；children() 仍可发现这棵（空）child——与「child 是从 spawn 起的真实 session」一致。
+def test_empty_subagent_does_not_materialize_child_session():
+    # Pi 对齐：child 也在首个 assistant 前延迟落盘。空/取消的 child 不应成为可恢复会话。
     parent = _agent("EP")
     parent._session_mgr = SessionManager.create("EP")
     sub = _sub_with_child(parent, "a-empty", None)
     parent._close_child_session("a-empty", sub)
     child_sid = parent.child_session_id("a-empty")
-    assert SessionManager.exists(child_sid)                          # 租约在 spawn 时建了 header
-    child = SessionManager.open(child_sid)
-    assert [e for e in child.entries() if e.type == T.MESSAGE] == []  # 但无任何 MESSAGE entry
+    assert not SessionManager.exists(child_sid)
 
 
 def test_build_subagent_child_session_uses_runtime_cwd(tmp_path):
@@ -97,6 +94,8 @@ def test_build_subagent_child_session_uses_runtime_cwd(tmp_path):
     try:
         sub = parent._build_sub_agent(system_prompt="s", tools=[],
                                       agent_type="coder", artifact_id="agent-cwd")
+        sub.agent_session.record_provider_messages({"role": "user", "content": "check cwd"})
+        sub.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
         parent._close_child_session("agent-cwd", sub)
         child = SessionManager.open(parent.child_session_id("agent-cwd"))
         assert child._cwd() == str(cwd.resolve())
@@ -104,13 +103,13 @@ def test_build_subagent_child_session_uses_runtime_cwd(tmp_path):
         th.release_lease()
 
 
-def test_agent_id_navigates_to_child():
+def test_child_session_id_navigates_to_child():
     from nanocode.entrypoints.commands.builtin import _agent as _agent_cmd
     parent = _agent("AGNAV")
     parent._session_mgr = SessionManager.create("AGNAV")
-    SessionManager.create("AGNAV.agent-001", parent_session={"sessionId": "AGNAV", "entryId": None})
-    res = asyncio.run(_agent_cmd(_ctx(parent), "agent-001"))
-    assert isinstance(res, Control) and res.payload["sessionId"] == "AGNAV.agent-001"
+    SessionManager.create("sess_child_nav", parent_session={"sessionId": "AGNAV", "entryId": None})
+    res = asyncio.run(_agent_cmd(_ctx(parent), "sess_child_nav"))
+    assert isinstance(res, Control) and res.payload["sessionId"] == "sess_child_nav"
 
 
 def test_agent_next_cycles_into_child_from_parent():

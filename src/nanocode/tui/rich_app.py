@@ -67,6 +67,16 @@ def _append_blank(lines: list) -> None:
     lines.append(Text(""))
 
 
+def _choice_options_text(labels: list[str], selected_index: int) -> Text:
+    text = Text()
+    for i, label in enumerate(labels):
+        if i:
+            text.append("   ")
+        selected = i == selected_index
+        text.append(("› " if selected else "  ") + label, style="bold cyan" if selected else "dim")
+    return text
+
+
 def _style(stack: list[str]) -> str:
     return " ".join(s for s in stack if s)
 
@@ -486,9 +496,17 @@ class RichApp:
             self.state.mode = "running" if self._is_running() else "idle"
             self._refresh()
 
+    _PLAN_OPTIONS = (
+        ("Clear + execute", {"choice": "clear-and-execute"}),
+        ("Execute, keep plan", {"choice": "execute"}),
+        ("Manual approve", {"choice": "manual-execute"}),
+        ("Keep planning", {"choice": "keep-planning", "feedback": None}),
+    )
     _PLAN_CHOICES = {
-        "1": {"choice": "clear-and-execute"}, "2": {"choice": "execute"},
-        "3": {"choice": "manual-execute"}, "4": {"choice": "keep-planning", "feedback": None},
+        "1": _PLAN_OPTIONS[0][1],
+        "2": _PLAN_OPTIONS[1][1],
+        "3": _PLAN_OPTIONS[2][1],
+        "4": _PLAN_OPTIONS[3][1],
     }
 
     async def plan_approval_fn(self, plan_content: str) -> dict:
@@ -625,13 +643,31 @@ class RichApp:
             self._dispatch_main(tok)
 
     def _dispatch_approval(self, tok) -> None:
-        if tok == "y":
+        modal = self.state.modal
+        if modal is None:
+            return
+        if tok in ("up", "left", "k"):
+            modal.selected_index = max(0, modal.selected_index - 1)
+        elif tok in ("down", "right", "j", "tab"):
+            modal.selected_index = min(1, modal.selected_index + 1)
+        elif tok == "enter":
+            self._resolve(self._approval_future, modal.selected_index == 1)
+        elif tok == "y":
             self._resolve(self._approval_future, True)
         elif tok in ("n", "escape", "ctrl-c"):
             self._resolve(self._approval_future, False)
 
     def _dispatch_plan(self, tok) -> None:
-        if tok in self._PLAN_CHOICES:
+        modal = self.state.plan_modal
+        if modal is None:
+            return
+        if tok in ("up", "left", "k"):
+            modal.selected_index = max(0, modal.selected_index - 1)
+        elif tok in ("down", "right", "j", "tab"):
+            modal.selected_index = min(len(self._PLAN_OPTIONS) - 1, modal.selected_index + 1)
+        elif tok == "enter":
+            self._resolve(self._plan_future, dict(self._PLAN_OPTIONS[modal.selected_index][1]))
+        elif tok in self._PLAN_CHOICES:
             self._resolve(self._plan_future, dict(self._PLAN_CHOICES[tok]))
         elif tok in ("escape", "ctrl-c"):
             self._resolve(self._plan_future, dict(self._PLAN_CHOICES["4"]))
@@ -1002,12 +1038,29 @@ class RichApp:
         if st.modal is not None:
             m = st.modal
             body = m.message + (f"\n  {m.command}" if m.command else "")
-            return Panel(Text.from_ansi(f"{body}\n\n  y allow once   n deny"),
-                         title="Approval", border_style="yellow")
+            selected = max(0, min(m.selected_index, 1))
+            return Panel(
+                Group(
+                    Text.from_ansi(body),
+                    Text(""),
+                    _choice_options_text(["Deny", "Allow once"], selected),
+                    Text("  ↑↓ choose · Enter confirm · Esc deny", style="dim"),
+                ),
+                title="Approval",
+                border_style="yellow",
+            )
         if st.plan_modal is not None:
-            return Panel(Text(f"{st.plan_modal.plan_content}\n\n"
-                              "  1 clear+execute   2 execute keep   3 manual-approve   4 keep planning"),
-                         title="Plan Approval", border_style="cyan")
+            selected = max(0, min(st.plan_modal.selected_index, len(self._PLAN_OPTIONS) - 1))
+            return Panel(
+                Group(
+                    Text(st.plan_modal.plan_content),
+                    Text(""),
+                    _choice_options_text([label for label, _ in self._PLAN_OPTIONS], selected),
+                    Text("  ↑↓ choose · Enter confirm · Esc keep planning", style="dim"),
+                ),
+                title="Plan Approval",
+                border_style="cyan",
+            )
         parts = []
         if st.text_prompt is not None:
             parts.append(Text(st.text_prompt, style="dim"))
@@ -1103,6 +1156,8 @@ class RichApp:
             if text.startswith("Session → "):
                 self._above_console().print(Text(text, style="accent"))
                 self._remove_notice_text(text)
+        elif kind in ("turn_completed", "turn_aborted", "error_raised"):
+            self._commit_all_timeline()
 
     def _commit_all_timeline(self) -> None:
         """把 live timeline 全部条目(SessionBoundary 除外)按序写入 scrollback 并移出 timeline。
@@ -1241,40 +1296,15 @@ class RichApp:
             self._transcript_scroll = 0
             return renderable
 
-        if max_lines <= 2:
-            max_scroll = max(0, len(lines) - max_lines)
-            scroll = max(0, min(self._transcript_scroll, max_scroll))
-            self._transcript_scroll = scroll
-            end = len(lines) - scroll
-            start = max(0, end - max_lines)
-            return Group(*(self._segments_to_text(line) for line in lines[start:end]))
-
         # _transcript_scroll means "visual lines below the viewport". 0 follows the bottom.
-        top_body_capacity = max(1, max_lines - 1)
-        max_scroll = max(0, len(lines) - top_body_capacity)
+        # Keep the viewport filled with transcript content only; scroll hints consume scarce
+        # terminal rows and can push input/options off-screen.
+        max_scroll = max(0, len(lines) - max_lines)
         scroll = max(0, min(self._transcript_scroll, max_scroll))
         self._transcript_scroll = scroll
         end = len(lines) - scroll
-        show_top = False
-        show_bottom = end < len(lines)
-        start = 0
-        for _ in range(3):
-            body_limit = max_lines - int(show_top) - int(show_bottom)
-            body_limit = max(1, body_limit)
-            start = max(0, end - body_limit)
-            new_show_top = start > 0
-            new_show_bottom = end < len(lines)
-            if new_show_top == show_top and new_show_bottom == show_bottom:
-                break
-            show_top, show_bottom = new_show_top, new_show_bottom
-
-        out = []
-        if show_top:
-            out.append(Text(f"... {start} earlier transcript lines (PageUp/scroll to view)", style="dim"))
-        out.extend(self._segments_to_text(line) for line in lines[start:end])
-        if show_bottom:
-            out.append(Text(f"... {len(lines) - end} later transcript lines (PageDown/scroll to bottom)", style="dim"))
-        return Group(*out)
+        start = max(0, end - max_lines)
+        return Group(*(self._segments_to_text(line) for line in lines[start:end]))
 
     @staticmethod
     def _segments_to_text(line) -> Text:

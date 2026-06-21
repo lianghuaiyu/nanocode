@@ -132,8 +132,7 @@ class Agent(PlanModeMixin):
         self._sandbox = SandboxManager()
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = session_id or uuid.uuid4().hex[:8]
-        # artifact_id：本 agent 全部产物（messages/meta/prompt/result）的目录键。
-        # 主 agent 默认 "main"；子 agent 由 _build_sub_agent 传入其 SubAgentRecord id。
+        # artifact_id：主 agent 默认 "main"；子 agent 传入 child session id。
         self.artifact_id = artifact_id or "main"
         # docs/13 cutover S1：主 agent 持一个 SessionManager，每条消息在 message-end 写进
         # canonical session.jsonl 树（干净原文；注入是 render-time 装饰、不入树）。lazy 创建。
@@ -192,8 +191,11 @@ class Agent(PlanModeMixin):
         # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
         self.task_manager = task_manager if task_manager is not None else TaskManager()
         self._background_tasks: set[asyncio.Task] = set()
+        self._background_run_queue: list[str] = []
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
         self._subagents = SubAgentManager(self)
+        from ..runs.runtime import AgentRunRuntime
+        self._run_runtime = AgentRunRuntime()
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
         self._spawn = SubAgentRunner()
         self._agent_session_obj = None     # lazy AgentSession（docs/16 #1：record_event 唯一 message 树写者）
@@ -665,6 +667,88 @@ class Agent(PlanModeMixin):
             self.task_manager, self._background_tasks, task_id,
             allow_orphan_cancel=not self.is_sub_agent)
 
+    def _live_run_ids(self) -> set[str]:
+        return {
+            rid for rid in (
+                getattr(task, "_nanocode_run_id", None)
+                for task in self._background_tasks
+                if not task.done()
+            )
+            if rid
+        }
+
+    def _reconcile_run(self, child_session_id: str):
+        from ..runs.models import TERMINAL_RUN_STATUSES
+        rec = self._run_runtime.status(child_session_id)
+        if rec.status not in TERMINAL_RUN_STATUSES and child_session_id not in self._live_run_ids():
+            rec = self._run_runtime.mark_lost(
+                child_session_id,
+                reason="no live coroutine in current runtime",
+            )
+        return rec
+
+    def run_list(self, status: str | None = None) -> str:
+        import json
+        records = [
+            r.to_dict()
+            for r in self._run_runtime.list(
+                self.session_id,
+                status=status,
+                live_run_ids=self._live_run_ids(),
+            )
+        ]
+        return json.dumps(records, ensure_ascii=False, indent=2)
+
+    def run_status(self, child_session_id: str) -> str:
+        import json
+        try:
+            rec = self._reconcile_run(child_session_id)
+        except Exception as e:
+            return f"Error: {e}"
+        return json.dumps(rec.to_dict(), ensure_ascii=False, indent=2)
+
+    def run_output(self, child_session_id: str, include_events: bool = False,
+                   tail_events: int = 20) -> str:
+        import json
+        try:
+            self._reconcile_run(child_session_id)
+        except Exception as e:
+            return f"Error: {e}"
+        return json.dumps(
+            self._run_runtime.output(child_session_id, include_events=include_events,
+                                     tail_events=tail_events),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    async def run_cancel(self, child_session_id: str) -> str:
+        for task in list(self._background_tasks):
+            if getattr(task, "_nanocode_run_id", None) == child_session_id:
+                task.cancel()
+                return f"Requested cancel of run {child_session_id}."
+        from ..runs.models import TERMINAL_RUN_STATUSES
+        try:
+            rec = self._run_runtime.status(child_session_id)
+        except Exception as e:
+            return f"Error: {e}"
+        if rec.status in TERMINAL_RUN_STATUSES:
+            return f"Run {child_session_id} is already terminal: {rec.status}."
+        self._run_runtime.mark_lost(
+            child_session_id,
+            reason="cancel requested but no live coroutine found",
+        )
+        return f"Run {child_session_id}: no live coroutine found; marked lost."
+
+    def run_send(self, child_session_id: str, prompt: str, *,
+                 delivery: str = "steer", wake: bool = False) -> str:
+        import json
+        try:
+            self._reconcile_run(child_session_id)
+            queued = self._run_runtime.send(child_session_id, prompt, delivery=delivery, wake=wake)
+        except Exception as e:
+            return f"Error: {e}"
+        return json.dumps(queued, ensure_ascii=False, indent=2)
+
     def _tool_blocked_by_allowlist(self, name: str) -> bool:
         """P4 call-time allowlist 判定——委托给 PermissionEngine（单一决策来源）。
 
@@ -869,16 +953,8 @@ class Agent(PlanModeMixin):
             )
             skill_name = inp.get("skill_name", "")
             fork_prompt = inp.get("args") or "Execute this skill task."
-            # 每次 fork 注册独立 SubAgentRecord → 各自的 artifact_id/dir，
-            # 避免多次 skill-fork 把产物并入同一个 agents/skill-fork/ 目录。
-            rec = self.task_manager.create_subagent(
-                type="skill-fork", description=skill_name,
-                model=self.model, provider=self._current_provider(),
-            )
-            self.task_manager.update_subagent(rec.id, status="running")
-            self._write_agent_spawn_artifacts(
-                agent_id=rec.id, agent_type="skill-fork", description=skill_name,
-                prompt=fork_prompt, model=self.model, background=False)
+            child_id = self._spawn.new_child_session_id()
+            self._spawn.record_subagent_spawn_leaf(self, child_id)
             self.emit(SubAgentStarted(agent_type="skill-fork", description=skill_name))
             sub_agent = None
             try:
@@ -887,51 +963,69 @@ class Agent(PlanModeMixin):
                     tools=tools,
                     agent_type="coder",
                     max_turns=self._subagents.bounded_max_turns(None),
-                    artifact_id=rec.id,
+                    artifact_id=child_id,
                 )
+                self._spawn.begin_run_record(
+                    self, sub_agent=sub_agent, agent_id=child_id, agent_type="skill-fork",
+                    prompt=fork_prompt, model=self.model, background=False,
+                    context_mode="fresh", isolation="shared", worktree_path=None)
                 # 经 _await_subagent_run（与前台一致）而非裸 await run_once：
                 # chat() 会吞掉 CancelledError，裸 await 会把真实取消误当成功。
                 # 此处无 wall-clock 超时，kind=='timeout' 即表示被取消/abort。
                 kind, payload = await self._await_subagent_run(sub_agent, fork_prompt, None)
             except asyncio.CancelledError:
-                self.task_manager.update_subagent(rec.id, status="cancelled")
                 if sub_agent is not None:
-                    self._close_child_session(rec.id, sub_agent)
-                self._finalize_agent_meta(rec.id, "cancelled")
+                    self._spawn.finish_run_record(
+                        sub_agent=sub_agent, status="cancelled",
+                        result_text=self._subagent_captured_text(sub_agent) or "(cancelled)",
+                        error="cancelled")
+                    self._close_child_session(child_id, sub_agent)
                 self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
-                self.task_manager.update_subagent(rec.id, status="failed")
                 if sub_agent is not None:
-                    self._close_child_session(rec.id, sub_agent)
-                self._finalize_agent_meta(rec.id, "failed")
+                    self._spawn.finish_run_record(
+                        sub_agent=sub_agent, status="failed",
+                        result_text=self._subagent_captured_text(sub_agent) or f"Skill fork error: {e}",
+                        error=str(e))
+                    self._close_child_session(child_id, sub_agent)
+                else:
+                    self._spawn.create_failed_run_record(
+                        self, child_session_id=child_id, agent_type="skill-fork",
+                        prompt=fork_prompt, model=self.model, background=False,
+                        context_mode="fresh", isolation="shared", worktree_path=None,
+                        error=str(e))
                 self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 return f"Skill fork error: {e}"
 
             if kind == "timeout":
                 # 无超时设定 → 'timeout' 表示运行被取消/aborted：落 cancelled 并向上传播取消。
-                self.task_manager.update_subagent(rec.id, status="cancelled")
-                self._close_child_session(rec.id, sub_agent)
-                self._finalize_agent_meta(rec.id, "cancelled")
+                self._spawn.finish_run_record(
+                    sub_agent=sub_agent, status="cancelled",
+                    result_text=self._subagent_captured_text(sub_agent) or "(cancelled)",
+                    error="cancelled")
+                self._close_child_session(child_id, sub_agent)
                 self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 raise asyncio.CancelledError()
             if kind == "error":
-                self.task_manager.update_subagent(rec.id, status="failed")
-                self._close_child_session(rec.id, sub_agent)
-                self._finalize_agent_meta(rec.id, "failed")
+                self._spawn.finish_run_record(
+                    sub_agent=sub_agent, status="failed",
+                    result_text=self._subagent_captured_text(sub_agent) or f"Skill fork error: {payload}",
+                    error=str(payload))
+                self._close_child_session(child_id, sub_agent)
                 self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
                 return f"Skill fork error: {payload}"
 
             sub_result = payload
             self.total_input_tokens += sub_result["tokens"]["input"]
             self.total_output_tokens += sub_result["tokens"]["output"]
-            self.task_manager.update_subagent(rec.id, status="completed")
-            self._close_child_session(rec.id, sub_agent)
-            result_path = self._write_agent_result(rec.id, sub_result["text"] or "")
-            self._finalize_agent_meta(rec.id, "completed")
+            result_path = self._spawn.finish_run_record(
+                sub_agent=sub_agent, status="completed",
+                result_text=sub_result["text"] or "", tokens=sub_result["tokens"])
+            self._close_child_session(child_id, sub_agent)
             self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))
             # 与 fresh/resume 一致：回传有界信封而非整段 transcript（完整在 result.md）。
-            return self._finalize_foreground_result(sub_agent, sub_result, result_path, rec.id)
+            return self._finalize_foreground_result(sub_agent, sub_result, result_path, child_id)
 
         self._pending_skill_bodies.append((inp.get("skill_name", ""), result["prompt"]))
         return f'[skill "{inp.get("skill_name", "")}" loaded — its instructions follow in the next message]'
@@ -947,22 +1041,6 @@ class Agent(PlanModeMixin):
         """子 agent 的 child session id（docs/14 §6b）。父 sid 作前缀，保证跨父唯一。"""
         return self._spawn.child_session_id(self, agent_id)
 
-    def _write_agent_spawn_artifacts(self, *, agent_id: str, agent_type: str,
-                                     description: str, prompt: str, model: str,
-                                     background: bool) -> None:
-        """子 agent 创建时落 prompt.txt + meta.json + 记 spawn 父 leaf（实现在 runtime/spawn.py）。"""
-        return self._spawn.write_agent_spawn_artifacts(
-            self, agent_id=agent_id, agent_type=agent_type, description=description,
-            prompt=prompt, model=model, background=background)
-
-    def _finalize_agent_meta(self, agent_id: str, status: str) -> None:
-        """子 agent 终态补 status + ended_at（实现在 runtime/spawn.py）。"""
-        return self._spawn.finalize_agent_meta(self, agent_id, status)
-
-    def _write_agent_result(self, agent_id: str, text: str) -> str | None:
-        """子 agent 最终文本 → <agent_dir>/result.md（实现在 runtime/spawn.py）。"""
-        return self._spawn.write_agent_result(self, agent_id, text)
-
     # ─── Structured AgentResult + bounded envelope ────────────────
     # docs/16 #7b：spawn 终态/成功路径改走 typed agents.result.ResultEnvelope；
     # engine 的 _build_agent_result/_render_agent_result_envelope 委托 shim 删除
@@ -971,10 +1049,6 @@ class Agent(PlanModeMixin):
     def _fold_subagent_tokens(self, sub_agent: "Agent") -> None:
         """把子 agent 已花费的 token 折叠进父（成功/超时/错误都折；实现在 runtime/spawn.py）。"""
         return self._spawn.fold_subagent_tokens(self, sub_agent)
-
-    def _write_terminal_result(self, agent_id: str, sub_agent, reason: str) -> str | None:
-        """终态写 result.md：有 partial 输出写它,否则写 reason（实现在 runtime/spawn.py）。"""
-        return self._spawn.write_terminal_result(self, agent_id, sub_agent, reason)
 
     def _finalize_foreground_terminal(self, sub_agent: "Agent", record_id: str,
                                       kind: str, payload, timeout_ms: int | None) -> str:
@@ -988,25 +1062,25 @@ class Agent(PlanModeMixin):
         return self._spawn.finalize_foreground_result(
             self, sub_agent, result, result_path, record_id)
 
-    # ─── Background sub-agent (detached, auto-deny-but-continue) ──
-
-    def _write_subagent_result(self, task_id: str, text: str) -> str | None:
-        """子 agent 完整输出 → task_dir/result.md（实现在 runtime/spawn.py）。"""
-        return self._spawn.write_subagent_result(self, task_id, text)
-
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
-                                         prompt: str, timeout_ms: int | None = None) -> str:
+                                         prompt: str, timeout_ms: int | None = None,
+                                         context_mode: str = "fresh",
+                                         isolation: str | None = None) -> str:
         """注册 subagent + task + detached 协程（实现在 runtime/spawn.py）。"""
         return await self._spawn.spawn_background_subagent(
-            self, agent_type=agent_type, description=description, prompt=prompt, timeout_ms=timeout_ms)
+            self, agent_type=agent_type, description=description, prompt=prompt,
+            timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation)
 
-    async def _run_background_subagent(self, *, agent_id: str, task_id: str, agent_type: str,
+    async def _run_background_subagent(self, *, agent_id: str, agent_type: str,
                                        description: str, prompt: str,
-                                       timeout_ms: int | None) -> None:
+                                       timeout_ms: int | None, sub_agent=None,
+                                       worktree_path: str | None = None,
+                                       queued: bool = False) -> None:
         """detached 后台子 agent 协程（实现在 runtime/spawn.py）。"""
         return await self._spawn.run_background_subagent(
-            self, agent_id=agent_id, task_id=task_id, agent_type=agent_type,
-            description=description, prompt=prompt, timeout_ms=timeout_ms)
+            self, agent_id=agent_id, agent_type=agent_type,
+            description=description, prompt=prompt, timeout_ms=timeout_ms,
+            sub_agent=sub_agent, worktree_path=worktree_path, queued=queued)
 
     
     # ─── Memory curator spawns（实现搬迁到 runtime/spawn.py；以下为薄委托）──────────

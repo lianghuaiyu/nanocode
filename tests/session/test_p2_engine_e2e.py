@@ -101,6 +101,8 @@ def test_subagent_writes_child_tree_not_parent_tree():
     a._session_mgr = SessionLease.open_or_create(
         a._tree_session_id, parent_session=a._child_parent_session).manager
     a.agent_session.record_provider_messages({"role": "user", "content": "x"})
+    assert not session_file("PARENT.s1sub").exists()   # Pi 对齐：首个 assistant 前不 materialize
+    a.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
     assert session_file("PARENT.s1sub").exists()       # 写到 child session
     assert not session_file("PARENT").exists()          # 不碰父 session
     assert not session_file("s1sub").exists()           # 也不写自身 session_id（已解耦到 child）

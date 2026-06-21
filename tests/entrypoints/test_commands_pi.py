@@ -12,6 +12,7 @@ from nanocode.entrypoints.commands.types import CommandContext, Control, Local
 from nanocode.entrypoints.host import RuntimeHost
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
+from nanocode.tui.selector import Outcome
 
 
 def _agent(sid):
@@ -120,10 +121,13 @@ def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage(
     assert new_t is not None
     assert a.session_id != "FORKFIRST"                       # 之前无内容 → 全新空 session
     assert a.agent_session.build_request_messages() == []
-    # review P1：空前缀路径**也**记 parentSession 血缘——children/parent 导航与审计依赖它，
-    # 且 header 形状与非空前缀路径一致（pi：空前缀 fork 仍是 fork，不是 new）。
+    # Pi 对齐：空 fork 首个 assistant 前不落盘、不污染 children()；materialize 后仍保留 lineage。
     from nanocode.session.manager import children
-    assert a.session_id in children("FORKFIRST")
+    new_sid = a.session_id
+    assert new_sid not in children("FORKFIRST")
+    a.agent_session.record_provider_messages({"role": "user", "content": "followup"})
+    a.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
+    assert new_sid in children("FORKFIRST")
     ps = SessionManager.open(a.session_id).parent_session()
     assert ps["sessionId"] == "FORKFIRST"
     assert ps["forkedBeforeEntryId"] == u1.id
@@ -177,8 +181,14 @@ def test_tree_assistant_entry_moves_to_that_entry():
 
 def test_tree_user_checkout_can_attach_branch_summary(monkeypatch):
     class _PromptHost:
-        async def ask_text(self, _prompt):
-            return "d"
+        async def run_selector(self, model, *, initial_index=None):
+            items = model.items()
+            assert [item.label for item in items] == [
+                "No summary",
+                "Summarize",
+                "Summarize with custom prompt",
+            ]
+            return Outcome("done", item=items[1], index=1)
 
     async def _fake_summary(messages, prompt):
         assert "q2" in str(messages) and "a2" in str(messages)

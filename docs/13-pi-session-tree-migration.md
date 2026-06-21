@@ -19,7 +19,7 @@
 4. **消息表示**：单一**中立 Message**模型 + send 时 `render`；**收编**双 provider `MessageStore`。
 5. **faithfulness**：abort 的 turn 走 **render 层 drop-and-retry**（Pi 行为，靠 `stopReason`），**放弃** nanocode 现有的"快照保半成品"。换来：无快照、纯确定性 render。**thinking 块亦存全**（含 `thinkingSignature`/`redacted`），由 render 按 `isSameModel` 严格 gate（§4⑦）——即"存全事实、render 严格 gate"。
 6. **leaf**：日志 entry；无 state.json 权威（顶多派生 cache）。
-7. **设置 entry 拆分**、**子会话 = child session**、**`/fork` 默认 in-file**：维持 v1；但 child-session 设计吸收 OpenCode 的优点：父子 session 一等索引、可恢复、可导航、可查询，而不是回到 Pi extension 的 `--no-session` 子进程。**子会话链接落在 `agent` tool_call/tool_result 上（无独立 off-path entry，§7.2），`task_id == childSessionId`。**
+7. **设置 entry 拆分**、**子会话 = child session**、**`/fork` 默认 in-file**：维持 v1；但 child-session 设计吸收 OpenCode 的优点：父子 session 一等索引、可恢复、可导航、可查询，而不是回到 Pi extension 的 `--no-session` 子进程。**子会话链接落在 `agent` tool_call/tool_result 上（无独立 off-path entry，§7.2），最终身份为 `runId == childSessionId`；`task-001` 只保留给 host jobs。**
 
 **主动舍弃的 nanocode 功能（换干净模型）**
 - snip/microcompact 增量裁剪（→ 改用 summary compaction）。
@@ -175,7 +175,7 @@ render(Message[], model) → provider payload:     # 评审 B2/B3:transform + co
 | `agent/message_store.py` | **收编**:live 上下文中立化、payload send-time render;不再双 provider 列表 |
 | `session/agent.py`(`AgentSession`) | `move_to`/`fork`/`clone`/`set_name`/`set_label`;fail-closed;leaf 动后 re-fold |
 | `agent/context_builder.py` | 降薄/退役:`rebuild`→`SessionManager.build_context`;**退役 snapshot fallback** |
-| `tasks/models.py`+`tasks/manager.py` | `TaskRecord/SubAgentRecord` 增 `child_session_id` 与 `legacy_agent_id`;`resume`/`task_output` 先按 child session 解析,再兼容旧 `agent-001` |
+| `tasks/models.py`+`tasks/manager.py` | 最终收敛后只保留 shell / memory 等 background host jobs；subagent 不再进入 `TaskRecord/SubAgentRecord`，查询走 child `subagent-run/` |
 | `runtime/facade.py`+`entrypoints/*` | 落 `Control` 分支(cli.py:568 占位);命令见 §8;`--session/--fork/--clone` |
 | `trajectory/project.py`+`metrics.py` | **重写**(评审 m2:两个独立消费者)从 `session.jsonl` 派生;退役 wire durable 契约 guard 或改钉 session schema |
 | 既有 `AgentSession.fork_to`/`Tracer.begin_branch`/wire `branch_id` | **同一 PR 退役/替换**(评审 M4),避免两套 fork |
@@ -188,7 +188,9 @@ render(Message[], model) → provider payload:     # 评审 B2/B3:transform + co
 
 Pi 给子 agent `--no-session`(§2.7)。nanocode 需要 background+resumable subagent,所以这里**主动超越 Pi**；但边界必须锁死：主会话仍是 Pi-style canonical `session.jsonl` entry tree，OpenCode 只提供 child-session 产品化闭环的参考，不引入 SQLite 表、HTTP server 依赖或"session DB 才是权威"。
 
-> **OpenCode 对照基线**：`sst/opencode@826419127ae0c2b742b9db866c4a9afb27a5ae2c`。**只吸收 child-session 闭环**：task tool 创建 child session、`parent_id`/`children` 导航、bounded `tool_result`、background inject、permission derive、`task_id == childSessionId`；**不吸收** SQLite/HTTP/API 作为权威。
+> **OpenCode 对照基线**：`sst/opencode@826419127ae0c2b742b9db866c4a9afb27a5ae2c`。**只吸收 child-session 闭环**：task tool 创建 child session、`parent_id`/`children` 导航、bounded `tool_result`、background inject、permission derive、child session id 作为 subagent run id；**不吸收** SQLite/HTTP/API 作为权威。
+>
+> **2026-06-21 最终收敛**：subagent run record、steer/resume、worktree isolation、fresh/fork context、mesh 分层和 compaction-safe persistence 的落地方案见 `docs/20-subagent-run-record-isolation-refactor.md`。若本文旧段落中出现 `legacyAgentId`、`agents/<agent-id>` 兼容、`task_output` 作为结果查询入口等描述，与 docs/20 冲突时以 docs/20 为准；新实现不做老旧兼容和兜底。
 
 ### 7.1 硬边界
 
@@ -237,13 +239,13 @@ child 的第一行 `session_start` 扩展字段：
 }
 ```
 
-这等价于 OpenCode 的 `session.parent_id`，但落在 Pi-style `session.jsonl` header 中。`parentSession.sessionId + parentSession.entryId` 是父子导航的稳定锚点；`agentId` 只是兼容当前 `SubAgentRecord(id="agent-001")` 的显示/迁移字段。
+这等价于 OpenCode 的 `session.parent_id`，但落在 Pi-style `session.jsonl` header 中。`parentSession.sessionId + parentSession.entryId` 是父子导航的稳定锚点；最终实现不再把 `agentId` / `agent-001` 作为兼容查找入口。
 
-### 7.4 单一标识 + resume / steer（优化：`task_id == childSessionId`）
+### 7.4 单一标识 + resume / steer（最终：`runId == childSessionId`）
 
-OpenCode 把三个 id 合一:**`task_id` 就是 child `sessionId`,也是 background job id**——传旧 `task_id` 即 `sessions.get(SessionID.make(task_id))` 续同一子会话(`task.ts:47-50,121-123`；`task_id` 作为 background jobId 见 `task.ts:246-276`)。nanocode 对齐:
+OpenCode 把 task tool 的 id 与 child `sessionId` 合一；nanocode 最终只吸收 subagent 身份这部分：
 
-- **唯一权威标识 = `childSessionId`（== `taskId` == background `jobId`）**;`legacyAgentId`(`agent-001`)仅迁移期查表兼容,解析到 child session 后继续。
+- **subagent 唯一权威标识 = `childSessionId`（== `runId`）**。`task-001` 保留为 shell / memory 等 background host job id，不再表示 subagent。
 - 新 spawn 先 mint `childSessionId`,作 child 目录名 + 父 tool_call/tool_result 的 `details.childSessionId`。
 - 恢复子 agent = open child `sessions/<childSessionId>/session.jsonl`、读其 branch,而非父 `agents/<agent-id>/messages.json`。
 - "给运行中后台子 agent 追加上下文 / steer" → 写 **child** session 的 user/`custom_message`;父只在 child 完成时追加 bounded 结果(§7.2)。
@@ -265,8 +267,8 @@ OpenCode 在 spawn 时派生 child permission（`deriveSubagentSessionPermission
 顶层 `/sessions` **隐藏 child session**（过滤 `parentSession != null`），子会话只在 `/agents` 下按父归组——OpenCode 把 child 当 sub-session、不混入顶层列表（`children(parentID)` 按 `parent_id` 过滤见 `session/session.ts:638-646`，`listByProject` 以 `roots`→`parent_id IS NULL` 隐藏 child 见 `:1022-1024`；child 还跳过标题自动生成 `session/prompt.ts:183`）。
 
 CLI 行为：
-- 父 session `/agents`：列出当前父会话的 child sessions，显示 `taskId / agentType / status / summary / childSessionId`。
-- 父 session `/agent <id>`：进入 child session；`id` 可为 `childSessionId`、`taskId` 或 legacy `agentId`。
+- 父 session `/agents`：列出当前父会话的 child sessions，显示 `runId / agentType / status / summary / childSessionId`。
+- 父 session `/agent <id>`：进入 child session；`id` 必须是 `childSessionId` / `runId`。
 - child session `/parent`：回父 session 的 `parentSession.entryId` 附近。
 - child session `/agent next|prev`：在同一父 session 的 siblings 间切换。
 
@@ -274,12 +276,7 @@ CLI 行为：
 
 ### 7.7 迁移现状模型
 
-现状是同一 `session_id` 下的 `agents/<agent-id>/{messages,meta,prompt,result,wire}.jsonl?`。迁移到 child session 时：
-
-- 每个 `SubAgentRecord` mint 一个 `childSessionId`，生成 `sessions/<childSessionId>/session.jsonl`。
-- `agents/<agent-id>/messages.json` → child `message` entries；`prompt.txt` → child root user message 或 `custom_message` provenance；`result.md` → child artifact + 父 `agent` toolResult `details.resultPath`。
-- 旧 `agentId` 写入 child `session_start.data.parentSession.agentId` 和 `SubAgentRecord.legacyAgentId`，仅做兼容查找。
-- 旧 `task_id` 写入 `TaskRecord.child_session_id`；`task_output` 先展示 bounded summary，再给 child session 路径。
+旧方案曾计划从 `agents/<agent-id>/` 迁移并保留 alias。最终收敛后不做这层老旧兼容：新实现只写 child `session.jsonl` 与 child-owned `subagent-run/`，父查询走 `run_output` / `get_subagent_result(childSessionId)`，`task_output` 只服务 host jobs。
 
 ### 7.8 单写者强制
 
@@ -335,7 +332,7 @@ CLI 行为：
 
 **P5 — 注入 → `custom_message`。** skill listing/memory recall/finished-task → `custom_message` entry(dedup 从树派生);删原地 `append_to_last_user`。验收:注入在树里、resume 重建一致、不改既有 user 消息。
 
-**P6 — 子会话 = child session(§7)。** 含 child-sid 铸造、父子链接 = `agent` tool_call + bounded toolResult（后台完成 = 合成 `custom_message`，§7.2，**无 off-path entry**）、child `session_start.parentSession`、`children/parent/siblings` 派生索引、`trajectory_id` 显式串、per-session 单写者 lock。验收:spawn/resume/background/permission/导航契约测试全过,旧 `agent-001` 只能作为兼容别名。
+**P6 — 子会话 = child session(§7)。** 含 child-sid 铸造、父子链接 = `agent` tool_call + bounded toolResult（后台完成 = 合成 `custom_message`，§7.2，**无 off-path entry**）、child `session_start.parentSession`、`children/parent/siblings` 派生索引、`trajectory_id` 显式串、per-session 单写者 lock。验收:spawn/resume/background/permission/导航契约测试全过；不保留旧 `agent-001` alias。
 
 **P7 — CLI(§8)。** Control 分支 + 命令 + 参数。
 
@@ -355,7 +352,7 @@ PR-8 CLI → PR-9 迁移 → PR-10 删旧主路径（messages.json/MessageStore/
 ## 10. 迁移
 
 - flat JSON / v2 `main/messages.json` → `session.jsonl`;**摘要正文/post-compaction 消息优先从 `messages.json` 取**（wire 的 **compaction 事件**只存计数、无摘要正文，评审 m13）。
-- v2 `agents/<agent-id>/` → 独立 child session；父补 `agent` tool_call/tool_result（bounded，`details.childSessionId`），child `session_start.parentSession.agentId=<legacy>`；旧 `task_id`/`agent_id` 保持 alias 但不再是权威。
+- 旧 v2 `agents/<agent-id>/` 迁移 alias 路线已被 docs/20 取代；新实现不读取该目录作为 subagent 权威，不保留旧 `task_id`/`agent_id` alias。
 - wire **`llm_request.messages`**（raw wire，**非** compaction 事件）是 post-注入/post-压缩的全文,**不可直接当中立 user 消息导入**(会把 ephemeral 注入变永久史,评审 m13);仅作 debug-trace 导入。（与上一条不矛盾:compaction 事件只存计数，llm_request 存被污染的全文——两种不同 wire 记录。）
 - 只 append/新建,不删旧文件;迁移失败不破坏原文件;报告不可精确恢复项。
 - 命令:`nanocode sessions migrate [<id>]` / `inspect <id>`。

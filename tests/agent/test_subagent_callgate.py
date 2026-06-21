@@ -9,6 +9,7 @@ emits write_file / run_shell is now BLOCKED at call time, not merely un-advertis
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -248,9 +249,9 @@ def test_subagent_cannot_trigger_memory_consolidate():
     assert "memory" in sub._allowed_tool_names
     res = asyncio.run(sub._execute_tool_call("memory", {"action": "consolidate"}))
     assert "not available to sub-agents" in res.lower()
-    # no curator sub-agent / consolidate task was created
-    assert [s for s in sub.task_manager.list_subagents()
-            if s.type == "memory-curator"] == []
+    # no curator run / consolidate task was created
+    assert [s for s in json.loads(parent.run_list())
+            if s["agent_type"] == "memory-curator"] == []
 
 
 def test_subagent_task_stop_cannot_cancel_unowned_parent_task():

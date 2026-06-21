@@ -201,6 +201,24 @@ def test_resume_current_rename_uses_runtime_callback():
     assert calls == ["new name"]
 
 
+def test_scan_sessions_hides_unnamed_header_only_sessions():
+    empty = SessionManager.create("EMPTYTOP")
+    empty.close()
+    child_empty = SessionManager.create("EMPTYCHILD", parent_session={"sessionId": "P", "entryId": "x"})
+    child_empty.close()
+    named = SessionManager.create("NAMEDEMPTY")
+    named.append_session_info("keep me")
+    named.close()
+
+    infos = SM.scan_sessions()
+    ids = {i.sid for i in infos}
+
+    assert "EMPTYTOP" not in ids
+    assert "EMPTYCHILD" not in ids
+    assert "NAMEDEMPTY" in ids
+    assert all(i.first_message != "(no messages)" for i in infos)
+
+
 def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     # 建 root + fork 子 session,/resume 无参非交互 → 按 parent 嵌套的文本列表(render_sessions_text)
     root = SessionManager.create("ROOTSID")

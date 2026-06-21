@@ -133,7 +133,7 @@ def test_no_memories_skips_no_task():
     res = asyncio.run(parent._spawn_memory_eval())
     assert "No memories" in res
     assert parent.task_manager.list_tasks() == []
-    assert parent.task_manager.list_subagents() == []
+    assert json.loads(parent.run_list()) == []
 
 
 def test_curator_error_marks_failed():

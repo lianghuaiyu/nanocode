@@ -89,7 +89,11 @@ def test_checkout_bad_id_fails_closed():
 
 def test_resume_lists_sessions():
     from nanocode.session.manager import SessionManager
-    SessionManager.create("rs1").close()                  # canonical 树才进列表（docs/16 C-3）
+    rs1 = SessionManager.create("rs1")
+    rs1.append_message(T.user_message("saved"))
+    rs1.append_message(T.assistant_message([T.text_block("ok")], provider="anthropic",
+                       api="anthropic", model="claude-x", stop_reason="stop"))
+    rs1.close()
     a = _agent("rs_cur")
     _seed(a, "rs_cur").append_message(T.user_message("hi"))
     res = asyncio.run(_resume(_ctx(a), ""))               # 无参非交互 → 嵌套文本列表

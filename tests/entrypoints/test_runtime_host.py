@@ -71,17 +71,6 @@ def test_can_switch_blocks_on_background_task():
     assert ok is False and "background" in reason
 
 
-def test_can_switch_blocks_on_running_subagent():
-    a, rt, t, host = _host("h6")
-
-    class _Sub:
-        status = "running"
-
-    a.task_manager.list_subagents = lambda: [_Sub()]
-    ok, reason = host.can_switch()
-    assert ok is False and "sub-agent" in reason
-
-
 # ─── P2 安全不变量：同一 Agent 跨 rebind 复用时 thread 身份/registry 正确性 ──────────────
 
 def test_thread_id_snapshot_survives_in_place_session_mutation():

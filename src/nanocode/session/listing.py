@@ -109,10 +109,13 @@ def scan_sessions() -> list[SessionInfo]:
             mtime = 0.0
         modified = last_activity or created or mtime
         origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
+        name = mgr.name()
+        if name is None and not msgs:
+            continue
         out.append(SessionInfo(
             sid=sid,
             path=str(path),
-            name=mgr.name(),
+            name=name,
             first_message=first,
             all_messages_text=" ".join(all_messages),
             message_count=len(msgs),

@@ -1,19 +1,16 @@
-"""阶段 E：background subagent（agent(run_in_background=True)）。
-
-- Task 1：_build_sub_agent(background=True) → auto-deny confirm_fn + 隔离空 confirmed_paths；
-  background=False（默认）维持共享父 confirm_fn + _confirmed_paths 同一引用。
-- Task 2：_spawn_background_subagent 立即返回 task_id；detached 协程完成后填
-  task/subagent 终态 + result_summary + result.md + child 树持久化 + token 累加 + 回注。
-- Task 3：failed（run_once 抛异常）/ cancelled（task_stop）/ timeout（timeout_ms）三态。
-"""
+"""阶段 E：background subagent（agent(run_in_background=True)）。"""
 
 import asyncio
+import json
+import re
 
 import pytest
 
 from nanocode.agent.engine import Agent
+from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import _auto_deny_confirm
-from nanocode.tools import tool_definitions, tasks_tool
+from nanocode.subagents import run_record
+from nanocode.tools import tool_definitions
 
 
 def _agent(**kw):
@@ -46,14 +43,22 @@ def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):
     return built
 
 
-async def _wait_task_terminal(parent, task_id, tries=200, delay=0.02):
-    from nanocode.tasks.models import TERMINAL_TASK_STATUSES
+async def _wait_run_terminal(run_id, tries=200, delay=0.02):
     for _ in range(tries):
-        t = parent.task_manager.get_task(task_id)
-        if t and t.status in TERMINAL_TASK_STATUSES:
-            return t
+        try:
+            status = run_record.read_status(run_id)
+        except FileNotFoundError:
+            status = None
+        if status and status["status"] in TERMINAL_RUN_STATUSES:
+            return status
         await asyncio.sleep(delay)
-    return parent.task_manager.get_task(task_id)
+    return run_record.read_status(run_id)
+
+
+def _run_id_from_started(text: str) -> str:
+    m = re.search(r"run (sess_[A-Za-z0-9_]+)", text)
+    assert m, text
+    return m.group(1)
 
 
 # ─── Task 1：_build_sub_agent(background=...) ────────────────
@@ -112,7 +117,7 @@ def test_foreground_sub_still_shares_confirm_and_paths():
 # ─── Task 2：_spawn_background_subagent + _run_background_subagent ──
 
 
-def test_background_spawn_returns_task_id_immediately():
+def test_background_spawn_returns_run_id_immediately():
     parent = _agent()
     _spy_build_with_stub(parent)
 
@@ -120,51 +125,46 @@ def test_background_spawn_returns_task_id_immediately():
         res = await parent._execute_agent_tool(
             {"type": "coder", "description": "bg task",
              "prompt": "do it", "run_in_background": True})
-        return res
+        run_id = _run_id_from_started(res)
+        return res, run_record.read_status(run_id)
 
-    res = asyncio.run(scenario())
-    assert "task-001" in res
-    rec = parent.task_manager.get_task("task-001")
-    assert rec is not None
-    assert rec.kind == "subagent"
-    assert rec.owner_agent_id == "agent-001"
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub is not None
-    assert sub.task_id == "task-001"
+    res, status = asyncio.run(scenario())
+    run_id = _run_id_from_started(res)
+    assert parent.task_manager.get_task(run_id) is None
+    assert status["runId"] == run_id
+    assert status["background"] is True
 
 
-def test_background_completes_and_fills_result_summary():
+def test_background_completes_and_fills_run_record_result():
     parent = _agent()
     _spy_build_with_stub(parent, text="the bg output body")
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
-        return await _wait_task_terminal(parent, "task-001")
+        run_id = _run_id_from_started(res)
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "completed"
-    assert "the bg output body" in (rec.result_summary or "")
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "completed"
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "completed"
+    assert "the bg output body" in run_record.read_result(run_id)
 
 
-def test_background_sets_result_path_and_last_result_path():
-    """P3: background completion sets task.result_path + subagent.last_result_path."""
+def test_background_sets_run_record_result_path():
+    """Background completion sets child-owned run record resultPath."""
     parent = _agent()
     _spy_build_with_stub(parent, text="bg result body")
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
-        return await _wait_task_terminal(parent, "task-001")
+        run_id = _run_id_from_started(res)
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.result_path and rec.result_path.endswith("result.md")
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.last_result_path and sub.last_result_path.endswith("result.md")
+    run_id, status = asyncio.run(scenario())
+    assert status["resultPath"] and status["resultPath"].endswith("result.md")
 
 
 def test_background_persists_messages_to_child_tree():
@@ -172,15 +172,17 @@ def test_background_persists_messages_to_child_tree():
     _spy_build_with_stub(parent, text="persisted bg body")
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
-        await _wait_task_terminal(parent, "task-001")
+        run_id = _run_id_from_started(res)
+        await _wait_run_terminal(run_id)
+        return run_id
 
-    asyncio.run(scenario())
+    run_id = asyncio.run(scenario())
     from nanocode.session import tree as T
     from nanocode.session.manager import SessionManager
-    child = SessionManager.open("bgsid.agent-001")
+    child = SessionManager.open(run_id)
     contents = str([e.data for e in child.entries() if e.type == T.MESSAGE])
     assert "persisted bg body" in contents
 
@@ -192,38 +194,34 @@ def test_background_token_accumulation():
     before_out = parent.total_output_tokens
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
-        await _wait_task_terminal(parent, "task-001")
+        await _wait_run_terminal(_run_id_from_started(res))
 
     asyncio.run(scenario())
     assert parent.total_input_tokens == before_in + 21
     assert parent.total_output_tokens == before_out + 9
 
 
-def test_background_finished_task_injected_to_reminder():
+def test_background_result_query_reads_run_record():
     parent = _agent()
     _spy_build_with_stub(parent, text="reminder body text")
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "the bg desc",
              "prompt": "p", "run_in_background": True})
-        await _wait_task_terminal(parent, "task-001")
+        run_id = _run_id_from_started(res)
+        await _wait_run_terminal(run_id)
+        return run_id
 
-    asyncio.run(scenario())
-    from nanocode.session import tree as _T
-    from nanocode.session.manager import SessionManager as _SM
-    parent._session_mgr = parent._session_mgr or _SM.create("bgsub_inj")
-    parent.agent_session.inject_finished_tasks()
-    content = next(e.data["content"] for e in parent._session_mgr.entries()
-                   if e.type == _T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks")
-    assert "<system-reminder>" in content
-    assert "task-001" in content
-    assert "subagent" in content
-    assert "reminder body text" in content
-    assert parent.task_manager.get_task("task-001").injected is True
+    run_id = asyncio.run(scenario())
+    out = json.loads(parent.run_output(run_id))
+    assert out["childSessionId"] == run_id
+    assert out["status"] == "completed"
+    assert "reminder body text" in out["result"]
+    assert parent.task_manager.get_task(run_id) is None
 
 
 def test_background_with_resume_errors_and_registers_nothing():
@@ -233,7 +231,7 @@ def test_background_with_resume_errors_and_registers_nothing():
          "run_in_background": True, "resume": "agent-001"}))
     assert "resume" in res.lower()
     assert "run_in_background" in res.lower() or "background" in res.lower()
-    assert parent.task_manager.list_subagents() == []
+    assert json.loads(parent.run_list()) == []
     assert parent.task_manager.list_tasks() == []
 
 
@@ -251,16 +249,15 @@ def test_background_failed_when_run_once_raises():
     _spy_build_with_stub(parent, run_once=_raising)
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
-        return await _wait_task_terminal(parent, "task-001")
+        run_id = _run_id_from_started(res)
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "failed"
-    assert "boom in sub" in (rec.error or "")
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "failed"
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "failed"
+    assert "boom in sub" in (status["error"] or "")
 
 
 def test_background_cancelled_via_task_stop():
@@ -277,21 +274,20 @@ def test_background_cancelled_via_task_stop():
     _spy_build_with_stub(parent, run_once=_slow)
 
     async def scenario():
-        await parent._execute_agent_tool(
+        res = await parent._execute_agent_tool(
             {"type": "coder", "description": "d",
              "prompt": "p", "run_in_background": True})
+        run_id = _run_id_from_started(res)
         # 等后台协程真正进入 run_once 的 await 点（真实场景 spawn→stop 间必有 yield）
         await asyncio.wait_for(started.wait(), timeout=2.0)
-        await tasks_tool.task_stop(parent.task_manager, parent._background_tasks, "task-001")
-        return await _wait_task_terminal(parent, "task-001")
+        await parent.run_cancel(run_id)
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "cancelled"
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "cancelled"
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "cancelled"
 
 
-def test_background_timeout_maps_task_timed_out_sub_failed():
+def test_background_timeout_marks_run_timed_out():
     parent = _agent()
 
     def _slow(sub):
@@ -303,14 +299,12 @@ def test_background_timeout_maps_task_timed_out_sub_failed():
     _spy_build_with_stub(parent, run_once=_slow)
 
     async def scenario():
-        await parent._spawn_background_subagent(
+        run_id = await parent._spawn_background_subagent(
             agent_type="coder", description="d", prompt="p", timeout_ms=50)
-        return await _wait_task_terminal(parent, "task-001")
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "timed_out"
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "failed"
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "timed_out"
 
 
 def test_background_construction_error_marks_records_failed_not_running():
@@ -325,22 +319,20 @@ def test_background_construction_error_marks_records_failed_not_running():
     parent._build_sub_agent = _boom
 
     async def scenario():
-        await parent._spawn_background_subagent(
+        run_id = await parent._spawn_background_subagent(
             agent_type="coder", description="d", prompt="p")
-        return await _wait_task_terminal(parent, "task-001")
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "failed"
-    assert "build blew up" in (rec.error or "")
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "failed"  # not left at 'running'
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "failed"
+    assert "build blew up" in (status["error"] or "")
 
 
 def test_background_timeout_reliable_even_if_run_once_swallows_cancel():
     """Codex P1 regression: Agent.chat() swallows CancelledError, so a naive
     asyncio.wait_for would let a timed-out background run be marked completed.
     A run_once that catches the cancel and returns a normal result must STILL be
-    detected as a timeout (task=timed_out, sub=failed), not completed."""
+        detected as a timeout, not completed."""
     parent = _agent()
 
     def _swallows_cancel(sub):
@@ -357,11 +349,9 @@ def test_background_timeout_reliable_even_if_run_once_swallows_cancel():
     _spy_build_with_stub(parent, run_once=_swallows_cancel)
 
     async def scenario():
-        await parent._spawn_background_subagent(
+        run_id = await parent._spawn_background_subagent(
             agent_type="coder", description="d", prompt="p", timeout_ms=50)
-        return await _wait_task_terminal(parent, "task-001")
+        return run_id, await _wait_run_terminal(run_id)
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "timed_out"   # NOT "completed"
-    sub = parent.task_manager.get_subagent("agent-001")
-    assert sub.status == "failed"
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "timed_out"   # NOT "completed"

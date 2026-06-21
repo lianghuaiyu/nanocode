@@ -1,7 +1,4 @@
-from nanocode.tasks.models import (
-    TaskRecord, SubAgentRecord,
-    TASK_KINDS, TERMINAL_TASK_STATUSES, SUBAGENT_STATUSES,
-)
+from nanocode.tasks.models import TaskRecord, TASK_KINDS, TERMINAL_TASK_STATUSES
 
 
 def test_task_record_roundtrip():
@@ -12,16 +9,9 @@ def test_task_record_roundtrip():
     assert TaskRecord.from_dict(d) == t
 
 
-def test_subagent_record_defaults_and_roundtrip():
-    a = SubAgentRecord(id="agent-001", type="coder", description="inspect parser")
-    assert a.status == "idle" and a.task_id is None
-    assert SubAgentRecord.from_dict(a.to_dict()) == a
-
-
 def test_constants():
-    assert "subagent" in TASK_KINDS and "shell" in TASK_KINDS
+    assert "subagent" not in TASK_KINDS and "shell" in TASK_KINDS
     assert "completed" in TERMINAL_TASK_STATUSES and "running" not in TERMINAL_TASK_STATUSES
-    assert "idle" in SUBAGENT_STATUSES
 
 
 def test_from_dict_ignores_unknown_keys():

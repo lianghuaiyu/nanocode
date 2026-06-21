@@ -44,7 +44,8 @@ class SessionLease:
         二者都由调用方处理（fail-closed：startup 退出 / `/resume` 提示 `--fork`）。"""
         mgr = (SessionManager.open(session_id, lock=True) if SessionManager.exists(session_id)
                else SessionManager.create(session_id, cwd=cwd,
-                                          parent_session=parent_session, lock=True))
+                                          parent_session=parent_session, lock=True,
+                                          defer_persist=True))
         return cls(mgr)
 
     def close(self) -> None:

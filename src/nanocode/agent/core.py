@@ -111,6 +111,8 @@ class AgentCore:
                 latency_ms=_latency_ms)              # §7.6②：fail-loud（record_event required）
 
             if not tool_uses:
+                if cfg.inject_follow_up():
+                    continue
                 break
 
             cfg.bump_turn()
@@ -217,6 +219,8 @@ class AgentCore:
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
+                if cfg.inject_follow_up():
+                    continue
                 break
 
             cfg.bump_turn()
