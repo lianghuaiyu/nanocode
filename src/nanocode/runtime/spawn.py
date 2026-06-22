@@ -307,8 +307,8 @@ class SubAgentRunner:
         sub_agent._event_subscribers.append(_project)
 
     def begin_run_record(self, host, *, sub_agent, agent_id: str, agent_type: str,
-                         prompt: str, model: str, background: bool, context_mode: str,
-                         isolation: str, worktree_path: str | None,
+                         description: str, prompt: str, model: str, background: bool,
+                         context_mode: str, isolation: str, worktree_path: str | None,
                          status: str = "running") -> str:
         self.materialize_child_session(sub_agent)
         child_session_id = sub_agent._tree_session_id
@@ -318,6 +318,7 @@ class SubAgentRunner:
             spawn_entry_id=host._subagent_spawn_leaf.get(agent_id),
             tool_call_id=None,
             agent_type=agent_type,
+            description=description,
             background=background,
             context_mode=context_mode,
             isolation=isolation,
@@ -335,7 +336,7 @@ class SubAgentRunner:
         return child_session_id
 
     def create_failed_run_record(self, host, *, child_session_id: str, agent_type: str,
-                                 prompt: str, model: str, background: bool,
+                                 description: str, prompt: str, model: str, background: bool,
                                  context_mode: str, isolation: str,
                                  worktree_path: str | None, error: str) -> str:
         from ..session.lease import SessionLease
@@ -360,6 +361,7 @@ class SubAgentRunner:
             spawn_entry_id=host._subagent_spawn_leaf.get(child_session_id),
             tool_call_id=None,
             agent_type=agent_type,
+            description=description,
             background=background,
             context_mode=context_mode,
             isolation=isolation,
@@ -727,7 +729,7 @@ class SubAgentRunner:
             self.apply_child_worktree(host, sub_agent, worktree_path)
             run_id = self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
-                prompt=prompt, model=eff_model, background=False,
+                description=description, prompt=prompt, model=eff_model, background=False,
                 context_mode=context_mode, isolation=selected_isolation,
                 worktree_path=worktree_path)
             if worktree_path:
@@ -921,7 +923,7 @@ class SubAgentRunner:
         except Exception as e:
             self.create_failed_run_record(
                 host, child_session_id=child_id, agent_type=agent_type,
-                prompt=prompt, model=eff_model, background=True,
+                description=description, prompt=prompt, model=eff_model, background=True,
                 context_mode=context_mode, isolation=selected_isolation,
                 worktree_path=worktree_path, error=str(e))
             host.emit(SubAgentEnded(agent_type=agent_type, description=description))
@@ -929,7 +931,7 @@ class SubAgentRunner:
         self.apply_child_worktree(host, sub_agent, worktree_path)
         run_id = self.begin_run_record(
             host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
-            prompt=prompt, model=eff_model, background=True,
+            description=description, prompt=prompt, model=eff_model, background=True,
             context_mode=context_mode, isolation=selected_isolation,
             worktree_path=worktree_path,
             status=(
@@ -1091,7 +1093,7 @@ class SubAgentRunner:
             self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=agent_id,
                 agent_type=host._MEMORY_CURATOR_TYPE,
-                prompt=user_message, model=eff_model, background=True,
+                description=description, prompt=user_message, model=eff_model, background=True,
                 context_mode="fresh", isolation="shared", worktree_path=None)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
@@ -1143,7 +1145,7 @@ class SubAgentRunner:
                 self.create_failed_run_record(
                     host, child_session_id=agent_id,
                     agent_type=host._MEMORY_CURATOR_TYPE,
-                    prompt=user_message, model=eff_model, background=True,
+                    description=description, prompt=user_message, model=eff_model, background=True,
                     context_mode="fresh", isolation="shared",
                     worktree_path=None, error=str(e))
             host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
@@ -1230,7 +1232,7 @@ class SubAgentRunner:
             self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=agent_id,
                 agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
-                prompt=user_message, model=eff_model, background=True,
+                description=description, prompt=user_message, model=eff_model, background=True,
                 context_mode="fresh", isolation="shared", worktree_path=None)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
@@ -1282,7 +1284,7 @@ class SubAgentRunner:
                 self.create_failed_run_record(
                     host, child_session_id=agent_id,
                     agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
-                    prompt=user_message, model=eff_model, background=True,
+                    description=description, prompt=user_message, model=eff_model, background=True,
                     context_mode="fresh", isolation="shared",
                     worktree_path=None, error=str(e))
             host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))

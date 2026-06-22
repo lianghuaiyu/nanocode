@@ -19,6 +19,7 @@ def _run_record(**kw):
         "parent_session_id": "sess-parent",
         "status": "completed",
         "agent_type": "coder",
+        "description": "look around",
         "model": {"provider": "anthropic", "modelId": "m"},
         "summary": "look around",
     }

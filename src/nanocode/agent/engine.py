@@ -967,7 +967,7 @@ class Agent(PlanModeMixin):
                 )
                 self._spawn.begin_run_record(
                     self, sub_agent=sub_agent, agent_id=child_id, agent_type="skill-fork",
-                    prompt=fork_prompt, model=self.model, background=False,
+                    description=skill_name, prompt=fork_prompt, model=self.model, background=False,
                     context_mode="fresh", isolation="shared", worktree_path=None)
                 # 经 _await_subagent_run（与前台一致）而非裸 await run_once：
                 # chat() 会吞掉 CancelledError，裸 await 会把真实取消误当成功。
@@ -992,7 +992,7 @@ class Agent(PlanModeMixin):
                 else:
                     self._spawn.create_failed_run_record(
                         self, child_session_id=child_id, agent_type="skill-fork",
-                        prompt=fork_prompt, model=self.model, background=False,
+                        description=skill_name, prompt=fork_prompt, model=self.model, background=False,
                         context_mode="fresh", isolation="shared", worktree_path=None,
                         error=str(e))
                 self.emit(SubAgentEnded(agent_type="skill-fork", description=skill_name))

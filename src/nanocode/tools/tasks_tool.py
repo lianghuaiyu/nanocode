@@ -65,7 +65,7 @@ def list_subagents_text(records) -> str:
     if not records:
         return "No sub-agent runs in this session."
     return "\n".join(
-        f"{r.child_session_id}  [{r.agent_type}]  {r.status}  {r.summary or ''}".rstrip()
+        f"{r.child_session_id}  [{r.agent_type}]  {r.status}  {r.description}  {r.summary or ''}".rstrip()
         for r in sorted(records, key=lambda x: x.child_session_id))
 
 
@@ -74,6 +74,7 @@ def subagent_detail_text(record) -> str:
         return "Unknown sub-agent run."
     parts = [
         f"Sub-agent run {record.child_session_id} [{record.agent_type}] status={record.status}",
+        f"Description: {record.description}",
         f"Parent session: {record.parent_session_id}",
         f"Context/isolation: {record.context_mode}/{record.isolation}",
         f"Provider/model: {(record.model or {}).get('provider')}/{(record.model or {}).get('modelId')}",

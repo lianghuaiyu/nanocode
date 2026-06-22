@@ -12,6 +12,8 @@ import json
 
 from .. import tui
 
+_TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked", "cancelled", "lost", "timed_out"}
+
 # 工具名 → 显示标题（领域知识）。未登记的工具用原名。
 _TOOL_TITLES = {
     "read_file": "read",
@@ -23,9 +25,9 @@ _TOOL_TITLES = {
     "skill": "Skill",
     "agent": "Task",
     "run_list": "runs",
-    "run_status": "status",
-    "run_output": "output",
-    "get_subagent_result": "result",
+    "run_status": "Sub-agent status",
+    "run_output": "Sub-agent output",
+    "get_subagent_result": "Sub-agent result",
     "run_cancel": "cancel",
     "run_send": "steer",
 }
@@ -88,7 +90,7 @@ def _result_summary(name: str, result: str) -> str:
         if summary:
             return summary
     if name in ("run_output", "get_subagent_result"):
-        summary = _run_output_summary(r)
+        summary = _run_output_summary(name, r)
         if summary:
             return summary
     if name == "read_file":
@@ -125,7 +127,7 @@ def _run_status_summary(result: str) -> str:
     metrics = data.get("metrics") or {}
     tools = metrics.get("toolUses")
     active = metrics.get("currentTool")
-    parts = [str(child), str(status)]
+    parts = ["Sub-agent status", str(child), str(status)]
     if active:
         parts.append(f"tool {active}")
     elif tools is not None:
@@ -133,19 +135,36 @@ def _run_status_summary(result: str) -> str:
     return " · ".join(p for p in parts if p)
 
 
-def _run_output_summary(result: str) -> str:
+def _first_text_line(value: object, *, limit: int = 80) -> str:
+    if not isinstance(value, str):
+        return ""
+    for line in value.splitlines():
+        text = line.strip()
+        if text:
+            return text[:limit]
+    return ""
+
+
+def _run_output_summary(name: str, result: str) -> str:
     try:
         data = json.loads(result)
     except Exception:
         return ""
     if not isinstance(data, dict):
         return ""
+    label = "Sub-agent result" if name == "get_subagent_result" else "Sub-agent output"
     status = data.get("status") or "unknown"
     child = data.get("childSessionId") or data.get("runId") or ""
-    summary = (data.get("summary") or data.get("error") or "").strip()
-    parts = [str(child), str(status)]
+    summary = (
+        _first_text_line(data.get("summary"))
+        or _first_text_line(data.get("error"))
+        or _first_text_line(data.get("result"))
+    )
+    if status not in _TERMINAL_RUN_STATUSES and not summary:
+        summary = "not ready"
+    parts = [label, str(child), str(status)]
     if summary:
-        parts.append(summary[:80])
+        parts.append(summary)
     return " · ".join(p for p in parts if p)
 
 

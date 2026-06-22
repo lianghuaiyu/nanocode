@@ -219,6 +219,35 @@ def test_scan_sessions_hides_unnamed_header_only_sessions():
     assert all(i.first_message != "(no messages)" for i in infos)
 
 
+def test_scan_sessions_hides_subagent_children_but_keeps_forks():
+    root = SessionManager.create("ROOTFORAGENTS")
+    root.append_message(T.user_message("root convo"))
+    root.close()
+    sub = SessionManager.create(
+        "SUBCHILD",
+        parent_session={
+            "sessionId": "ROOTFORAGENTS",
+            "entryId": "x",
+            "taskId": "SUBCHILD",
+            "agentId": "SUBCHILD",
+        },
+    )
+    sub.append_message(T.user_message("subagent convo"))
+    sub.close()
+    fork = SessionManager.create(
+        "FORKCHILD",
+        parent_session={"sessionId": "ROOTFORAGENTS", "entryId": "x", "forkedBeforeEntryId": "x"},
+    )
+    fork.append_message(T.user_message("fork convo"))
+    fork.close()
+
+    ids = {i.sid for i in SM.scan_sessions()}
+
+    assert "ROOTFORAGENTS" in ids
+    assert "FORKCHILD" in ids
+    assert "SUBCHILD" not in ids
+
+
 def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     # 建 root + fork 子 session,/resume 无参非交互 → 按 parent 嵌套的文本列表(render_sessions_text)
     root = SessionManager.create("ROOTSID")

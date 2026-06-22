@@ -23,6 +23,7 @@ class _Thread:
                 "output_tokens": 0, "cost_usd": 0.0, "context_window": 200000, "model": "m", "thinking": None}
     def state(self):
         s = self.status(); s["is_processing"] = False; s["messages"] = []; return s
+    def subagent_widget_snapshot(self): return []
     def subscribe(self, l): return lambda: None
 
 

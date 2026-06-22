@@ -198,23 +198,30 @@ async def _task(ctx: CommandContext, args: str) -> Local:
     return Local(output=ctx.thread.task_output(args.strip()))
 
 
-async def _agents(ctx: CommandContext, args: str) -> Local:
+async def _agents(ctx: CommandContext, args: str) -> "Control | Local":
     toks = args.split(maxsplit=1)
     sub = toks[0] if toks else ""
     if sub == "":
-        lines = [ctx.thread.agents_overview()]
-        # docs/14 §6b：磁盘派生的 child session（经 header parentSession 回指），survives restart，
-        # 不依赖 in-process task_manager。可 `/resume <child-sid>` 进入、`/sessions` 浏览父子。
-        from ...session.manager import children
-        kids = children(ctx.thread.session_id)
-        if kids:
-            lines.append("")
-            lines.append("Child sessions (/resume <id> to enter):")
-            lines.extend(f"    {k}" for k in kids)
-        return Local(output="\n".join(lines))
+        if ctx.interactive and ctx.selector_host is not None:
+            from ...tui.session_pages.agents import run_agents_page
+            res = await run_agents_page(ctx.thread, host=ctx.selector_host)
+            if res and res.get("action") == "resume":
+                return Control("resume", {"sessionId": res["session_id"]})
+            return Local()
+        return Local(output=ctx.thread.agents_overview())
     elif sub == "available":
+        if ctx.interactive and ctx.selector_host is not None:
+            from ...tui.session_pages.agents import view_agent_text
+            await view_agent_text(ctx.selector_host, "Agent types", ctx.thread.agent_definitions())
+            return Local()
         return Local(output=ctx.thread.agent_definitions())
     elif sub == "running":
+        if ctx.interactive and ctx.selector_host is not None:
+            from ...tui.session_pages.agents import run_agent_runs
+            res = await run_agent_runs(ctx.thread, host=ctx.selector_host)
+            if res and res.get("action") == "resume":
+                return Control("resume", {"sessionId": res["session_id"]})
+            return Local()
         return Local(output=ctx.thread.subagents())
     elif sub == "show":
         arg = toks[1].strip() if len(toks) > 1 else ""

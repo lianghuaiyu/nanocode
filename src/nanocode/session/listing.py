@@ -79,6 +79,8 @@ def scan_sessions() -> list[SessionInfo]:
 
     out: list[SessionInfo] = []
     for sid, ps in _scan_headers():
+        if ps and ps.get("agentId"):
+            continue
         path: Path = session_file(sid)
         try:
             mgr = SessionManager.open(sid)

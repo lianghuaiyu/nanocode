@@ -136,6 +136,7 @@ def test_resume_reserved_curator_record_is_rejected():
         spawn_entry_id=parent._session_mgr.get_leaf(),
         tool_call_id=None,
         agent_type=config.MEMORY_CURATOR_TYPE,
+        description="memory curator",
         background=True,
         context_mode="fresh",
         isolation="shared",

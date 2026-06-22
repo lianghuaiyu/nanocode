@@ -472,10 +472,13 @@ class RuntimeThread:
         a = self.agent
         mgr = getattr(a, "_session_mgr", None)
         mode = getattr(a, "_thinking_mode", "disabled")
+        parent = mgr.parent_session() if mgr is not None else None
         return {
             "session_id": a.session_id,
             "cwd": self.services.cwd if self.services is not None else (mgr._cwd() if mgr is not None else _os.getcwd()),
             "session_name": (mgr.name() if mgr is not None else None),
+            "parent_session_id": (parent or {}).get("sessionId"),
+            "is_subagent_session": bool((parent or {}).get("agentId")),
             "input_tokens": a.total_input_tokens,
             "output_tokens": a.total_output_tokens,
             "context_used": getattr(a, "last_input_token_count", 0),
@@ -703,6 +706,38 @@ class RuntimeThread:
     def subagents(self) -> str:
         from ..tools.tasks_tool import list_subagents_text
         return list_subagents_text(self._subagent_records())
+
+    def subagent_widget_snapshot(self) -> list[dict]:
+        """Read-only UI projection for parent-visible subagent runs.
+
+        The returned records are derived from child-owned run sidecars discovered
+        through canonical session parent headers. The TUI treats this as a
+        rendering snapshot, not session truth.
+        """
+        return [r.to_dict() for r in self._subagent_records()]
+
+    def subagent_conversation_snapshot(self, child_session_id: str) -> dict:
+        """Read-only child transcript snapshot for the /agents viewer.
+
+        Transcript authority remains the child session's canonical session.jsonl.
+        The run sidecar is included only as navigation/status metadata.
+        """
+        from ..session import tree as T
+        from ..session.manager import SessionManager, children
+
+        if child_session_id not in children(self.session_id):
+            raise FileNotFoundError(f"sub-agent run is not a child of this session: {child_session_id}")
+        record = self.agent._reconcile_run(child_session_id)
+        mgr = SessionManager.open(child_session_id)
+        messages = [
+            dict(e.data.get("message") or {})
+            for e in mgr.entries()
+            if e.type == T.MESSAGE
+        ]
+        return {"record": record.to_dict(), "messages": messages}
+
+    async def subagent_cancel(self, child_session_id: str) -> str:
+        return await self.agent.run_cancel(child_session_id)
 
     def agent_detail(self, name: str) -> str:
         from ..tools.tasks_tool import agent_definition_detail_text, subagent_detail_text

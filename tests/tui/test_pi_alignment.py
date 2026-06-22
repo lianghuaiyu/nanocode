@@ -13,6 +13,7 @@ import re
 from rich.console import Console
 
 from nanocode.tui.rich_app import RichApp
+from nanocode.tui.subagent_widget import render_subagent_widget
 from nanocode.tui.state import AssistantItem, ToolItem, UserItem
 
 
@@ -222,7 +223,7 @@ def test_read_file_result_is_hidden_until_tools_expand():
     assert "line 1" in expanded and "line 2" in expanded
 
 
-def test_run_status_tool_box_uses_child_id_and_status_summary():
+def test_run_status_tool_box_renders_subagent_notice_not_machine_title():
     app = RichApp(output=_console())
     result = json.dumps({
         "child_session_id": "sess_child123",
@@ -238,8 +239,140 @@ def test_run_status_tool_box_uses_child_id_and_status_summary():
     )
 
     out = _plain(_render(app, app._render_message_block(item)))
-    assert "status sess_child123" in out
-    assert "sess_child123 · running · tool read_file" in out
+    assert "Sub-agent status · sess_child123 · running · tool read_file" in out
+    assert "status sess_child123" not in out
+
+
+def test_run_output_tool_box_renders_not_ready_without_json_preview():
+    app = RichApp(output=_console())
+    result = json.dumps({
+        "childSessionId": "sess_child123",
+        "status": "running",
+        "result": "",
+    }, indent=2)
+    item = ToolItem(
+        id="tout",
+        name="get_subagent_result",
+        input={"child_session_id": "sess_child123"},
+        status="done",
+        result_excerpt=result,
+    )
+
+    out = _plain(_render(app, app._render_message_block(item)))
+    assert "Sub-agent result · sess_child123 · running · not ready" in out
+    assert "result sess_child123" not in out
+    assert "{" not in out
+
+
+def test_run_output_tool_box_uses_completed_result_first_line():
+    app = RichApp(output=_console())
+    result = json.dumps({
+        "childSessionId": "sess_child123",
+        "status": "completed",
+        "result": "Finished analysis\nFull details follow",
+    }, indent=2)
+    item = ToolItem(
+        id="tout",
+        name="run_output",
+        input={"child_session_id": "sess_child123"},
+        status="done",
+        result_excerpt=result,
+    )
+
+    out = _plain(_render(app, app._render_message_block(item)))
+    assert "Sub-agent output · sess_child123 · completed · Finished analysis" in out
+    assert "output sess_child123" not in out
+    assert "Full details follow" not in out
+
+
+def test_subagent_widget_renders_running_activity():
+    app = RichApp(output=_console())
+    widget = render_subagent_widget([
+        {
+            "child_session_id": "sess_child123",
+            "agent_type": "explore",
+            "description": "inspect subagents",
+            "status": "running",
+            "created_at": "2026-06-22T00:00:00Z",
+            "started_at": "2026-06-22T00:00:00Z",
+            "metrics": {
+                "turnCount": 2,
+                "toolUses": 3,
+                "usage": {"input": 1000, "output": 200},
+                "activeTools": [
+                    {"tool": "read_file", "inputSummary": '{"file_path": "src/nanocode/subagents/run_record.py"}'}
+                ],
+            },
+        }
+    ], width=100, frame=2)
+
+    out = _plain(_render(app, widget))
+    assert "● Agents" in out
+    assert "Explore" in out
+    assert "inspect subagents" in out
+    assert "↻2" in out and "3 tool uses" in out and "1.2k token" in out
+    assert "reading" in out and "run_record.py" in out
+
+
+def test_rich_app_subagent_widget_reads_thread_snapshot_once_per_render():
+    app = RichApp(output=_console(width=100))
+
+    class _Thread:
+        is_processing = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def status(self):
+            return {
+                "cwd": "/tmp",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "context_used": 0,
+                "context_window": 200000,
+                "model": "m",
+            }
+
+        def subagent_widget_snapshot(self):
+            self.calls += 1
+            return [{
+                "child_session_id": "sess_child123",
+                "agent_type": "plan",
+                "description": "summarize design",
+                "status": "queued",
+                "created_at": "2026-06-22T00:00:00Z",
+                "metrics": {},
+            }]
+
+    thread = _Thread()
+    app.thread = thread
+    out = _plain(_render(app, app.__rich__()))
+    assert "● Agents" in out
+    assert "Plan" in out and "summarize design" in out
+    assert thread.calls == 1
+
+
+def test_footer_marks_subagent_session_navigation_hint():
+    app = RichApp(output=_console(width=100))
+
+    class _Thread:
+        def status(self):
+            return {
+                "cwd": "/tmp",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "context_used": 0,
+                "context_window": 200000,
+                "model": "m",
+                "parent_session_id": "sess_parentabcdef12",
+                "is_subagent_session": True,
+            }
+
+    app.thread = _Thread()
+    out = _plain(_render(app, app._status_line()))
+    assert "sub-agent session" in out
+    assert "parent …abcdef12" in out
+    assert "/agent prev|next" in out
 
 
 def test_user_message_is_filled_box_no_title():
@@ -262,6 +395,7 @@ def test_consecutive_tool_blocks_have_no_blank_gap():
         is_processing = False
         def status(self): return {}
         def state(self): return {}
+        def subagent_widget_snapshot(self): return []
         def subscribe(self, l): return lambda: None
     app.thread = _T()
     app.state.timeline = [

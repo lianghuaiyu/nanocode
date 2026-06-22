@@ -302,6 +302,7 @@ def create_run_record(
     spawn_entry_id: str | None,
     tool_call_id: str | None,
     agent_type: str,
+    description: str,
     background: bool,
     context_mode: str,
     isolation: str,
@@ -318,6 +319,7 @@ def create_run_record(
         f"- runId: {child_session_id}\n"
         f"- parentSessionId: {parent_session_id}\n"
         f"- agentType: {agent_type}\n"
+        f"- description: {description}\n"
         f"- contextMode: {context_mode}\n"
         f"- isolation: {isolation}\n"
         f"- worktreePath: {worktree_path or ''}\n\n"
@@ -333,6 +335,7 @@ def create_run_record(
         "spawnEntryId": spawn_entry_id,
         "toolCallId": tool_call_id,
         "agentType": agent_type,
+        "description": description,
         "status": status,
         "background": background,
         "contextMode": context_mode,

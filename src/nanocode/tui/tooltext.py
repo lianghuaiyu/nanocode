@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 
+RUN_QUERY_TOOLS = {"run_status", "run_output", "get_subagent_result"}
+TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked", "cancelled", "lost", "timed_out"}
+
 # 工具名 → 显示标题。未登记的工具用原名。
 TOOL_TITLES = {
     "read_file": "read",
@@ -20,15 +23,19 @@ TOOL_TITLES = {
     "skill": "Skill",
     "agent": "Task",
     "run_list": "runs",
-    "run_status": "status",
-    "run_output": "output",
-    "get_subagent_result": "result",
+    "run_status": "Sub-agent status",
+    "run_output": "Sub-agent output",
+    "get_subagent_result": "Sub-agent result",
     "run_cancel": "cancel",
     "run_send": "steer",
 }
 
 def tool_title(name: str) -> str:
     return TOOL_TITLES.get(name, name)
+
+
+def is_run_query_tool(name: str) -> bool:
+    return name in RUN_QUERY_TOOLS
 
 
 def _legacy_list_path(inp: dict) -> str:
@@ -114,7 +121,7 @@ def result_summary(name: str, result: str) -> str:
         if summary:
             return summary
     if name in ("run_output", "get_subagent_result"):
-        summary = _run_output_summary(r)
+        summary = _run_output_summary(name, r)
         if summary:
             return summary
     if name == "read_file":
@@ -151,7 +158,7 @@ def _run_status_summary(result: str) -> str:
     metrics = data.get("metrics") or {}
     tools = metrics.get("toolUses")
     active = metrics.get("currentTool")
-    parts = [str(child), str(status)]
+    parts = ["Sub-agent status", str(child), str(status)]
     if active:
         parts.append(f"tool {active}")
     elif tools is not None:
@@ -159,19 +166,84 @@ def _run_status_summary(result: str) -> str:
     return " · ".join(p for p in parts if p)
 
 
-def _run_output_summary(result: str) -> str:
+def _run_output_summary(name: str, result: str) -> str:
     try:
         data = json.loads(result)
     except Exception:
         return ""
     if not isinstance(data, dict):
         return ""
+    label = "Sub-agent result" if name == "get_subagent_result" else "Sub-agent output"
     status = data.get("status") or "unknown"
     child = data.get("childSessionId") or data.get("runId") or ""
-    summary = (data.get("summary") or data.get("error") or "").strip()
-    parts = [str(child), str(status)]
+    summary = (
+        _first_text_line(data.get("summary"))
+        or _first_text_line(data.get("error"))
+        or _first_text_line(data.get("result"))
+    )
+    if status not in TERMINAL_RUN_STATUSES and not summary:
+        summary = "not ready"
+    parts = [label, str(child), str(status)]
     if summary:
-        parts.append(summary[:80])
+        parts.append(summary)
+    return " · ".join(p for p in parts if p)
+
+
+def _first_text_line(value: object, *, limit: int = 80) -> str:
+    if not isinstance(value, str):
+        return ""
+    for line in value.splitlines():
+        text = line.strip()
+        if text:
+            return text[:limit]
+    return ""
+
+
+def run_query_line(name: str, inp: dict, result: str, *, running: bool = False) -> str:
+    label = {
+        "run_status": "Sub-agent status",
+        "run_output": "Sub-agent output",
+        "get_subagent_result": "Sub-agent result",
+    }.get(name, "Sub-agent run")
+    child = (inp or {}).get("child_session_id") or ""
+    if running:
+        return " · ".join(p for p in (label, child, "checking") if p)
+    if is_error_result(result):
+        first = (result or "").split("\n", 1)[0].strip()
+        return " · ".join(p for p in (label, child, first or "error") if p)
+    try:
+        data = json.loads(result or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    child = (
+        data.get("child_session_id")
+        or data.get("childSessionId")
+        or data.get("run_id")
+        or data.get("runId")
+        or child
+    )
+    status = str(data.get("status") or "unknown")
+    metrics = data.get("metrics") or {}
+    parts = [label, str(child), status]
+    if name == "run_status":
+        active = metrics.get("currentTool")
+        tools = metrics.get("toolUses")
+        if active:
+            parts.append(f"tool {active}")
+        elif tools is not None:
+            parts.append(f"{tools} tools")
+    else:
+        summary = (
+            _first_text_line(data.get("summary"))
+            or _first_text_line(data.get("error"))
+            or _first_text_line(data.get("result"))
+        )
+        if status not in TERMINAL_RUN_STATUSES and not summary:
+            summary = "not ready"
+        if summary:
+            parts.append(summary)
     return " · ".join(p for p in parts if p)
 
 

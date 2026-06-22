@@ -91,6 +91,7 @@ def _run_record(**kw):
         "parent_session_id": "sess-parent",
         "status": "completed",
         "agent_type": "coder",
+        "description": "inspect parser",
         "model": {"provider": "anthropic", "modelId": "claude-opus-4-6"},
         "background": False,
         "context_mode": "fresh",

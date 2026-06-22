@@ -43,6 +43,7 @@ def test_run_ledger_lists_only_session_header_children_not_orphan_sidecars():
         "childSessionId": orphan,
         "parentSessionId": "PARENT",
         "agentType": "coder",
+        "description": "orphan",
         "status": "completed",
         "background": False,
         "contextMode": "fresh",
@@ -64,6 +65,7 @@ def test_pending_steer_drains_through_child_agent_session_record_event():
             spawn_entry_id=parent._session_mgr.get_leaf(),
             tool_call_id=None,
             agent_type="coder",
+            description="test run",
             background=True,
             context_mode="fresh",
             isolation="shared",
@@ -94,6 +96,7 @@ def test_run_record_tracks_tool_activity_projection():
             spawn_entry_id=parent._session_mgr.get_leaf(),
             tool_call_id=None,
             agent_type="coder",
+            description="test run",
             background=True,
             context_mode="fresh",
             isolation="shared",
@@ -129,6 +132,71 @@ def test_run_record_tracks_tool_activity_projection():
         lease.close()
 
 
+def test_run_record_persists_description_projection():
+    parent = _agent("PARENT")
+    child, lease = _child(parent, "CHILD")
+    try:
+        run_record.create_run_record(
+            child_session_id="CHILD",
+            parent_session_id="PARENT",
+            spawn_entry_id=parent._session_mgr.get_leaf(),
+            tool_call_id=None,
+            agent_type="explore",
+            description="inspect subagent UI",
+            background=True,
+            context_mode="fresh",
+            isolation="shared",
+            worktree_path=None,
+            model={"provider": "anthropic", "modelId": "m"},
+            prompt="initial",
+        )
+        status = run_record.read_status("CHILD")
+        rec = RunLedger().replay("CHILD")
+        assert status["description"] == "inspect subagent UI"
+        assert rec.description == "inspect subagent UI"
+    finally:
+        lease.close()
+
+
+def test_runtime_subagent_conversation_snapshot_reads_child_session_messages():
+    from nanocode.runtime import AgentRuntime
+
+    parent = _agent("PARENT")
+    child, lease = _child(parent, "CHILD")
+    try:
+        run_record.create_run_record(
+            child_session_id="CHILD",
+            parent_session_id="PARENT",
+            spawn_entry_id=parent._session_mgr.get_leaf(),
+            tool_call_id=None,
+            agent_type="explore",
+            description="inspect transcript",
+            background=True,
+            context_mode="fresh",
+            isolation="shared",
+            worktree_path=None,
+            model={"provider": "anthropic", "modelId": "m"},
+            prompt="initial",
+        )
+        lease.manager.append_message(T.user_message("child prompt"))
+        lease.manager.append_message(T.assistant_message(
+            "child answer",
+            provider="anthropic",
+            api="messages",
+            model="m",
+            stop_reason="end_turn",
+        ))
+    finally:
+        lease.close()
+
+    thread = AgentRuntime()._attach_agent(parent)
+    snapshot = thread.subagent_conversation_snapshot("CHILD")
+
+    assert snapshot["record"]["description"] == "inspect transcript"
+    assert [m["role"] for m in snapshot["messages"]] == ["user", "assistant"]
+    assert snapshot["messages"][0]["content"] == "child prompt"
+
+
 def test_terminal_steer_rejected_use_resume():
     parent = _agent("PARENT")
     child, lease = _child(parent, "CHILD")
@@ -139,6 +207,7 @@ def test_terminal_steer_rejected_use_resume():
             spawn_entry_id=parent._session_mgr.get_leaf(),
             tool_call_id=None,
             agent_type="coder",
+            description="test run",
             background=False,
             context_mode="fresh",
             isolation="shared",
@@ -166,6 +235,7 @@ def test_rebind_marks_nonterminal_run_without_live_runner_lost():
             spawn_entry_id=parent._session_mgr.get_leaf(),
             tool_call_id=None,
             agent_type="coder",
+            description="test run",
             background=True,
             context_mode="fresh",
             isolation="shared",
@@ -193,6 +263,7 @@ def test_run_cancel_without_live_coroutine_marks_lost_not_cancelled():
             spawn_entry_id=parent._session_mgr.get_leaf(),
             tool_call_id=None,
             agent_type="coder",
+            description="test run",
             background=True,
             context_mode="fresh",
             isolation="shared",

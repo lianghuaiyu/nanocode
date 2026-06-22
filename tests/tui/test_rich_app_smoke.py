@@ -44,6 +44,9 @@ class FakeThread:
         s["transcript_messages"] = self.transcript_messages
         return s
 
+    def subagent_widget_snapshot(self):
+        return []
+
     def subscribe(self, l):
         self._listeners.append(l)
         return lambda: self._listeners.remove(l) if l in self._listeners else None

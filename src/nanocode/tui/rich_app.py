@@ -33,6 +33,7 @@ from . import tooltext as _tt
 from .line_editor import KeyParser, LineEditor, PasteToken, raw_mode, restore
 from .reducer import hydrate_status, reduce
 from .selector import Outcome
+from .subagent_widget import MAX_WIDGET_LINES, TERMINAL_STATUSES, render_subagent_widget
 from .state import (
     ApprovalModal,
     AssistantItem,
@@ -370,6 +371,9 @@ class RichApp:
         self._tools_expanded = False
         self._turn_started: float | None = None
         self._live = None
+        self._subagent_widget_cache_at = 0.0
+        self._subagent_widget_snapshot: list[dict] = []
+        self._subagent_widget_frame = 0
         # ── autocomplete(斜杠命令 / @文件 / Tab 路径)状态 ──
         self._ac_items: list = []
         self._ac_index = 0
@@ -1073,6 +1077,9 @@ class RichApp:
         if st.mode == "running" and not self._has_open_assistant_text():
             self._spinner.update(text=Text(self._spinner_message(), style="dim"), style="accent")
             parts.append(self._spinner)
+        widget = self._render_subagent_widget()
+        if widget is not None:
+            parts.append(Padding(widget, (0, 0, 0, 2)))
         parts.append(Text(""))               # 输入框前空一行（Codex 组间留空）
         parts.append(self._input_frame())
         ac = self._render_autocomplete()      # 斜杠/@文件/路径补全菜单(输入框下方,无边框缩进)
@@ -1144,9 +1151,33 @@ class RichApp:
                 model=s.get("model", "") or "",
                 thinking=s.get("thinking"),
             )
-            return Group(*render_footer_styled(state, max(10, self._term_w() - 2)))
+            lines = list(render_footer_styled(state, max(10, self._term_w() - 2)))
+            if s.get("is_subagent_session") and s.get("parent_session_id"):
+                parent = str(s["parent_session_id"])
+                lines.append(Text(f"sub-agent session · parent …{parent[-8:]} · /agent prev|next", style="dim"))
+            return Group(*lines)
         except Exception:
             return None
+
+    def _subagent_records_for_widget(self) -> list[dict]:
+        if self.thread is None:
+            return []
+        now = time.monotonic()
+        if now - self._subagent_widget_cache_at < 0.5:
+            return self._subagent_widget_snapshot
+        snapshot = self.thread.subagent_widget_snapshot()
+        self._subagent_widget_snapshot = list(snapshot or [])
+        self._subagent_widget_cache_at = now
+        return self._subagent_widget_snapshot
+
+    def _render_subagent_widget(self):
+        records = self._subagent_records_for_widget()
+        self._subagent_widget_frame += 1
+        return render_subagent_widget(
+            records,
+            width=max(20, self._term_w() - 2),
+            frame=self._subagent_widget_frame,
+        )
 
     def _commit_finalized_event(self, env: dict) -> None:
         kind = env.get("type")
@@ -1264,7 +1295,21 @@ class RichApp:
         reserve = 6
         if self.state.mode == "running" and not self._has_open_assistant_text():
             reserve += 1
+        reserve += self._subagent_widget_height_estimate()
         return max(1, self._term_h() - reserve)
+
+    def _subagent_widget_height_estimate(self) -> int:
+        records = self._subagent_records_for_widget()
+        if not records:
+            return 0
+        body = 0
+        for rec in records:
+            status = rec["status"]
+            if status == "running":
+                body += 2
+            elif status == "queued" or status in TERMINAL_STATUSES:
+                body += 1
+        return min(MAX_WIDGET_LINES, 1 + body) if body else 0
 
     def _render_timeline(self, *, max_lines: int | None = None):
         items = [it for it in self.state.timeline if not isinstance(it, SessionBoundaryItem)]
@@ -1348,6 +1393,15 @@ class RichApp:
 
     def _render_tool_box(self, item):
         """状态着色的工具块(对位 Pi tool-execution):标题行 + 结果预览/diff,整块填充三态背景。"""
+        if _tt.is_run_query_tool(item.name):
+            line = _tt.run_query_line(
+                item.name,
+                item.input,
+                item.result_excerpt or "",
+                running=item.status == "running",
+            )
+            style = "error" if item.status == "error" else "tool_output"
+            return Padding(Text(line, style=style), (0, 1))
         title = _tt.tool_title(item.name)
         summary = _tt.tool_summary(item.name, item.input)
         status = item.status

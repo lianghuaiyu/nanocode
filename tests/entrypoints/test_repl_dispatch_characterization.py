@@ -53,6 +53,9 @@ class _FakeAgent:
         self.task_manager = _FakeTaskManager()
         self._background_tasks = set()          # can_switch 取 len()/真值（docs/14 P2 Control 路由会查闸）
         self._event_subscribers = []            # docs/16 #4：RuntimeThread push tap 挂载点
+        self._run_runtime = type("_RunRuntime", (), {
+            "list": lambda _self, parent_session_id, *, status=None, live_run_ids=None: []
+        })()
         self._sink = None  # CommandContext(out=agent._sink)；CMD-P0 handler 不用它
         # CMD-P2.5：RuntimeThread.run 读取 token 计数（turn 前后取差）
         self.total_input_tokens = 0
@@ -84,6 +87,7 @@ class _FakeAgent:
     async def _spawn_memory_eval(self): self.calls.append(("_spawn_memory_eval",)); return ""
     async def _spawn_memory_optimize(self): self.calls.append(("_spawn_memory_optimize",)); return ""
     def _register_skill_hooks(self, skill): self.calls.append(("_register_skill_hooks", skill.name))
+    def _live_run_ids(self): return set()
 
 
 class _RecordingSession:

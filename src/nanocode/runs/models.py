@@ -36,14 +36,14 @@ class RunMetrics:
         if not isinstance(value, dict):
             return cls()
         return cls(
-            tool_uses=int(value.get("toolUses") or value.get("tool_uses") or 0),
+            tool_uses=int(value.get("toolUses") or 0),
             usage=dict(value.get("usage") or {}),
-            turn_count=int(value.get("turnCount") or value.get("turn_count") or 0),
-            compaction_count=int(value.get("compactionCount") or value.get("compaction_count") or 0),
-            active_tools=list(value.get("activeTools") or value.get("active_tools") or []),
+            turn_count=int(value.get("turnCount") or 0),
+            compaction_count=int(value.get("compactionCount") or 0),
+            active_tools=list(value.get("activeTools") or []),
             current_tool=value.get("currentTool"),
             current_tool_started_at=value.get("currentToolStartedAt"),
-            last_event_at=value.get("lastEventAt") or value.get("last_event_at"),
+            last_event_at=value.get("lastEventAt"),
         )
 
     def to_status_dict(self) -> dict[str, Any]:
@@ -66,6 +66,7 @@ class AgentRunRecord:
     parent_session_id: str
     status: str
     agent_type: str
+    description: str
     model: dict[str, Any] | None = None
     background: bool = False
     context_mode: str = "fresh"
@@ -91,7 +92,8 @@ class AgentRunRecord:
             child_session_id=status["childSessionId"],
             parent_session_id=status["parentSessionId"],
             status=status["status"],
-            agent_type=status.get("agentType") or "coder",
+            agent_type=status["agentType"],
+            description=status["description"],
             model=status.get("model"),
             background=bool(status.get("background")),
             context_mode=status.get("contextMode") or "fresh",

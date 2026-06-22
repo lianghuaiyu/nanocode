@@ -46,6 +46,7 @@ def _stub_running_bg_subagent(parent):
         spawn_entry_id=None,
         tool_call_id=None,
         agent_type="coder",
+        description="capability run",
         background=True,
         context_mode="fresh",
         isolation="shared",
