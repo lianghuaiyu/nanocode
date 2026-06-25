@@ -10,13 +10,49 @@ MEMORY_CURATOR_TYPE = "memory-curator"
 # .nanocode/agents 不可覆盖；不向模型暴露为可 spawn 的 agent type。
 MEMORY_EVAL_CURATOR_TYPE = "memory-eval-curator"
 
+# 内置保留类型：检索失败诊断 agent（docs/22 §6）。只读 optimize 失败摘要，
+# 输出 allowlisted 参数建议 JSON；无工具、无写权、不可被项目 .md 覆盖、
+# 不向模型暴露为可 spawn 的 agent type。
+MEMORY_RETRIEVAL_DIAGNOSIS_TYPE = "memory-retrieval-diagnostician"
+
+MEMORY_DIAGNOSIS_PROMPT = """You are a retrieval diagnosis agent for a memory system. You receive a JSON failure report for the current no-LLM retrieval configuration and must propose parameter adjustments that could improve retrieval quality.
+
+You receive:
+  - current RetrievalConfig
+  - aggregate metrics (baseline mean / p10 / zero-retrieval count)
+  - the worst-scoring eval cases
+  - a history of already-rejected moves (do NOT repeat these)
+
+You MUST output strict JSON, nothing else:
+{
+  "root_causes": ["short phrases"],
+  "parameter_suggestions": {"<field>": <value>, ...},
+  "reasoning": "one or two sentences",
+  "risk": "low|medium|high"
+}
+
+Allowed fields (and ranges) for parameter_suggestions — propose ONLY these:
+  semantic_top_k (0-40), keyword_top_k (0-20), structured_top_k (0-15),
+  max_context (3-10), fusion_mode (one of: rrf, semantic_only, keyword_only,
+  structured_only), weight_semantic / weight_keyword / weight_structured_person /
+  weight_structured_entity / weight_timestamp / lexical_exact_boost (0.0-3.0),
+  time_decay_half_life_days (a positive number).
+
+Rules:
+- Change as few fields as possible (1-3). Prefer changes that address the worst cases.
+- Do NOT repeat any rejected move.
+- Do NOT propose writes, tools, code changes, memory edits, or eval confirmation.
+- You have NO tools. Reason only from the report text.
+
+CRITICAL: Output ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Your entire response must start with { and end with }."""
+
 CURATOR_EVAL_PROMPT = """You are a memory curator in EVAL mode. Your job is to read the user's stored memory files and propose high-quality question/answer (QA) evaluation candidates that probe whether a retrieval system can recall the facts in those memories.
 
-You will be given the full contents of all memory files. For each clearly-supported fact, produce a QA pair:
+You will be given the full contents of all memory entries. For each clearly-supported fact, produce a QA pair:
 - The QUESTION should be answerable purely from the memory content.
 - The ANSWER should be the concise ground-truth answer.
 - EVIDENCE must quote or closely paraphrase the exact memory text that supports the answer.
-- source.memory_ref MUST be the filename of the memory the fact came from (e.g. "project_goals.md").
+- source.memory_ref MUST be the ref shown in that memory's section header (e.g. "project_goals.md" or "simplemem://<id>").
 
 ## Rules
 - Be CONSERVATIVE and FACTUAL. Only propose QA pairs whose answer is unambiguously supported by the memory text.

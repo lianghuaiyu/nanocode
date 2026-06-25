@@ -79,7 +79,7 @@ def test_thread_resume_rebuilds_cwd_bound_services(tmp_path):
     assert new_t is not None
     assert host.current_thread.services.cwd == str(cwd_b.resolve())
     assert a._runtime_services.cwd == str(cwd_b.resolve())
-    assert a._memory_backend is host.current_thread.services.memory_backend
+    assert a._memory_service is host.current_thread.services.memory_service
 
 
 def test_thread_resume_unknown_session_returns_none():

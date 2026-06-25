@@ -7,7 +7,6 @@ import os
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 IS_WIN = sys.platform == "win32"
 
@@ -36,7 +35,7 @@ def _cap_line(line: str) -> str:
     return line[:MAX_LINE_CHARS] + f"… [+{len(line) - MAX_LINE_CHARS} chars]"
 
 
-def run(inp: dict) -> str:
+def run(ctx, inp: dict) -> str:
     pattern = inp["pattern"]
     path = inp.get("path") or "."
     include = inp.get("include")
@@ -64,10 +63,10 @@ def run(inp: dict) -> str:
             pass  # Fall through to Python fallback
 
     # Pure Python fallback (Windows, or system grep unavailable)
-    return _grep_python(pattern, path, include)
+    return _grep_python(ctx, pattern, path, include)
 
 
-def _grep_python(pattern: str, directory: str, include: str | None) -> str:
+def _grep_python(ctx, pattern: str, directory: str, include: str | None) -> str:
     regex = re.compile(pattern)
     include_pattern = include
     matches: list[str] = []
@@ -76,20 +75,20 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
         if len(matches) >= 200:
             return
         try:
-            entries = os.listdir(d)
+            entries = ctx.fs_list.listdir(d)
         except Exception:
             return
         for name in entries:
             if name.startswith(".") or name == "node_modules":
                 continue
             full = os.path.join(d, name)
-            if os.path.isdir(full):
+            if ctx.fs_list.is_dir(full):
                 walk(full)
                 continue
             if include_pattern and not fnmatch.fnmatch(name, include_pattern):
                 continue
             try:
-                text = Path(full).read_text(errors="replace")
+                text = ctx.fs_read.read_text(full, errors="replace")
                 for i, line in enumerate(text.split("\n")):
                     if regex.search(line):
                         matches.append(f"{full}:{i+1}:{line}")

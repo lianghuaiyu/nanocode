@@ -1,7 +1,7 @@
 # 记忆系统
 
 > 源码位置：`src/nanocode/memory/`
-> 关键文件：`store.py`（CRUD + 索引）、`recall.py`（语义召回 + 预取）、`prompt_section.py`（注入索引到系统提示词）
+> 关键文件：`service.py`（host-owned 记忆边界）、`markdown_backend.py`（Markdown 后端）、`simplemem_backend.py` / `engines/simplemem/`（nanocode-owned SimpleMem 引擎）、`prompts.py`（按后端生成静态提示）、`recall.py`（召回注入模型）
 
 记忆系统让 nanocode 把跨会话有价值的信息持久化为带类型的 Markdown 文件，并在恰当的用户输入到来时，由模型语义选取相关记忆注入当前上下文。它把"长期知识"与"当前对话"解耦：记忆按需召回，而非全部塞进每次请求。
 
@@ -13,7 +13,7 @@
 
 **存储**（`store.py`）：记忆是带 frontmatter 的 `.md` 文件，存放在按项目隔离的目录（`paths.project_memory_dir()`，对 cwd 做哈希，受 `NANOCODE_HOME` 控制）。每条记忆有四种类型之一：`user` / `feedback` / `project` / `reference`（`VALID_TYPES`）。`save_memory` / `list_memories` / `delete_memory` 提供 CRUD，文件名形如 `<type>_<slug>.md`。每次增删都会调用 `_update_memory_index()` 重写 `MEMORY.md` 索引（每条一行：名称、文件、类型、描述）。`load_memory_index()` 读取索引并对过长内容做行数/字节截断。
 
-**索引注入**（`prompt_section.py`）：`build_memory_prompt_section()` 把 `MEMORY.md` 索引拼进系统提示词，让模型始终"知道有哪些记忆存在"，但不加载它们的正文。
+**静态提示注入**（`service.py` → `prompts.py`）：`MemoryService.static_prompt()` 按当前后端生成提示。Markdown 后端会把 `MEMORY.md` 索引拼进系统提示词；SimpleMem 后端只说明 indexed memory 和 `memory` 工具用法，不暴露文件路径。
 
 **语义召回**（`recall.py`）：正文的召回是按需、语义化的：
 - `scan_memory_headers()` 只读每个记忆文件的前 30 行 frontmatter，快速得到轻量头部（描述、类型、mtime），按修改时间倒序，上限 `MAX_MEMORY_FILES`（200）。
@@ -28,7 +28,7 @@
 
 ```
 保存: save_memory → 写 <type>_<slug>.md → 重建 MEMORY.md 索引
-启动: build_memory_prompt_section → 索引进系统提示词（仅目录，不含正文）
+启动: RuntimeServices → MemoryService.static_prompt → backend-aware memory prompt
 
 用户输入到来:
   门控（多词 / 预算未满 / 有记忆） → start_memory_prefetch（后台任务）

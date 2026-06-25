@@ -1,4 +1,7 @@
 from nanocode.agent.compaction import persist_large_result
+from nanocode.tools.context import default_tool_context
+
+_CTX = default_tool_context()
 
 
 def test_small_passthrough():
@@ -38,7 +41,7 @@ def test_persist_large_result_other_tools_keep_head(tmp_path, monkeypatch):
 def test_grep_line_cap_truncates_long_matches(tmp_path):
     from nanocode.tools import grep_search
     (tmp_path / "minified.js").write_text("needle " + "x" * 5000 + "\n")
-    out = grep_search.run({"pattern": "needle", "path": str(tmp_path)})
+    out = grep_search.run(_CTX, {"pattern": "needle", "path": str(tmp_path)})
     line = next(l for l in out.split("\n") if "needle" in l)
     assert len(line) <= grep_search.MAX_LINE_CHARS + 100   # 500 cap + 路径前缀 + 截断标记
     assert "chars]" in line                                 # 截断标记在场

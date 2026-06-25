@@ -11,3 +11,7 @@ SCHEMA = {
         "required": [],
     },
 }
+
+
+def run(ctx, inp: dict) -> str:
+    return ctx.runs.list(inp.get("status"))

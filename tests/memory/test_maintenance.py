@@ -272,40 +272,24 @@ class TestApplyPlan:
         assert "backup=" in line
 
 
-# ─── Evolve Config Lifecycle ─────────────────────────────────
+# ─── Retrieval Config Lifecycle (docs/22 Phase 7: moved to retrieval_config_store) ───
 
 
-class TestEvolveConfig:
-    def test_save_and_load(self, mem_env):
-        config = {"k_sem": 3, "k_kw": 5, "evolved": True}
-        path = maintenance.save_evolve_config(config)
-        assert path
-        loaded = maintenance.load_evolve_config()
-        assert loaded == config
+class TestRetrievalConfigStoreReplacesEvolveConfig:
+    def test_evolve_config_functions_are_gone(self):
+        # docs/22 Phase 7: the markdown-centric evolve_config lifecycle is deleted;
+        # there is exactly one retrieval-config truth source.
+        for name in ("load_evolve_config", "save_evolve_config",
+                     "rollback_evolve_config", "evolve_config_path"):
+            assert not hasattr(maintenance, name), f"{name} should be removed"
 
-    def test_save_creates_backup_of_previous(self, mem_env):
-        maintenance.save_evolve_config({"version": 1})
-        maintenance.save_evolve_config({"version": 2})
-        # A .bak should exist
-        simplemem = maintenance._simplemem_dir()
-        baks = list(simplemem.glob("evolve_config.*.bak"))
-        assert len(baks) >= 1
-        loaded = maintenance.load_evolve_config()
-        assert loaded["version"] == 2
-
-    def test_rollback(self, mem_env):
-        maintenance.save_evolve_config({"version": 1})
-        maintenance.save_evolve_config({"version": 2})
-        assert maintenance.rollback_evolve_config() is True
-        loaded = maintenance.load_evolve_config()
-        assert loaded["version"] == 1
-
-    def test_rollback_no_backup(self, mem_env):
-        maintenance.save_evolve_config({"version": 1})
-        assert maintenance.rollback_evolve_config() is False
-
-    def test_load_nonexistent_returns_none(self, mem_env):
-        assert maintenance.load_evolve_config() is None
+    def test_retrieval_config_store_roundtrip(self, tmp_path):
+        from nanocode.memory import retrieval_config_store as RCS
+        from nanocode.memory.engines.simplemem.retrieval_config import RetrievalConfig
+        cfg = RetrievalConfig(semantic_top_k=12)
+        RCS.save_retrieval_config(str(tmp_path), cfg, run_id="r1",
+                                  report={"summary": {}, "cases": [], "history": {}})
+        assert RCS.load_retrieval_config(str(tmp_path)) == cfg
 
 
 # ─── Eval Provenance Pruning ─────────────────────────────────

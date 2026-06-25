@@ -49,6 +49,9 @@ class ContextRequest:
     context_window_tokens: int = 0         # 模型上下文窗（repo map no-files 放大的封顶基准）
     map_refresh: str = "auto"              # aider refresh 档（map 结果缓存策略）
     map_multiplier_no_files: float = 2.0
+    # docs/24 Phase 4a：DeferredToolsProvider 据此读 per-agent overlay 的激活集（tool_search
+    # 激活落在 agent registry 上）。None → 全局 REGISTRY（行为等价）。
+    tool_registry: object | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +169,7 @@ class DeferredToolsProvider:
 
     async def collect(self, request):
         from ..tools import get_deferred_tool_names
-        names = get_deferred_tool_names()
+        names = get_deferred_tool_names(registry=getattr(request, "tool_registry", None))
         if not names:
             return None
         text = ("The following deferred tools are available via tool_search: "
@@ -271,8 +274,7 @@ def _default_project_instructions_source(request: ContextRequest) -> str:
 
 
 def _default_memory_static_source(request: ContextRequest) -> str:
-    from ..memory import build_memory_prompt_section
-    return build_memory_prompt_section()
+    return ""
 
 
 def default_providers(sources: ContextSources | None = None) -> list:

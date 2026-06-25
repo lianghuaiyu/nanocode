@@ -14,3 +14,7 @@ SCHEMA = {
         "required": ["child_session_id"],
     },
 }
+
+
+def run(ctx, inp: dict) -> str:
+    return ctx.runs.status(inp.get("child_session_id", ""))

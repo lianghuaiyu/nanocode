@@ -37,8 +37,12 @@ def _type_ok(value, json_type: str) -> bool:
     return isinstance(value, py)
 
 
-def validate_tool_input(name: str, inp) -> str | None:
-    """校验一次工具调用的 public args。通过返回 None；否则返回拒绝文案（不抛）。"""
+def validate_tool_input(name: str, inp, *, registry=None) -> str | None:
+    """校验一次工具调用的 public args。通过返回 None；否则返回拒绝文案（不抛）。
+
+    docs/24 Phase 4a：schema 查表用传入 `registry`（router 经 host.registry 传 per-agent
+    overlay，使 MCP/扩展/嵌入者工具按其各自 schema 校验）；None → 退回全局 REGISTRY（builtins，
+    standalone / 旧单测路径，行为等价）。"""
     # 1. 下划线键一律拒（普适，含 MCP）——封死隐藏字段注入。
     if isinstance(inp, dict):
         for key in inp:
@@ -46,8 +50,10 @@ def validate_tool_input(name: str, inp) -> str | None:
                 return (f"rejected tool input for '{name}': key '{key}' is not allowed "
                         f"(leading underscore keys are reserved for the runtime).")
 
-    from ..tools.spec import TOOLS  # lazy：避免 capabilities ↔ tools 包级 import 环
-    spec = TOOLS.get(name)
+    if registry is None:
+        from ..tools import REGISTRY  # lazy：避免 capabilities ↔ tools 包级 import 环
+        registry = REGISTRY
+    spec = registry.get(name)
     if spec is None:
         return None  # MCP / 未登记：无本地 schema，结构校验跳过（下划线键已挡）
 

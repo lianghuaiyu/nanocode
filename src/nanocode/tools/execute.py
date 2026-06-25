@@ -10,21 +10,41 @@ import json
 import os
 from pathlib import Path
 
-from . import registry
+from .registry import REGISTRY
 from .shared import _truncate_result
-from .spec import TOOLS
 
-# docs/16 #5：handler 表从 spec.TOOLS 派生（单一真相源；host-routed 工具 run=None 不在表内，
-# 含 run_shell——它经 SandboxManager 执行，不走通用 handler）。
-_HANDLERS = {name: s.run for name, s in TOOLS.items() if s.run is not None}
+# docs/24 Phase 2：dispatch 在咽喉点（engine._run_real_tool）按「needs ∩ 信任档策略」铸造
+# ToolContext（fs 能力把手）后传入；execute_tool 不再裸调 .run(inp)，而是 .run(ctx, inp)。
+# host-routed 工具 run=None，不经此（更早分支截走）。
+
+
+def _default_ctx():
+    """无传入 ctx 时的退路：宽松 fs 把手（与今天裸 Path/os 行为等价）。
+
+    保留供旧调用点 / 直接单测（tests/tools/test_execute.py）使用——它们不构造 ctx；
+    engine 真实派发总是显式传 ctx。Phase 2 零行为变更：默认 policy 不收紧。
+    """
+    from .context import default_tool_context
+    return default_tool_context()
 
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str,
+    inp: dict,
+    read_file_state: dict[str, float] | None = None,
+    *,
+    ctx=None,
+    registry=None,
 ) -> str:
+    # docs/24 Phase 4a：per-agent overlay registry 经此参数线穿过（engine._run_real_tool 传
+    # self._registry）；直接调用 / 旧单测不传 → 退回全局 REGISTRY（builtins-only，行为等价）。
+    if registry is None:
+        registry = REGISTRY
+    if ctx is None:
+        ctx = _default_ctx()
     # ─── read-before-edit + mtime freshness checks ───────────
     if name == "read_file":
-        result = _HANDLERS["read_file"](inp)
+        result = registry.get("read_file").run(ctx, inp)
         if read_file_state is not None and not result.startswith("Error"):
             abs_path = str(Path(inp["file_path"]).resolve())
             try:
@@ -46,7 +66,7 @@ async def execute_tool(
     # tool_search: activate deferred tools and return their schemas
     if name == "tool_search":
         query = (inp.get("query") or "").lower()
-        deferred = [t for t in registry.tool_definitions if t.get("deferred")]
+        deferred = [t for t in registry.schemas() if t.get("deferred")]
         matches = [
             t for t in deferred
             if query in t["name"].lower() or query in (t.get("description") or "").lower()
@@ -54,16 +74,21 @@ async def execute_tool(
         if not matches:
             return "No matching deferred tools found."
         for m in matches:
-            registry._activated_tools.add(m["name"])
+            registry.activate(m["name"])
         return json.dumps(
             [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["input_schema"]} for t in matches],
             indent=2,
         )
 
-    handler = _HANDLERS.get(name)
-    if not handler:
+    tool = registry.get(name)
+    if tool is None or tool.run is None:
         return f"Unknown tool: {name}"
-    result = _truncate_result(handler(inp))
+    raw = tool.run(ctx, inp)
+    # run_shell 前台 run 是 async（经 ctx.exec → SandboxManager）；其余 fs/web 工具同步。
+    # 统一在此 await 协程，execute_tool 不必关心各 run 的 sync/async 形态。
+    if hasattr(raw, "__await__"):
+        raw = await raw
+    result = _truncate_result(raw)
 
     # Update mtime after successful write/edit
     if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):

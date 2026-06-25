@@ -107,7 +107,8 @@ async def _context(ctx: CommandContext, args: str) -> Local:
                          include_repo_map=map_tokens > 0,
                          map_tokens=map_tokens,
                          map_refresh=cfg["map_refresh"],
-                         map_multiplier_no_files=cfg["map_multiplier_no_files"])
+                         map_multiplier_no_files=cfg["map_multiplier_no_files"],
+                         tool_registry=getattr(getattr(ctx.thread, "agent", None), "registry", None))
     services = getattr(ctx.thread, "services", None)
     plan = await ContextRuntime(budget=budget, sources=(services.context_sources if services is not None else None)).collect(req)
     return Local(output=plan.ledger.render_summary())
@@ -125,12 +126,14 @@ async def _memory_consolidate(ctx: CommandContext, args: str) -> Local:
     return Local(output=await ctx.thread.spawn_memory_consolidate())
 
 
-async def _memory_eval_generate(ctx: CommandContext, args: str) -> Local:
-    return Local(output=await ctx.thread.spawn_memory_eval())
+# docs/22: /memory optimize and /memory eval generate are registered by the
+# memory-evolution system extension. They are intentionally not builtin
+# handlers, so there is no second optimize truth source.
 
 
-async def _memory_optimize(ctx: CommandContext, args: str) -> Local:
-    return Local(output=await ctx.thread.spawn_memory_optimize())
+async def _memory_generate(ctx: CommandContext, args: str) -> Local:
+    force = args.strip().lower() in ("--force", "-f", "force")
+    return Local(output=await ctx.thread.generate_memory(force=force))
 
 
 async def _memory_eval(ctx: CommandContext, args: str) -> Local:
@@ -138,13 +141,7 @@ async def _memory_eval(ctx: CommandContext, args: str) -> Local:
 
 
 async def _memory(ctx: CommandContext, args: str) -> Local:
-    from ...memory import list_memories
-    memories = list_memories()
-    if not memories:
-        return Local(output="No memories saved yet.")
-    lines = [f"{len(memories)} memories:"]
-    lines.extend(f"    [{m.type}] {m.name} — {m.description}" for m in memories)
-    return Local(output="\n".join(lines))
+    return Local(output=ctx.thread.memory_overview())
 
 
 async def _skills(ctx: CommandContext, args: str) -> Local:
@@ -623,10 +620,8 @@ _BUILTINS = [
     ("/compact", _compact, "exact_or_prefix", "Manually compact the conversation", "[prompt]"),
     ("/memory consolidate", _memory_consolidate, "exact",
      "Run a curator pass to merge/rewrite/archive memories", ""),
-    ("/memory eval generate", _memory_eval_generate, "exact",
-     "Run an EVAL-mode curator pass to propose pending eval candidates", ""),
-    ("/memory optimize", _memory_optimize, "exact",
-     "Run EvolveMem on confirmed eval candidates to tune retrieval config", ""),
+    ("/memory generate", _memory_generate, "exact_or_prefix",
+     "Extract long-term memory from this session (simplemem backend)", "[--force]"),
     ("/memory eval", _memory_eval, "exact_or_prefix",
      "List/confirm/reject memory eval candidates",
      "[pending|confirmed|rejected | confirm <id> | reject <id>]"),
@@ -658,4 +653,6 @@ def build_registry() -> Registry:
             CommandSpec(name=name, kind="local", description=desc, arg_hint=hint, match=match),
             handler,
         ))
+    from .extension_bridge import merge_system_extension_commands
+    merge_system_extension_commands(r)
     return r

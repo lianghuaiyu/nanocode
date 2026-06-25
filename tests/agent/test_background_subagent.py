@@ -11,7 +11,9 @@ from nanocode.agent.events import ToolCallRequested, ToolResultObserved
 from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.subagents import run_record
-from nanocode.tools import tool_definitions
+from nanocode.tools import REGISTRY
+
+tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):

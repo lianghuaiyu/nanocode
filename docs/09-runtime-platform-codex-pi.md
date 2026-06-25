@@ -996,7 +996,7 @@ tool wrappers
 }
 ```
 
-> **schema 演进**：`events.jsonl` 作为事实源，老会话须被新代码永久（或至迁移点前）可重放。`SessionEvent` 已带 `v`（沿用 tracer 的 `SCHEMA_VERSION=1`，勿重置）。补一个 upcaster：读端**容忍未知 `type` 与未知 `data` key**（skip-and-warn，绝不 crash 会话），由 upcaster 把旧事件形状映射到当前再交给 ContextBuilder。仓库已有范式可借：`_vendor/simplemem` 的 `SCHEMA_VERSION=6` 迁移梯子。可选：resume 的老会话惰性重快照为当前 schema、归档 pre-upcast 原始事件，使 upcaster 面有界。
+> **schema 演进**：`events.jsonl` 作为事实源，老会话须被新代码永久（或至迁移点前）可重放。`SessionEvent` 已带 `v`（沿用 tracer 的 `SCHEMA_VERSION=1`，勿重置）。补一个 upcaster：读端**容忍未知 `type` 与未知 `data` key**（skip-and-warn，绝不 crash 会话），由 upcaster 把旧事件形状映射到当前再交给 ContextBuilder。仓库已有范式可借：`memory/engines/simplemem/migrations.py` 的 schema marker + fail-loud migration guard。可选：resume 的老会话惰性重快照为当前 schema、归档 pre-upcast 原始事件，使 upcaster 面有界。
 
 ## 迁移路线图
 
@@ -1278,7 +1278,7 @@ tests/subagents/
 
 ### 风险 7：事件 schema 演进失控
 
-控制方式：`SessionEvent` 带 `v`（沿用 tracer `SCHEMA_VERSION`）；读端容忍未知 type/key（skip-and-warn）+ upcaster；vN→vN+1 round-trip 测试。借 `_vendor/simplemem` 的迁移梯子范式。
+控制方式：`SessionEvent` 带 `v`（沿用 tracer `SCHEMA_VERSION`）；读端容忍未知 type/key（skip-and-warn）+ upcaster；vN→vN+1 round-trip 测试。借 `memory/engines/simplemem/migrations.py` 的 schema marker / migration guard 范式。
 
 ### 风险 8：多进程单 session 写冲突
 

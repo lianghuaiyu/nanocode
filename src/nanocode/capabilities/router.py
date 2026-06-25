@@ -83,9 +83,14 @@ class CapabilityRouter:
     """
 
     async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
+        # docs/24 Phase 4a：本次派发用的 registry = host 的 per-agent overlay（real Agent.registry）；
+        # 极简 ToolHost 测试替身可能不暴露 registry → 退回全局 REGISTRY（builtins，行为等价）。
+        # 同一 registry 贯穿 validate / host-routed tool.run 解析，绝不混读两个表。
+        from ..tools.registry import REGISTRY as _GLOBAL_REGISTRY
+        registry = getattr(host, "registry", None) or _GLOBAL_REGISTRY
         # docs/19 Phase 1：严格输入校验是真实执行前的第一道（覆盖流式早执行 + 直接/hook 调用）。
         # 拒下划线键（封死 _cwd/_session_id spoof）/ unknown key / 缺 required / 类型不符。
-        verr = validate_tool_input(name, inp)
+        verr = validate_tool_input(name, inp, registry=registry)
         if verr is not None:
             return f"Error: {verr}"
         # P4 call-time allowlist enforcement（安全基石）：任何真实工具派发（含 run_shell 后台分支）之前 fail-closed。
@@ -93,57 +98,49 @@ class CapabilityRouter:
             from ..agent.events import ToolBlocked   # lazy：避免 capabilities↔agent 包级 import 环
             host.emit(ToolBlocked(tool=name, reason="not_in_allowlist"))
             return f"Error: tool '{name}' is not permitted for this sub-agent."
+
+        # ─── host-routed 工具（docs/24 Phase 3）─────────────────────────────────
+        # 这些工具经 curated ToolContext 能力把手自包含执行（tool.run(ctx, inp)），把手薄转发到
+        # host 服务方法。**保留在 hook 段之前截走**——与今天 host-routed 分支位置一致，故它们
+        # 今天「不被 skill hook 包裹」的行为**逐字保持**（parity A：hook 套用集合不变）。
+        # 门与守卫（parity B）就地保留：plan-mode 主 agent-only、memory consolidate 子 agent 守卫、
+        # run_shell 后台分支不变（task_stop 归属、get_subagent_result 别名在 host 方法内）。
+
+        # run_shell 后台分支：保持在 hook 段之前截走（今天不被 hook 包裹）。前台 run_shell 不在此，
+        # 落到下方 REAL+hook 段（今天即被 hook 包裹）——split 与今天逐字一致。run_shell.run 自身
+        # 据 run_in_background 选择 ctx.tasks.spawn_shell（含「Started background shell task …」文案）。
         if name == "run_shell" and inp.get("run_in_background"):
-            tid = await host.spawn_background_shell(inp.get("command", ""), inp.get("timeout"))
-            return (f"Started background shell task {tid}. It will report completion later. "
-                    f"Use task_output with task_id={tid} to inspect progress.")
-        if name == "task_list":
-            return host.list_tasks(inp.get("status"), inp.get("kind"))
-        if name == "task_output":
-            return host.task_output(inp.get("task_id", ""), int(inp.get("tail_bytes") or 8000))
-        if name == "task_stop":
-            return await host.stop_task(inp.get("task_id", ""))
-        if name == "get_subagent_result":
-            return host.run_output(
-                inp.get("child_session_id", ""),
-                bool(inp.get("include_events")),
-                int(inp.get("tail_events") or 20),
-            )
-        if name == "run_list":
-            return host.run_list(inp.get("status"))
-        if name == "run_status":
-            return host.run_status(inp.get("child_session_id", ""))
-        if name == "run_output":
-            return host.run_output(
-                inp.get("child_session_id", ""),
-                bool(inp.get("include_events")),
-                int(inp.get("tail_events") or 20),
-            )
-        if name == "run_cancel":
-            return await host.run_cancel(inp.get("child_session_id", ""))
-        if name == "run_send":
-            return host.run_send(
-                inp.get("child_session_id", ""),
-                inp.get("prompt", ""),
-                delivery=inp.get("delivery") or "steer",
-                wake=bool(inp.get("wake")),
-            )
-        if name == "memory" and inp.get("action") == "recall" and inp.get("semantic"):
-            return await host.recall_memory_semantic(inp.get("query", ""), int(inp.get("limit") or 5))
-        if name == "memory" and inp.get("action") == "consolidate":
-            if host.is_sub_agent:
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
+        if name in _TASK_META_TOOLS or name in _RUN_META_TOOLS:
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
+        if name == "memory":
+            # 守卫：子 agent 不得 consolidate（host/session 操作）。
+            if host.is_sub_agent and inp.get("action") == "consolidate":
                 return ("Error: memory consolidation is a host/session operation and "
                         "is not available to sub-agents.")
-            return await host.spawn_memory_consolidate()
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
         if name in ("enter_plan_mode", "exit_plan_mode"):
+            # 门：plan-mode 仅主 agent（子 agent ctx.set_mode=None；此守卫保留子 agent 报错语义）。
             if host.is_sub_agent:
                 return "Error: plan-mode tools are not available to sub-agents."
-            return await host.execute_plan_mode_tool(name)
-        if name == "agent":
-            return await host.execute_agent_tool(inp)
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
+        if name == AGENT_META_TOOL:
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
         if name == "skill":
-            return await host.execute_skill_tool(inp)
-        # 真实工具(mcp/execute_tool)——受 hooks 约束(meta 工具上面已返回)。
+            ctx = host.mint_tool_context(name)
+            return await _maybe_await(registry.get(name).run(ctx, inp))
+
+        # ─── REAL 工具（fs/web_fetch/tool_search/mcp + run_shell 前台）——受 hooks 约束 ───────
         # cwd/session_id 不再注入 inp：它们是 HostContext（SandboxManager 经 host 取），非 tool input。
         if host.hooks_suppressed() or not host.has_active_hooks():
             return await host.run_real_tool(name, inp)
@@ -160,3 +157,14 @@ class CapabilityRouter:
         if warnings:
             result = result + "\n\n" + "\n".join(warnings)
         return result
+
+
+async def _maybe_await(value):
+    """host-routed tool.run 可能是 sync（run_list/output/...）或 async（stop/cancel/exec/spawn/...）。
+
+    同步 run 直接返回 str；async run 返回 coroutine，在此 await。统一咽喉点不必关心各 run 的
+    sync/async 形态。
+    """
+    if hasattr(value, "__await__"):
+        return await value
+    return value

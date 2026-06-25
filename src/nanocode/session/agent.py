@@ -74,7 +74,17 @@ class AgentSession:
                     notify=lambda text, level="info": a.emit(_events.NoticeRaised(text=text, level=level)))
                 mcp_defs = a._mcp_manager.get_tool_definitions()
                 if mcp_defs:
-                    a.tools = a.tools + mcp_defs
+                    # docs/24 Phase 4b：MCP 工具并入 agent 的 per-agent overlay registry（不写全局
+                    # REGISTRY）。每个注册为 Tool(schema=mcp 开放 schema **不 _closed**——保 MCP arg
+                    # 校验不收紧；run=None；source=MCP；trust=UNTRUSTED；needs=∅；name=mcp__server__tool)。
+                    # 执行经 engine._run_real_tool 的 source 判定路由回 mcp_manager.call_tool。
+                    from ..tools.spec import Tool
+                    from ..tools.types import ToolSource, Trust
+                    for d in mcp_defs:
+                        a._registry.register(Tool(
+                            schema=d, run=None, source=ToolSource.MCP, trust=Trust.UNTRUSTED,
+                            needs=frozenset()))
+                    a.tools = a._registry.schemas()
             except Exception as e:
                 a.emit(_events.NoticeRaised(text=f"[mcp] Init failed: {e}"))
 
@@ -259,16 +269,13 @@ class AgentSession:
 
     # ── memory prefetch（docs/16 #3c：宿主侧 helper，loop 经 cfg 调用）──────────
     def start_memory_prefetch(self, user_message: str):
-        """主 agent 每 turn 启动语义记忆预取（子 agent / 无 side-query 能力 → None）。"""
+        """主 agent 每 turn 启动 no-LLM 快速记忆预取（子 agent / 无 service → None）。"""
         a = self.agent
-        if a.is_sub_agent:
+        if a.is_sub_agent or a._memory_service is None:
             return None
-        sq = a._build_side_query()
-        if not sq:
-            return None
-        from ..memory import start_memory_prefetch
-        return start_memory_prefetch(user_message, sq, a._already_surfaced_memories,
-                                     a._session_memory_bytes, backend=a._memory_backend)
+        return a._memory_service.start_prefetch(
+            user_message, already_surfaced=a._already_surfaced_memories,
+            session_memory_bytes=a._session_memory_bytes)
 
     def consume_memory_prefetch(self, prefetch) -> None:
         """settle 后注入一次：树是唯一注入通道（写失败 → 不推进 dedup，下一轮 prefetch 重新浮现）；

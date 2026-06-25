@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from .shared import _normalize_quotes, _find_actual_string, _generate_diff
 
 SCHEMA = {
@@ -21,10 +19,10 @@ SCHEMA = {
 }
 
 
-def run(inp: dict) -> str:
+def run(ctx, inp: dict) -> str:
     try:
-        path = Path(inp["file_path"])
-        content = path.read_text()
+        path = inp["file_path"]
+        content = ctx.fs_write.read_text(path)
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
@@ -35,7 +33,7 @@ def run(inp: dict) -> str:
             return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
 
         new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content)
+        ctx.fs_write.write_text(path, new_content)
 
         diff = _generate_diff(content, actual, inp["new_string"])
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""

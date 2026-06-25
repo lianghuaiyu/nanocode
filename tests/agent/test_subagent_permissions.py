@@ -10,7 +10,9 @@ import asyncio
 import pytest
 
 from nanocode.agent.engine import Agent
-from nanocode.tools import tool_definitions, check_permission
+from nanocode.tools import REGISTRY, check_permission
+
+tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):

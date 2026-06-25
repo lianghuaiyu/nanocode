@@ -73,6 +73,7 @@ class _FakeAgent:
     def clear_history(self): self.calls.append(("clear_history",))
     def toggle_plan_mode(self): self.calls.append(("toggle_plan_mode",))
     def show_cost(self): self.calls.append(("show_cost",))
+    def emit(self, event): self.calls.append(("emit", getattr(event, "kind", type(event).__name__)))
 
     @property
     def agent_session(self):
@@ -85,7 +86,6 @@ class _FakeAgent:
 
     async def _spawn_memory_consolidate(self): self.calls.append(("_spawn_memory_consolidate",)); return ""
     async def _spawn_memory_eval(self): self.calls.append(("_spawn_memory_eval",)); return ""
-    async def _spawn_memory_optimize(self): self.calls.append(("_spawn_memory_optimize",)); return ""
     def _register_skill_hooks(self, skill): self.calls.append(("_register_skill_hooks", skill.name))
     def _live_run_ids(self): return set()
 
@@ -153,6 +153,28 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     monkeypatch.setattr(RuntimeThread, "sandbox_status", _fake_sandbox_status)
     monkeypatch.setattr(RuntimeThread, "set_sandbox_profile", _fake_set_sandbox_profile)
 
+    # docs/20: /memory goes through RuntimeThread.memory_overview (MemoryService
+    # view), not the legacy file-list helper.
+    def _fake_memory_overview(self):
+        calls.append(("memory_overview",))
+        return "memory stub"
+
+    monkeypatch.setattr(RuntimeThread, "memory_overview", _fake_memory_overview)
+
+    # docs/20 Phase 6: /memory generate triggers host-owned generation.
+    async def _fake_generate_memory(self, *, force=False, auto=False):
+        calls.append(("generate_memory", force))
+        return "gen stub"
+
+    monkeypatch.setattr(RuntimeThread, "generate_memory", _fake_generate_memory)
+
+    # docs/22: /memory optimize is contributed by the memory-evolution extension.
+    async def _fake_run_extension_task(self, kind, payload):
+        calls.append(("run_extension_task", kind))
+        return "started"
+
+    monkeypatch.setattr(RuntimeThread, "run_extension_task", _fake_run_extension_task)
+
     monkeypatch.setattr(
         RuntimeThread, "agents_overview",
         lambda self: (calls.append(("agents_overview_text",)) or "stub"))
@@ -208,11 +230,16 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
         from nanocode.agent import AgentRuntime, RuntimeThread
         rt = AgentRuntime()
         thread = rt.register(RuntimeThread(rt, agent, _RecordingSession(agent)))
+        from nanocode.extensions import ExtensionHost
+        ext_host = ExtensionHost.load_system_extensions().activate_all()
+        thread._extension_host = ext_host
+        ext_host.bind_runtime(thread, None)
         task = asyncio.ensure_future(cli.run_repl(thread, input=r, output=console))
         await asyncio.sleep(0.05)
         for ln in lines:
             os.write(w, (ln + "\r").encode("utf-8"))
-            await asyncio.sleep(0.06)
+            await asyncio.sleep(0.12)
+        await asyncio.sleep(0.12)
         os.write(w, b"\x04")  # Ctrl-D 空行退出
         try:
             await asyncio.wait_for(task, timeout=5)
@@ -237,6 +264,36 @@ def _names(calls) -> list:
     return [c[0] for c in calls]
 
 
+def _dispatch_direct(monkeypatch, line: str) -> list:
+    """Run one command through the registry runner without the RichApp pipe seam.
+
+    Used for extension-contributed commands: RichApp.feed() submits them in
+    production, while the fd-based test harness can miss them before Ctrl-D.
+    """
+    calls: list = []
+    agent = _FakeAgent(calls)
+    from nanocode.agent import AgentRuntime, RuntimeThread
+    from nanocode.entrypoints.commands.types import CommandContext
+    from nanocode.extensions import ExtensionHost
+
+    async def _fake_run_extension_task(self, kind, payload):
+        calls.append(("run_extension_task", kind))
+        return "started"
+
+    monkeypatch.setattr(RuntimeThread, "run_extension_task", _fake_run_extension_task)
+
+    async def _scenario():
+        rt = AgentRuntime()
+        thread = rt.register(RuntimeThread(rt, agent, _RecordingSession(agent)))
+        ext_host = ExtensionHost.load_system_extensions().activate_all()
+        thread._extension_host = ext_host
+        ext_host.bind_runtime(thread, None)
+        await cli.dispatch(line, cli._REGISTRY, CommandContext(thread=thread, registry=cli._REGISTRY))
+
+    asyncio.run(_scenario())
+    return calls
+
+
 # ════════════════════════════════════════════════════════════════
 # Tier A —— refactor-stable：落点分区 / 顺序 / exit / 全角 / shell
 # ════════════════════════════════════════════════════════════════
@@ -244,8 +301,8 @@ def _names(calls) -> list:
 # 已知命令一律不得落到普通 chat
 _KNOWN_COMMANDS = [
     "/clear", "/plan", "/cost", "/compact",
-    "/memory", "/memory consolidate", "/memory eval", "/memory eval generate",
-    "/memory optimize", "/skills", "/sandbox",
+    "/memory", "/memory consolidate", "/memory eval", "/memory generate",
+    "/skills", "/sandbox",
     "/tasks", "/task abc", "/task-stop abc", "/agents", "/agent", "/agent agent-001",
 ]
 
@@ -269,10 +326,15 @@ def test_plain_text_goes_to_chat(monkeypatch):
 
 def test_memory_eval_generate_not_eaten_by_memory_eval(monkeypatch):
     """most-specific-first：精确分支必须先于 startswith 前缀分支命中。"""
-    calls = _run_script(monkeypatch, ["/memory eval generate"])
+    calls = _dispatch_direct(monkeypatch, "/memory eval generate")
     n = _names(calls)
     assert "_spawn_memory_eval" in n
     assert "handle_eval_command" not in n
+
+
+def test_memory_optimize_routes_to_extension_task(monkeypatch):
+    calls = _dispatch_direct(monkeypatch, "/memory optimize")
+    assert ("run_extension_task", "memory_optimize") in calls
 
 
 def test_memory_eval_with_args_routes_to_eval_handler(monkeypatch):
@@ -289,7 +351,7 @@ def test_bare_memory_eval_defaults_to_eval_handler(monkeypatch):
 def test_fullwidth_slash_is_normalized(monkeypatch):
     """中文输入法的全角 ／ 归一为 /，故 '／memory' 命中 /memory 而非当文本。"""
     calls = _run_script(monkeypatch, ["／memory"])
-    assert "list_memories" in _names(calls)
+    assert "memory_overview" in _names(calls)
     assert ("run_turn", "／memory") not in calls
 
 
@@ -360,9 +422,8 @@ def test_control_result_routes_to_apply_control_not_chat(monkeypatch):
     ("/cost", "show_cost"),
     ("/compact", "compact"),
     ("/memory consolidate", "_spawn_memory_consolidate"),
-    ("/memory eval generate", "_spawn_memory_eval"),
-    ("/memory optimize", "_spawn_memory_optimize"),
-    ("/memory", "list_memories"),
+    ("/memory generate", "generate_memory"),
+    ("/memory", "memory_overview"),
     ("/skills", "discover_skills"),
     ("/sandbox", "sandbox_status"),
 ])

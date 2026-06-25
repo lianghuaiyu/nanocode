@@ -16,7 +16,6 @@ import shutil
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
 
 from ..paths import project_memory_dir
 
@@ -36,15 +35,11 @@ def _backup_dir() -> Path:
 
 
 def _simplemem_dir() -> Path:
-    """SimpleMem index + eval + evolve_config.json directory."""
+    """SimpleMem eval store directory (the eval/ tree lives under here)."""
     mem_dir = project_memory_dir()
     d = mem_dir.parent / "simplemem"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def evolve_config_path() -> Path:
-    return _simplemem_dir() / "evolve_config.json"
 
 
 # ─── Consolidation Plan Model ──────────────────────────────
@@ -312,45 +307,12 @@ def apply_plan(plan: ConsolidationPlan) -> ConsolidationResult:
     return result
 
 
-# ─── Optimization Config Lifecycle ──────────────────────────
-
-def load_evolve_config() -> dict[str, Any] | None:
-    """Load the current evolve_config.json, or None if missing."""
-    path = evolve_config_path()
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def save_evolve_config(config_data: dict[str, Any]) -> str:
-    """Atomically save a new evolve_config.json. Returns path."""
-    path = evolve_config_path()
-
-    # Backup old config if it exists
-    if path.exists():
-        backup_path = path.with_suffix(f".{_timestamp_id()}.bak")
-        shutil.copy2(str(path), str(backup_path))
-
-    # Write new config atomically (write to temp, then rename)
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False))
-    tmp_path.replace(path)
-    return str(path)
-
-
-def rollback_evolve_config() -> bool:
-    """Rollback to the most recent .bak config. Returns True if rolled back."""
-    path = evolve_config_path()
-    simplemem = _simplemem_dir()
-    # Find latest .bak
-    baks = sorted(simplemem.glob("evolve_config.*.bak"), reverse=True)
-    if not baks:
-        return False
-    shutil.copy2(str(baks[0]), str(path))
-    return True
+# docs/22 Phase 7: the optimization config lifecycle moved out of markdown-land.
+# The single retrieval-config truth source is now
+# memory/retrieval_config_store.py at the SimpleMem store root
+# ({store_root}/retrieval_config.json). The old markdown-centric
+# load/save/rollback_evolve_config + evolve_config_path are deleted — no dual
+# config truth source.
 
 
 # ─── Optimization env knobs ─────────────────────────────────
@@ -389,12 +351,19 @@ def evolve_max_rounds() -> int:
 
 # ─── Eval Provenance Check ──────────────────────────────────
 
-def prune_orphaned_evals(eval_dir: Path | None = None) -> int:
-    """Remove confirmed eval entries whose source memories no longer exist.
+def prune_orphaned_evals(eval_dir: Path | None = None,
+                         valid_refs: "set[str] | None" = None) -> int:
+    """Remove eval entries whose source memories no longer exist.
 
-    After consolidation, some memories may have been archived/merged.
-    Evals referencing those memories should be discarded so EvolveMem
-    doesn't optimize on stale signals.
+    After consolidation/archival, some memories may be gone. Evals referencing
+    them should be discarded so the optimizer doesn't tune on stale signals.
+
+    Backend-aware (docs/22 Phase 2): when `valid_refs` is provided (e.g. from
+    `eval_source.valid_memory_refs(backend)`), an eval is kept iff its full
+    `source.memory_ref` is in that set — works for `simplemem://<id>` refs as
+    well as markdown filenames. When `valid_refs` is None, falls back to the
+    legacy markdown behavior (compare the `source_memory` basename against the
+    project markdown files).
 
     Returns count of pruned entries.
     """
@@ -403,8 +372,9 @@ def prune_orphaned_evals(eval_dir: Path | None = None) -> int:
     if not eval_dir.is_dir():
         return 0
 
-    mem_dir = project_memory_dir()
-    existing_files = {f.name for f in mem_dir.glob("*.md") if f.name != "MEMORY.md"}
+    markdown_files = None
+    if valid_refs is None:
+        markdown_files = {f.name for f in project_memory_dir().glob("*.md") if f.name != "MEMORY.md"}
     pruned = 0
 
     for eval_file in eval_dir.glob("*.json"):
@@ -413,9 +383,16 @@ def prune_orphaned_evals(eval_dir: Path | None = None) -> int:
         except (json.JSONDecodeError, OSError):
             continue
 
-        # Check if source_memory field references a still-existing file
+        if valid_refs is not None:
+            ref = ((data.get("source") or {}).get("memory_ref") or "").strip()
+            if ref and ref not in valid_refs:
+                eval_file.unlink()
+                pruned += 1
+            continue
+
+        # Legacy markdown behavior: compare source_memory basename to .md files.
         source = data.get("source_memory", "")
-        if source and source not in existing_files:
+        if source and source not in markdown_files:
             eval_file.unlink()
             pruned += 1
 
@@ -500,28 +477,6 @@ def build_curator_user_message() -> str:
     return "\n".join(parts)
 
 
-def build_eval_curator_message() -> str:
-    """Build the user message for the EVAL-mode curator: all memory file contents.
-
-    Mirrors build_curator_user_message but framed for QA-candidate generation.
-    Returns a "No memory files..." sentinel when there is nothing to read,
-    so the host can short-circuit without spawning a task.
-    """
-    mem_dir = project_memory_dir()
-    parts = [f"Today's date: {time.strftime('%Y-%m-%d')}", ""]
-    parts.append("# Memory Files (derive QA eval candidates from these)\n")
-
-    files = sorted(mem_dir.glob("*.md"))
-    for f in files:
-        if f.name == "MEMORY.md":
-            continue
-        try:
-            content = f.read_text()
-            parts.append(f"## File: {f.name}\n\n{content}\n\n")
-        except OSError:
-            continue
-
-    if len(parts) <= 3:
-        return "No memory files found. Return an empty candidate list."
-
-    return "\n".join(parts)
+# docs/22 Phase 2: the EVAL-mode curator input is now backend-aware and lives in
+# memory/eval_source.py (build_eval_curator_message(backend)). The old
+# markdown-only build_eval_curator_message() here is removed — no dual source.

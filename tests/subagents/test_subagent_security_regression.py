@@ -17,8 +17,10 @@ import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
-from nanocode.tools import tool_definitions
+from nanocode.tools import REGISTRY
 from nanocode.agents import registry as config
+
+tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):

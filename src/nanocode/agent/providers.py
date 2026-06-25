@@ -65,8 +65,14 @@ class ProviderAdapter:
 
     name: str = ""
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, registry=None) -> None:
         self.client = client
+        # docs/24 Phase 4a：per-agent overlay registry——active-tool 过滤读其激活集（tool_search
+        # 激活落在 agent registry 上）。None → 全局 REGISTRY（行为等价，旧路径/裸构造）。
+        self._registry = registry
+
+    def _active_tools(self, tools: list) -> list:
+        return get_active_tool_definitions(tools, registry=self._registry)
 
     async def stream(self, *, model: str, system: "str | None", tools: list,
                      messages: list, thinking_mode: str, callbacks: StreamCallbacks) -> Any:
@@ -94,7 +100,7 @@ class AnthropicAdapter(ProviderAdapter):
                 "model": model,
                 "max_tokens": max_output if thinking_mode != "disabled" else 16384,
                 "system": system,
-                "tools": get_active_tool_definitions(tools),
+                "tools": get_active_tool_definitions(tools, registry=self._registry),
                 "messages": messages,
             }
             if thinking_mode in ("adaptive", "enabled"):
@@ -153,7 +159,7 @@ class OpenAIAdapter(ProviderAdapter):
         async def _do():
             stream = await self.client.chat.completions.create(
                 model=model,
-                tools=_to_openai_tools(get_active_tool_definitions(tools)),
+                tools=_to_openai_tools(get_active_tool_definitions(tools, registry=self._registry)),
                 messages=messages,
                 stream=True,
                 stream_options={"include_usage": True},
@@ -209,6 +215,10 @@ class OpenAIAdapter(ProviderAdapter):
         return await _with_retry(_do, on_retry=callbacks.retry)
 
 
-def make_provider_adapter(*, use_openai: bool, anthropic_client, openai_client) -> ProviderAdapter:
-    """按 use_openai 选 adapter（engine.__init__ 与子 agent 构造共用）。"""
-    return OpenAIAdapter(openai_client) if use_openai else AnthropicAdapter(anthropic_client)
+def make_provider_adapter(*, use_openai: bool, anthropic_client, openai_client,
+                          registry=None) -> ProviderAdapter:
+    """按 use_openai 选 adapter（engine.__init__ 与子 agent 构造共用）。
+
+    docs/24 Phase 4a：传入 agent 的 per-agent overlay registry，使 active-tool 过滤读其激活集。"""
+    return (OpenAIAdapter(openai_client, registry=registry) if use_openai
+            else AnthropicAdapter(anthropic_client, registry=registry))

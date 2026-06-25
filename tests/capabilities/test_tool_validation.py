@@ -5,7 +5,7 @@
 """
 
 from nanocode.capabilities.validation import validate_tool_input
-from nanocode.tools.spec import TOOLS
+from nanocode.tools import REGISTRY
 
 
 # ─── 隐藏字段（下划线键）一律拒 ─────────────────────────────────
@@ -63,10 +63,10 @@ def test_unknown_tool_without_underscore_passes():
 # ─── schema 闭合性：所有 public tool 都 additionalProperties:false ──
 
 def test_all_public_schemas_closed():
-    for name, spec in TOOLS.items():
-        insch = spec.schema.get("input_schema", {})
+    for name in REGISTRY.names():
+        insch = REGISTRY.get(name).schema.get("input_schema", {})
         assert insch.get("additionalProperties") is False, f"{name} schema not closed"
 
 
 def test_sandbox_shell_not_public():
-    assert "sandbox_shell" not in TOOLS
+    assert REGISTRY.get("sandbox_shell") is None
