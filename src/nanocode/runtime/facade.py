@@ -195,6 +195,11 @@ class RuntimeServices:
     # docs/23 Step 7-S4：sandbox manager 归 runtime 所有（per-runtime 共享，无状态）。
     # profile 仍 per-agent（AgentConfig.sandbox_profile）；per-call HostContext 现场收窄。
     sandbox: object | None = None
+    # docs/23 Step 7-S5：MCP 连接管理器 + run-ledger runtime 也归 runtime 所有（③）。二者
+    # per-runtime 生命周期、跨会话切换保活（rebind 复用同一 Agent，今天就不重建它们）——
+    # 故主 agent 只在首次装配采用，rebind 不换（见 _apply_runtime_services 的 first_attach）。
+    mcp_manager: object | None = None
+    run_runtime: object | None = None
 
     @classmethod
     def create(cls, config: AgentConfig, *, cwd: str | None = None) -> "RuntimeServices":
@@ -241,6 +246,8 @@ class RuntimeServices:
             extension_host = ExtensionHost.load_system_extensions().activate_all()
 
         from ..capabilities.sandbox import SandboxManager
+        from ..mcp import McpManager
+        from ..runs.runtime import AgentRunRuntime
 
         trusted = config.workspace_trusted if str(Path(config.cwd or resolved).resolve()) == resolved else is_trusted(Path(resolved))
         return cls(
@@ -256,17 +263,27 @@ class RuntimeServices:
             extension_host=extension_host,
             diagnostics=tuple(diagnostics),
             sandbox=SandboxManager(),
+            mcp_manager=McpManager(),
+            run_runtime=AgentRunRuntime(),
         )
 
 
 def _apply_runtime_services(agent, services: RuntimeServices) -> None:
+    # docs/23 Step 7-S5：首次装配 vs rebind 区分。rebind 复用同一 Agent；有状态、per-runtime
+    # 生命周期的服务（MCP 连接 / run ledger）今天就不随会话切换重建，故只在首次采用、rebind 不换
+    # （保活 MCP 连接 + _mcp_initialized 语义）。fresh agent 尚无 _runtime_services → first_attach。
+    first_attach = getattr(agent, "_runtime_services", None) is None
     agent._runtime_services = services
     agent._memory_service = services.memory_service
     agent.workspace_trusted = services.workspace_trusted
-    # docs/23 Step 7-S4：采用 runtime 所有的 sandbox manager（无状态、per-runtime 共享）。
-    # 缺省 None 时保留 Agent.__init__ 自建的实例（未经 runtime 装配的白盒/测试 agent）。
+    # docs/23 Step 7-S4：sandbox manager 无状态、per-runtime 共享，可随 bundle 重建（含 rebind）。
     if getattr(services, "sandbox", None) is not None:
         agent._sandbox = services.sandbox
+    if first_attach:
+        if getattr(services, "mcp_manager", None) is not None:
+            agent._mcp_manager = services.mcp_manager
+        if getattr(services, "run_runtime", None) is not None:
+            agent._run_runtime = services.run_runtime
     with _push_cwd(services.cwd):
         from ..prompt import build_system_prompt
         agent._base_system_prompt = build_system_prompt()

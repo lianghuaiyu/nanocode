@@ -218,6 +218,8 @@ class Agent(PlanModeMixin):
         self._background_run_queue: list[str] = []
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
         self._subagents = SubAgentManager(self)
+        # docs/23 Step 7-S5：run-ledger runtime 归 runtime 所有（RuntimeServices.run_runtime）——
+        # 主 agent 首次装配采用 bundle 实例；此处自建作兜底（子 agent / 未装配的白盒/测试 agent）。
         from ..runs.runtime import AgentRunRuntime
         self._run_runtime = AgentRunRuntime()
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
@@ -261,6 +263,9 @@ class Agent(PlanModeMixin):
         self._files_modified: set[str] = set()
 
         # MCP integration
+        # docs/23 Step 7-S5：McpManager 归 runtime 所有（RuntimeServices.mcp_manager，per-runtime
+        # 生命周期、跨会话保活）——主 agent 首次装配采用 bundle 实例并在首 turn 连接。此处自建作兜底；
+        # 子 agent 保留各自这个 inert 实例（子被 session/agent.py 的 not is_sub_agent 闸挡在 MCP 外）。
         from ..mcp import McpManager
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
