@@ -13,6 +13,8 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -40,6 +42,7 @@ def _agent(sid, **kw):
     a._mcp_initialized = True
     if not a.use_openai:
         a.model = "claude-x"
+    attach_runtime_agent(a)   # docs/23 Phase 4: inject session-writer lease (was a.chat() pre-cutover)
     return a
 
 
@@ -64,7 +67,7 @@ def test_unified_loop_anthropic_tree_usage():
         return _FakeResp([_FakeBlock("text", text="done")], stop_reason="end_turn")
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("go"))
+    asyncio.run(a._chat_internal("go"))
 
     m = _msgs("b2a_anth")
     assert [x["role"] for x in m] == ["user", "assistant", "toolResult", "assistant"]
@@ -90,7 +93,7 @@ def test_unified_loop_openai_tree_usage():
                              "message": {"role": "assistant", "content": "done"}}]}
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("go"))
+    asyncio.run(a._chat_internal("go"))
 
     m = _msgs("b2a_oai")
     # 同一逻辑回合：相同 role 序列 + 相同 stopReason/usage 语义（toolResult wire 形状 provider 各异但树语义一致）
@@ -127,7 +130,7 @@ def test_anthropic_concurrent_safe_tools_run_in_parallel_post_stream():
         return _FakeResp([_FakeBlock("text", text="done")], stop_reason="end_turn")
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("scan"))
+    asyncio.run(a._chat_internal("scan"))
 
     assert inflight["max"] == 2              # 并行执行（gather）——非串行回归
     m = _msgs("b2a_parallel")
@@ -161,6 +164,6 @@ def test_anthropic_unsafe_tools_run_serially_post_stream():
         return _FakeResp([_FakeBlock("text", text="done")], stop_reason="end_turn")
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("run"))
+    asyncio.run(a._chat_internal("run"))
 
     assert inflight["max"] == 1              # 串行执行（不安全工具不并行）
