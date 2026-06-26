@@ -89,6 +89,30 @@ def test_agent_import_does_not_pull_runtime():
     assert proc.returncode == 0, proc.stderr
 
 
+def test_agent_engine_import_does_not_pull_runtime():
+    """The low-level model loop (``nanocode.agent.engine``, layer ②a/②b) must not
+    statically import the L4 host-service layer (``nanocode.runtime``). Host
+    services (③) are injected at construction time, not imported by the core
+    module (docs/23 §4.1/§4.2)."""
+    src = Path(__file__).resolve().parents[2] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src) + os.pathsep + env.get("PYTHONPATH", "")
+    code = textwrap.dedent(
+        """
+        import sys
+        import nanocode.agent.engine
+        leaked = sorted(
+            name for name in sys.modules
+            if name == "nanocode.runtime" or name.startswith("nanocode.runtime.")
+        )
+        assert not leaked, leaked
+        """
+    )
+    proc = subprocess.run([sys.executable, "-c", code], env=env, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_cli_help_lists_runtime_shell_escape():
     from nanocode.entrypoints import cli
 

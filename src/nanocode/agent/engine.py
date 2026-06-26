@@ -81,10 +81,6 @@ def _embedder_overlay(embedder_tools: "list | None") -> list:
 # （ALWAYS_ALLOWED_META / AGENT_META_TOOL / allowlist_blocks），由 PermissionEngine 统一持有。
 
 
-# docs/15 Phase 6：子 agent 构造 + 产物落盘搬迁到 runtime/spawn.py（host-driven SubAgentRunner）。
-from ..runtime.spawn import SubAgentRunner  # noqa: E402
-
-
 class Agent(PlanModeMixin):
     # 记忆巩固 curator 的内置保留类型（与 subagents.prompts.MEMORY_CURATOR_TYPE 对齐）。
     _MEMORY_CURATOR_TYPE = "memory-curator"
@@ -226,6 +222,10 @@ class Agent(PlanModeMixin):
         from ..runs.runtime import AgentRunRuntime
         self._run_runtime = AgentRunRuntime()
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
+        # docs/23 §4.1/§4.2：runtime/spawn 是 L4 host 服务（③）；core(②a/②b) 不在模块顶层
+        # 静态依赖 ③ 实现——lazy import 保 `import nanocode.agent.engine` 不拖入 nanocode.runtime
+        # （与同构造器内 AgentRunRuntime 的 lazy import 同风格；行为不变，构造点与时机一致）。
+        from ..runtime.spawn import SubAgentRunner
         self._spawn = SubAgentRunner()
         self._agent_session_obj = None     # lazy AgentSession（docs/16 #1：record_event 唯一 message 树写者）
         # docs/15 Phase 5：工具派发单一入口（allowlist 咽喉点 + meta/agent/skill/real 路由 + hooks）。
