@@ -33,7 +33,7 @@ class _FakeAgent:
 
 class _FakeThread:
     def __init__(self):
-        self.agent = _FakeAgent()
+        self._agent = _FakeAgent()
         self.model = "claude-opus"
 
     def readonly_session(self):
@@ -53,9 +53,9 @@ def test_context_is_live_while_bound():
     assert ctx.memory is None              # services=None
     assert ctx.session is None
     ctx.tasks.update_task("t1", status="completed")
-    assert thread.agent.task_manager.updated == [("t1", {"status": "completed"})]
+    assert thread._agent.task_manager.updated == [("t1", {"status": "completed"})]
     ctx.events.notice("hi")
-    assert thread.agent.events  # NoticeRaised emitted
+    assert thread._agent.events  # NoticeRaised emitted
 
 
 def test_stale_context_fails_loud_after_invalidate():

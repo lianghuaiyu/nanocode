@@ -30,7 +30,7 @@ def test_thread_new_switches_to_empty_session_preserving_old():
     new_t = rt.thread_new(host)
     new_sid = a.session_id
     assert host.current_thread is new_t
-    assert new_t.agent is a                              # 同一 Agent，原地 rebind
+    assert new_t._agent is a                             # 同一 Agent，原地 rebind
     assert new_sid != "OLD"                              # 切到新 mint 的 sid
     assert not SessionManager.exists(new_sid)            # Pi 对齐：顶层空 session 首个 assistant 前不落盘
     assert a.agent_session.build_request_messages() == []   # 新 session 上下文为空
@@ -57,7 +57,7 @@ def test_thread_resume_reloads_target_and_rebinds_session():
     assert "target-conversation" in str(a.agent_session.build_request_messages())
     assert "current-q" not in str(a.agent_session.build_request_messages())
     # docs/14 P2/P7：新 AgentSession 绑新 session（SessionContextBuilder 已退役，不再有 stale 缓存）
-    assert host.current_thread.session.session_id == "TGT"
+    assert host.current_thread._session.session_id == "TGT"
     assert seen[0]["type"] == "session_shutdown"
     assert seen[0]["event"]["reason"] == "resume"
 

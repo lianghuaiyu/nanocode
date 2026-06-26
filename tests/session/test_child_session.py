@@ -90,7 +90,7 @@ def test_build_subagent_child_session_uses_runtime_cwd(tmp_path):
     th = rt.thread_start(AgentConfig(api_key="test", session_id="PCWD",
                                      permission_mode="bypassPermissions",
                                      cwd=str(cwd)))
-    parent = th.agent
+    parent = th._agent
     try:
         sub = parent._build_sub_agent(system_prompt="s", tools=[],
                                       agent_type="coder", artifact_id="agent-cwd")

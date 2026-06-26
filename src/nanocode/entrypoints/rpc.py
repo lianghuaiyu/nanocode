@@ -25,7 +25,7 @@ import asyncio
 import json
 import sys
 
-from ..runtime import ApprovalManager, RuntimeApprovalBroker
+from ..runtime import RuntimeApprovalBroker
 from .host import RuntimeHost
 
 
@@ -67,7 +67,7 @@ async def run_rpc_mode(host: RuntimeHost) -> None:
     loop = asyncio.get_running_loop()
 
     broker = RuntimeApprovalBroker(emit=_emit_line)
-    ApprovalManager(confirm_fn=broker.confirm).attach(thread.agent)
+    thread.attach_approvals(confirm_fn=broker.confirm)
     # 订阅事件流 → 逐条 JSON line 到 stdout。RuntimeThread 已保证 event 是 JSON-able。
     unsubscribe = thread.subscribe(_emit_line)
 
@@ -75,7 +75,7 @@ async def run_rpc_mode(host: RuntimeHost) -> None:
         nonlocal thread, unsubscribe
         unsubscribe()
         thread = host.current_thread
-        ApprovalManager(confirm_fn=broker.confirm).attach(thread.agent)
+        thread.attach_approvals(confirm_fn=broker.confirm)
         unsubscribe = thread.subscribe(_emit_line)
 
     async def _run_turn(text: str) -> None:

@@ -44,7 +44,7 @@ def test_thread_start_builds_and_registers_thread():
     assert isinstance(th, RuntimeThread)
     assert th.thread_id == "tsid"
     assert rt.thread("tsid") is th
-    assert th.agent.model == cfg.model
+    assert th._agent.model == cfg.model
     th.release_lease()
 
 
@@ -86,7 +86,7 @@ def test_run_returns_turnresult_completed_with_tokens():
         a.total_output_tokens += 4
 
     th = rt._attach_agent(a)
-    th.session.run_turn = fake_chat        # docs/16 #3c：turn 实现在 AgentSession.run_turn
+    th._session.run_turn = fake_chat        # docs/16 #3c：turn 实现在 AgentSession.run_turn
     res = asyncio.run(th.run("hi"))
     assert isinstance(res, TurnResult)
     assert res.status == "completed"
@@ -103,7 +103,7 @@ def test_run_maps_aborted_to_cancelled_status():
         a._aborted = True   # 模拟取消被吞
 
     th = rt._attach_agent(a)
-    th.session.run_turn = aborted_chat
+    th._session.run_turn = aborted_chat
     res = asyncio.run(th.run("x"))
     assert res.status == "cancelled"   # 不是 completed
 
@@ -193,7 +193,7 @@ def test_final_response_derived_from_event_stream():
         a._emit_block("hello world")
 
     th = rt._attach_agent(a)
-    th.session.run_turn = fake_chat
+    th._session.run_turn = fake_chat
     res = asyncio.run(th.run("q"))
     assert res.final_response == "hello world"
 
@@ -207,7 +207,7 @@ def test_final_response_resets_between_turns():
         a._emit_block(next(seq))
 
     th = rt._attach_agent(a)
-    th.session.run_turn = fake_chat
+    th._session.run_turn = fake_chat
     r1 = asyncio.run(th.run("a"))
     r2 = asyncio.run(th.run("b"))
     assert r1.final_response == "first"
@@ -274,9 +274,9 @@ def test_model_run_shell_receives_runtime_cwd(monkeypatch, tmp_path):
         captured["cwd"] = str(host.cwd)
         return "ok"
 
-    monkeypatch.setattr(th.agent._sandbox, "execute_shell", fake_exec)
+    monkeypatch.setattr(th._agent._sandbox, "execute_shell", fake_exec)
     try:
-        out = asyncio.run(th.agent._execute_tool_call("run_shell", {"command": "git status"}))
+        out = asyncio.run(th._agent._execute_tool_call("run_shell", {"command": "git status"}))
         assert out == "ok"
         assert captured["cwd"] == str(cwd.resolve())
     finally:

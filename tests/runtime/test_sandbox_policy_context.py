@@ -55,8 +55,8 @@ def test_agent_config_carries_sandbox_profile():
                                      permission_mode="bypassPermissions",
                                      sandbox_profile="read-only"))
     try:
-        assert th.agent._sandbox_profile == "read-only"
-        assert th.agent.sandbox_policy().engine is SandboxEngine.NATIVE
+        assert th._agent._sandbox_profile == "read-only"
+        assert th._agent.sandbox_policy().engine is SandboxEngine.NATIVE
     finally:
         th.release_lease()
 
@@ -74,7 +74,7 @@ def test_facade_sandbox_status_and_switch():
         assert "msb" not in repr(s) and "volume" not in repr(s)   # 不泄漏 adapter 细节
         th.set_sandbox_profile("read-only")
         assert th.sandbox_status()["profile"] == "read-only"
-        assert th.agent.sandbox_policy().engine is SandboxEngine.NATIVE
+        assert th._agent.sandbox_policy().engine is SandboxEngine.NATIVE
     finally:
         th.release_lease()
 

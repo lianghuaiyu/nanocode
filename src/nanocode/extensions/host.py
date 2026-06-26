@@ -187,7 +187,7 @@ class ExtensionHost:
                 "extension host is not bound to a live runtime (or was invalidated)")
         thread = self._thread
         services = self._services
-        agent = getattr(thread, "agent", None)
+        agent = getattr(thread, "_agent", None)
         memory = getattr(services, "memory_service", None) if services is not None else None
         session = thread.readonly_session() if thread is not None else None
         host_model = getattr(thread, "model", "") or ""

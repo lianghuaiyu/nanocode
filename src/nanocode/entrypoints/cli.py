@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from ..runtime import AgentRuntime, RuntimeThread, ApprovalManager, AgentConfig
+from ..runtime import AgentRuntime, RuntimeThread, AgentConfig
 from ..session import get_latest_session_id
 from ..trajectory import (
     trajectory_enabled as _trajectory_enabled,
@@ -379,7 +379,6 @@ async def run_repl(thread: RuntimeThread, *, input=None, output=None) -> None:
         raise TypeError("run_repl() requires a RuntimeThread")
     _thread = thread
     _runtime = _thread._runtime
-    agent = _thread.agent
     # docs/18 Rich Live：交互客户端是挂在 runtime/session 上的订阅端（drop-in 换掉旧 prompt_toolkit
     # TuiApp）。RichApp 采用 Codex 式 inline viewport：流式内容和刚完成的一轮先留在 Live active
     # cell，下一轮开始时再写入 Live 上方的终端 scrollback，避免完成瞬间输入框跳位。
@@ -459,7 +458,7 @@ async def run_repl(thread: RuntimeThread, *, input=None, output=None) -> None:
 
     # docs/18：审批/plan 不再读一行，改成 TuiApp 的 modal future（confirm_fn → choice modal；
     # plan_approval_fn → 1-4 modal）。
-    ApprovalManager(confirm_fn=_app.confirm_fn, plan_approval_fn=_app.plan_approval_fn).attach(agent)
+    _thread.attach_approvals(confirm_fn=_app.confirm_fn, plan_approval_fn=_app.plan_approval_fn)
 
     async def _submit(text: str) -> None:
         """用户提交一行：命令分发 / skill / !shell / 跑一轮 chat（注入给 TuiApp）。

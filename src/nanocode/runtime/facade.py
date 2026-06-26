@@ -371,8 +371,8 @@ class RuntimeThread:
     def __init__(self, runtime: "AgentRuntime", agent, session: AgentSession,
                  *, lease=None, services: RuntimeServices | None = None) -> None:
         self._runtime = runtime
-        self.agent = agent
-        self.session = session
+        self._agent = agent
+        self._session = session
         self.services = services
         # docs/16 #4（EVENT-P2）：typed AgentEvent push 流。tap 挂在 agent.emit 的订阅者扇出腿上，
         # 每条事件包成 {thread_id, session_id, seq, type, event} 信封（绝不携带 tree entry id，
@@ -406,7 +406,7 @@ class RuntimeThread:
         self._seq += 1
         return serialize_event_envelope({
             "thread_id": self.thread_id,
-            "session_id": self.agent.session_id,
+            "session_id": self._agent.session_id,
             "seq": self._seq,
             "type": type_,
             "event": event,
@@ -439,9 +439,22 @@ class RuntimeThread:
                 pass
         return _unsubscribe
 
+    def attach_approvals(self, *, confirm_fn=None, plan_approval_fn=None) -> None:
+        """接线两条审批通道（confirm_fn(bool) + plan_approval_fn(dict)）到内部 agent。
+
+        替代外部直接 `ApprovalManager(...).attach(thread.agent)`——审批接线是 RuntimeThread
+        的稳定操作（docs/23 §4.3），外部不碰 raw agent。未注入的通道保持 agent 默认。"""
+        ApprovalManager(confirm_fn=confirm_fn,
+                        plan_approval_fn=plan_approval_fn).attach(self._agent)
+
+    def _agent_for_runtime(self):
+        """runtime-private raw agent 句柄（docs/23 Phase 2）：仅供 src/nanocode/runtime/* 内部
+        使用（如 _switch_via_rebind 原地 rebind）。绝不对 CLI/RPC/TUI/SDK 公开。"""
+        return self._agent
+
     @property
     def is_processing(self) -> bool:
-        return self.agent.is_processing
+        return self._agent.is_processing
 
     async def run(self, prompt: str) -> TurnResult:
         if self._disposed:
@@ -450,27 +463,27 @@ class RuntimeThread:
             raise RuntimeError("RuntimeThread is disposed; obtain the current thread from the host")
         # docs/17 Phase 0：final_response 从 agent 的 emit 流派生（AssistantMessageCompleted），
         # 每 turn 入口重置累加器，取代旧 BufferSink/TeeSink 捕获。
-        self.agent.reset_final_text()
-        prev_in = self.agent.total_input_tokens
-        prev_out = self.agent.total_output_tokens
-        await self.session.run_turn(prompt)
+        self._agent.reset_final_text()
+        prev_in = self._agent.total_input_tokens
+        prev_out = self._agent.total_output_tokens
+        await self._session.run_turn(prompt)
         # 取消语义：chat() 把取消吞成 _aborted 并正常返回——必须在此 await 之后读 _aborted。
-        status: "Literal['completed','cancelled']" = "cancelled" if self.agent._aborted else "completed"
-        final = self.agent.final_text()
+        status: "Literal['completed','cancelled']" = "cancelled" if self._agent._aborted else "completed"
+        final = self._agent.final_text()
         return TurnResult(
-            session_id=self.agent.session_id,
+            session_id=self._agent.session_id,
             thread_id=self.thread_id,
             status=status,
             final_response=final,
-            input_tokens=self.agent.total_input_tokens - prev_in,
-            output_tokens=self.agent.total_output_tokens - prev_out,
+            input_tokens=self._agent.total_input_tokens - prev_in,
+            output_tokens=self._agent.total_output_tokens - prev_out,
         )
 
     def cancel(self) -> None:
         """委托 agent.abort()（先置 _aborted 再 cancel task）——保留优雅取消契约。"""
         if self._disposed:
             return
-        self.agent.abort()
+        self._agent.abort()
 
     def dispose(self) -> None:
         """从 runtime registry 注销本 thread、置 disposed（使 run/cancel inert）（docs/14 P1）。
@@ -490,7 +503,7 @@ class RuntimeThread:
                 pass
         # 摘除 emit 订阅 tap（old/new thread 复用同一 Agent：disposed thread 不再累积事件）。
         try:
-            self.agent._event_subscribers.remove(self._agent_tap)
+            self._agent._event_subscribers.remove(self._agent_tap)
         except ValueError:
             pass
 
@@ -508,13 +521,13 @@ class RuntimeThread:
             self._lease = None
 
     def tokens(self) -> dict:
-        return self.agent.get_token_usage()
+        return self._agent.get_token_usage()
 
     def status(self) -> dict:
         """会话状态快照——供客户端（footer / RPC / 状态栏）读取，不再跨边界 reach 进 Agent 私有面
         （docs/17 Phase 5a）。高频可调（footer 每次重绘）；纯读、无副作用。"""
         import os as _os
-        a = self.agent
+        a = self._agent
         mgr = getattr(a, "_session_mgr", None)
         mode = getattr(a, "_thinking_mode", "disabled")
         parent = mgr.parent_session() if mgr is not None else None
@@ -538,7 +551,7 @@ class RuntimeThread:
     def sandbox_status(self) -> dict:
         """当前 sandbox 策略快照（profile + engine + fs/network + 后端可用性）。纯读。"""
         from ..capabilities.sandbox import UNRESTRICTED
-        a = self.agent
+        a = self._agent
         policy = a.sandbox_policy()
         sb = a._sandbox
         wr = policy.filesystem.writable_roots
@@ -565,7 +578,7 @@ class RuntimeThread:
         from ..capabilities.sandbox import PROFILES
         if name not in PROFILES:
             raise ValueError(f"unknown profile: {name} (valid: {', '.join(PROFILES)})")
-        self.agent._sandbox_profile = name
+        self._agent._sandbox_profile = name
         return name
 
     def messages(self) -> list:
@@ -574,7 +587,7 @@ class RuntimeThread:
         重绘 / RPC get_state 的视图地基——**on-demand 重建**（每次重读树），非每帧热路径；无会话写者
         租约（_session_mgr=None）或树不可折叠时返回 []。中立 Message dict 与 provider 无关，
         客户端据此自渲染。"""
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         if mgr is None:
             return []
         try:
@@ -589,7 +602,7 @@ class RuntimeThread:
         messages、repo-map volatile tail 等模型上下文材料；它是给 TUI/RPC 展示用户可见
         transcript 用的。
         """
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         if mgr is None:
             return []
         try:
@@ -614,7 +627,7 @@ class RuntimeThread:
         return snap
 
     def session_stats(self) -> dict:
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         entries = mgr.entries() if mgr is not None else []
         messages = [e for e in entries if getattr(e, "type", None) == "message"]
         user_messages = 0
@@ -637,9 +650,9 @@ class RuntimeThread:
             "user_messages": user_messages,
             "assistant_messages": assistant_messages,
             "tool_results": tool_results,
-            "input_tokens": self.agent.total_input_tokens,
-            "output_tokens": self.agent.total_output_tokens,
-            "cost_usd": self.agent._get_current_cost_usd(),
+            "input_tokens": self._agent.total_input_tokens,
+            "output_tokens": self._agent.total_output_tokens,
+            "cost_usd": self._agent._get_current_cost_usd(),
         }
 
     def events(self) -> list[dict]:
@@ -657,48 +670,48 @@ class RuntimeThread:
 
     @property
     def session_id(self) -> str:
-        return self.agent.session_id
+        return self._agent.session_id
 
     @property
     def effective_window(self) -> int:
-        return getattr(self.agent, "effective_window", 200000)
+        return getattr(self._agent, "effective_window", 200000)
 
     @property
     def model(self) -> str:
-        return getattr(self.agent, "model", "")
+        return getattr(self._agent, "model", "")
 
     @property
     def is_sub_agent(self) -> bool:
-        return getattr(self.agent, "is_sub_agent", False)
+        return getattr(self._agent, "is_sub_agent", False)
 
     def clear_history(self) -> None:
-        self.agent.agent_session.clear_history()
+        self._agent.agent_session.clear_history()
 
     async def compact(self, instructions: str | None = None) -> None:
         if instructions:
-            await self.agent.agent_session.compact(instructions)
+            await self._agent.agent_session.compact(instructions)
         else:
-            await self.agent.agent_session.compact()
+            await self._agent.agent_session.compact()
 
     def toggle_plan_mode(self) -> str:
-        return self.agent.toggle_plan_mode()
+        return self._agent.toggle_plan_mode()
 
     def show_cost(self) -> None:
-        self.agent.show_cost()
+        self._agent.show_cost()
 
     def move_to(self, entry_id: str | None):
         """in-file 树导航（移 active leaf）；返回重载后的 messages。"""
-        return self.session.move_to(entry_id)
+        return self._session.move_to(entry_id)
 
     def branch_summary_available(self, entry_id: str | None) -> bool:
-        return self.session.branch_summary_available(entry_id)
+        return self._session.branch_summary_available(entry_id)
 
     async def move_to_with_branch_summary(self, entry_id: str | None, *,
                                           focus: str | None = None):
-        return await self.session.move_to_with_branch_summary(entry_id, focus=focus)
+        return await self._session.move_to_with_branch_summary(entry_id, focus=focus)
 
     def child_session_id(self, name: str) -> "str | None":
-        fn = getattr(self.agent, "child_session_id", None)
+        fn = getattr(self._agent, "child_session_id", None)
         return fn(name) if callable(fn) else None
 
     def readonly_session(self):
@@ -707,22 +720,22 @@ class RuntimeThread:
         Writes and lifecycle operations stay on RuntimeThread/AgentRuntime; the
         returned object intentionally does not expose SessionManager mutation APIs.
         """
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         return ReadOnlySessionView(mgr) if mgr is not None else None
 
     def session_name(self) -> str | None:
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         return mgr.name() if mgr is not None else None
 
     def set_session_name(self, name: str) -> None:
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         if mgr is None:
             raise RuntimeError("No active session writer lease for this session.")
         mgr.append_session_info(name)
         self.push_boundary("session_info_changed", name=mgr.name())
 
     def set_entry_label(self, entry_id: str, label: str) -> None:
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         if mgr is None:
             raise RuntimeError("No active session writer lease for this session.")
         mgr.append_label(entry_id, label)
@@ -730,22 +743,22 @@ class RuntimeThread:
     def can_switch(self) -> "tuple[bool, str | None]":
         if self.is_processing:
             return False, "a turn is currently running"
-        tasks = getattr(self.agent, "_background_tasks", set())
+        tasks = getattr(self._agent, "_background_tasks", set())
         if tasks:
             return False, f"{len(tasks)} background task(s) still running"
         return True, None
 
     def task_list(self, status=None, kind=None) -> str:
         from ..tools.tasks_tool import list_tasks_text
-        return list_tasks_text(self.agent.task_manager, status, kind)
+        return list_tasks_text(self._agent.task_manager, status, kind)
 
     def task_output(self, task_id: str, tail_bytes: int = 8000) -> str:
         from ..tools.tasks_tool import task_output_text
-        return task_output_text(self.agent.task_manager, task_id, tail_bytes)
+        return task_output_text(self._agent.task_manager, task_id, tail_bytes)
 
     async def task_stop(self, task_id: str) -> str:
         from ..tools.tasks_tool import task_stop
-        return await task_stop(self.agent.task_manager, self.agent._background_tasks, task_id)
+        return await task_stop(self._agent.task_manager, self._agent._background_tasks, task_id)
 
     def agents_overview(self) -> str:
         from ..tools.tasks_tool import agents_overview_text
@@ -779,7 +792,7 @@ class RuntimeThread:
 
         if child_session_id not in children(self.session_id):
             raise FileNotFoundError(f"sub-agent run is not a child of this session: {child_session_id}")
-        record = self.agent._reconcile_run(child_session_id)
+        record = self._agent._reconcile_run(child_session_id)
         mgr = SessionManager.open(child_session_id)
         messages = [
             dict(e.data.get("message") or {})
@@ -789,7 +802,7 @@ class RuntimeThread:
         return {"record": record.to_dict(), "messages": messages}
 
     async def subagent_cancel(self, child_session_id: str) -> str:
-        return await self.agent.run_cancel(child_session_id)
+        return await self._agent.run_cancel(child_session_id)
 
     def agent_detail(self, name: str) -> str:
         from ..tools.tasks_tool import agent_definition_detail_text, subagent_detail_text
@@ -797,15 +810,15 @@ class RuntimeThread:
         if detail is not None:
             return detail
         try:
-            record = self.agent._reconcile_run(name)
+            record = self._agent._reconcile_run(name)
         except Exception:
             record = None
         return subagent_detail_text(record)
 
     def _subagent_records(self):
-        return self.agent._run_runtime.list(
+        return self._agent._run_runtime.list(
             self.session_id,
-            live_run_ids=self.agent._live_run_ids(),
+            live_run_ids=self._agent._live_run_ids(),
         )
 
     async def execute_user_shell(self, command: str, *, timeout_ms: int = 120000,
@@ -850,7 +863,7 @@ class RuntimeThread:
         if not skill or not skill.user_invocable:
             return SkillInvocation(handled=False)
         if getattr(skill, "hooks", None):
-            self.agent._register_skill_hooks(skill)
+            self._agent._register_skill_hooks(skill)
         if skill.context == "fork":
             result = execute_skill(skill.name, args)
             if not result:
@@ -867,15 +880,15 @@ class RuntimeThread:
         )
 
     async def spawn_memory_consolidate(self) -> str:
-        return await self.agent._spawn_memory_consolidate()
+        return await self._agent._spawn_memory_consolidate()
 
     async def spawn_memory_eval(self) -> str:
-        return await self.agent._spawn_memory_eval()
+        return await self._agent._spawn_memory_eval()
 
     async def run_reserved_subagent(self, agent_type: str, prompt: str, *,
                                     model: "str | None" = None,
                                     timeout_ms: "int | None" = None) -> str:
-        return await self.agent._run_reserved_agent(
+        return await self._agent._run_reserved_agent(
             agent_type=agent_type, prompt=prompt, model=model, timeout_ms=timeout_ms)
 
     async def run_extension_task(self, kind: str, payload: dict) -> str:
@@ -883,7 +896,7 @@ class RuntimeThread:
         host = self._extension_host
         if host is None or not host.is_active:
             return "memory evolution extension is not available for this session."
-        agent = self.agent
+        agent = self._agent
         desc = {"memory_optimize": "memory optimization"}.get(kind, kind)
         task_rec = agent.task_manager.create_task(kind, desc, owner_agent_id=None)
 
@@ -908,16 +921,16 @@ class RuntimeThread:
                 f"Use task_output with task_id={task_rec.id} to inspect the result.")
 
     async def generate_memory(self, *, force: bool = False, auto: bool = False) -> str:
-        svc = getattr(self.agent, "_memory_service", None)
+        svc = getattr(self._agent, "_memory_service", None)
         if svc is None:
             return "" if auto else "Memory is not available for this session."
-        mgr = getattr(self.agent, "_session_mgr", None)
+        mgr = getattr(self._agent, "_session_mgr", None)
         if mgr is None:
             return "" if auto else "No active session writer lease."
         try:
             res = await svc.maybe_start_generation_pipeline(
-                thread_id=self.agent.session_id, session_mgr=mgr,
-                is_subagent=self.agent.is_sub_agent, force=force)
+                thread_id=self._agent.session_id, session_mgr=mgr,
+                is_subagent=self._agent.is_sub_agent, force=force)
         except Exception as e:
             return "" if auto else f"Memory generation failed: {e}"
         if res is None or not res.ran:
@@ -929,7 +942,7 @@ class RuntimeThread:
         return f"Memory generation complete: extracted {n} entr{'y' if n == 1 else 'ies'} from this session."
 
     def memory_overview(self) -> str:
-        svc = getattr(self.agent, "_memory_service", None)
+        svc = getattr(self._agent, "_memory_service", None)
         if svc is None:
             return "Memory is not available for this session."
         try:
@@ -1072,7 +1085,7 @@ class AgentRuntime:
         ④ 新 RuntimeThread 持新 lease。调用方负责先过 host.can_switch() fail-closed 闸。
 
         resume 到**当前** session = no-op：直接返回当前 thread，绝不对同一 sid 取第二把锁（自锁死）。"""
-        agent = host.current_thread.agent
+        agent = host.current_thread._agent_for_runtime()
         if new_sid == agent.session_id:
             return host.current_thread
         from ..session.lease import SessionLease
