@@ -76,18 +76,17 @@ def test_anthropic_serial_tool_round_tree_and_consistency():
     assert AgentSession(a).verify_turn_consistency() == []
 
 
-# ── 路径 2：anthropic early-exec（流中并发预执行 CONCURRENCY_SAFE 工具）──────────
+# ── 路径 2：anthropic 并发安全工具 post-stream 执行（B2-a：旧「流中早执行」已去除）──────
+# B2-a 把两 provider 合一为 post-stream 单循环；StreamCallbacks.tool_block 早执行钩子已删。
+# 并发安全工具改在流完后经 batch 模型执行（单个时串行）；树/延迟结果与早执行时代逐字一致。
 
-def test_anthropic_early_exec_path_tree_and_consistency():
+def test_anthropic_safe_tool_post_stream_tree_and_consistency():
     a = _agent("evt_early")
     calls = {"n": 0}
 
     async def fake_stream(*, callbacks=None, **_kw):
         calls["n"] += 1
         if calls["n"] == 1:
-            blk = {"id": "e1", "name": "list_files", "input": {"path": "."}}
-            if callbacks and callbacks.tool_block:
-                callbacks.tool_block(blk)               # 流中触发 early-exec（CONCURRENCY_SAFE + allow）
             return _FakeResp([_FakeBlock("tool_use", id="e1", name="list_files", input={"path": "."})],
                              stop_reason="tool_use")
         return _FakeResp([_FakeBlock("text", text="ok")], stop_reason="end_turn")
@@ -98,7 +97,7 @@ def test_anthropic_early_exec_path_tree_and_consistency():
     assert _tree_roles("evt_early") == ["user", "assistant", "toolResult", "assistant"]
     tr = _tree_msgs("evt_early")[2]
     assert tr["toolCallId"] == "e1" and tr["toolName"] == "list_files"
-    assert isinstance(tr.get("latencyMs"), int)         # early 路径的 per-tool 延迟同样入树
+    assert isinstance(tr.get("latencyMs"), int)         # post-stream 路径的 per-tool 延迟同样入树
     assert AgentSession(a).verify_turn_consistency() == []
 
 

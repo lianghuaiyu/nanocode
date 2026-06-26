@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ..memory import get_memory_dir
-
 SCHEMA = {
     "name": "write_file",
     "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
@@ -22,7 +20,10 @@ SCHEMA = {
 
 
 def _auto_update_memory_index(file_path: str) -> None:
+    # HOST-WRITE EXEMPTION (docs/24 Phase 2)：MEMORY.md 是宿主配置派生的固定路径（get_memory_dir()），
+    # **非模型入参**，故不经 ctx.fs_write 的模型路径沙箱约束——保持裸写，让记忆索引继续工作。
     try:
+        from ..memory import get_memory_dir
         mem_dir = str(get_memory_dir())
         if file_path.startswith(mem_dir) and file_path.endswith(".md") and not file_path.endswith("MEMORY.md"):
             mem_path = Path(mem_dir)
@@ -47,12 +48,13 @@ def _auto_update_memory_index(file_path: str) -> None:
         pass
 
 
-def run(inp: dict) -> str:
+def run(ctx, inp: dict) -> str:
     try:
-        path = Path(inp["file_path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inp["content"])
-        _auto_update_memory_index(str(path))
+        path = inp["file_path"]
+        parent = str(Path(path).parent)
+        ctx.fs_write.mkdir(parent, parents=True, exist_ok=True)
+        ctx.fs_write.write_text(path, inp["content"])
+        _auto_update_memory_index(str(Path(path)))
         lines = inp["content"].split("\n")
         line_count = len(lines)
         preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))

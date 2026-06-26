@@ -119,11 +119,42 @@ class ShellRequest:
 
 # ─── 策略（session/profile 投影）────────────────────────────────
 
+class _Unrestricted:
+    """`writable_roots` 的**类型内**哨兵：表达「无 containment」语义（全宿主可写）。
+
+    单例（见 `UNRESTRICTED`）。用类型而非魔法字符串，故误路由可被 `FileSystemPolicy.__post_init__`
+    与下游 adapter 显式判别（`is UNRESTRICTED`），不会被当成可迭代的字符串逐字符拆成假 root。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - 诊断用
+        return "UNRESTRICTED"
+
+    def __bool__(self) -> bool:
+        # 「无约束」是允许写的姿态（非 read-only 的空元组）——保 `bool(writable_roots)` 真。
+        return True
+
+    def __iter__(self):
+        # fail-loud：哨兵不可迭代成 roots。误把它喂给 seatbelt/bwrap/microVM（应只见真 roots）
+        # 会在这里炸，而非静默生成垃圾 mount。
+        raise TypeError(
+            "writable_roots is the UNRESTRICTED sentinel and must not be iterated as roots; "
+            "this policy carries no filesystem containment (danger-full-access / no-policy fallback)"
+        )
+
+
+# `writable_roots` 取此单例 = 不强制 containment（danger-full-access / 无策略退路）。
+# 真实受限档铸真 roots 元组（含空元组 = read-only 拒所有写），永不取它。
+UNRESTRICTED = _Unrestricted()
+
+
 @dataclass(frozen=True)
 class FileSystemPolicy:
     """文件系统策略。语义：
 
-    - writable_roots：可写目录（workspace + temp）。空 = read-only 姿态（仅 /dev/null 可写）。
+    - writable_roots：可写目录（workspace + temp）。空元组 = read-only 姿态（仅 /dev/null 可写）；
+      `UNRESTRICTED` 哨兵 = 无 containment（全宿主可写，danger-full-access / 无策略退路）。
     - protected_roots：落在 writable_roots 内仍**只读**的元数据目录绝对路径（含 .git pointer target）。
     - denied_roots：需**拒绝读取**的目录（strict）。native base profile 放行 file-read*，无法 deny
       指定读 → denied_roots 非空时 `native_can_enforce` 返回 False，AUTO 会升级到 VM（只挂 workspace,
@@ -132,9 +163,21 @@ class FileSystemPolicy:
     """
 
     readable_roots: tuple[Path, ...]
-    writable_roots: tuple[Path, ...]
+    writable_roots: "tuple[Path, ...] | _Unrestricted"
     denied_roots: tuple[Path, ...]
     protected_roots: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        # writable_roots 要么是 UNRESTRICTED 哨兵，要么是全 Path 的元组——否则 fail-loud。
+        # 杜绝把 str（如旧魔法字符串哨兵）或混杂类型当 roots 静默写进沙箱 profile。
+        w = self.writable_roots
+        if w is UNRESTRICTED:
+            return
+        if not isinstance(w, tuple) or not all(isinstance(p, Path) for p in w):
+            raise TypeError(
+                "FileSystemPolicy.writable_roots must be a tuple[Path, ...] or the "
+                f"UNRESTRICTED sentinel, got {w!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -315,9 +358,11 @@ def policy_for_profile(profile: str, host: HostContext) -> SandboxPolicy:
                                         denied_roots=(), protected_roots=protected),
             network=none_net, approval_mode=host.approval_mode, vm_required=True, profile=name)
     if name == "danger-full-access":
+        # 全宿主访问：fs 把手**不**做 containment（writable_roots=UNRESTRICTED），与同档 shell
+        # 经 HOST backend 在宿主裸跑、可写全盘的行为对齐。protected_roots 同样为空（无元数据保护）。
         return SandboxPolicy(
             engine=SandboxEngine.HOST,
-            filesystem=FileSystemPolicy(readable_roots=(), writable_roots=writable,
+            filesystem=FileSystemPolicy(readable_roots=(), writable_roots=UNRESTRICTED,
                                         denied_roots=(), protected_roots=()),
             network=NetworkPolicy(mode=NetworkMode.FULL),
             approval_mode="explicit", profile=name)
@@ -348,9 +393,16 @@ def narrow_policy_for_context(policy: SandboxPolicy, host: HostContext) -> Sandb
     if policy.engine != SandboxEngine.HOST:
         return policy
     fs = policy.filesystem
+    # 关键：danger 的 writable_roots 可能是 UNRESTRICTED 哨兵（无 containment）。收窄回沙盒后
+    # 后端（seatbelt/bwrap）只吃真 roots，哨兵不可带入——一律重建为真实 workspace+temp roots。
+    confined_writable = (
+        _writable_default(host)
+        if (fs.writable_roots is UNRESTRICTED or not fs.writable_roots)
+        else fs.writable_roots
+    )
     confined_fs = FileSystemPolicy(
         readable_roots=fs.readable_roots,
-        writable_roots=fs.writable_roots or _writable_default(host),
+        writable_roots=confined_writable,
         denied_roots=fs.denied_roots,
         protected_roots=fs.protected_roots or _protected(host))
     return SandboxPolicy(

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from ..tools import (
-    tool_definitions,
+    REGISTRY,
     execute_tool,
     PermissionEngine,
     ToolDef,
@@ -53,6 +53,28 @@ from .core import AgentCore
 # 子 agent 策略（并发/深度/超时/turn 上限）已抽入 subagent_manager（CAP-P1）。
 from .subagent_manager import SubAgentManager  # noqa: E402
 
+
+def _embedder_overlay(embedder_tools: "list | None") -> list:
+    """嵌入者工具（AgentConfig.tools）→ 规范化为 source=EMBEDDER、name=embedder__<name> 的 Tool 列表
+    （docs/24 §4.5 / Phase 4b）。
+
+    嵌入者传 Tool 对象（schema+run）；此处强制 source=EMBEDDER、名加 embedder__ 前缀（已带则不重复
+    加），trust 由嵌入者在 Tool 上声明（默认 UNTRUSTED）。这些只进 per-agent overlay，绝不写全局
+    REGISTRY；UNTRUSTED ⟹ dispatch 铸 ctx 时能力槽全 None。"""
+    if not embedder_tools:
+        return []
+    from dataclasses import replace as _replace
+    from ..tools.types import ToolSource
+    out: list = []
+    for t in embedder_tools:
+        name = t.name
+        schema = t.schema
+        if not name.startswith("embedder__"):
+            schema = dict(t.schema)
+            schema["name"] = f"embedder__{name}"
+        out.append(_replace(t, schema=schema, source=ToolSource.EMBEDDER))
+    return out
+
 # 永不经 execute_tool/mcp、且对持久状态无副作用的纯宿主 meta 工具——P4 allowlist 对
 # 这些放行（它们要么是只读任务面板，要么是 plan-mode 状态切换）。
 # Sub-agent call-time allowlist 的 meta 工具集与判定已上移至 tools.permissions
@@ -77,6 +99,7 @@ class Agent(PlanModeMixin):
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         api_key: str | None = None,
+        provider: str | None = None,
         thinking: bool = False,
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
@@ -90,13 +113,14 @@ class Agent(PlanModeMixin):
         task_manager: "TaskManager | None" = None,
         session_id: str | None = None,
         confirmed_paths: set[str] | None = None,
-        memory_backend: "MemoryBackend | None" = None,
+        memory_service: "MemoryService | None" = None,
         artifact_id: str | None = None,
         allowed_tool_names: set[str] | None = None,
         depth: int = 0,
         agent_type: str | None = None,
         agent_source: str | None = None,
         sandbox_profile: str = "default",
+        embedder_tools: "list | None" = None,
     ):
         self.permission_mode = permission_mode
         # 构造时配置的 baseline permission_mode（plan toggle 前）：rebind_session 切 session 时
@@ -104,7 +128,10 @@ class Agent(PlanModeMixin):
         self._base_permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
-        self.use_openai = bool(api_base)
+        # B1 provider seam：provider name 是单一真源（= 旧 bool(api_base)）；client/adapter/capture
+        # api/system 放置都从 providers.SPECS[provider] 派生。显式 provider 优先，否则按 api_base 解析。
+        from .providers import resolve_provider_name
+        self._provider_name = provider or resolve_provider_name(api_base=api_base)
         self.is_sub_agent = is_sub_agent
         # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
         # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
@@ -121,7 +148,13 @@ class Agent(PlanModeMixin):
         # None = 主 agent 默认全量工具表；[] = 子 agent 显式空工具集（绝不回退全量，
         # 否则 deny-all / allowed-tools:agent / extends 空交集 / curator(tools:[]) 会被
         # 提权为全部工具，含 agent）。
-        self.tools = tool_definitions if custom_tools is None else custom_tools
+        # docs/24 Phase 4a/4b：本 agent 持自己的 overlay registry（builtins + 本 agent 的外部工具）。
+        # 外部工具（MCP 每会话 / 扩展每 runtime / 嵌入者每 config）绝不写进全局 REGISTRY——
+        # 它们只进 per-agent overlay（跨会话不泄漏 / 不重复注册炸）。嵌入者工具（AgentConfig.tools，
+        # source=EMBEDDER、name=embedder__name）在构造时叠加；MCP（首 turn）/ 扩展（apply services）
+        # 后续 register。self.tools = self._registry.schemas()。
+        self._registry = REGISTRY.overlay(_embedder_overlay(embedder_tools))
+        self.tools = self._registry.schemas() if custom_tools is None else custom_tools
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -236,10 +269,10 @@ class Agent(PlanModeMixin):
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
 
-        # Memory recall state — semantic prefetch per user turn
+        # Memory recall state — no-LLM fast prefetch per user turn.
         self._already_surfaced_memories: set[str] = set()
         self._session_memory_bytes = 0
-        self._memory_backend = memory_backend
+        self._memory_service = memory_service
 
         # 渐进披露：已播报的 skill 名 + 待投递的 skill body
         self._sent_skill_names: set[str] = set()
@@ -261,39 +294,29 @@ class Agent(PlanModeMixin):
 
         # Initialize clients. Provider SDK imports are intentionally lazy so
         # embedding/import-boundary users can construct runtime/test Agents
-        # without installing every provider package.
-        if self.use_openai:
-            try:
-                import openai
-            except ModuleNotFoundError:
-                openai = None
-            if openai is None:
-                self._openai_client = None
-            else:
-                self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
-            self._anthropic_client = None
-        else:
-            kwargs: dict[str, Any] = {}
-            if api_key:
-                kwargs["api_key"] = api_key
-            if anthropic_base_url:
-                kwargs["base_url"] = anthropic_base_url
-            try:
-                import anthropic
-            except ModuleNotFoundError:
-                anthropic = None
-            self._anthropic_client = (None if anthropic is None
-                                      else anthropic.AsyncAnthropic(**kwargs))
-            self._openai_client = None
+        # without installing every provider package. B1：client 工厂归 providers.SPECS
+        # （ModuleNotFoundError → None，逐字保留旧 inline 行为）；engine 只持单一活跃 client。
+        from .providers import SPECS, make_provider_adapter
+        spec = SPECS[self._provider_name]
+        client = spec.build_client(
+            api_key=api_key, api_base=api_base, anthropic_base_url=anthropic_base_url)
+        # 兼容旧读者（spawn.py / 测试）：保留按 provider 命名的 client 属性，非活跃侧为 None。
+        self._openai_client = client if self._provider_name == "openai" else None
+        self._anthropic_client = client if self._provider_name == "anthropic" else None
 
         # docs/15 STEP B：provider 流式 + capture 收敛到 ProviderAdapter（backend mixin 经 self._provider
         # .stream 委托,engine 不再持 _call_*_stream）。clients 在 rebind 不变,故 _provider 跨 rebind 有效。
-        from .providers import make_provider_adapter
         self._provider = make_provider_adapter(
-            use_openai=self.use_openai,
-            anthropic_client=self._anthropic_client, openai_client=self._openai_client)
+            provider=self._provider_name, client=client, registry=self._registry)
         # docs/15 STEP C：模型循环上移到 AgentCore（host=self 注入 collaborators）。无状态,可共享。
         self._core = AgentCore()
+
+    @property
+    def use_openai(self) -> bool:
+        """B1：迁移期 read-only 兼容垫——provider 真源是 self._provider.name。外部读者（spawn.py /
+        cli.py / turn-loop 选择）仍可读；15 个行为站点已改读 self._provider 的 capture_api /
+        places_system_in_messages，不再读此属性。"""
+        return self._provider.name == "openai"
 
     def _apply_permission_mode_prompt(self) -> None:
         """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
@@ -346,24 +369,10 @@ class Agent(PlanModeMixin):
         return None
 
     async def _recall_memory_semantic(self, query: str, limit: int = 5) -> str:
-        """memory 工具的语义档：复用 side_query LLM 选记忆。无 client 时回退关键词档。"""
-        from ..memory import select_relevant_memories
-        from ..tools import memory_tool
-        sq = self._build_side_query()
-        if sq is None or not query.strip():
-            return memory_tool._recall_keyword(query, limit)
-        try:
-            hits = await select_relevant_memories(query, sq, set())
-        except Exception:
-            return memory_tool._recall_keyword(query, limit)
-        if not hits:
-            # 语义档返回空：可能是 LLM 故障（select_* 内部吞异常返回 []），也可能真无匹配。
-            # 回退关键词档兜底——它要么找到，要么如实说无匹配。
-            return memory_tool._recall_keyword(query, limit)
-        out = [f"Top {min(limit, len(hits))} memories for: {query}"]
-        for m in hits[:limit]:
-            out.append(f"\n{m.header}\n{m.content}")
-        return "\n".join(out)
+        if self._memory_service is None:
+            return "Memory is not available for this agent."
+        return await self._memory_service.execute_tool(
+            {"action": "search", "query": query, "limit": limit}, host=self)
 
     def abort(self) -> None:
         self._aborted = True
@@ -451,21 +460,73 @@ class Agent(PlanModeMixin):
         return {"exceeded": False}
 
     # docs/16 #3a：compaction 流程（阈值门 + entry 写入）归 AgentSession（turn shell / compaction
-    # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（实现在 AgentCore，
-    # summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走 agent_session.compact()。
+    # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（B1 后实现下沉到
+    # ProviderAdapter.summarize，summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走
+    # agent_session.compact()。这四个薄 delegator 是 monkeypatch 锚（~40 处测试 patch 之），故保留：
+    # 调用点经 Agent._compact / Agent._summarize 选锚（按 provider name，非 use_openai），锚体经
+    # self._provider.summarize 落地（provider 差异下沉 adapter，行为 byte-equivalent）。
+    _COMPACT_PERSONA = ("You are a coding-session summarizer. Follow the user's summary format "
+                        "exactly; be thorough but do not pad.")
+    _BRANCH_SUMMARY_PERSONA = "You summarize abandoned conversation branches for continuity."
+
     async def _compact_anthropic(self, messages: "list | None",
                                  instructions: str | None = None) -> "str | None":
-        return await self._core._compact_anthropic(self, messages, instructions)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._COMPACT_PERSONA,
+            instruction=self._core._compact_prompt(
+                instructions, partial=getattr(self, "_summarizer_partial", False)),
+            max_output_tokens=8192, min_messages=3, strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0   # 调用方写（adapter 不碰 AgentState），仅在真发起调用时
+        return summary
 
     async def _compact_openai(self, messages: "list | None",
                               instructions: str | None = None) -> "str | None":
-        return await self._core._compact_openai(self, messages, instructions)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._COMPACT_PERSONA,
+            instruction=self._core._compact_prompt(
+                instructions, partial=getattr(self, "_summarizer_partial", False)),
+            max_output_tokens=8192, min_messages=4, strip_leading_system=True)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
 
     async def _summarize_anthropic(self, messages: "list | None", prompt_text: str) -> "str | None":
-        return await self._core._summarize_anthropic(self, messages, prompt_text)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._BRANCH_SUMMARY_PERSONA,
+            instruction=prompt_text, max_output_tokens=2048, min_messages=1,
+            strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
 
     async def _summarize_openai(self, messages: "list | None", prompt_text: str) -> "str | None":
-        return await self._core._summarize_openai(self, messages, prompt_text)
+        # parity 雷 A：branch-summary transcript 是 user-only（未渲染 system），故 **不**切片
+        # （strip_leading_system=False）——逐字保留旧 _summarize_openai 行为。
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._BRANCH_SUMMARY_PERSONA,
+            instruction=prompt_text, max_output_tokens=2048, min_messages=1,
+            strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
+
+    async def _compact(self, messages: "list | None",
+                       instructions: str | None = None) -> "str | None":
+        """compaction summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。
+        锚仍是 _compact_anthropic / _compact_openai（patch 点存活）；分支只剩 provider name 选择。
+        instructions 只在 truthy 时作位置参数传入——逐字保留旧调用点的两形态签名（monkeypatch fake
+        可声明单参 _fake(messages)，与旧 `_compact_anthropic(prefix)` 调用形态一致）。"""
+        target = self._compact_openai if self._provider.name == "openai" else self._compact_anthropic
+        if instructions:
+            return await target(messages, instructions)
+        return await target(messages)
+
+    async def _summarize(self, messages: "list | None", prompt_text: str) -> "str | None":
+        """branch-summary summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。"""
+        if self._provider.name == "openai":
+            return await self._summarize_openai(messages, prompt_text)
+        return await self._summarize_anthropic(messages, prompt_text)
 
     # ─── Message-list ownership：已退役（docs/16 #3c）─────────────────────────
     # _anthropic_messages/_openai_messages/_active_messages/_load_messages/_dump_messages/
@@ -768,28 +829,114 @@ class Agent(PlanModeMixin):
         return await self._router.dispatch(self, name, inp)
 
     async def _run_real_tool(self, name: str, inp: dict) -> str:
-        if self._mcp_manager.is_mcp_tool(name):
+        # docs/24 Phase 4b：MCP 路由改为 source 判定（不再 is_mcp_tool 前缀旁路）——MCP 工具已
+        # register 进 self._registry（source=MCP）。执行仍经 mcp_manager.call_tool（行为等价）。
+        from ..tools.types import ToolSource
+        tool = self._registry.get(name)
+        if tool is not None and tool.source is ToolSource.MCP:
             return await self._mcp_manager.call_tool(name, inp)
-        if name == "run_shell":
-            # docs/19：run_shell 执行经唯一规划点 SandboxManager。cwd/session 来自 HostContext，
-            # 非 tool input（模型无法 spoof）；profile 投影为 SandboxPolicy。
-            # approval 显式构造：escalate 抵达此处 ⟹ _authorize_dispatch 已 gate 并批准
-            # （confirm；未批/非交互不会到这里）。SandboxManager 不自行从 escalate bit 推断。
-            from ..capabilities.sandbox import ShellRequest, ApprovalDecision
-            request = ShellRequest.from_tool_input(inp)
-            approval = ApprovalDecision(approved=request.escalate)
-            return await self._sandbox.execute_shell(
-                request, self.host_context(), self.sandbox_policy(), approval)
-        result = await execute_tool(name, inp, self._read_file_state)
+        result = await execute_tool(name, inp, self._read_file_state,
+                                    ctx=self._mint_tool_context(name), registry=self._registry)
         if name in ("read_file", "write_file", "edit_file") and not result.startswith(("Error", "Warning")):
             self._on_file_touched(name, inp)
         return result
 
+    @property
+    def registry(self):
+        """本 agent 的 per-agent overlay registry（docs/24 §4.3 / Phase 4a，ToolHost.registry）。
+
+        router/validation/execute 经此读 schema、解析 tool、铸 ctx——绝不读全局 REGISTRY。
+        外部工具只进此 overlay；全局 REGISTRY 运行时永不被改（只读基底）。"""
+        return self._registry
+
+    def _granted_capabilities(self, tool):
+        """docs/24 §4.3 铸造规则：granted = tool.needs ∩ policy_for_trust(tool.trust)。
+
+        BUILTIN 信任档策略 = 全集 → needs ∩ 全集 = needs(「声明什么给什么」，与今天等价;
+        把手仍沙箱中介)。TRUSTED 仅读类、UNTRUSTED 空——外部工具(Phase 4)默认零宿主能力。
+        """
+        from ..tools.types import policy_for_trust
+        return frozenset(tool.needs) & policy_for_trust(tool.trust)
+
+    def _mint_tool_context(self, name: str):
+        """咽喉点现场铸造 per-call ToolContext（docs/24 §4.4 ③）。
+
+        按 granted（BUILTIN 信任档「声明什么给什么」）铸造对应把手；未授予的槽为 None。
+        - FS_READ → fs_read/fs_list（以 sandbox_policy().filesystem 为依据）
+        - FS_WRITE → fs_write
+        - EXEC → exec（SandboxManager 前台执行）
+        - TASKS → tasks（后台任务面板）
+        - SESSION_READ → runs（child-session run record）
+        - MEMORY → memory；SPAWN → spawn
+        - SET_MODE → set_mode，**但子 agent 时强制 None**（保住 plan-mode 主 agent-only 门）
+        把手内部持 host(self) 引用做薄转发；ToolContext 本身无任何字段通向 raw Agent/_session_mgr/lease。"""
+        from ..tools.context import (
+            ToolContext, FsReadCap, FsWriteCap, FsListCap,
+            ExecCap, TasksCap, RunsCap, MemoryCap, SpawnCap, SetModeCap,
+        )
+        from ..tools.types import Capability
+        tool = self._registry.get(name)
+        granted = self._granted_capabilities(tool) if tool is not None else frozenset()
+        fs_policy = self.sandbox_policy().filesystem
+        fs_read = FsReadCap(fs_policy) if Capability.FS_READ in granted else None
+        fs_list = FsListCap(fs_policy) if Capability.FS_READ in granted else None
+        fs_write = FsWriteCap(fs_policy) if Capability.FS_WRITE in granted else None
+        exec_cap = ExecCap(self) if Capability.EXEC in granted else None
+        tasks_cap = TasksCap(self) if Capability.TASKS in granted else None
+        runs_cap = RunsCap(self) if Capability.SESSION_READ in granted else None
+        memory_cap = MemoryCap(self) if Capability.MEMORY in granted else None
+        spawn_cap = SpawnCap(self) if Capability.SPAWN in granted else None
+        # SET_MODE 仅主 agent：子 agent 时即便声明也不铸造把手（plan-mode 主 agent-only 门）。
+        set_mode_cap = (SetModeCap(self)
+                        if (Capability.SET_MODE in granted and not self.is_sub_agent)
+                        else None)
+        return ToolContext(
+            call_id="",
+            cwd=str(self.host_context().cwd),
+            signal=None,
+            fs_read=fs_read,
+            fs_write=fs_write,
+            fs_list=fs_list,
+            exec=exec_cap,
+            tasks=tasks_cap,
+            runs=runs_cap,
+            memory=memory_cap,
+            spawn=spawn_cap,
+            set_mode=set_mode_cap,
+        )
+
+    def mint_tool_context(self, name: str):
+        """公开 port：dispatch 咽喉点（CapabilityRouter）为 host-routed 工具铸造 per-call ToolContext。
+
+        薄委托 _mint_tool_context（按 granted 铸造能力把手；子 agent set_mode=None）。"""
+        return self._mint_tool_context(name)
+
     async def run_real_tool(self, name: str, inp: dict) -> str:
-        return await self._run_real_tool(name, inp)
+        result = await self._run_real_tool(name, inp)
+        self._mark_external_memory_context(name)
+        return result
+
+    def _mark_external_memory_context(self, name: str) -> None:
+        svc = self._memory_service
+        if svc is None:
+            return
+        if name in ("web_fetch", "web_search"):
+            source = name
+        elif name == "tool_search":
+            source = "tool_search"
+        elif name.startswith("mcp__"):
+            source = "mcp"
+        else:
+            return
+        svc.on_external_context_used(source=source, thread_id=self.session_id)
 
     async def recall_memory_semantic(self, query: str, limit: int = 5) -> str:
         return await self._recall_memory_semantic(query, limit)
+
+    async def execute_memory_tool(self, inp: dict) -> str:
+        if self._memory_service is None:
+            return "Memory is not available for this agent."
+        return await self._memory_service.execute_tool(inp, host=self)
 
     async def spawn_memory_consolidate(self) -> str:
         return await self._spawn_memory_consolidate()
@@ -1096,11 +1243,8 @@ class Agent(PlanModeMixin):
     async def _run_memory_eval(self, **kw) -> None:
         return await self._spawn.run_memory_eval(self, **kw)
 
-    async def _spawn_memory_optimize(self) -> str:
-        return await self._spawn.spawn_memory_optimize(self)
-
-    async def _run_memory_optimize(self, **kw) -> None:
-        return await self._spawn.run_memory_optimize(self, **kw)
+    async def _run_reserved_agent(self, **kw) -> str:
+        return await self._spawn.run_reserved_agent(self, **kw)
 
     async def _await_subagent_run(self, sub_agent: "Agent", prompt: str,
                                   timeout_ms: int | None) -> tuple[str, object]:
@@ -1129,7 +1273,8 @@ class Agent(PlanModeMixin):
         拒绝消息 "Error: tool '…' is not permitted" 与 prompt-then-block 行为不变）。
         """
         # docs/19 Phase 1：先 validate 再 permission——permission 必须看到 validated args。
-        verr = validate_tool_input(name, inp)
+        # docs/24 Phase 4a：schema 查表走 self._registry（per-agent overlay）。
+        verr = validate_tool_input(name, inp, registry=self._registry)
         if verr is not None:
             self.emit(ToolCallAuthorized(tool=name, action="deny", message=verr))
             return False, f"Error: {verr}"

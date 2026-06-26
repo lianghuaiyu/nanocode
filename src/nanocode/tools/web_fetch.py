@@ -18,7 +18,8 @@ SCHEMA = {
 }
 
 
-def run(inp: dict) -> str:
+def run(ctx, inp: dict) -> str:
+    # ctx 接收以保持 dispatch arity 一致；web_fetch 是网络操作，不用 fs 把手。
     import urllib.request
     import urllib.error
 

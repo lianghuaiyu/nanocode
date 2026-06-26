@@ -193,9 +193,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-level", choices=["summary", "full"], default=None,
                         help="summary (default): drop heavy payloads, keep hash+summary; "
                              "full: keep full prompts/messages/tool results (may contain secrets)")
-    parser.add_argument("--memory-backend", choices=["auto", "simplemem", "markdown", "off"],
+    parser.add_argument("--memory-backend", choices=["simplemem", "markdown", "off"],
                         default=None,
-                        help="Long-term memory backend (default: auto)")
+                        help="Long-term memory backend (default: markdown)")
     parser.add_argument("--rpc", action="store_true",
                         help="Headless RPC mode: JSON-lines over stdio drive the same session (docs/17)")
     parser.add_argument("--verbose", action="store_true",
@@ -576,7 +576,7 @@ Options:
                       summary (default): drop heavy payloads, keep hash + summary.
                       full: keep full prompts/messages/tool results — may contain secrets.
   --verbose           Print per-turn token cost and MCP connection logs (default: quiet)
-  --memory-backend B  Long-term memory: auto|simplemem|markdown|off (default: auto)
+  --memory-backend B  Long-term memory: simplemem|markdown|off (default: markdown)
   --help, -h          Show this help
 
 Environment:

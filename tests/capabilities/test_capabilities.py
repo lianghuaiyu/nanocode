@@ -89,6 +89,10 @@ def test_router_task_meta_uses_service_methods_without_task_manager():
 
         def tool_blocked_by_allowlist(self, name): return False
         def emit(self, event): return True
+        def mint_tool_context(self, name):
+            # Phase 3：host-routed task_* 经 ctx.tasks 把手薄转发回这些 service 方法。
+            from nanocode.tools.context import ToolContext, TasksCap, RunsCap
+            return ToolContext(tasks=TasksCap(self), runs=RunsCap(self))
         async def spawn_background_shell(self, command, timeout_ms): return "tid"
         def list_tasks(self, status=None, kind=None): return f"tasks:{status}:{kind}"
         def task_output(self, task_id, tail_bytes=8000): return f"output:{task_id}:{tail_bytes}"

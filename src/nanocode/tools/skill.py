@@ -14,3 +14,8 @@ SCHEMA = {
         "required": ["skill_name"],
     },
 }
+
+
+async def run(ctx, inp: dict) -> str:
+    """host-routed：纯转发 ctx.spawn.skill。"""
+    return await ctx.spawn.skill(inp)

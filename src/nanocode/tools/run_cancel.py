@@ -11,3 +11,7 @@ SCHEMA = {
         "required": ["child_session_id"],
     },
 }
+
+
+async def run(ctx, inp: dict) -> str:
+    return await ctx.runs.cancel(inp.get("child_session_id", ""))

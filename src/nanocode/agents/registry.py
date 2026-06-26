@@ -41,9 +41,12 @@ _BUILTIN_BASE_TYPES = {"explore", "plan", "general", "coder"}
 from ..subagents.prompts import (  # noqa: E402
     EXPLORE_PROMPT, PLAN_PROMPT, GENERAL_PROMPT,
     MEMORY_CURATOR_TYPE, MEMORY_EVAL_CURATOR_TYPE, CURATOR_EVAL_PROMPT,
+    MEMORY_RETRIEVAL_DIAGNOSIS_TYPE, MEMORY_DIAGNOSIS_PROMPT,
 )
 
-RESERVED_AGENT_TYPES = frozenset({MEMORY_CURATOR_TYPE, MEMORY_EVAL_CURATOR_TYPE})
+RESERVED_AGENT_TYPES = frozenset({
+    MEMORY_CURATOR_TYPE, MEMORY_EVAL_CURATOR_TYPE, MEMORY_RETRIEVAL_DIAGNOSIS_TYPE,
+})
 
 # ─── Custom agent discovery（自 subagents/config.py port，语义逐字保持）────────
 
@@ -291,6 +294,12 @@ def build_profile(agent_type: str) -> AgentProfile:
             tools_allow=set(), tools_deny=set(),
             permission=PermissionProfile(), context=ContextProfile(),
             isolation=IsolationPolicy(own_session=True, can_spawn=False), hidden=True)
+    if agent_type == MEMORY_RETRIEVAL_DIAGNOSIS_TYPE:
+        return AgentProfile(
+            name=agent_type, mode="system", prompt=MEMORY_DIAGNOSIS_PROMPT,
+            tools_allow=set(), tools_deny=set(), max_turns=1,
+            permission=PermissionProfile(), context=ContextProfile(),
+            isolation=IsolationPolicy(own_session=True, can_spawn=False), hidden=True)
 
     eff = _resolve_effective(agent_type)
     custom = discover_custom_agents().get(agent_type)
@@ -316,7 +325,8 @@ def effective_tools(profile: AgentProfile) -> list:
 
     顺序保持 tool_definitions 原序；allow ∩ → deny −（deny 胜出）→ 永剔 'agent'
     （除非 isolation.can_spawn）。"""
-    from ..tools import tool_definitions
+    from ..tools import REGISTRY
+    tool_definitions = REGISTRY.schemas()
     names = profile.effective_tool_names({t["name"] for t in tool_definitions})
     return [t for t in tool_definitions if t["name"] in names]
 

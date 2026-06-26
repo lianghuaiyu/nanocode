@@ -57,19 +57,19 @@ def _requested_dir(inp: dict) -> Path:
     return base / prefix
 
 
-def run(inp: dict) -> str:
+def run(ctx, inp: dict) -> str:
     try:
         dir_path = _requested_dir(inp)
         raw_limit = inp.get("limit")
         limit = int(DEFAULT_LIMIT if raw_limit is None else raw_limit)
 
-        if not dir_path.exists():
+        if not ctx.fs_list.exists(str(dir_path)):
             return f"Error: Path not found: {dir_path}"
-        if not dir_path.is_dir():
+        if not ctx.fs_list.is_dir(str(dir_path)):
             return f"Error: Not a directory: {dir_path}"
 
         try:
-            entries = sorted(os.listdir(dir_path), key=lambda name: name.lower())
+            entries = sorted(ctx.fs_list.listdir(str(dir_path)), key=lambda name: name.lower())
         except OSError as e:
             return f"Error: Cannot read directory: {e}"
 
@@ -82,7 +82,7 @@ def run(inp: dict) -> str:
             full_path = dir_path / entry
             suffix = ""
             try:
-                if full_path.is_dir():
+                if ctx.fs_list.is_dir(str(full_path)):
                     suffix = "/"
             except OSError:
                 continue

@@ -7,6 +7,7 @@ from nanocode.agent.engine import Agent
 from nanocode.paths import project_memory_dir
 from nanocode.subagents.prompts import MEMORY_EVAL_CURATOR_TYPE
 from nanocode.memory import eval_store
+from nanocode.memory.service import MemoryService, MemoryServiceConfig
 from nanocode.session import v2 as _v2
 
 
@@ -15,6 +16,11 @@ SID = "evalsid"
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
+    kw.setdefault(
+        "memory_service",
+        MemoryService(config=MemoryServiceConfig(backend="markdown"),
+                      cwd=".", agent_dir="."),
+    )
     return Agent(api_key="test", session_id=SID, **kw)
 
 

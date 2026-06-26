@@ -202,3 +202,18 @@ async def _await_quietly(task) -> None:
         await task
     except BaseException:
         pass
+
+
+# ─── host-routed executors（docs/24 Phase 3：经 ctx.tasks 把手薄转发）──────────────
+
+
+def run_list(ctx, inp: dict) -> str:
+    return ctx.tasks.list(inp.get("status"), inp.get("kind"))
+
+
+def run_output(ctx, inp: dict) -> str:
+    return ctx.tasks.output(inp.get("task_id", ""), int(inp.get("tail_bytes") or 8000))
+
+
+async def run_stop(ctx, inp: dict) -> str:
+    return await ctx.tasks.stop(inp.get("task_id", ""))

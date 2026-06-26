@@ -26,7 +26,6 @@ from dataclasses import replace
 from ..memory.maintenance import (
     apply_plan,
     build_curator_user_message,
-    build_eval_curator_message,
     parse_consolidation_plan,
 )
 from ..agent.subagent_manager import SubAgentManager
@@ -160,7 +159,8 @@ def child_tools(host, profile: AgentProfile, *, background: bool = False) -> lis
     语义：allow 交集（子绝不获得父没有的工具）、deny 并集、永剔 'agent'（子不 spawn 孙）。
     主 agent 父（allow=None、deny=∅）下与 registry.effective_tools(profile) 逐字节等价——
     typed 派生让「子不得超过父」对未来的非主 parent 也结构性成立。"""
-    from ..tools import tool_definitions
+    from ..tools import REGISTRY
+    tool_definitions = REGISTRY.schemas()
     names = effective_child_tools(live_agent_profile(host), profile,
                                   {t["name"] for t in tool_definitions}, background=background)
     return [t for t in tool_definitions if t["name"] in names]
@@ -1182,8 +1182,11 @@ class SubAgentRunner:
     async def spawn_memory_eval(self, host) -> str:
         """触发 eval 候选生成：EVAL-mode curator 子 agent 出候选 JSON →
         宿主逐条 add_pending（非法跳过）。无记忆短路。"""
-        user_message = build_eval_curator_message()
-        if user_message.startswith("No memory files"):
+        from ..memory.eval_source import build_eval_curator_message
+        svc = getattr(host, "_memory_service", None)
+        backend = getattr(svc, "backend", None) if svc is not None else None
+        user_message = build_eval_curator_message(backend)
+        if user_message.startswith("No memories"):
             return "No memories to generate eval candidates from."
         if host._subagents.background_cap_reached():
             return (f"Error: max concurrent sub-agents ({host._subagents.max_threads()}) reached; "
@@ -1341,96 +1344,40 @@ class SubAgentRunner:
             result_summary=summary)
         host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
 
-    # ─── Memory optimization (EvolveMem, host-only) ───────────
+    # ─── Memory optimization (EvolveMem) ──────────────────────
+    # Optimization is owned by the memory-evolution system extension. There is
+    # intentionally no SubAgentRunner optimize path and no vendored fallback.
 
-    async def spawn_memory_optimize(self, host) -> str:
-        """触发记忆检索配置优化：prune confirmed evals → 阈值门控 →
-        simplemem.optimize → 原子落 evolve_config.json。纯宿主计算（无 curator）。
-
-        与 consolidate/eval 不同：**不**注册 subagent（optimize 非判断型任务），
-        仅建 task（kind=memory_optimize, owner=None）+ detached _run_memory_optimize。
-        也**不**短路：即便 backend 不可用也建 task，让 task 报告 unavailable，
-        这样 REPL 用户能 task_output 看到有意义的诊断结果。
-        """
-        description = "memory optimization"
-        task_rec = host.task_manager.create_task(
-            "memory_optimize", description, owner_agent_id=None)
-        task = asyncio.create_task(host._run_memory_optimize(task_id=task_rec.id))
-        task._nanocode_task_id = task_rec.id
-        host._background_tasks.add(task)
-        task.add_done_callback(host._background_tasks.discard)
-        return (f"Started memory optimization task {task_rec.id}. It will report completion later. "
-                f"Use task_output with task_id={task_rec.id} to inspect the result.")
-
-    async def run_memory_optimize(self, host, *, task_id: str, timeout_ms: int | None = None) -> None:
-        """detached 协程：纯宿主优化计算。四态对称（cancel/timeout 仅为对称保留）。
-
-        ① backend 非 simplemem（duck-type：name != "simplemem" 或无 _system）→
-           completed + unavailable 提示（有意义的诊断结果，非短路）。
-        ② prune_orphaned_evals(eval/confirmed)：源记忆已巩固归档/合并的孤儿 confirmed
-           被清掉，避免 EvolveMem 在 stale 信号上优化。
-        ③ 阈值门控：confirmed_dev_questions() 在 prune 之后 < 阈值 → completed + skipped。
-        ④ 够数 → 拿 finalized SimpleMem 实例（backend._system，即 SimpleMemSystem，
-           直接暴露 llm_client/embedding_model/get_all_memories，_resolve_backend 兼容）
-           → simplemem.optimize → Config → save_evolve_config(asdict)（保留 .bak）。
-        ⑤ optimize 抛异常 → failed + error，且**不调 save** → 旧 config 原样保留。
-        """
-        from ..memory import eval_store
-        from ..memory.maintenance import (
-            prune_orphaned_evals, save_evolve_config, _simplemem_dir,
-            evolve_min_confirmed, evolve_max_rounds,
-        )
-        from dataclasses import asdict as _asdict
-
-        backend = host._memory_backend
+    async def run_reserved_agent(self, host, *, agent_type: str, prompt: str,
+                                 model: "str | None" = None,
+                                 timeout_ms: "int | None" = None) -> str:
+        profile = build_profile(agent_type)
+        rec = host.task_manager.create_subagent(
+            type=agent_type, description=agent_type, model=model or host.model,
+            provider=host._current_provider())
+        host.task_manager.update_subagent(rec.id, status="running")
+        sub_agent = None
         try:
-            # ① backend duck-type 判定（不 import SimpleMemBackend，避免顶层耦合）
-            mem = getattr(backend, "_system", None)
-            if getattr(backend, "name", "") != "simplemem" or mem is None:
-                host.task_manager.update_task(
-                    task_id, status="completed",
-                    result_summary="memory_optimize unavailable: backend is not simplemem")
-                return
-
-            # ② prune 孤儿 confirmed evals（源记忆已被巩固归档/合并）
-            confirmed_dir = _simplemem_dir() / "eval" / "confirmed"
-            pruned = prune_orphaned_evals(eval_dir=confirmed_dir)
-
-            # ③ 阈值门控（prune 之后）
-            dev = eval_store.confirmed_dev_questions()
-            threshold = evolve_min_confirmed()
-            if len(dev) < threshold:
-                host.task_manager.update_task(
-                    task_id, status="completed",
-                    result_summary=(f"memory_optimize skipped: confirmed {len(dev)} "
-                                    f"< threshold {threshold} (pruned {pruned})"))
-                return
-
-            # ④ 跑 optimize（测试 monkeypatch simplemem.optimize；绝不真跑 EvolveMem）
-            from .._vendor import simplemem
-            max_rounds = evolve_max_rounds()
-            config = simplemem.optimize(mem, dev, max_rounds=max_rounds)
-
-            # ⑤ 原子落 config（save_evolve_config 已 .bak 备份 + tmp 替换）
-            path = save_evolve_config(_asdict(config))
-            rounds = getattr(config, "evolution_rounds", "?")
-            host.task_manager.update_task(
-                task_id, status="completed",
-                result_summary=(f"memory_optimize: evolved config saved "
-                                f"({len(dev)} dev questions, pruned {pruned}, "
-                                f"rounds {rounds}) -> {path}"))
-        except asyncio.CancelledError:
-            host.task_manager.update_task(
-                task_id, status="cancelled",
-                result_summary="(cancelled by task_stop)")
+            sub_agent = host._build_sub_agent(
+                system_prompt=profile.prompt,
+                tools=child_tools(host, profile, background=True),
+                agent_type=agent_type, background=True,
+                max_turns=host._subagents.bounded_max_turns(profile.max_turns or 1),
+                model=model, artifact_id=rec.id, agent_source=profile.source)
+            if timeout_ms is not None:
+                result = await asyncio.wait_for(
+                    sub_agent.run_once(prompt), timeout=timeout_ms / 1000.0)
+            else:
+                result = await sub_agent.run_once(prompt)
+        except BaseException:
+            if sub_agent is not None:
+                host._fold_subagent_tokens(sub_agent)
+                host._close_child_session(rec.id, sub_agent)
+            host.task_manager.update_subagent(rec.id, status="failed")
             raise
-        except asyncio.TimeoutError:
-            host.task_manager.update_task(
-                task_id, status="timed_out",
-                result_summary=f"(timed out after {timeout_ms}ms)")
-            return
-        except Exception as e:
-            host.task_manager.update_task(
-                task_id, status="failed", error=str(e),
-                result_summary=f"(optimize error: {e})")
-            return
+        host.total_input_tokens += result["tokens"]["input"]
+        host.total_output_tokens += result["tokens"]["output"]
+        text = result["text"] or ""
+        host.task_manager.update_subagent(rec.id, status="completed")
+        host._close_child_session(rec.id, sub_agent)
+        return text

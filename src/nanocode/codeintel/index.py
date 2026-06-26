@@ -46,7 +46,7 @@ _DEF_PATTERNS["tsx"] = _DEF_PATTERNS["typescript"]
 _GENERIC_DEF = [r"^\s*(?:public|private|protected|static|func|function|def|fn|class|struct)\s+([A-Za-z_]\w*)"]
 _IDENT_RE = re.compile(r"[A-Za-z_]\w{2,}")
 _SKIP_DIRS = {".git", ".nanocode", ".claude", "node_modules", "__pycache__", ".venv", "venv",
-              "dist", "build", ".mypy_cache", ".pytest_cache", "_vendor"}
+              "dist", "build", ".mypy_cache", ".pytest_cache"}
 
 
 @dataclass

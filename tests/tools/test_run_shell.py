@@ -23,6 +23,7 @@ def test_is_dangerous_negatives():
 
 
 def test_run_shell_is_host_routed():
-    # docs/19：run_shell 不再有 module-level executor（run=None）；执行经 SandboxManager。
-    from nanocode.tools.spec import TOOLS
-    assert TOOLS["run_shell"].run is None
+    # docs/24 Phase 3：run_shell 现有自包含 run（前台经 ctx.exec→SandboxManager，
+    # 后台经 ctx.tasks.spawn_shell）；仍 host-routed（执行经能力把手，不经 execute.py 通用 handler）。
+    from nanocode.tools import REGISTRY
+    assert REGISTRY.get("run_shell").run is not None

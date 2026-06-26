@@ -24,3 +24,12 @@ SCHEMA = {
         "required": ["child_session_id", "prompt"],
     },
 }
+
+
+def run(ctx, inp: dict) -> str:
+    return ctx.runs.send(
+        inp.get("child_session_id", ""),
+        inp.get("prompt", ""),
+        delivery=inp.get("delivery") or "steer",
+        wake=bool(inp.get("wake")),
+    )

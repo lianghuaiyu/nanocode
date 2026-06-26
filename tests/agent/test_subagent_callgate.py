@@ -15,8 +15,10 @@ import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.tools.permissions import ALWAYS_ALLOWED_META as _ALWAYS_ALLOWED_META
-from nanocode.tools import tool_definitions
+from nanocode.tools import REGISTRY
 from nanocode.agents import registry as config
+
+tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):

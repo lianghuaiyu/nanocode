@@ -17,3 +17,17 @@ SCHEMAS = [
         "deferred": True,
     },
 ]
+
+
+async def run_enter(ctx, inp: dict) -> str:
+    """host-routed：进入 plan 模式（主 agent 专用；ctx.set_mode 子 agent 为 None + router 守卫）。"""
+    return await ctx.set_mode.enter_plan()
+
+
+async def run_exit(ctx, inp: dict) -> str:
+    """host-routed：退出 plan 模式（含交互审批）。"""
+    return await ctx.set_mode.exit_plan()
+
+
+# 按 schema name 选 run（spec._ALL 构造期绑定）。
+RUNS = {"enter_plan_mode": run_enter, "exit_plan_mode": run_exit}

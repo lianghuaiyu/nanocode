@@ -139,16 +139,23 @@ class AgentConfig:
     api_key: str | None = None
     api_base: str | None = None            # openai-compatible base（非空 → use_openai）
     anthropic_base_url: str | None = None
+    # B1 provider seam：显式 provider name（"anthropic"/"openai"）。None → 按 api_base 解析
+    # （resolve_provider_name，= 旧 bool(api_base)）。显式值优先，使非 api_base 触发的 provider 选择成为可能。
+    provider: str | None = None
     trajectory_enabled: bool = False
     trajectory_level: str = "summary"
     workspace_trusted: bool = True
-    memory_backend: object | None = None
+    memory_service: object | None = None
     memory_backend_choice: str | None = None
     session_id: str | None = None          # resume adopt 目标（None = 新 mint）
     cwd: str | None = None
     # docs/19：public sandbox profile（default/read-only/strict/vm/danger-full-access）。
     # 投影为 SandboxPolicy；public API 只暴露 profile，不暴露 adapter argv / msb / mount。
     sandbox_profile: str = "default"
+    # docs/24 §4.5 / Phase 4b：嵌入者注入的工具（tools.spec.Tool 列表）。Agent 构造时叠加进
+    # per-agent overlay registry（source=EMBEDDER、name=embedder__name 强制）；绝不写全局 REGISTRY。
+    # 默认 UNTRUSTED（dispatch 铸 ctx 时能力槽全 None）；嵌入者可在 Tool 上 opt-in TRUSTED。
+    tools: "list | None" = None
 
     def build_agent(self):
         from ..agent.engine import Agent
@@ -156,10 +163,12 @@ class AgentConfig:
             permission_mode=self.permission_mode, model=self.model, thinking=self.thinking,
             max_cost_usd=self.max_cost_usd, max_turns=self.max_turns,
             api_base=self.api_base, anthropic_base_url=self.anthropic_base_url, api_key=self.api_key,
+            provider=self.provider,
             trajectory_enabled=self.trajectory_enabled,
             trajectory_level=self.trajectory_level, workspace_trusted=self.workspace_trusted,
-            session_id=self.session_id, memory_backend=self.memory_backend,
+            session_id=self.session_id, memory_service=self.memory_service,
             sandbox_profile=self.sandbox_profile,
+            embedder_tools=self.tools,
         )
 
 
@@ -183,8 +192,9 @@ class RuntimeServices:
     cwd: str
     agent_dir: str
     workspace_trusted: bool
-    memory_backend: object | None
+    memory_service: object | None
     context_sources: object
+    extension_host: object | None = None
     diagnostics: tuple[str, ...] = ()
 
     @classmethod
@@ -208,44 +218,73 @@ class RuntimeServices:
             from ..prompt import load_project_instructions
             return load_project_instructions()
 
-        def _memory(_request):
-            from ..memory import build_memory_prompt_section
-            return build_memory_prompt_section()
-
         diagnostics: list[str] = []
-        backend = config.memory_backend
-        if backend is None:
-            try:
-                from ..memory import select_backend
-                with _push_cwd(resolved):
-                    backend = select_backend(config.memory_backend_choice)
-            except Exception as e:
-                backend = None
-                diagnostics.append(f"memory backend unavailable: {e}")
+        service = config.memory_service
+        if service is None:
+            from ..memory.service import MemoryService, MemoryServiceConfig
+            from ..memory.env_callables import (
+                build_embed_callable_from_env, build_llm_callable_from_env,
+            )
+            mem_cfg = MemoryServiceConfig.resolve(config.memory_backend_choice)
+            with _push_cwd(resolved):
+                embed = build_embed_callable_from_env()
+                llm = build_llm_callable_from_env()
+            with _push_cwd(resolved):
+                service = MemoryService(
+                    config=mem_cfg, cwd=resolved, agent_dir=str(data_dir()),
+                    llm=llm, embed=embed)
+
+        def _memory(request):
+            return service.static_prompt(request)
+
+        from ..extensions import ExtensionHost
+        with _push_cwd(resolved):
+            extension_host = ExtensionHost.load_system_extensions().activate_all()
 
         trusted = config.workspace_trusted if str(Path(config.cwd or resolved).resolve()) == resolved else is_trusted(Path(resolved))
         return cls(
             cwd=resolved,
             agent_dir=str(data_dir()),
             workspace_trusted=trusted,
-            memory_backend=backend,
+            memory_service=service,
             context_sources=ContextSources(
                 git=_in_cwd(_git),
                 project_instructions=_in_cwd(_project),
                 memory_static=_in_cwd(_memory),
             ),
+            extension_host=extension_host,
             diagnostics=tuple(diagnostics),
         )
 
 
 def _apply_runtime_services(agent, services: RuntimeServices) -> None:
     agent._runtime_services = services
-    agent._memory_backend = services.memory_backend
+    agent._memory_service = services.memory_service
     agent.workspace_trusted = services.workspace_trusted
     with _push_cwd(services.cwd):
         from ..prompt import build_system_prompt
         agent._base_system_prompt = build_system_prompt()
     agent._apply_permission_mode_prompt()
+    # docs/24 Phase 4b：把扩展贡献的工具 drain 进 agent 的 per-agent overlay registry（绝不写全局
+    # REGISTRY）。每个包成 Tool(source=EXT, trust=UNTRUSTED, name=ext__<id>__name)；执行经 dispatch
+    # 咽喉点授权 + UNTRUSTED 策略铸 ctx（全 None 把手）。rebind 复用同一 _registry 且扩展 host 每
+    # services 新建——按已存在名跳过，保 idempotent（不重复注册炸）。扩展是主 agent runtime 关注点；
+    # 子 agent 的 tools 是固定子集，不在此被刷新（避免提权回全量）。
+    host = getattr(services, "extension_host", None)
+    registry = getattr(agent, "_registry", None)
+    if (host is not None and getattr(host, "_activated", False)
+            and registry is not None and not getattr(agent, "is_sub_agent", False)):
+        try:
+            ext_tools = host.tool_contributions()
+        except Exception:
+            ext_tools = []
+        added = False
+        for t in ext_tools:
+            if registry.get(t.name) is None:
+                registry.register(t)
+                added = True
+        if added:
+            agent.tools = registry.schemas()
 
 
 # ─── 审批归口 ────────────────────────────────────────────────
@@ -356,10 +395,15 @@ class RuntimeThread:
         # agent.session_id，若此处用 live property，old/new thread（复用同一 Agent）的 thread_id
         # 会同时变成 new sid，dispose(old) 误注销 new。快照保证 thread 身份稳定、注册/注销不串。
         self._thread_id = agent.session_id
+        self._extension_host = getattr(services, "extension_host", None) if services is not None else None
 
     @property
     def thread_id(self) -> str:
         return self._thread_id
+
+    @property
+    def extension_host(self):
+        return self._extension_host
 
     # ── typed 事件 push（docs/16 #4）────────────────────────────────────────────
     def _envelope(self, type_: str, event) -> dict:
@@ -443,6 +487,11 @@ class RuntimeThread:
         self.push_boundary("thread_invalidated", reason="dispose")
         self._disposed = True
         self._runtime.unregister(self)
+        if self._extension_host is not None:
+            try:
+                self._extension_host.invalidate("dispose")
+            except Exception:
+                pass
         # 摘除 emit 订阅 tap（old/new thread 复用同一 Agent：disposed thread 不再累积事件）。
         try:
             self.agent._event_subscribers.remove(self._agent_tap)
@@ -492,14 +541,21 @@ class RuntimeThread:
 
     def sandbox_status(self) -> dict:
         """当前 sandbox 策略快照（profile + engine + fs/network + 后端可用性）。纯读。"""
+        from ..capabilities.sandbox import UNRESTRICTED
         a = self.agent
         policy = a.sandbox_policy()
         sb = a._sandbox
+        wr = policy.filesystem.writable_roots
+        writable_roots = (
+            ["(unrestricted — full host access)"]
+            if wr is UNRESTRICTED
+            else [str(p) for p in wr]
+        )
         return {
             "profile": getattr(a, "_sandbox_profile", "default"),
             "engine": policy.engine.value,
             "network": policy.network.mode.value,
-            "writable_roots": [str(p) for p in policy.filesystem.writable_roots],
+            "writable_roots": writable_roots,
             "protected_roots": [str(p) for p in policy.filesystem.protected_roots],
             "native_available": sb.native_available(),
             "vm_available": sb.vm_available(),
@@ -820,8 +876,88 @@ class RuntimeThread:
     async def spawn_memory_eval(self) -> str:
         return await self.agent._spawn_memory_eval()
 
-    async def spawn_memory_optimize(self) -> str:
-        return await self.agent._spawn_memory_optimize()
+    async def run_reserved_subagent(self, agent_type: str, prompt: str, *,
+                                    model: "str | None" = None,
+                                    timeout_ms: "int | None" = None) -> str:
+        return await self.agent._run_reserved_agent(
+            agent_type=agent_type, prompt=prompt, model=model, timeout_ms=timeout_ms)
+
+    async def run_extension_task(self, kind: str, payload: dict) -> str:
+        import asyncio
+        host = self._extension_host
+        if host is None or not host.is_active:
+            return "memory evolution extension is not available for this session."
+        agent = self.agent
+        desc = {"memory_optimize": "memory optimization"}.get(kind, kind)
+        task_rec = agent.task_manager.create_task(kind, desc, owner_agent_id=None)
+
+        async def _run() -> None:
+            try:
+                await host.run_task(kind, payload, task_id=task_rec.id)
+            except asyncio.CancelledError:
+                agent.task_manager.update_task(
+                    task_rec.id, status="cancelled",
+                    result_summary="(cancelled by task_stop)")
+                raise
+            except Exception as e:
+                agent.task_manager.update_task(
+                    task_rec.id, status="failed", error=str(e),
+                    result_summary=f"({kind} error: {e})")
+
+        task = asyncio.create_task(_run())
+        task._nanocode_task_id = task_rec.id
+        agent._background_tasks.add(task)
+        task.add_done_callback(agent._background_tasks.discard)
+        return (f"Started {kind} task {task_rec.id}. It will report completion later. "
+                f"Use task_output with task_id={task_rec.id} to inspect the result.")
+
+    async def generate_memory(self, *, force: bool = False, auto: bool = False) -> str:
+        svc = getattr(self.agent, "_memory_service", None)
+        if svc is None:
+            return "" if auto else "Memory is not available for this session."
+        mgr = getattr(self.agent, "_session_mgr", None)
+        if mgr is None:
+            return "" if auto else "No active session writer lease."
+        try:
+            res = await svc.maybe_start_generation_pipeline(
+                thread_id=self.agent.session_id, session_mgr=mgr,
+                is_subagent=self.agent.is_sub_agent, force=force)
+        except Exception as e:
+            return "" if auto else f"Memory generation failed: {e}"
+        if res is None or not res.ran:
+            reason = getattr(res, "skipped_reason", None) or "not applicable"
+            return "" if auto else f"Memory generation skipped: {reason}"
+        if res.error:
+            return "" if auto else f"Memory generation ran but failed: {res.error}"
+        n = res.produced
+        return f"Memory generation complete: extracted {n} entr{'y' if n == 1 else 'ies'} from this session."
+
+    def memory_overview(self) -> str:
+        svc = getattr(self.agent, "_memory_service", None)
+        if svc is None:
+            return "Memory is not available for this session."
+        try:
+            stats = svc.stats()
+        except Exception as e:
+            return f"[memory] stats unavailable: {e}"
+        lines = [f"memory backend: {stats.get('backend', '?')}"]
+        for k in ("count", "root", "dir", "mode"):
+            if k in stats:
+                lines.append(f"    {k}: {stats[k]}")
+        try:
+            res = svc.backend.list(limit=50)
+        except Exception as e:
+            lines.append(f"    (list failed: {e})")
+            return "\n".join(lines)
+        if not res.entries:
+            lines.append("    (no memories saved yet)")
+            return "\n".join(lines)
+        lines.append(f"{res.total or len(res.entries)} memories:")
+        for e in res.entries:
+            tag = f"[{e.kind}] " if e.kind else ""
+            desc = f" - {e.description}" if e.description else ""
+            lines.append(f"    {tag}{e.title} ({e.ref}){desc}")
+        return "\n".join(lines)
 
 
 # ─── Runtime ────────────────────────────────────────────────
@@ -866,7 +1002,7 @@ class AgentRuntime:
                 max_cost_usd=getattr(agent, "max_cost_usd", None),
                 max_turns=getattr(agent, "max_turns", None),
                 workspace_trusted=getattr(agent, "workspace_trusted", True),
-                memory_backend=getattr(agent, "_memory_backend", None),
+                memory_service=getattr(agent, "_memory_service", None),
                 session_id=getattr(agent, "session_id", None),
             )
             cwd = lease.manager._cwd() if lease is not None else os.getcwd()
@@ -874,6 +1010,8 @@ class AgentRuntime:
         _apply_runtime_services(agent, services)
         session = AgentSession(agent)
         thread = RuntimeThread(self, agent, session, lease=lease, services=services)
+        if services is not None and services.extension_host is not None:
+            services.extension_host.bind_runtime(thread, services)
         return self.register(thread)
 
     def thread_start(self, config: "AgentConfig", *, approvals: "ApprovalManager | None" = None,
@@ -890,7 +1028,7 @@ class AgentRuntime:
                                                 cwd=config.cwd)
         services = RuntimeServices.create(config, cwd=lease.manager._cwd())
         effective_config = replace(config, session_id=lease.manager.session_id, cwd=services.cwd,
-                                   memory_backend=services.memory_backend,
+                                   memory_service=services.memory_service,
                                    workspace_trusted=services.workspace_trusted)
         self._config = effective_config
         with _push_cwd(services.cwd):
@@ -955,24 +1093,31 @@ class AgentRuntime:
                 max_cost_usd=getattr(agent, "max_cost_usd", None),
                 max_turns=getattr(agent, "max_turns", None),
                 workspace_trusted=getattr(agent, "workspace_trusted", True),
-                memory_backend=getattr(agent, "_memory_backend", None),
+                memory_service=getattr(agent, "_memory_service", None),
                 session_id=new_sid,
             )
             services = RuntimeServices.create(
-                replace(config, session_id=new_sid, cwd=lease.manager._cwd()),
+                replace(config, session_id=new_sid, cwd=lease.manager._cwd(),
+                        memory_service=None),
                 cwd=lease.manager._cwd(),
             )
             host.current_thread.push_boundary("session_shutdown",
                                               reason=reason, target_session=new_sid)
             agent.rebind_session(lease.manager)  # finalize 旧（close 旧锁）+ rebuild 新
             _apply_runtime_services(agent, services)
+            if services.diagnostics:
+                from ..agent import events as _events
+                for _d in services.diagnostics:
+                    agent.emit(_events.NoticeRaised(text=f"[memory] {_d}", level="warn"))
             self._config = replace(config, session_id=new_sid, cwd=services.cwd,
-                                   memory_backend=services.memory_backend,
+                                   memory_service=services.memory_service,
                                    workspace_trusted=services.workspace_trusted)
             # rebind 边界（docs/16 #4）：旧 thread 的订阅者得知流被切走，新 thread 的流以切换开篇。
             host.current_thread.push_boundary("session_switch",
                                               from_session=old_sid, to_session=new_sid)
             new_thread = RuntimeThread(self, agent, AgentSession(agent), lease=lease, services=services)
+            if services.extension_host is not None:
+                services.extension_host.bind_runtime(new_thread, services)
             new_thread.push_boundary("session_switch", from_session=old_sid, to_session=new_sid)
             host.replace_thread(new_thread)
         except BaseException:

@@ -14,6 +14,7 @@ import json
 import pytest
 
 from nanocode.agent.engine import Agent
+from nanocode.memory.service import MemoryService, MemoryServiceConfig
 from nanocode.paths import project_memory_dir
 from nanocode.subagents.prompts import MEMORY_CURATOR_TYPE
 
@@ -21,6 +22,14 @@ from nanocode.subagents.prompts import MEMORY_CURATOR_TYPE
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
     return Agent(api_key="test", session_id="memsid", **kw)
+
+
+def _markdown_memory_service():
+    return MemoryService(
+        config=MemoryServiceConfig(backend="markdown"),
+        cwd=".",
+        agent_dir=".",
+    )
 
 
 def _seed_memories():
@@ -245,7 +254,7 @@ def test_curator_error_marks_failed():
 
 
 def test_memory_tool_consolidate_action_delegates():
-    parent = _agent()
+    parent = _agent(memory_service=_markdown_memory_service())
     _seed_memories()
     _spy_build_with_stub(parent, text=_DELETE_PLAN)
 

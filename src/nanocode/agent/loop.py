@@ -1,7 +1,7 @@
 """agent/loop.py — provider-independent 循环辅助 + AgentLoopConfig（docs/15 §5 / docs/16 #3c）。
 
-把两条后端循环里可纯函数化的小块抽出来（OpenAI 的 serial-check → parallel-batch 分组）,使
-AgentCore 的循环更薄、可单测。纯函数,无 I/O、无 self。
+把两条后端循环里可纯函数化的小块抽出来（post-stream 的 serial-check → parallel-batch 分组,对两
+provider 统一适用）,使 AgentCore 的循环更薄、可单测。纯函数,无 I/O、无 self。
 
 AgentLoopConfig：AgentCore.run_turn 的全部宿主能力注入面（docs/16 #3c）。loop 不再触 Agent——
 它只见 (state, cfg, emit, stream_fn)。cfg 的 callable 字段由 AgentSession._loop_config 绑定到
@@ -22,23 +22,24 @@ class AgentLoopConfig:
     """一个 turn 的模型循环配置：scalars + 宿主能力注入（docs/16 #3c）。
 
     安全不变量：execute_tool 必须是 allowlist fail-closed 咽喉点（router.dispatch）所在的入口；
-    permission_check 仅作流式早执行的 allow 预判（早执行只对 allow 起跑，正式授权仍在
-    authorize / execute_tool 链上）。
+    authorize（validate→gate→confirm 完整授权）是 post-stream 工具阶段唯一的授权路径。
     """
 
     # ── scalars（turn 开始快照；plan-mode 的 system prompt 切换经 rebuild_snapshot 实时生效）──
-    provider: str                                     # "anthropic" | "openai"（决定循环变体）
+    # B2-a：provider 派发已删（单一 provider-agnostic 循环）；wire/capture 形状由 adapter 决定，
+    # 循环不再读 provider，故不在 config 上保留该死字段。
     model: str
     thinking_mode: str
     tools: list
     is_sub_agent: bool
-    # ── 请求构建 / 消息落树 ──
+    # ── 请求构建 / 完成归一 / 消息落树 ──
     rebuild_snapshot: Callable[[], Any]               # () -> ProviderProjection（每请求树渲染）
+    to_completion: Callable[[Any], Any]               # (raw stream() 返回) -> Completion（B2-a：provider 归一）
     record_provider_messages: Callable[..., None]     # (provider_msg, **kw) -> None（capture-at-emit）
+    tool_result_messages: Callable[[list], list]      # (results) -> [(provider_msg, latency_ms), ...]（B2-a）
     # ── 工具派发 ──
     execute_tool: Callable[[str, dict], Awaitable[str]]
     authorize: Callable[[str, dict], Awaitable[tuple]]
-    permission_check: Callable[[str, dict], Any]      # 早执行 allow 预判
     persist_large_result: Callable[[str, str], str]
     # ── 预算 / 计数 writeback ──
     check_budget: Callable[[], dict]
@@ -57,9 +58,10 @@ class AgentLoopConfig:
     poll_memory: Callable[[], None]                   # memory prefetch settle → ContextInjected
 
 
-def group_openai_batches(checked: list[dict]) -> list[dict]:
-    """OpenAI Phase 2 grouping：把 serial-checked 的 tool calls 分组——连续的 allowed +
-    concurrency-safe 工具并成一个并行 batch,其余各自成串行 batch（移植自 openai loop,行为逐字一致）。
+def group_tool_batches(checked: list[dict]) -> list[dict]:
+    """post-stream Phase 2 grouping（B2-a，对两 provider 统一适用）：把 serial-checked 的 tool calls
+    分组——连续的 allowed + concurrency-safe 工具并成一个并行 batch,其余各自成串行 batch
+    （移植自旧 openai loop 的 group_openai_batches,逻辑逐字一致；仅更名以示 provider-agnostic）。
 
     入参 checked：[{tc, fn, inp, allowed, result?}, ...]（serial 权限判定后的结果）。
     返回：[{concurrent: bool, items: [...]}, ...]。

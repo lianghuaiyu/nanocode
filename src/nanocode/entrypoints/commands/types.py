@@ -113,7 +113,7 @@ class CommandSpec:
     #   most-specific-first 由 Registry 按 name 长度降序保证（/memory eval generate 先于 /memory eval 先于 /memory）
     is_hidden: bool = False                                # 不进补全菜单（仍可用），如别名
     is_enabled: bool = True                                # P0 静态布尔；需要时升级为 Callable[[], bool]
-    source: Literal["builtin", "user", "project"] = "builtin"  # 仅当配套 loader 时才有意义
+    source: Literal["builtin", "extension", "user", "project"] = "builtin"  # 仅当配套 loader 时才有意义
 
 
 # handler：吃 (上下文, 命令后的剩余 raw 文本)，产出 CommandResult

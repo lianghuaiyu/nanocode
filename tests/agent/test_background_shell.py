@@ -47,8 +47,8 @@ def test_execute_tool_call_foreground_unchanged():
 
 
 def test_task_tools_registered():
-    from nanocode.tools.registry import tool_definitions
-    names = {t["name"] for t in tool_definitions}
+    from nanocode.tools import REGISTRY
+    names = set(REGISTRY.names())
     assert {"task_list", "task_output", "task_stop"} <= names
 
 

@@ -49,3 +49,8 @@ SCHEMA = {
         "required": [],
     },
 }
+
+
+async def run(ctx, inp: dict) -> str:
+    """host-routed：纯转发 ctx.spawn.agent（编排逻辑留在 runtime/spawn.py、engine）。"""
+    return await ctx.spawn.agent(inp)

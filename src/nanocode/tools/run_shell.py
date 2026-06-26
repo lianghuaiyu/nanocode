@@ -58,3 +58,21 @@ DANGEROUS_PATTERNS = [
 
 def is_dangerous(command: str) -> bool:
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
+
+
+# ─── host-routed executor（docs/24 Phase 3）────────────────────────
+#
+# run_shell 经 curated ToolContext 能力把手自包含执行：
+# - run_in_background → ctx.tasks.spawn_shell（后台任务面板，与今天 router 后台分支等价）；
+# - 前台 → ctx.exec.run（唯一规划点 SandboxManager，与今天 engine._run_real_tool 前台特例等价）。
+# cwd/session 来自 HostContext（把手内取），非 tool input（模型无法 spoof）。
+
+
+async def run(ctx, inp: dict) -> str:
+    if inp.get("run_in_background"):
+        tid = await ctx.tasks.spawn_shell(inp.get("command", ""), inp.get("timeout"))
+        return (f"Started background shell task {tid}. It will report completion later. "
+                f"Use task_output with task_id={tid} to inspect progress.")
+    from ..capabilities.sandbox import ShellRequest
+    request = ShellRequest.from_tool_input(inp)
+    return await ctx.exec.run(request)
