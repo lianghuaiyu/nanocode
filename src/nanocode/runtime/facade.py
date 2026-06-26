@@ -869,27 +869,18 @@ class RuntimeThread:
         return "\n".join(parts)
 
     def invoke_skill(self, name: str, args: str) -> SkillInvocation:
-        """Resolve a user-invoked skill and return the prompt to run, if any."""
-        from ..skills import execute_skill, get_skill_by_name, resolve_skill_prompt
-        skill = get_skill_by_name(name)
-        if not skill or not skill.user_invocable:
-            return SkillInvocation(handled=False)
-        if getattr(skill, "hooks", None):
-            self._agent._register_skill_hooks(skill)
-        if skill.context == "fork":
-            result = execute_skill(skill.name, args)
-            if not result:
-                return SkillInvocation(handled=True, error=f"Unknown skill: {skill.name}")
-            return SkillInvocation(
-                handled=True,
-                notice=f"Invoking skill: {skill.name}",
-                prompt=f'Use the skill tool to invoke "{skill.name}" with args: {args or "(none)"}',
-            )
-        return SkillInvocation(
-            handled=True,
-            notice=f"Invoking skill: {skill.name}",
-            prompt=resolve_skill_prompt(skill, args),
-        )
+        """Resolve a user-invoked skill and return the prompt to run, if any.
+
+        docs/23 Phase 5：解析与 hook 安装由 runtime 拥有的 SkillRuntimeService 持有；facade
+        只委托并把 runtime-private agent 句柄交给服务安装 hook（不再内联 skill helper、不再
+        直接 reach agent._register_skill_hooks）。
+        """
+        from .skill_service import SkillRuntimeService
+        service = SkillRuntimeService()
+        resolved = service.resolve_user_invocation(name, args)
+        if resolved.skill is not None:
+            service.install_hooks(self._agent, resolved.skill)
+        return resolved.invocation
 
     async def spawn_memory_consolidate(self) -> str:
         return await self._agent._spawn_memory_consolidate()
