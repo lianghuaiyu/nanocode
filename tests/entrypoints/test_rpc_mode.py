@@ -10,7 +10,7 @@ import sys
 import time
 
 from nanocode.agent.engine import Agent
-from nanocode.agent import AgentRuntime
+from nanocode.runtime import AgentRuntime
 from nanocode.entrypoints.host import RuntimeHost
 from nanocode.entrypoints.rpc import run_rpc_mode
 from nanocode.session import tree as T

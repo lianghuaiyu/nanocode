@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from nanocode.agent import AgentRuntime
+from nanocode.runtime import AgentRuntime
 from nanocode.entrypoints import cli
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager, session_file

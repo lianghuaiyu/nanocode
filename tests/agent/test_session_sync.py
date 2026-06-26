@@ -10,7 +10,7 @@ import asyncio
 
 from nanocode.agent import events as E
 from nanocode.agent.engine import Agent
-from nanocode.agent.session import AgentSession
+from nanocode.session.agent import AgentSession
 from nanocode.agent.state import AgentState
 from nanocode.session import tree as T
 from nanocode.session.lease import SessionLease

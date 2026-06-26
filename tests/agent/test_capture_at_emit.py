@@ -9,7 +9,7 @@
 import pytest
 
 from nanocode.agent.engine import Agent
-from nanocode.agent.session import AgentSession
+from nanocode.session.agent import AgentSession
 from nanocode.agent.events import (
     AssistantMessageCompleted,
     ToolResultCompleted,

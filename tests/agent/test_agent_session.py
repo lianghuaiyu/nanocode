@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from nanocode.agent.engine import Agent
-from nanocode.agent.session import AgentSession
+from nanocode.session.agent import AgentSession
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 

@@ -9,7 +9,7 @@ import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from nanocode.agent import AgentRuntime, RuntimeThread
+from nanocode.runtime import AgentRuntime, RuntimeThread
 from nanocode.extensions import ExtensionHost
 from nanocode.memory.retrieval_eval import RetrievalEvalCase
 from nanocode.memory import retrieval_config_store as RCS

@@ -38,7 +38,7 @@ _RUNTIME_SOURCES = (
     _SRC / "agent" / "core.py",
     _SRC / "agent" / "loop.py",
     _SRC / "agent" / "providers.py",
-    _SRC / "agent" / "session.py",
+    _SRC / "session" / "agent.py",
 )
 
 # 任务点名的「import trajectory」文本形态（兜底子串扫描用）。

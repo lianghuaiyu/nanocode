@@ -1,7 +1,8 @@
 """docs/14 P1：RuntimeHost —— context() 动态绑定当前 thread、replace_thread dispose+rebind、
 can_switch fail-closed 闸。"""
 
-from nanocode.agent import AgentRuntime, AgentSession, RuntimeThread
+from nanocode.runtime import AgentRuntime, RuntimeThread
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.host import RuntimeHost
 

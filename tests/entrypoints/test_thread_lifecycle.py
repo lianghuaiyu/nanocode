@@ -5,7 +5,8 @@ headline 修复：thread_resume 后 RuntimeHost.current_thread.session.context_b
 指向**新** session（unsafe-switch 时它 stale 在旧 session——见已删的 P0 characterization）。
 """
 
-from nanocode.agent import AgentRuntime, AgentSession, RuntimeThread
+from nanocode.runtime import AgentRuntime, RuntimeThread
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.host import RuntimeHost
 from nanocode.session import tree as T

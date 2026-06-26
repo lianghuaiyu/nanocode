@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # 仅类型；避免 import 期耦合（agent 包较重）
-    from ...agent import RuntimeThread
+    from ...runtime import RuntimeThread
     from .registry import Registry
 
 

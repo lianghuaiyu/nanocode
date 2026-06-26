@@ -5,7 +5,8 @@ thread_clone/thread_fork 原子切换；/tree 是 in-file（经 AgentSession.mov
 
 import asyncio
 
-from nanocode.agent import AgentRuntime, AgentSession, RuntimeThread
+from nanocode.runtime import AgentRuntime, RuntimeThread
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _clone, _fork, _name, _tree
 from nanocode.entrypoints.commands.types import CommandContext, Control, Local

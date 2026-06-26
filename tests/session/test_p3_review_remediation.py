@@ -5,7 +5,8 @@ clone 不污染（无双 session_start）；in-file /fork before 首消息 → �
 canonical 树是唯一权威；见文件末说明。）
 """
 
-from nanocode.agent import AgentRuntime, AgentSession, RuntimeThread
+from nanocode.runtime import AgentRuntime, RuntimeThread
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.host import RuntimeHost
 from nanocode.session import tree as T
@@ -43,7 +44,7 @@ def test_fork_pre3a_first_message_yields_empty_new_session():
     # pi /fork + pre-3a 盘上树（首消息 parentId 指向 session_start）：fork before 首消息 →
     # 前缀只剩 session_start（剥掉后无可复制）→ runtime 落到全新空 session。
     import asyncio
-    from nanocode.agent import AgentRuntime, RuntimeThread
+    from nanocode.runtime import AgentRuntime, RuntimeThread
     from nanocode.entrypoints.commands.builtin import _fork
     from nanocode.entrypoints.commands.types import CommandContext, Control
     from nanocode.entrypoints.host import RuntimeHost

@@ -88,7 +88,7 @@ def test_user_message_is_recorded_before_volatile_collect(monkeypatch):
     async def fake_stream(**_kw):
         return _FakeResp([_FakeBlock("text", text="ok")])
 
-    monkeypatch.setattr("nanocode.agent.session.AgentSession._collect_turn_volatile",
+    monkeypatch.setattr("nanocode.session.agent.AgentSession._collect_turn_volatile",
                         fake_collect)
     a._provider.stream = fake_stream
     asyncio.run(a.chat("hello"))

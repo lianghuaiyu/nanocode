@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import re
 
-from nanocode.agent import AgentRuntime, AgentSession
+from nanocode.runtime import AgentRuntime
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _resume, _session
 from nanocode.entrypoints.commands.types import CommandContext, Local

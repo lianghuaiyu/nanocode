@@ -4,8 +4,8 @@ parentSession 血缘，artifacts 仍 parent-keyed）。children() 发现；/pare
 
 import asyncio
 
-from nanocode.agent import AgentRuntime, AgentSession
-from nanocode.agent.runtime import AgentConfig
+from nanocode.runtime import AgentConfig, AgentRuntime
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.types import CommandContext, Control
 from nanocode.session import tree as T

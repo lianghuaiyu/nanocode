@@ -1,6 +1,6 @@
 """P5a：注入作为 custom_message tree entry（additive），build_context 折入、render 合并进 user 消息。"""
 
-from nanocode.agent import AgentSession
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager

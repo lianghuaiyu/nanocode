@@ -139,7 +139,7 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     monkeypatch.setattr(_builtin, "handle_eval_command",
                         lambda rest: (calls.append(("handle_eval_command", rest)) or "stub"))
     # docs/19：/sandbox 经 RuntimeThread.sandbox_status（无参展示）/ set_sandbox_profile（切换）。
-    from nanocode.agent.runtime import RuntimeThread
+    from nanocode.runtime import RuntimeThread
 
     def _fake_sandbox_status(self):
         calls.append(("sandbox_status",))
@@ -227,7 +227,7 @@ def _run_script(monkeypatch, lines, *, skill_lookup=None) -> list:
     async def _scenario():
         r, w = os.pipe()
         console = Console(file=io.StringIO(), force_terminal=True, width=100)
-        from nanocode.agent import AgentRuntime, RuntimeThread
+        from nanocode.runtime import AgentRuntime, RuntimeThread
         rt = AgentRuntime()
         thread = rt.register(RuntimeThread(rt, agent, _RecordingSession(agent)))
         from nanocode.extensions import ExtensionHost
@@ -272,7 +272,7 @@ def _dispatch_direct(monkeypatch, line: str) -> list:
     """
     calls: list = []
     agent = _FakeAgent(calls)
-    from nanocode.agent import AgentRuntime, RuntimeThread
+    from nanocode.runtime import AgentRuntime, RuntimeThread
     from nanocode.entrypoints.commands.types import CommandContext
     from nanocode.extensions import ExtensionHost
 

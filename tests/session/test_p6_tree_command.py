@@ -2,7 +2,8 @@
 
 import asyncio
 
-from nanocode.agent import AgentRuntime, AgentSession
+from nanocode.runtime import AgentRuntime
+from nanocode.session.agent import AgentSession
 from nanocode.agent.engine import Agent
 from nanocode.entrypoints.commands.builtin import _checkout, _resume, _tree
 from nanocode.entrypoints.commands.types import CommandContext

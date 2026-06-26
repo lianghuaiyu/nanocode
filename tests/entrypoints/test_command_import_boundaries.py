@@ -54,13 +54,34 @@ def test_agent_and_agent_profile_public_imports_are_light():
 
         sys.meta_path.insert(0, Blocker())
         import nanocode.agent
-        from nanocode.agent import AgentConfig, AgentRuntime
         import nanocode.runtime
         from nanocode.runtime import AgentRuntime as RuntimeAgentRuntime
         import nanocode.session
         from nanocode.session import AgentSession
         import nanocode.agents
         from nanocode.agents import AgentProfile
+        """
+    )
+    proc = subprocess.run([sys.executable, "-c", code], env=env, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_agent_import_does_not_pull_runtime():
+    """``import nanocode.agent`` must stay a leaf: it must not drag in the
+    runtime layer (docs/23 Phase 3 boundary)."""
+    src = Path(__file__).resolve().parents[2] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src) + os.pathsep + env.get("PYTHONPATH", "")
+    code = textwrap.dedent(
+        """
+        import sys
+        import nanocode.agent
+        leaked = sorted(
+            name for name in sys.modules
+            if name == "nanocode.runtime" or name.startswith("nanocode.runtime.")
+        )
+        assert not leaked, leaked
         """
     )
     proc = subprocess.run([sys.executable, "-c", code], env=env, text=True,

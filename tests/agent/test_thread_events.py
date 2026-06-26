@@ -10,7 +10,7 @@
 import asyncio
 
 from nanocode.agent.engine import Agent
-from nanocode.agent.runtime import AgentRuntime
+from nanocode.runtime import AgentRuntime
 
 
 class _FakeBlock:
