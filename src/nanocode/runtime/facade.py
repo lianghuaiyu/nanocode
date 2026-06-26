@@ -741,8 +741,20 @@ class RuntimeThread:
         mgr.append_label(entry_id, label)
 
     def can_switch(self) -> "tuple[bool, str | None]":
+        """切换/rebind 前的 fail-closed 闸（docs/23 Phase 6）。返回 (允许?, 拒绝原因)，契约不变。
+
+        拒绝任何会把写入引到错误 session 的 live 状态，全部经现有查询面（不新增追踪）：
+        - 当前 turn 运行中——含等待审批的 turn（审批期 turn 协程仍在跑，故 is_processing 命中）；
+        - live 子 agent child writer 运行中（`_live_run_ids()`：切父 session 会让 child 回调写错父上下文）；
+        - 其余后台 host 任务运行中（`_background_tasks`：扩展任务 / 记忆 curator 等都登记于此）。
+
+        未单独建闸（无现成廉价查询面，按 docs/23 不新增 state 机器）：`!shell` 运行中（REPL 串行
+        await，切换命令本就排其后）；审批 broker 的 pending 队列只在 RPC adapter 局部、未挂到 thread。"""
         if self.is_processing:
             return False, "a turn is currently running"
+        live_runs = self._agent._live_run_ids()
+        if live_runs:
+            return False, f"{len(live_runs)} sub-agent run(s) still running"
         tasks = getattr(self._agent, "_background_tasks", set())
         if tasks:
             return False, f"{len(tasks)} background task(s) still running"

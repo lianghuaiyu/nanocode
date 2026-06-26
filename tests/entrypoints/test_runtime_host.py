@@ -65,11 +65,28 @@ def test_can_switch_blocks_on_running_turn():
     assert ok is False and "turn" in reason
 
 
+class _FakeTask:
+    """Minimal stand-in for an asyncio Task in _background_tasks (has .done())."""
+    def __init__(self, run_id=None):
+        if run_id is not None:
+            self._nanocode_run_id = run_id
+    def done(self):
+        return False
+
+
 def test_can_switch_blocks_on_background_task():
     a, rt, t, host = _host("h5")
-    a._background_tasks.add(object())
+    a._background_tasks.add(_FakeTask())          # 非子 agent 后台任务（无 _nanocode_run_id）
     ok, reason = host.can_switch()
     assert ok is False and "background" in reason
+
+
+def test_can_switch_blocks_on_live_subagent_run():
+    # docs/23 Phase 6：live 子 agent child writer 运行中 → 拒绝切换，给出子 agent 专属原因。
+    a, rt, t, host = _host("h6")
+    a._background_tasks.add(_FakeTask(run_id="run-1"))
+    ok, reason = host.can_switch()
+    assert ok is False and "sub-agent run" in reason
 
 
 # ─── P2 安全不变量：同一 Agent 跨 rebind 复用时 thread 身份/registry 正确性 ──────────────
