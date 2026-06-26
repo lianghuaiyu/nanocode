@@ -86,6 +86,7 @@ class Agent(PlanModeMixin):
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         api_key: str | None = None,
+        provider: str | None = None,
         thinking: bool = False,
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
@@ -114,7 +115,10 @@ class Agent(PlanModeMixin):
         self._base_permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
-        self.use_openai = bool(api_base)
+        # B1 provider seam：provider name 是单一真源（= 旧 bool(api_base)）；client/adapter/capture
+        # api/system 放置都从 providers.SPECS[provider] 派生。显式 provider 优先，否则按 api_base 解析。
+        from .providers import resolve_provider_name
+        self._provider_name = provider or resolve_provider_name(api_base=api_base)
         self.is_sub_agent = is_sub_agent
         # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
         # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
@@ -295,40 +299,29 @@ class Agent(PlanModeMixin):
 
         # Initialize clients. Provider SDK imports are intentionally lazy so
         # embedding/import-boundary users can construct runtime/test Agents
-        # without installing every provider package.
-        if self.use_openai:
-            try:
-                import openai
-            except ModuleNotFoundError:
-                openai = None
-            if openai is None:
-                self._openai_client = None
-            else:
-                self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
-            self._anthropic_client = None
-        else:
-            kwargs: dict[str, Any] = {}
-            if api_key:
-                kwargs["api_key"] = api_key
-            if anthropic_base_url:
-                kwargs["base_url"] = anthropic_base_url
-            try:
-                import anthropic
-            except ModuleNotFoundError:
-                anthropic = None
-            self._anthropic_client = (None if anthropic is None
-                                      else anthropic.AsyncAnthropic(**kwargs))
-            self._openai_client = None
+        # without installing every provider package. B1：client 工厂归 providers.SPECS
+        # （ModuleNotFoundError → None，逐字保留旧 inline 行为）；engine 只持单一活跃 client。
+        from .providers import SPECS, make_provider_adapter
+        spec = SPECS[self._provider_name]
+        client = spec.build_client(
+            api_key=api_key, api_base=api_base, anthropic_base_url=anthropic_base_url)
+        # 兼容旧读者（spawn.py / 测试）：保留按 provider 命名的 client 属性，非活跃侧为 None。
+        self._openai_client = client if self._provider_name == "openai" else None
+        self._anthropic_client = client if self._provider_name == "anthropic" else None
 
         # docs/15 STEP B：provider 流式 + capture 收敛到 ProviderAdapter（backend mixin 经 self._provider
         # .stream 委托,engine 不再持 _call_*_stream）。clients 在 rebind 不变,故 _provider 跨 rebind 有效。
-        from .providers import make_provider_adapter
         self._provider = make_provider_adapter(
-            use_openai=self.use_openai,
-            anthropic_client=self._anthropic_client, openai_client=self._openai_client,
-            registry=self._registry)
+            provider=self._provider_name, client=client, registry=self._registry)
         # docs/15 STEP C：模型循环上移到 AgentCore（host=self 注入 collaborators）。无状态,可共享。
         self._core = AgentCore()
+
+    @property
+    def use_openai(self) -> bool:
+        """B1：迁移期 read-only 兼容垫——provider 真源是 self._provider.name。外部读者（spawn.py /
+        cli.py / turn-loop 选择）仍可读；15 个行为站点已改读 self._provider 的 capture_api /
+        places_system_in_messages，不再读此属性。"""
+        return self._provider.name == "openai"
 
     def _apply_permission_mode_prompt(self) -> None:
         """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
@@ -475,21 +468,73 @@ class Agent(PlanModeMixin):
         return {"exceeded": False}
 
     # docs/16 #3a：compaction 流程（阈值门 + entry 写入）归 AgentSession（turn shell / compaction
-    # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（实现在 AgentCore，
-    # summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走 agent_session.compact()。
+    # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（B1 后实现下沉到
+    # ProviderAdapter.summarize，summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走
+    # agent_session.compact()。这四个薄 delegator 是 monkeypatch 锚（~40 处测试 patch 之），故保留：
+    # 调用点经 Agent._compact / Agent._summarize 选锚（按 provider name，非 use_openai），锚体经
+    # self._provider.summarize 落地（provider 差异下沉 adapter，行为 byte-equivalent）。
+    _COMPACT_PERSONA = ("You are a coding-session summarizer. Follow the user's summary format "
+                        "exactly; be thorough but do not pad.")
+    _BRANCH_SUMMARY_PERSONA = "You summarize abandoned conversation branches for continuity."
+
     async def _compact_anthropic(self, messages: "list | None",
                                  instructions: str | None = None) -> "str | None":
-        return await self._core._compact_anthropic(self, messages, instructions)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._COMPACT_PERSONA,
+            instruction=self._core._compact_prompt(
+                instructions, partial=getattr(self, "_summarizer_partial", False)),
+            max_output_tokens=8192, min_messages=3, strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0   # 调用方写（adapter 不碰 AgentState），仅在真发起调用时
+        return summary
 
     async def _compact_openai(self, messages: "list | None",
                               instructions: str | None = None) -> "str | None":
-        return await self._core._compact_openai(self, messages, instructions)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._COMPACT_PERSONA,
+            instruction=self._core._compact_prompt(
+                instructions, partial=getattr(self, "_summarizer_partial", False)),
+            max_output_tokens=8192, min_messages=4, strip_leading_system=True)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
 
     async def _summarize_anthropic(self, messages: "list | None", prompt_text: str) -> "str | None":
-        return await self._core._summarize_anthropic(self, messages, prompt_text)
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._BRANCH_SUMMARY_PERSONA,
+            instruction=prompt_text, max_output_tokens=2048, min_messages=1,
+            strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
 
     async def _summarize_openai(self, messages: "list | None", prompt_text: str) -> "str | None":
-        return await self._core._summarize_openai(self, messages, prompt_text)
+        # parity 雷 A：branch-summary transcript 是 user-only（未渲染 system），故 **不**切片
+        # （strip_leading_system=False）——逐字保留旧 _summarize_openai 行为。
+        summary = await self._provider.summarize(
+            model=self.model, messages=messages, system_persona=self._BRANCH_SUMMARY_PERSONA,
+            instruction=prompt_text, max_output_tokens=2048, min_messages=1,
+            strip_leading_system=False)
+        if summary is not None:
+            self.last_input_token_count = 0
+        return summary
+
+    async def _compact(self, messages: "list | None",
+                       instructions: str | None = None) -> "str | None":
+        """compaction summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。
+        锚仍是 _compact_anthropic / _compact_openai（patch 点存活）；分支只剩 provider name 选择。
+        instructions 只在 truthy 时作位置参数传入——逐字保留旧调用点的两形态签名（monkeypatch fake
+        可声明单参 _fake(messages)，与旧 `_compact_anthropic(prefix)` 调用形态一致）。"""
+        target = self._compact_openai if self._provider.name == "openai" else self._compact_anthropic
+        if instructions:
+            return await target(messages, instructions)
+        return await target(messages)
+
+    async def _summarize(self, messages: "list | None", prompt_text: str) -> "str | None":
+        """branch-summary summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。"""
+        if self._provider.name == "openai":
+            return await self._summarize_openai(messages, prompt_text)
+        return await self._summarize_anthropic(messages, prompt_text)
 
     # ─── Message-list ownership：已退役（docs/16 #3c）─────────────────────────
     # _anthropic_messages/_openai_messages/_active_messages/_load_messages/_dump_messages/

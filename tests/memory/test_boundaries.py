@@ -22,10 +22,16 @@ def test_agent_core_does_not_import_memory():
     assert not re.search(r"from \.\.memory|import .*\bmemory\b", src)
 
 
-def test_memory_tool_is_schema_only():
+def test_memory_tool_is_host_routed_thin_forward():
+    # docs/24 contract: memory_tool carries the SCHEMA + a thin run(ctx, inp) that forwards to
+    # ctx.memory.execute (the host-routed capability handle). It must NOT import or touch the
+    # store/backend/engine itself — the embedded-agent boundary stays: routing lives in the host.
     src = _read(PKG / "tools" / "memory_tool.py")
-    assert "def run(" not in src
-    # no imports of the store/backend/engine — schema + prose only
+    assert "SCHEMA" in src
+    # run is the host-routed thin forwarder (ctx.memory.execute), not a store/backend implementation.
+    assert re.search(r"def run\(", src)
+    assert "ctx.memory.execute" in src
+    # no imports of the store/backend/engine — schema + prose + thin forward only
     assert not re.search(r"^\s*(from|import)\b.*\b(store|backend|simplemem|engines)\b",
                          src, re.M | re.I)
 

@@ -139,6 +139,9 @@ class AgentConfig:
     api_key: str | None = None
     api_base: str | None = None            # openai-compatible base（非空 → use_openai）
     anthropic_base_url: str | None = None
+    # B1 provider seam：显式 provider name（"anthropic"/"openai"）。None → 按 api_base 解析
+    # （resolve_provider_name，= 旧 bool(api_base)）。显式值优先，使非 api_base 触发的 provider 选择成为可能。
+    provider: str | None = None
     trajectory_enabled: bool = False
     trajectory_level: str = "summary"
     workspace_trusted: bool = True
@@ -160,6 +163,7 @@ class AgentConfig:
             permission_mode=self.permission_mode, model=self.model, thinking=self.thinking,
             max_cost_usd=self.max_cost_usd, max_turns=self.max_turns,
             api_base=self.api_base, anthropic_base_url=self.anthropic_base_url, api_key=self.api_key,
+            provider=self.provider,
             trajectory_enabled=self.trajectory_enabled,
             trajectory_level=self.trajectory_level, workspace_trusted=self.workspace_trusted,
             session_id=self.session_id, memory_service=self.memory_service,

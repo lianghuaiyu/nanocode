@@ -159,14 +159,14 @@ class AgentSession:
             return drain_pending_steers(a, delivery="follow_up") > 0
 
         return AgentLoopConfig(
-            provider=("openai" if a.use_openai else "anthropic"),
             model=a.model, thinking_mode=a._thinking_mode, tools=a.tools,
             is_sub_agent=a.is_sub_agent,
             rebuild_snapshot=self.project_request,
+            to_completion=a._provider.complete,
             record_provider_messages=self.record_provider_messages,
+            tool_result_messages=a._provider.tool_result_messages,
             execute_tool=a._execute_tool_call,
             authorize=a._authorize_dispatch,
-            permission_check=a.permission.check,
             persist_large_result=a._persist_large_result,
             check_budget=a._check_budget,
             bump_turn=bump_turn, note_api_call=note_api_call, add_usage=add_usage,
@@ -186,7 +186,7 @@ class AgentSession:
         （required=True，写失败 fail-loud——树是唯一权威，缺一条 = 下一轮上下文错误）。"""
         a = self.agent
         for ev in _events.events_from_provider_message(
-                provider_msg, provider=("openai" if a.use_openai else "anthropic"),
+                provider_msg, provider=a._provider.name,
                 model=a.model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms):
             a.emit(ev)
 
@@ -200,10 +200,9 @@ class AgentSession:
         （_collect_turn_volatile），turn 内各迭代复用（git subprocess per-turn 缓存）。"""
         from ..agent.state import ProviderProjection
         a = self.agent
-        provider = "openai" if a.use_openai else "anthropic"
-        return ProviderProjection(provider=provider,
+        return ProviderProjection(provider=a._provider.name,
                                   messages=self.build_request_messages(extra_neutral=self._volatile_tail()),
-                                  system=(None if a.use_openai else a._system_prompt))
+                                  system=(None if a._provider.places_system_in_messages else a._system_prompt))
 
     def _volatile_tail(self) -> "list[dict] | None":
         """本 turn 的 volatile packs → 一条中立 user 消息（render 会与相邻 user 合并，保持 provider
@@ -436,11 +435,7 @@ class AgentSession:
             a._summarizer_partial = retry_count > 0
             prefix_messages = self._project_branch_prefix(prefix_branch)
             try:
-                if instructions:
-                    return (await (a._compact_openai(prefix_messages, instructions) if a.use_openai
-                                   else a._compact_anthropic(prefix_messages, instructions)), retry_count)
-                return (await (a._compact_openai(prefix_messages) if a.use_openai
-                               else a._compact_anthropic(prefix_messages)), retry_count)
+                return (await a._compact(prefix_messages, instructions), retry_count)
             except Exception as e:
                 dropped = self._drop_oldest_round(prefix_branch)
                 if (retry_count >= 3 or not is_context_overflow_error(e)
@@ -620,9 +615,13 @@ class AgentSession:
             rich, _ = _ctx.fold(kept)
             neutral = _ctx.convert_to_llm(rich)
             probe = [_tree.user_message("[compaction summary placeholder]")] + neutral
-            for provider, api in (("anthropic", "anthropic"), ("openai", "openai-completions")):
-                sysp = a._system_prompt if provider == "openai" else None
-                render(probe, ModelCtx(provider=provider, api=api, model_id=a.model), system_prompt=sysp)
+            # deliberately 探两 provider（renderability 对所有 provider 都须成立）：从 SPECS 派生
+            # (provider, api, places_system)，in-band system 规则不再硬编码 == "openai"（B1 标志真源）。
+            from ..agent.providers import SPECS
+            for spec in SPECS.values():
+                sysp = a._system_prompt if spec.places_system_in_messages else None
+                render(probe, ModelCtx(provider=spec.name, api=spec.capture_api, model_id=a.model),
+                       system_prompt=sysp)
         except Exception:
             return False
         return True
@@ -657,10 +656,9 @@ class AgentSession:
         neutral = _ctx.convert_to_llm(rich)
         if not neutral:
             return None
-        provider = "openai" if a.use_openai else "anthropic"
-        api = "openai-completions" if a.use_openai else "anthropic"
-        sysp = a._system_prompt if a.use_openai else None
-        return render(neutral, ModelCtx(provider=provider, api=api, model_id=a.model),
+        sysp = a._system_prompt if a._provider.places_system_in_messages else None
+        return render(neutral, ModelCtx(provider=a._provider.name, api=a._provider.capture_api,
+                                        model_id=a.model),
                       system_prompt=sysp)["messages"]
 
     def _predicted_post_compaction_count(self, summary: str, first_kept: "str | None") -> "int | None":
@@ -692,7 +690,7 @@ class AgentSession:
         built = a._session_mgr.build_context()
         return AgentState.hydrate(
             built,
-            provider=("openai" if a.use_openai else "anthropic"),
+            provider=a._provider.name,
             model=a.model,
             system_prompt=a._system_prompt,
             thinking_level=a._thinking_mode,
@@ -826,9 +824,9 @@ class AgentSession:
         if a._session_mgr is None:
             raise _tree.SessionTreeError("no writer lease: cannot build request messages without canonical tree")
         from .render import ModelCtx, render
-        provider = "openai" if a.use_openai else "anthropic"
-        api = "openai-completions" if a.use_openai else "anthropic"
-        sysp = a._system_prompt if a.use_openai else None
+        provider = a._provider.name
+        api = a._provider.capture_api
+        sysp = a._system_prompt if a._provider.places_system_in_messages else None
         built = a._session_mgr.build_context()
         messages = list(built.messages)
         if extra_neutral:
@@ -838,7 +836,7 @@ class AgentSession:
         # 仅 Anthropic：其 render 把连续 toolResult 并成**一条** user message（聚合上限有意义）；OpenAI
         # 每个 toolResult 自成一条 tool message（无聚合上限），施加聚合预算会过度删减（review）。
         state = getattr(a, "_content_replacement", None)
-        if state is not None and not a.use_openai:
+        if state is not None and a._provider.name == "anthropic":
             from ..agent.tool_result_budget import apply_tool_result_budget
             messages = apply_tool_result_budget(
                 messages, state,
@@ -1069,8 +1067,7 @@ class AgentSession:
 
         prompt = branch_summary_prompt(focus)
         messages = [{"role": "user", "content": "Abandoned branch transcript:\n\n" + transcript}]
-        summary = await (a._summarize_openai(messages, prompt) if a.use_openai
-                         else a._summarize_anthropic(messages, prompt))
+        summary = await a._summarize(messages, prompt)
         summary = format_compact_summary(summary) if summary else summary
         if not summary:
             return self.move_to(target_id)
@@ -1089,9 +1086,9 @@ class AgentSession:
         mgr.append_branch_summary(summary=summary, from_id=old_leaf, details=details,
                                   parent_id=target_id, attach_to_root=(target_id is None))
         built = mgr.build_context()
-        provider = "openai" if a.use_openai else "anthropic"
-        api = "openai-completions" if a.use_openai else "anthropic"
-        sysp = a._system_prompt if a.use_openai else None
+        provider = a._provider.name
+        api = a._provider.capture_api
+        sysp = a._system_prompt if a._provider.places_system_in_messages else None
         return render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
                       system_prompt=sysp)["messages"]
 
@@ -1108,9 +1105,9 @@ class AgentSession:
             raise ValueError(f"entry '{entry_id}' not found in session tree; session left unchanged")
         mgr.set_leaf(entry_id)
         built = mgr.build_context()
-        provider = "openai" if a.use_openai else "anthropic"
-        api = "openai-completions" if a.use_openai else "anthropic"
-        sysp = a._system_prompt if a.use_openai else None
+        provider = a._provider.name
+        api = a._provider.capture_api
+        sysp = a._system_prompt if a._provider.places_system_in_messages else None
         return render(built.messages, ModelCtx(provider=provider, api=api, model_id=a.model),
                       system_prompt=sysp)["messages"]
 

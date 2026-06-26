@@ -93,30 +93,30 @@ def test_anthropic_adapter_parses_text_thinking_tool():
                     _FinalBlock("thinking", thinking="reason"),
                     _FinalBlock("tool_use", id="t1", name="read_file", input={"p": "a"})])
     ad = AnthropicAdapter(_FakeAnthropicClient(_FakeAnthropicStream(events, final)))
-    texts, thinks, tools, spins = [], [], [], []
+    texts, thinks, spins = [], [], []
     cb = StreamCallbacks(spinner_stop=lambda: spins.append(1), text_block=texts.append,
-                         thinking_block=thinks.append, tool_block=tools.append)
+                         thinking_block=thinks.append)
     res = asyncio.run(ad.stream(model="claude-x", system="S", tools=[], messages=[],
                                 thinking_mode="disabled", callbacks=cb))
     assert texts == ["hel", "lo"]
     assert thinks == ["reason"]
-    assert tools == [{"type": "tool_use", "id": "t1", "name": "read_file", "input": {"p": "a"}}]
     assert spins  # spinner stopped before first text/thinking block
     assert res._nanocode_thinking == "reason"
     assert all(b.type != "thinking" for b in res.content)   # thinking 过滤出 final content
 
 
-def test_anthropic_adapter_bad_tool_json_falls_back_empty():
+def test_anthropic_adapter_streams_text_thinking_only():
+    # B2-a：adapter 流中不再解析 tool_use/不再 fire tool_block（早执行已去除）；
+    # tool_calls 在流完后由 complete() 从 final_message.content 派生。此处只钉 text/thinking 流式。
     events = [
-        _FE("content_block_start", index=0, content_block=_CB("tool_use", id="t1", name="x")),
-        _FE("content_block_delta", index=0, delta=_Delta(partial_json="{bad json")),
+        _FE("content_block_delta", index=0, delta=_Delta(text="hi")),
         _FE("content_block_stop", index=0),
     ]
     ad = AnthropicAdapter(_FakeAnthropicClient(_FakeAnthropicStream(events, _Final([]))))
-    tools = []
+    texts = []
     asyncio.run(ad.stream(model="claude-x", system=None, tools=[], messages=[],
-                          thinking_mode="disabled", callbacks=StreamCallbacks(tool_block=tools.append)))
-    assert tools == [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]
+                          thinking_mode="disabled", callbacks=StreamCallbacks(text_block=texts.append)))
+    assert texts == ["hi"]
 
 
 # ─── OpenAI fake SDK stream ──────────────────────────────────────────────────
