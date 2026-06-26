@@ -23,28 +23,22 @@ class SubAgentManager:
         self.agent = agent
 
     def running_background_count(self) -> int:
-        """当前并发运行的后台子 agent 数。
+        """当前并发运行的后台子 agent 数（单账本 = child-owned run record，docs/25 A2）。
 
-        普通 background subagent 以 live coroutine 的 ``_nanocode_run_id`` 和 child-owned
-        run record 为准；memory curator/eval/optimize 这类内部后台 agent 仍是 host task，
-        继续按 owner_agent_id 计入。shell 后台任务 owner_agent_id 为 None，不计。
+        所有后台子 agent（含 memory curator/eval）以 live coroutine 的 ``_nanocode_run_id`` +
+        child run record 为准。host task（后台 shell / 扩展任务）``owner_agent_id`` 恒为 None，
+        不计入子 agent 并发上限。
         """
         n = 0
         for t in self.agent._background_tasks:
             run_id = getattr(t, "_nanocode_run_id", None)
-            if run_id:
-                try:
-                    rec = self.agent._run_runtime.status(run_id)
-                except Exception:
-                    continue
-                if rec.status == "running":
-                    n += 1
+            if not run_id:
                 continue
-            tid = getattr(t, "_nanocode_task_id", None)
-            if not tid:
+            try:
+                rec = self.agent._run_runtime.status(run_id)
+            except Exception:
                 continue
-            rec = self.agent.task_manager.get_task(tid)
-            if rec and rec.owner_agent_id and rec.status == "running":
+            if rec.status == "running":
                 n += 1
         return n
 

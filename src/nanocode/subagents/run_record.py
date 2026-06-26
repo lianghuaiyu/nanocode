@@ -310,6 +310,7 @@ def create_run_record(
     model: dict[str, Any],
     prompt: str,
     status: str = "running",
+    inject_summary: bool = False,
 ) -> dict[str, Any]:
     now = _now()
     rd = run_dir(child_session_id)
@@ -349,6 +350,9 @@ def create_run_record(
         "resultEntryId": None,
         "resultPath": None,
         "error": None,
+        "resultSummary": None,
+        "injectSummary": inject_summary,
+        "injected": False,
         "pendingSteerCount": 0,
         "metrics": {
             "toolUses": 0,
@@ -375,6 +379,7 @@ def complete_run(
     prompt_entry_id: str | None = None,
     error: str | None = None,
     tokens: dict[str, int] | None = None,
+    result_summary: str | None = None,
 ) -> dict[str, Any]:
     path = write_result(child_session_id, result or "")
     snapshot = read_status(child_session_id)
@@ -395,6 +400,8 @@ def complete_run(
         "error": error,
         "metrics": metrics,
     })
+    if result_summary is not None:
+        snapshot["resultSummary"] = result_summary
     if prompt_entry_id is not None:
         snapshot["promptEntryId"] = prompt_entry_id
     write_status(child_session_id, snapshot)
@@ -402,3 +409,8 @@ def complete_run(
         "cancelled" if status == "cancelled" else "failed")
     append_event(child_session_id, event_type, status=status, resultPath=path, error=error)
     return snapshot
+
+
+def mark_injected(child_session_id: str) -> dict[str, Any]:
+    """标记该 run 的完成摘要已注入回父上下文（finished-task PUSH 去重，docs/25 A2）。"""
+    return update_status(child_session_id, injected=True)

@@ -73,7 +73,7 @@ def test_pending_steer_drains_through_child_agent_session_record_event():
             model={"provider": "anthropic", "modelId": "m"},
             prompt="initial",
         )
-        queued = queue_steer("CHILD", "narrow the search", delivery="steer", wake=False)
+        queued = queue_steer("CHILD", "narrow the search", delivery="steer")
         assert queued["state"] == "queued"
 
         assert drain_pending_steers(child, delivery="steer") == 1
@@ -222,7 +222,7 @@ def test_terminal_steer_rejected_use_resume():
         lease.close()
 
     with pytest.raises(RuntimeError, match="use resume"):
-        AgentRunRuntime().send("CHILD", "change scope", delivery="steer", wake=False)
+        AgentRunRuntime().send("CHILD", "change scope", delivery="steer")
 
 
 def test_rebind_marks_nonterminal_run_without_live_runner_lost():
@@ -277,4 +277,41 @@ def test_run_cancel_without_live_coroutine_marks_lost_not_cancelled():
     import asyncio
     res = asyncio.run(parent.run_cancel("CHILD"))
     assert "marked lost" in res
+    assert run_record.read_status("CHILD")["status"] == "lost"
+
+
+def test_list_is_readonly_view_does_not_persist_lost():
+    """A4a (docs/25)：重绘/列举 list() 对「非终态 + 无 live coroutine」的 run 只在内存里显示
+    lost，不落盘、不发事件；显式 rebind() 才持久化 lost。"""
+    parent = _agent("PARENT")
+    child, lease = _child(parent, "CHILD")
+    try:
+        run_record.create_run_record(
+            child_session_id="CHILD",
+            parent_session_id="PARENT",
+            spawn_entry_id=parent._session_mgr.get_leaf(),
+            tool_call_id=None,
+            agent_type="coder",
+            description="test run",
+            background=True,
+            context_mode="fresh",
+            isolation="shared",
+            worktree_path=None,
+            model={"provider": "anthropic", "modelId": "m"},
+            prompt="initial",
+        )
+    finally:
+        lease.close()
+
+    rt = AgentRunRuntime()
+    events_before = len(run_record.read_events("CHILD"))
+    for _ in range(5):  # 多次重绘
+        recs = rt.list("PARENT", live_run_ids=set())
+        assert [(r.child_session_id, r.status) for r in recs] == [("CHILD", "lost")]
+    # 视图显示 lost，但磁盘仍非终态（未写 lost），且零新事件（重绘零写）
+    assert run_record.read_status("CHILD")["status"] == "running"
+    assert not any(e["type"] == "lost" for e in run_record.read_events("CHILD"))
+    assert len(run_record.read_events("CHILD")) == events_before
+    # 显式 rebind 才持久化 lost
+    rt.rebind("PARENT", live_run_ids=set())
     assert run_record.read_status("CHILD")["status"] == "lost"

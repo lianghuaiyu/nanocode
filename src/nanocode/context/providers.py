@@ -330,31 +330,52 @@ class SkillListingProvider:
 
 
 class FinishedTasksProvider:
-    """终态且未注入的后台任务提醒（lifecycle=turn）。commit 把任务标 injected。"""
+    """终态且未注入的后台完成提醒（lifecycle=turn）。commit 把来源标 injected。
+
+    双源（docs/25 A2）：host TaskManager 任务（后台 shell 等）+ child-session run_record
+    中 `inject_summary=True` 的子 agent run（memory curator/eval）。普通后台子 agent
+    `inject_summary=False`，仍走 PULL（模型主动 agent resume 取），不在此 PUSH。
+    """
 
     id = "finished_tasks"
 
     def __init__(self, agent) -> None:
         self.agent = agent
         self._pending: list = []
+        self._pending_runs: list = []
 
     def collect(self) -> "ContextPack | None":
-        from ..tasks.inject import collect_pending_injections, render_task_reminder
+        from ..tasks.inject import (
+            collect_pending_injections, render_run_reminder, render_task_reminder)
+        from ..runs.models import TERMINAL_RUN_STATUSES
         a = self.agent
         pending = collect_pending_injections(a.task_manager)
-        if not pending:
+        try:
+            runs = [r for r in a._run_runtime.list(a.session_id, live_run_ids=a._live_run_ids())
+                    if r.inject_summary and not r.injected and r.status in TERMINAL_RUN_STATUSES]
+        except Exception:
+            runs = []
+        runs = sorted(runs, key=lambda r: r.run_id)
+        if not pending and not runs:
             return None
         self._pending = pending
-        text = "\n\n".join(render_task_reminder(t) for t in pending)
+        self._pending_runs = runs
+        text = "\n\n".join(
+            [render_task_reminder(t) for t in pending]
+            + [render_run_reminder(r) for r in runs])
         return ContextPack(id="finished_tasks", kind="finished_tasks", content=text,
                            lifecycle="turn", cache_policy="append_only",
                            persist_policy="custom_message", priority=38,
                            provenance={"source": "FinishedTasksProvider",
-                                       "task_ids": [t.id for t in pending]})
+                                       "task_ids": [t.id for t in pending],
+                                       "run_ids": [r.run_id for r in runs]})
 
     def commit(self) -> None:
+        from ..subagents import run_record
         for t in self._pending:
             self.agent.task_manager.update_task(t.id, injected=True)
+        for r in self._pending_runs:
+            run_record.mark_injected(r.run_id)
 
 
 class MemoryRecallProvider:

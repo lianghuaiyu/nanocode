@@ -83,6 +83,9 @@ class AgentRunRecord:
     ended_at: str | None = None
     error: str | None = None
     pending_steer_count: int = 0
+    result_summary: str | None = None
+    inject_summary: bool = False
+    injected: bool = False
     summary: str | None = None
 
     @classmethod
@@ -110,6 +113,9 @@ class AgentRunRecord:
             ended_at=status.get("endedAt"),
             error=status.get("error"),
             pending_steer_count=int(status.get("pendingSteerCount") or 0),
+            result_summary=status.get("resultSummary"),
+            inject_summary=bool(status.get("injectSummary")),
+            injected=bool(status.get("injected")),
             summary=summary,
         )
 

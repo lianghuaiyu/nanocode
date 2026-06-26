@@ -4,18 +4,22 @@
 （_run_memory_consolidate 内子 agent 完成后跑）。绕开 _execute_agent_tool（其 type 归一会把
 memory-curator 改成 coder 拿全工具），直接 get_sub_agent_config + _build_sub_agent(background=True)。
 
+docs/25 A2：单账本 = child-session run_record（不再镜像 host TaskManager）；完成摘要经
+inject_summary=True 由 FinishedTasksProvider PUSH 回父上下文。
+
 测试不跑真 API：spy _build_sub_agent 注入 stub run_once 返回固定 JSON；apply_plan 在隔离
 NANOCODE_HOME 真跑（先 seed 几个 .md 到 project_memory_dir）。
 """
 
 import asyncio
 import json
-
-import pytest
+import re
 
 from nanocode.agent.engine import Agent
 from nanocode.memory.service import MemoryService, MemoryServiceConfig
 from nanocode.paths import project_memory_dir
+from nanocode.runs.models import TERMINAL_RUN_STATUSES
+from nanocode.subagents import run_record
 from nanocode.subagents.prompts import MEMORY_CURATOR_TYPE
 
 
@@ -67,14 +71,23 @@ def _spy_build_with_stub(parent, *, run_once=None, text=None, tokens=None, captu
     parent._build_sub_agent = _spy
 
 
-async def _wait_task_terminal(parent, task_id, tries=200, delay=0.02):
-    from nanocode.tasks.models import TERMINAL_TASK_STATUSES
+def _run_id(res: str) -> str:
+    """从 spawn 返回串里抽 child-session run id（"...run sess_xxx."）。"""
+    m = re.search(r"run (sess_[A-Za-z0-9_]+)", res)
+    assert m, f"no run id in: {res!r}"
+    return m.group(1)
+
+
+async def _wait_run_terminal(parent, run_id, tries=200, delay=0.02):
     for _ in range(tries):
-        t = parent.task_manager.get_task(task_id)
-        if t and t.status in TERMINAL_TASK_STATUSES:
-            return t
+        try:
+            st = run_record.read_status(run_id)
+        except FileNotFoundError:
+            st = None
+        if st and st["status"] in TERMINAL_RUN_STATUSES:
+            return st
         await asyncio.sleep(delay)
-    return parent.task_manager.get_task(task_id)
+    return run_record.read_status(run_id)
 
 
 _DELETE_PLAN = json.dumps({
@@ -101,29 +114,28 @@ def test_applies_plan_and_sets_summary():
 
     async def scenario():
         res = await parent._spawn_memory_consolidate()
-        task_id = res.split()[-1] if "task" not in res else "task-001"
-        return await _wait_task_terminal(parent, "task-001"), res
+        run_id = _run_id(res)
+        return await _wait_run_terminal(parent, run_id), run_id
 
-    rec, res = asyncio.run(scenario())
+    st, run_id = asyncio.run(scenario())
     # 子 agent 用 memory-curator 类型 + background=True
     assert captured["kw"]["agent_type"] == MEMORY_CURATOR_TYPE
     assert captured["kw"]["background"] is True
-    # task kind=memory_consolidate, completed, summary 含 archived/rewritten/backup=
-    assert rec.kind == "memory_consolidate"
-    assert rec.status == "completed"
-    summary = rec.result_summary or ""
+    # run_record completed，summary 含 archived/rewritten/backup=
+    assert st["status"] == "completed"
+    assert st["agentType"] == MEMORY_CURATOR_TYPE
+    summary = st.get("resultSummary") or ""
     assert "archived" in summary
     assert "rewritten" in summary
     assert "backup=" in summary
+    assert st["injectSummary"] is True
     # 真落库：stale 归档（原文件不在），goals 改写
     mem = project_memory_dir()
     assert not (mem / "stale_note.md").exists()
     assert "Ship v3 by Q2" in (mem / "project_goals.md").read_text()
-    # curator child run completed; task id remains a host job id
-    assert rec.owner_agent_id and rec.owner_agent_id.startswith("sess_")
-    run = json.loads(parent.run_status(rec.owner_agent_id))
-    assert run["status"] == "completed"
-    assert run["agent_type"] == MEMORY_CURATOR_TYPE
+    # 单账本：不再镜像 host TaskManager
+    assert run_id.startswith("sess_")
+    assert parent.task_manager.list_tasks() == []
 
 
 # ─── 2. archives_not_hard_delete ─────────────────────────────
@@ -135,8 +147,8 @@ def test_archives_not_hard_delete():
     _spy_build_with_stub(parent, text=_DELETE_PLAN)
 
     async def scenario():
-        await parent._spawn_memory_consolidate()
-        await _wait_task_terminal(parent, "task-001")
+        res = await parent._spawn_memory_consolidate()
+        await _wait_run_terminal(parent, _run_id(res))
 
     asyncio.run(scenario())
     from nanocode.memory.maintenance import _archive_dir
@@ -154,12 +166,12 @@ def test_bad_json_no_apply_completed():
     _spy_build_with_stub(parent, text="this is not json at all {")
 
     async def scenario():
-        await parent._spawn_memory_consolidate()
-        return await _wait_task_terminal(parent, "task-001")
+        res = await parent._spawn_memory_consolidate()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "completed"
-    assert "no changes" in (rec.result_summary or "").lower()
+    st = asyncio.run(scenario())
+    assert st["status"] == "completed"
+    assert "no changes" in (st.get("resultSummary") or "").lower()
     # 记忆未动
     assert (mem / "stale_note.md").exists()
     assert "ship v2 by end of Q1" in (mem / "project_goals.md").read_text()
@@ -174,12 +186,12 @@ def test_empty_plan_completed_no_changes():
     _spy_build_with_stub(parent, text=_EMPTY_PLAN)
 
     async def scenario():
-        await parent._spawn_memory_consolidate()
-        return await _wait_task_terminal(parent, "task-001")
+        res = await parent._spawn_memory_consolidate()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "completed"
-    assert "no changes" in (rec.result_summary or "").lower()
+    st = asyncio.run(scenario())
+    assert st["status"] == "completed"
+    assert "no changes" in (st.get("resultSummary") or "").lower()
     # 记忆未动
     assert (mem / "stale_note.md").exists()
 
@@ -193,35 +205,40 @@ def test_no_memories_skips_no_task():
     project_memory_dir()
     res = asyncio.run(parent._spawn_memory_consolidate())
     assert "No memories to consolidate" in res
-    # 不建 task / subagent
+    # 不建 task / run
     assert parent.task_manager.list_tasks() == []
     assert json.loads(parent.run_list()) == []
 
 
-# ─── 6. finished_task_injected_with_summary ──────────────────
+# ─── 6. finished_run_injected_with_summary ───────────────────
 
 
-def test_finished_task_injected_with_summary():
+def test_finished_run_injected_with_summary():
+    """A2：完成摘要经 run_record（inject_summary=True）PUSH 回父上下文，并标 injected。"""
     parent = _agent()
     _seed_memories()
     _spy_build_with_stub(parent, text=_DELETE_PLAN)
 
     async def scenario():
-        await parent._spawn_memory_consolidate()
-        await _wait_task_terminal(parent, "task-001")
+        res = await parent._spawn_memory_consolidate()
+        run_id = _run_id(res)
+        await _wait_run_terminal(parent, run_id)
+        return run_id
 
-    asyncio.run(scenario())
+    run_id = asyncio.run(scenario())
     from nanocode.session import tree as _T
     from nanocode.session.manager import SessionManager as _SM
-    parent._session_mgr = parent._session_mgr or _SM.create("memcon_inj")
+    if parent._session_mgr is None:
+        parent._session_mgr = _SM.create("memsid")
     parent.agent_session.inject_finished_tasks()
     content = next(e.data["content"] for e in parent._session_mgr.entries()
                    if e.type == _T.CUSTOM_MESSAGE and e.data.get("customType") == "finished_tasks")
     assert "<system-reminder>" in content
-    assert "task-001" in content
-    assert "memory_consolidate" in content
+    assert run_id in content
+    assert "memory-curator" in content
     assert "archived" in content
-    assert parent.task_manager.get_task("task-001").injected is True
+    # 去重：run 标 injected，下一轮不再 PUSH
+    assert run_record.read_status(run_id)["injected"] is True
 
 
 # ─── 7. curator_error_marks_failed ───────────────────────────
@@ -239,15 +256,12 @@ def test_curator_error_marks_failed():
     _spy_build_with_stub(parent, run_once=_raising)
 
     async def scenario():
-        await parent._spawn_memory_consolidate()
-        return await _wait_task_terminal(parent, "task-001")
+        res = await parent._spawn_memory_consolidate()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "failed"
-    assert "curator boom" in (rec.error or "")
-    run = json.loads(parent.run_status(rec.owner_agent_id))
-    assert run["status"] == "failed"
-    assert "curator boom" in (run["error"] or "")
+    st = asyncio.run(scenario())
+    assert st["status"] == "failed"
+    assert "curator boom" in (st.get("error") or "")
 
 
 # ─── 8. memory_tool_consolidate_action_delegates ─────────────
@@ -260,11 +274,13 @@ def test_memory_tool_consolidate_action_delegates():
 
     async def scenario():
         res = await parent._execute_tool_call("memory", {"action": "consolidate"})
-        await _wait_task_terminal(parent, "task-001")
+        await _wait_run_terminal(parent, _run_id(res))
         return res
 
     res = asyncio.run(scenario())
-    assert "task-001" in res
-    rec = parent.task_manager.get_task("task-001")
-    assert rec is not None
-    assert rec.kind == "memory_consolidate"
+    assert "run sess_" in res
+    st = run_record.read_status(_run_id(res))
+    assert st["agentType"] == MEMORY_CURATOR_TYPE
+    assert st["status"] == "completed"
+    # 单账本：tool 委派也不建 host task
+    assert parent.task_manager.list_tasks() == []

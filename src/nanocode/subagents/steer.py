@@ -49,8 +49,7 @@ def queued_count(child_session_id: str) -> int:
     return sum(1 for item in _latest_records(child_session_id) if item.get("state") == "queued")
 
 
-def queue_steer(child_session_id: str, prompt: str, *, delivery: str = "steer",
-                wake: bool = False) -> dict[str, Any]:
+def queue_steer(child_session_id: str, prompt: str, *, delivery: str = "steer") -> dict[str, Any]:
     if delivery not in DELIVERIES:
         raise ValueError(f"invalid delivery: {delivery}")
     status = run_record.read_status(child_session_id)
@@ -59,7 +58,6 @@ def queue_steer(child_session_id: str, prompt: str, *, delivery: str = "steer",
     record = {
         "id": f"steer_{uuid4().hex[:12]}",
         "delivery": delivery,
-        "wakeRequested": bool(wake),
         "prompt": prompt,
         "queuedAt": _now(),
         "state": "queued",
@@ -68,7 +66,7 @@ def queue_steer(child_session_id: str, prompt: str, *, delivery: str = "steer",
     count = queued_count(child_session_id)
     run_record.update_status(child_session_id, pendingSteerCount=count)
     run_record.append_event(child_session_id, "steer_queued", steerId=record["id"],
-                            delivery=delivery, wakeRequested=bool(wake))
+                            delivery=delivery)
     return record
 
 

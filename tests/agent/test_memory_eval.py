@@ -1,10 +1,11 @@
 import asyncio
 import json
-
-import pytest
+import re
 
 from nanocode.agent.engine import Agent
 from nanocode.paths import project_memory_dir
+from nanocode.runs.models import TERMINAL_RUN_STATUSES
+from nanocode.subagents import run_record
 from nanocode.subagents.prompts import MEMORY_EVAL_CURATOR_TYPE
 from nanocode.memory import eval_store
 from nanocode.memory.service import MemoryService, MemoryServiceConfig
@@ -53,14 +54,22 @@ def _spy_build_with_stub(parent, *, text, captured=None, tokens=None):
     parent._build_sub_agent = _spy
 
 
-async def _wait_terminal(parent, task_id, tries=200, delay=0.02):
-    from nanocode.tasks.models import TERMINAL_TASK_STATUSES
+def _run_id(res: str) -> str:
+    m = re.search(r"run (sess_[A-Za-z0-9_]+)", res)
+    assert m, f"no run id in: {res!r}"
+    return m.group(1)
+
+
+async def _wait_run_terminal(parent, run_id, tries=200, delay=0.02):
     for _ in range(tries):
-        t = parent.task_manager.get_task(task_id)
-        if t and t.status in TERMINAL_TASK_STATUSES:
-            return t
+        try:
+            st = run_record.read_status(run_id)
+        except FileNotFoundError:
+            st = None
+        if st and st["status"] in TERMINAL_RUN_STATUSES:
+            return st
         await asyncio.sleep(delay)
-    return parent.task_manager.get_task(task_id)
+    return run_record.read_status(run_id)
 
 
 _GOOD = json.dumps({"candidates": [
@@ -90,18 +99,21 @@ def test_generates_pending_candidates():
 
     async def scenario():
         res = await parent._spawn_memory_eval()
-        return await _wait_terminal(parent, "task-001"), res
+        return await _wait_run_terminal(parent, _run_id(res)), res
 
-    rec, res = asyncio.run(scenario())
+    st, res = asyncio.run(scenario())
     assert captured["kw"]["agent_type"] == MEMORY_EVAL_CURATOR_TYPE
     assert captured["kw"]["background"] is True
-    assert rec.kind == "memory_eval"
-    assert rec.status == "completed"
-    assert "2 pending eval candidate" in (rec.result_summary or "")
+    assert st["agentType"] == MEMORY_EVAL_CURATOR_TYPE
+    assert st["status"] == "completed"
+    assert st["injectSummary"] is True
+    assert "2 pending eval candidate" in (st.get("resultSummary") or "")
     pend = eval_store.list_pending()
     assert len(pend) == 2
     # 宿主强制填 session_id = self.session_id
     assert all(c.source.get("session_id") == SID for c in pend)
+    # 单账本：不再镜像 host TaskManager
+    assert parent.task_manager.list_tasks() == []
 
 
 def test_invalid_candidate_skipped_not_failed():
@@ -109,13 +121,14 @@ def test_invalid_candidate_skipped_not_failed():
     _spy_build_with_stub(parent, text=_ONE_BAD)
 
     async def scenario():
-        await parent._spawn_memory_eval()
-        return await _wait_terminal(parent, "task-001")
+        res = await parent._spawn_memory_eval()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "completed"          # 非法候选不让 task failed
-    assert "1 pending eval candidate" in (rec.result_summary or "")
-    assert "1 skipped" in (rec.result_summary or "")
+    st = asyncio.run(scenario())
+    assert st["status"] == "completed"          # 非法候选不让 run failed
+    summary = st.get("resultSummary") or ""
+    assert "1 pending eval candidate" in summary
+    assert "1 skipped" in summary
     assert len(eval_store.list_pending()) == 1
 
 
@@ -124,12 +137,12 @@ def test_bad_json_completed_zero():
     _spy_build_with_stub(parent, text="not json {")
 
     async def scenario():
-        await parent._spawn_memory_eval()
-        return await _wait_terminal(parent, "task-001")
+        res = await parent._spawn_memory_eval()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "completed"
-    assert "0 pending eval candidate" in (rec.result_summary or "")
+    st = asyncio.run(scenario())
+    assert st["status"] == "completed"
+    assert "0 pending eval candidate" in (st.get("resultSummary") or "")
     assert eval_store.list_pending() == []
 
 
@@ -156,9 +169,9 @@ def test_curator_error_marks_failed():
     parent._build_sub_agent = _spy
 
     async def scenario():
-        await parent._spawn_memory_eval()
-        return await _wait_terminal(parent, "task-001")
+        res = await parent._spawn_memory_eval()
+        return await _wait_run_terminal(parent, _run_id(res))
 
-    rec = asyncio.run(scenario())
-    assert rec.status == "failed"
-    assert "eval curator boom" in (rec.error or "")
+    st = asyncio.run(scenario())
+    assert st["status"] == "failed"
+    assert "eval curator boom" in (st.get("error") or "")

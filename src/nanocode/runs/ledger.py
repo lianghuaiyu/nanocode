@@ -55,6 +55,31 @@ class RunLedger:
             records.append(rec)
         return records
 
+    def view_for_parent(
+        self,
+        parent_session_id: str,
+        *,
+        live_run_ids: set[str] | frozenset[str] | None = None,
+    ) -> list[AgentRunRecord]:
+        """只读视图（docs/25 A4a）：非终态 + 无 live coroutine 的 run 在**内存里**显示为
+        ``lost``，但不落盘、不发事件——listing/footer/``/agents`` 重绘专用。
+
+        持久化 ``mark_lost`` 只在显式生命周期事件触发（``run_cancel`` / steer·resume 前的
+        ``_reconcile_run`` / 显式 ``rebind``），不在高频重绘里产生写放大或误判。
+        """
+        from dataclasses import replace
+        live = set(live_run_ids or set())
+        records: list[AgentRunRecord] = []
+        for child_id in children(parent_session_id):
+            try:
+                rec = self.replay(child_id)
+            except FileNotFoundError:
+                continue
+            if rec.status not in TERMINAL_RUN_STATUSES and child_id not in live:
+                rec = replace(rec, status="lost", error="no live coroutine (read-only view)")
+            records.append(rec)
+        return records
+
     def mark_lost(self, child_session_id: str, *, reason: str) -> AgentRunRecord:
         rec = self.replay(child_session_id)
         if rec.status in TERMINAL_RUN_STATUSES:

@@ -16,10 +16,6 @@ SCHEMA = {
                 "type": "string",
                 "description": "steer or follow_up. Default: steer.",
             },
-            "wake": {
-                "type": "boolean",
-                "description": "Whether this send is allowed to wake an idle child. Default: false.",
-            },
         },
         "required": ["child_session_id", "prompt"],
     },
@@ -31,5 +27,4 @@ def run(ctx, inp: dict) -> str:
         inp.get("child_session_id", ""),
         inp.get("prompt", ""),
         delivery=inp.get("delivery") or "steer",
-        wake=bool(inp.get("wake")),
     )
