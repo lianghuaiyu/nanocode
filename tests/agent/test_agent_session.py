@@ -22,7 +22,7 @@ def _agent(**kw):
 
 
 def test_chat_delegates_to_run_turn():
-    # docs/16 #3c 方向反转：turn shell 在 AgentSession.run_turn，Agent.chat 是薄公开入口。
+    # docs/16 #3c 方向反转：turn shell 在 AgentSession.run_turn，Agent._chat_internal 是薄内部入口。
     a = _agent()
     seen = []
 
@@ -30,11 +30,23 @@ def test_chat_delegates_to_run_turn():
         seen.append(prompt)
 
     a.agent_session.run_turn = fake_run_turn
-    asyncio.run(a.chat("hello"))
+    asyncio.run(a._chat_internal("hello"))
     assert seen == ["hello"]
     s = AgentSession(a)
     assert s.session_id == a.session_id
     assert s.aborted is a._aborted
+
+
+def test_ensure_session_lease_fails_loud_without_runtime():
+    # docs/23 Phase 4：缺 runtime 注入的写者租约时 fail loud（不再自取）；经 helper 注入后即恢复。
+    import pytest
+    from .._helpers import attach_runtime_agent
+    a = _agent()
+    with pytest.raises(RuntimeError, match="No active session writer lease"):
+        a._ensure_session_lease()
+    attach_runtime_agent(a)
+    a._ensure_session_lease()                # 注入后即 no-op，不再抛
+    assert a._session_mgr is not None
 
 
 def test_move_to_navigates_in_file_and_reloads():

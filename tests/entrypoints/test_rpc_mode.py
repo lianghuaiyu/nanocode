@@ -16,6 +16,8 @@ from nanocode.entrypoints.rpc import run_rpc_mode
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -73,6 +75,7 @@ def _run(agent, steps, monkeypatch):
     out = []
     monkeypatch.setattr(sys, "stdout", _CapStdout(out))
     monkeypatch.setattr(sys, "stdin", _GatedStdin(steps, out))
+    attach_runtime_agent(agent)                  # 白盒 runtime turn：显式注入写者租约（docs/23 Phase 4）
     rt = AgentRuntime()
     thread = rt._attach_agent(agent)
     host = RuntimeHost(rt, thread, interactive=False)

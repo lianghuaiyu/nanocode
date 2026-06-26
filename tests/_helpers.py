@@ -43,3 +43,18 @@ def make_leased_agent(session_id: str, **agent_kw):
     mgr = leased_manager(session_id)
     a._session_mgr = mgr
     return a, mgr
+
+
+def attach_runtime_agent(agent):
+    """给一个**已构造**的 Agent 注入一把已加锁的会话写者租约（白盒等价于 runtime/spawn 的
+    lease 注入）。docs/23 Phase 4：`_ensure_session_lease` 不再自取——直接驱动 turn loop
+    （`Agent._chat_internal` / `run_once` / `clear_history`）或显式取 lease 的白盒用例经此注入。
+
+    复用 agent 自身的 `_tree_session_id` / `_child_parent_session`（与旧自取语义逐字一致），
+    故主 agent 与白盒子 agent 都适用。返回该 agent，便于链式调用。"""
+    from nanocode.session.lease import SessionLease
+    lease = SessionLease.open_or_create(
+        agent._tree_session_id, parent_session=agent._child_parent_session)
+    agent._session_lease = lease
+    agent._session_mgr = lease.manager
+    return agent

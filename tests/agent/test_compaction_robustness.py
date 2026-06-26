@@ -11,6 +11,8 @@ import pytest
 from nanocode.agent.engine import Agent
 from nanocode.agent.providers import is_context_overflow_error
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -60,7 +62,8 @@ def test_overflow_compacts_and_retries_once():
 
     a._provider.stream = fake_stream
     a.agent_session.compact = fake_compact
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
     assert calls == {"stream": 2, "compact": 1}     # 压缩一次 + 重试成功，turn 正常收尾
 
 
@@ -76,8 +79,9 @@ def test_overflow_twice_propagates():
 
     a._provider.stream = always_overflow
     a.agent_session.compact = fake_compact
+    attach_runtime_agent(a)
     with pytest.raises(RuntimeError):
-        asyncio.run(a.chat("hello"))
+        asyncio.run(a._chat_internal("hello"))
     assert calls["compact"] == 1                    # 每 turn 至多恢复一次，二次如实上抛
 
 
@@ -93,8 +97,9 @@ def test_non_overflow_errors_do_not_trigger_compaction():
 
     a._provider.stream = boom
     a.agent_session.compact = fake_compact
+    attach_runtime_agent(a)
     with pytest.raises(RuntimeError):
-        asyncio.run(a.chat("hello"))
+        asyncio.run(a._chat_internal("hello"))
     assert calls["compact"] == 0
 
 

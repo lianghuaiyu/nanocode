@@ -1,6 +1,8 @@
 import asyncio
 from nanocode.agent.engine import Agent
 
+from .._helpers import attach_runtime_agent
+
 
 def _agent():
     return Agent(api_key="test")
@@ -68,6 +70,7 @@ def test_clear_resets_hooks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = _agent()
     a._active_hooks = [{"skill": "g", "event": "pre-tool-use", "matcher": ["*"], "command": "true", "timeout_ms": 1}]
+    attach_runtime_agent(a)
     a.agent_session.clear_history()
     assert a._active_hooks == []
 

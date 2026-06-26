@@ -397,9 +397,12 @@ class Agent(PlanModeMixin):
 
     # ─── Main entry point ────────────────────────────────────
 
-    async def chat(self, user_message: str) -> None:
-        """公开 turn 入口：委托 AgentSession.run_turn（turn shell，docs/16 #3c）。
-        取消吞成 _aborted=True 并正常返回的契约由 run_turn 保持。"""
+    async def _chat_internal(self, user_message: str) -> None:
+        """内部 turn 入口：委托 AgentSession.run_turn（turn shell，docs/16 #3c）。
+
+        docs/23 Phase 4：外部/生产调用方必须经 RuntimeThread.run()；这是 run_once 等内部
+        路径专用的薄 helper，不再作公开 turn 入口。取消吞成 _aborted=True 并正常返回的契约
+        由 run_turn 保持。"""
         await self.agent_session.run_turn(user_message)
 
     # ─── docs/15 Phase 3 / docs/16 #3b：session-context 注入（项目指令 + memory 静态段）已迁入
@@ -413,7 +416,7 @@ class Agent(PlanModeMixin):
         self.reset_final_text()
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
-        await self.chat(prompt)
+        await self._chat_internal(prompt)
         return {
             "text": self._captured_text(),
             "tokens": {
@@ -512,16 +515,13 @@ class Agent(PlanModeMixin):
     def _ensure_session_lease(self) -> None:
         """确保本 agent 持有一把会话写者租约（已加锁的 SessionManager）——在每个 turn 开始处调用。
 
-        docs/14 SessionLease：写者身份归 runtime 的 active-thread lease。生产路径（CLI/REPL/一次性/
-        子 agent spawn）由 runtime 经 `SessionLease` 注入 `_session_mgr`，此处即 no-op。headless / SDK /
-        直接构造（含测试）无 runtime 注入时，在 turn 活动期自取一把**加锁** lease（经
-        `SessionLease.open_or_create`，绝非未加锁 create、绝非 flat fallback）。取锁时机在 turn 活动期、
-        而非 `__init__`——构造模型 core 不决定写者身份、不占 fd。"""
-        if self._session_mgr is not None:
-            return
-        from ..session.lease import SessionLease
-        self._session_mgr = SessionLease.open_or_create(
-            self._tree_session_id, parent_session=self._child_parent_session).manager
+        docs/14 SessionLease / docs/23 Phase 4：写者身份归 runtime 的 active-thread lease。生产路径
+        （CLI/REPL/一次性/子 agent spawn）由 runtime 经 `SessionLease` 注入 `_session_mgr`（spawn 给
+        子 agent 注入 child 租约），此处即 no-op。缺注入时 **fail loud**——绝不自取一把 lease，因为
+        自取会绕开 runtime 的单写者所有权。白盒测试经 `tests._helpers.attach_runtime_agent` 显式注入。"""
+        if self._session_mgr is None:
+            raise RuntimeError(
+                "No active session writer lease. Start the agent through AgentRuntime.")
 
     @property
     def agent_session(self):

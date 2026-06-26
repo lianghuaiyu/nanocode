@@ -12,6 +12,8 @@ from nanocode.session.agent import AgentSession
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -65,7 +67,8 @@ def test_anthropic_serial_tool_round_tree_and_consistency():
         return _FakeResp([_FakeBlock("text", text="done")], stop_reason="end_turn")
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("list"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("list"))
 
     assert _tree_roles("evt_anth") == ["user", "assistant", "toolResult", "assistant"]
     msgs = _tree_msgs("evt_anth")
@@ -93,7 +96,8 @@ def test_anthropic_early_exec_path_tree_and_consistency():
         return _FakeResp([_FakeBlock("text", text="ok")], stop_reason="end_turn")
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("scan"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("scan"))
 
     assert _tree_roles("evt_early") == ["user", "assistant", "toolResult", "assistant"]
     tr = _tree_msgs("evt_early")[2]
@@ -128,7 +132,8 @@ def test_openai_concurrent_batch_tree_and_consistency():
                              "message": {"role": "assistant", "content": "done"}}]}
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("go"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("go"))
 
     roles = _tree_roles("evt_oai_batch")
     assert roles == ["user", "assistant", "toolResult", "toolResult", "assistant"]
@@ -162,7 +167,8 @@ def test_openai_denied_tool_result_lands_in_tree(monkeypatch):
                              "message": {"role": "assistant", "content": "ok"}}]}
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("try"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("try"))
 
     msgs = _tree_msgs("evt_oai_deny")
     assert [m["role"] for m in msgs] == ["user", "assistant", "toolResult", "assistant"]

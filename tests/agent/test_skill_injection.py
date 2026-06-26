@@ -3,6 +3,8 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 def _custom_msgs(mgr, kind=None):
     return [e.data.get("content", "") for e in mgr.entries() if e.type == T.CUSTOM_MESSAGE
@@ -63,6 +65,7 @@ def test_clear_history_resets_skill_state(tmp_path, monkeypatch):
     a = _agent()
     a._sent_skill_names.add("x")
     a._pending_skill_bodies.append(("x", "b"))
+    attach_runtime_agent(a)
     a.agent_session.clear_history()
     assert a._sent_skill_names == set() and a._pending_skill_bodies == []
 
@@ -98,5 +101,6 @@ def test_clear_resets_activation(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = _agent()
     a._activated_path_skills.add("x")
+    attach_runtime_agent(a)
     a.agent_session.clear_history()
     assert a._activated_path_skills == set()

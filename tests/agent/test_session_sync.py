@@ -16,6 +16,8 @@ from nanocode.session import tree as T
 from nanocode.session.lease import SessionLease
 from nanocode.session.render import ModelCtx, render
 
+from .._helpers import attach_runtime_agent
+
 ANTH = ModelCtx("anthropic", "anthropic", "claude-x")
 
 
@@ -51,7 +53,8 @@ def test_hydrate_state_rebuilds_request_from_tree():
         return _FakeResp([_FakeBlock("text", text="hi there")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
 
     sess = AgentSession(a)
     state = sess.hydrate_state()
@@ -79,7 +82,8 @@ def test_hydrate_tool_turn_rebuilds_and_consistent():
         return _FakeResp([_FakeBlock("text", text="done")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("list"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("list"))
     sess = AgentSession(a)
     built = a._session_mgr.build_context()
     # docs/15 Phase 3 cutover：真实 round 在末尾,前面是 session-context 包。

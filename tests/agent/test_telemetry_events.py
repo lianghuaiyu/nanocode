@@ -15,6 +15,8 @@ from nanocode.agent.events import ContextInjected, ToolBlocked
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -58,7 +60,8 @@ def test_live_turn_emits_llm_request_permission_and_single_turn_end():
         return _FakeResp([_FakeBlock("text", text="done")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hi"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hi"))
 
     # LLM_REQUEST：每次请求一条，字段形状与原 _tree_event 直写一致。
     reqs = _entries("tel2_live", T.LLM_REQUEST)
@@ -85,7 +88,8 @@ def test_budget_exceeded_entry_via_typed_event():
         return _FakeResp([_FakeBlock("tool_use", id="t1", name="list_files", input={"path": "."})])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("go"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("go"))
 
     bud = _entries("tel2_budget", T.BUDGET_EXCEEDED)
     assert len(bud) == 1 and "Turn limit" in bud[0].data["reason"]
@@ -99,7 +103,8 @@ def test_aborted_turn_writes_single_cancelled_turn_end():
         return _FakeResp([_FakeBlock("text", text="partial")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hi"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hi"))
 
     te = _entries("tel2_abort", T.TURN_END)
     assert len(te) == 1 and te[0].data["finalStatus"] == "cancelled"
@@ -111,7 +116,7 @@ def test_tool_blocked_event_enriched_with_agent_identity():
     a = _agent("tel2_blocked")
     a.agent_type = "coder"
     a.artifact_id = "agent-1"
-    a._ensure_session_lease()
+    attach_runtime_agent(a)
     a.emit(ToolBlocked(tool="run_shell", reason="not_in_allowlist"))
     e = [e for e in a._session_mgr.entries() if e.type == T.TOOL_BLOCKED][0]
     assert e.data == {"tool": "run_shell", "reason": "not_in_allowlist",
@@ -122,7 +127,7 @@ def test_context_injected_emit_returns_write_result_for_dedup():
     a = _agent("tel2_ctx")
     # 无写者租约 → 树写失败 → False（调用方据此**不**推进 dedup）。
     assert a.emit(ContextInjected(custom_type="memory", content="m1")) is False
-    a._ensure_session_lease()
+    attach_runtime_agent(a)
     assert a.emit(ContextInjected(custom_type="memory", content="m1")) is True
     cm = [e for e in a._session_mgr.entries() if e.type == T.CUSTOM_MESSAGE]
     assert [e.data["customType"] for e in cm] == ["memory"]

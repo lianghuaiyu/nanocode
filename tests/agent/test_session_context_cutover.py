@@ -9,6 +9,8 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.lease import SessionLease
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeUsage:
     input_tokens = 1
@@ -46,14 +48,16 @@ def _proj_entries(mgr):
 
 def test_fresh_session_injects_project_instructions_once():
     a = _agent("cut1")
-    asyncio.run(a.chat("hi"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hi"))
     assert len(_proj_entries(a._session_mgr)) == 1
 
 
 def test_resume_same_session_does_not_reinject():
     a = _agent("cut2")
-    asyncio.run(a.chat("hi"))
-    asyncio.run(a.chat("again"))           # 同 session 第二轮：dedup,不重复注入
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hi"))
+    asyncio.run(a._chat_internal("again"))           # 同 session 第二轮：dedup,不重复注入
     assert len(_proj_entries(a._session_mgr)) == 1
 
 
@@ -68,7 +72,8 @@ def test_system_prompt_no_longer_bakes_project_or_memory():
 def test_subagent_does_not_get_session_context():
     a = _agent("cut3")
     a.is_sub_agent = True
-    asyncio.run(a.chat("hi"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hi"))
     assert _proj_entries(a._session_mgr) == []               # 子 agent 不注入项目指令
 
 
@@ -125,7 +130,8 @@ def test_per_customtype_dedup_not_suppressed_by_other_kind():
 
 def test_injected_pack_does_not_mutate_user_message():
     a = _agent("cut5")
-    asyncio.run(a.chat("hello world"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello world"))
     msg_entries = [e for e in a._session_mgr.entries() if e.type == T.MESSAGE]
     first_user = msg_entries[0].data["message"]
     assert first_user["role"] == "user" and first_user["content"] == "hello world"   # §8.5：user 未被污染

@@ -12,6 +12,8 @@ import asyncio
 from nanocode.agent.engine import Agent
 from nanocode.runtime import AgentRuntime
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -56,6 +58,7 @@ def _tool_turn_agent(sid):
 
 def test_turn_pushes_typed_envelopes_and_events_snapshot_matches():
     a = _tool_turn_agent("push1")
+    attach_runtime_agent(a)                                  # 白盒 runtime turn：显式注入写者租约
     thread = AgentRuntime()._attach_agent(a)
     received = []
     unsubscribe = thread.subscribe(received.append)

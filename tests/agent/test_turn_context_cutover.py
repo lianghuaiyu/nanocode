@@ -15,6 +15,8 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
+from .._helpers import attach_runtime_agent
+
 
 class _FakeBlock:
     def __init__(self, type="text", **kw):
@@ -63,7 +65,8 @@ def test_turn_requests_carry_volatile_tail_and_tree_stays_clean(monkeypatch):
         return _FakeResp([_FakeBlock("text", text="done")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
 
     today = date.today().isoformat()
     for req in captured["reqs"]:                              # 每个请求（含 turn 内第二迭代）都带快照
@@ -91,7 +94,8 @@ def test_user_message_is_recorded_before_volatile_collect(monkeypatch):
     monkeypatch.setattr("nanocode.session.agent.AgentSession._collect_turn_volatile",
                         fake_collect)
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
 
     assert seen["user_visible"]
 
@@ -115,10 +119,11 @@ def test_git_subprocess_runs_once_per_turn(monkeypatch):
         return _FakeResp([_FakeBlock("text", text="done")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("go"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("go"))
     assert n_iter["n"] == 3
     assert calls["n"] == 1                                    # per-turn 缓存：迭代间不重跑 git
-    asyncio.run(a.chat("again"))
+    asyncio.run(a._chat_internal("again"))
     assert calls["n"] == 2                                    # 下一 turn 重新收集（新鲜度即修复的 bug）
 
 
@@ -135,7 +140,7 @@ def test_sub_agent_gets_no_volatile_tail():
 
     sub._provider.stream = fake
     sub._session_mgr = SessionManager.create("ctx6_sub.child")
-    asyncio.run(sub.chat("task"))
+    asyncio.run(sub._chat_internal("task"))
     assert "Per-turn context" not in str(captured["messages"])
 
 
@@ -146,7 +151,8 @@ def test_context_ledger_records_full_turn_visibility():
         return _FakeResp([_FakeBlock("text", text="hi")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
 
     led = a._context_ledger
     assert led is not None and led.entries
@@ -191,7 +197,8 @@ def test_repo_map_in_request_tail_never_in_tree(tmp_path, monkeypatch):
         return _FakeResp([_FakeBlock("text", text="ok")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
     tail = str(captured["messages"][-1])
     assert "# Repo map" in tail and "unique_marker_fn" in tail   # volatile tail 携带
     blob = str([e.to_dict() for e in SessionManager.open("ctx6_rmap").entries()])
@@ -209,7 +216,8 @@ def test_repo_map_excludes_files_read_and_uses_mentions(tmp_path, monkeypatch):
         return _FakeResp([_FakeBlock("text", text="ok")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("look at unique_marker_fn"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("look at unique_marker_fn"))
     tail = str(captured["messages"][-1])
     assert "applib.py" in tail                                   # 被已读文件引用 + 提及 → 入图
     assert "caller.py:" not in tail                              # personal（已读）不渲染
@@ -229,6 +237,7 @@ def test_repo_map_settings_escape_hatch(tmp_path, monkeypatch):
         return _FakeResp([_FakeBlock("text", text="ok")])
 
     a._provider.stream = fake
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
     reset_permission_cache()
     assert "# Repo map" not in str(captured["messages"])         # 逃生阀关闭注入

@@ -9,6 +9,8 @@ from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager, session_file
 from nanocode.session.render import ModelCtx, render
 
+from .._helpers import attach_runtime_agent
+
 ANTH = ModelCtx("anthropic", "anthropic", "claude-x")
 
 
@@ -44,7 +46,8 @@ def test_message_end_writes_clean_tree():
         return _FakeResp([_FakeBlock("text", text="hi there")])
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("hello"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("hello"))
 
     assert session_file("s1e").exists()
     mgr = SessionManager.open("s1e")
@@ -78,7 +81,8 @@ def test_message_end_tool_turn_records_full_round():
         return _FakeResp([_FakeBlock("text", text="done")])
 
     a._provider.stream = fake_stream
-    asyncio.run(a.chat("list"))
+    attach_runtime_agent(a)
+    asyncio.run(a._chat_internal("list"))
 
     msgs = SessionManager.open("s1t").build_context().messages
     # 末尾是真实 round；前面是 session-context 包（proj + memory 指引）。
