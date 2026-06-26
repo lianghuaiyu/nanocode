@@ -57,6 +57,32 @@ def _push_cwd(cwd: str | None):
         os.chdir(old)
 
 
+def _child_cwd(host, *, cwd: str | None = None) -> str | None:
+    """子 agent 工作目录派生（docs/23 Step 7-S3，单一来源）。
+
+    worktree cwd 覆盖优先 → host 的 RuntimeServices.cwd → host._session_mgr._cwd() → None。
+    与搬迁前 build_sub_agent / apply_child_worktree / create_failed_run_record 三处内联派生
+    逐字一致。"""
+    if cwd is not None:
+        return cwd
+    services = getattr(host, "_runtime_services", None)
+    if services is not None:
+        return services.cwd
+    return host._session_mgr._cwd() if host._session_mgr is not None else None
+
+
+def _child_runtime_services(host, *, cwd: str | None = None):
+    """子 agent 的 RuntimeServices bundle，从 host bundle 派生（docs/23 Step 7-S3）。
+
+    host 无 bundle（白盒/测试 agent）→ 返回 None，子 agent 保持 bundle-less，在进程 cwd 跑
+    （与今天一致）。唯一被子 agent 读取的字段是 `.cwd`（await_subagent_run / engine._effective_cwd），
+    其余字段（memory_service/context_sources/extension_host）在子 agent 路径上从不被读。"""
+    services = getattr(host, "_runtime_services", None)
+    if services is None:
+        return None
+    return replace(services, cwd=_child_cwd(host, cwd=cwd))
+
+
 async def _auto_deny_confirm(_command: str) -> bool:
     """后台子 agent 的 confirm_fn：无 TTY 等价拒绝（auto-deny-but-continue）。"""
     return False
@@ -229,12 +255,14 @@ class SubAgentRunner:
             sub._child_parent_session = {"sessionId": host.session_id,
                                          "entryId": host._subagent_spawn_leaf.get(artifact_id),
                                          "taskId": artifact_id, "agentId": artifact_id}
-            services = getattr(host, "_runtime_services", None)
-            cwd = services.cwd if services is not None else (
-                host._session_mgr._cwd() if host._session_mgr is not None else None)
+            cwd = _child_cwd(host)
             sub._session_lease = SessionLease.open_or_create(
                 sub._tree_session_id, parent_session=sub._child_parent_session, cwd=cwd)
             sub._session_mgr = sub._session_lease.manager
+            # docs/23 Step 7-S3：子 agent 携带一致的 RuntimeServices bundle（host 无 bundle → None,
+            # 保持 bundle-less）。production 非 worktree 子 agent 自此持 cwd=host cwd 的 bundle,与旧
+            # 「未设 → await_subagent_run 在进程 cwd 跑」逐字等价（host bundle cwd == 进程 cwd）。
+            sub._runtime_services = _child_runtime_services(host)
         return sub
 
     def materialize_child_session(self, sub_agent) -> None:
@@ -245,9 +273,10 @@ class SubAgentRunner:
     def apply_child_worktree(self, host, sub_agent, worktree_path: str | None) -> None:
         if not worktree_path:
             return
-        services = getattr(host, "_runtime_services", None)
+        # docs/23 Step 7-S3：worktree cwd 覆盖经同一派生口（host 无 bundle → None,不设）。
+        services = _child_runtime_services(host, cwd=worktree_path)
         if services is not None:
-            sub_agent._runtime_services = replace(services, cwd=worktree_path)
+            sub_agent._runtime_services = services
 
     def attach_run_record_projector(self, sub_agent, child_session_id: str) -> None:
         """Project child UI events into the child-owned run sidecar.
@@ -346,9 +375,7 @@ class SubAgentRunner:
             "taskId": child_session_id,
             "agentId": child_session_id,
         }
-        services = getattr(host, "_runtime_services", None)
-        cwd = services.cwd if services is not None else (
-            host._session_mgr._cwd() if host._session_mgr is not None else None)
+        cwd = _child_cwd(host)
         lease = SessionLease.open_or_create(child_session_id, parent_session=parent_session, cwd=cwd)
         try:
             if not SessionManager.exists(child_session_id):
