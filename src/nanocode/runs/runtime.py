@@ -30,7 +30,9 @@ class AgentRunRuntime:
         status: str | None = None,
         live_run_ids: set[str] | frozenset[str] | None = None,
     ) -> list[AgentRunRecord]:
-        records = self.rebind(parent_session_id, live_run_ids=live_run_ids)
+        # docs/25 A4a：重绘/列举走只读视图（不 mark_lost、不写放大）。持久化 reconcile 经
+        # 显式 rebind() / per-child _reconcile_run / run_cancel 触发。
+        records = self.ledger.view_for_parent(parent_session_id, live_run_ids=live_run_ids)
         if status is not None:
             records = [r for r in records if r.status == status]
         return records
@@ -46,11 +48,8 @@ class AgentRunRuntime:
     def mark_lost(self, child_session_id: str, *, reason: str) -> AgentRunRecord:
         return self.ledger.mark_lost(child_session_id, reason=reason)
 
-    def send(self, child_session_id: str, prompt: str, *, delivery: str = "steer",
-             wake: bool = False) -> dict:
+    def send(self, child_session_id: str, prompt: str, *, delivery: str = "steer") -> dict:
         rec = self.ledger.replay(child_session_id)
         if rec.status in TERMINAL_RUN_STATUSES:
             raise RuntimeError(f"run {child_session_id} is terminal ({rec.status}); use resume")
-        if wake and rec.status != "running":
-            raise RuntimeError(f"run {child_session_id} is not live-running; use agent resume to wake it")
-        return queue_steer(child_session_id, prompt, delivery=delivery, wake=wake)
+        return queue_steer(child_session_id, prompt, delivery=delivery)

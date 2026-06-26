@@ -251,33 +251,54 @@ def test_tool_timeout_beats_settings(monkeypatch, tmp_path):
 
 
 def _stub_running_curator(parent):
-    """A running background curator (kind='memory_consolidate') with owner_agent_id —
-    it runs a real sub-agent and must count toward max_threads."""
-    child_id = T.new_id("sess")
-    task_rec = parent.task_manager.create_task(
-        "memory_consolidate", "curate", owner_agent_id=child_id)
-    parent.task_manager.update_task(task_rec.id, status="running")
+    """A running background curator (agent_type='memory-curator') as a child-session
+    run record (docs/25 A2 single ledger). It counts toward max_threads via
+    ``_nanocode_run_id`` — like any background sub-agent — not via a host task."""
+    if parent._session_mgr is None:
+        parent._session_mgr = SessionManager.create(parent.session_id)
+    run_id = T.new_id("sess")
+    child = SessionManager.create(
+        run_id,
+        parent_session={"sessionId": parent.session_id, "entryId": None,
+                        "taskId": run_id, "agentId": run_id},
+    )
+    child.close()
+    run_record.create_run_record(
+        child_session_id=run_id,
+        parent_session_id=parent.session_id,
+        spawn_entry_id=None,
+        tool_call_id=None,
+        agent_type="memory-curator",
+        description="curate",
+        background=True,
+        context_mode="fresh",
+        isolation="shared",
+        worktree_path=None,
+        model={"provider": parent._current_provider(), "modelId": parent.model},
+        prompt="curate",
+        inject_summary=True,
+    )
 
     async def _never():
         await asyncio.sleep(3600)
 
     t = asyncio.ensure_future(_never())
-    t._nanocode_task_id = task_rec.id
+    t._nanocode_run_id = run_id
     parent._background_tasks.add(t)
     return t
 
 
 def test_running_count_includes_curator_subagents(monkeypatch, tmp_path):
-    """Codex P4 MED: memory curator/eval background sub-agents (kind != 'subagent')
-    were bypassing max_threads. The count keys on owner_agent_id, so they count;
-    a plain background shell task (no owner) does not."""
+    """memory curator/eval background sub-agents must count toward max_threads. After
+    docs/25 A2 they are child-session run records (single ledger), counted via
+    ``_nanocode_run_id``; a plain background shell task (no run id) does not count."""
     _set_agents_settings(monkeypatch, tmp_path, {"max_threads": 5})
 
     async def scenario():
         parent = _agent()
-        t1 = _stub_running_bg_subagent(parent)   # kind=subagent
-        t2 = _stub_running_curator(parent)       # kind=memory_consolidate
-        # a background SHELL task has no owner_agent_id -> must NOT count
+        t1 = _stub_running_bg_subagent(parent)   # agent_type=coder
+        t2 = _stub_running_curator(parent)       # agent_type=memory-curator
+        # a background SHELL task has no run id -> must NOT count
         sh = parent.task_manager.create_task("shell", "echo", owner_agent_id=None)
         parent.task_manager.update_task(sh.id, status="running")
         n = parent._subagents.running_background_count()

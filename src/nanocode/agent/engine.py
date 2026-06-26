@@ -759,11 +759,11 @@ class Agent(PlanModeMixin):
         return f"Run {child_session_id}: no live coroutine found; marked lost."
 
     def run_send(self, child_session_id: str, prompt: str, *,
-                 delivery: str = "steer", wake: bool = False) -> str:
+                 delivery: str = "steer") -> str:
         import json
         try:
             self._reconcile_run(child_session_id)
-            queued = self._run_runtime.send(child_session_id, prompt, delivery=delivery, wake=wake)
+            queued = self._run_runtime.send(child_session_id, prompt, delivery=delivery)
         except Exception as e:
             return f"Error: {e}"
         return json.dumps(queued, ensure_ascii=False, indent=2)

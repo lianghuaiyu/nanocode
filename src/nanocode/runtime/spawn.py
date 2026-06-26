@@ -338,7 +338,7 @@ class SubAgentRunner:
     def begin_run_record(self, host, *, sub_agent, agent_id: str, agent_type: str,
                          description: str, prompt: str, model: str, background: bool,
                          context_mode: str, isolation: str, worktree_path: str | None,
-                         status: str = "running") -> str:
+                         status: str = "running", inject_summary: bool = False) -> str:
         self.materialize_child_session(sub_agent)
         child_session_id = sub_agent._tree_session_id
         run_record.create_run_record(
@@ -355,6 +355,7 @@ class SubAgentRunner:
             model=_model_snapshot(host, model),
             prompt=prompt,
             status=status,
+            inject_summary=inject_summary,
         )
         self.attach_run_record_projector(sub_agent, child_session_id)
         run_record.append_event(child_session_id, "session_ready")
@@ -408,7 +409,8 @@ class SubAgentRunner:
         return child_session_id
 
     def finish_run_record(self, *, sub_agent, status: str, result_text: str,
-                          tokens: dict | None = None, error: str | None = None) -> str | None:
+                          tokens: dict | None = None, error: str | None = None,
+                          result_summary: str | None = None) -> str | None:
         child_session_id = getattr(sub_agent, "_tree_session_id", None)
         if not child_session_id:
             return None
@@ -425,6 +427,7 @@ class SubAgentRunner:
             result_entry_id=result_entry_id,
             tokens=tokens,
             error=error,
+            result_summary=result_summary,
         )
         return snapshot.get("resultPath")
 
@@ -607,7 +610,6 @@ class SubAgentRunner:
                 return host.run_send(
                     steer_id, prompt,
                     delivery=inp.get("delivery") or "steer",
-                    wake=bool(inp.get("wake", False)),
                 )
             except Exception as e:
                 return f"Error: {e}"
@@ -1065,10 +1067,10 @@ class SubAgentRunner:
     async def spawn_memory_consolidate(self, host) -> str:
         """触发记忆巩固：curator 子 agent 出 JSON 提案 → 宿主 parse+apply。
 
-        无记忆短路：build_curator_user_message() 返回 "No memory files..." 时不建
-        task/subagent，直接返回提示。否则分配 curator child session + task
-        (memory_consolidate, owner=child_session_id) + detached _run_memory_consolidate，
-        立即返回 task_id 提示（同 _spawn_background_subagent 的双向链 + 后台登记）。
+        无记忆短路：build_curator_user_message() 返回 "No memory files..." 时不建 subagent，
+        直接返回提示。否则分配 curator child session + child-session run_record（单账本，
+        `inject_summary=True`：完成摘要 PUSH 回父上下文）+ detached _run_memory_consolidate，
+        立即返回 run id 提示（不再镜像 host TaskManager，docs/25 A2）。
         """
         user_message = build_curator_user_message()
         if user_message.startswith("No memory files"):
@@ -1077,29 +1079,29 @@ class SubAgentRunner:
             return (f"Error: max concurrent sub-agents ({host._subagents.max_threads()}) reached; "
                     f"memory consolidation not started — try again later.")
 
-        description = "memory consolidation"
         child_id = self.new_child_session_id()
         self.record_subagent_spawn_leaf(host, child_id)
-        task_rec = host.task_manager.create_task(
-            "memory_consolidate", description, owner_agent_id=child_id)
-        host.emit(SubAgentStarted(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
+        host.emit(SubAgentStarted(agent_type=host._MEMORY_CURATOR_TYPE,
+                                  description="memory consolidation"))
         task = asyncio.create_task(host._run_memory_consolidate(
-            agent_id=child_id, task_id=task_rec.id, user_message=user_message))
-        task._nanocode_task_id = task_rec.id
+            agent_id=child_id, user_message=user_message))
+        task._nanocode_run_id = child_id
         host._background_tasks.add(task)
         task.add_done_callback(host._background_tasks.discard)
-        return (f"Started memory consolidation task {task_rec.id}. It will report completion later. "
-                f"Use task_output with task_id={task_rec.id} to inspect the proposal + result.")
+        return (f"Started memory consolidation run {child_id}. It will report completion later "
+                f"(summary auto-injected on completion; run_status {child_id} to inspect the "
+                f"proposal + outcome).")
 
-    async def run_memory_consolidate(self, host, *, agent_id: str, task_id: str,
+    async def run_memory_consolidate(self, host, *, agent_id: str,
                                       user_message: str, timeout_ms: int | None = None) -> None:
-        """detached 协程：判断型(curator)+确定性(Python apply)解耦。
+        """detached 协程：判断型(curator)+确定性(Python apply)解耦。单账本 = child-session
+        run_record（docs/25 A2，不再镜像 host TaskManager）。
 
         **不复用** _run_background_subagent（后者把子文本当最终 result；巩固需 parse+apply
-        后处理）。**绕开** _execute_agent_tool（其 type 归一会把 memory-curator 改成 coder
-        拿全工具）——直接 build_profile(memory-curator)（恒无工具）+ _build_sub_agent
-        (background=True)。四态对称：cancel/timeout/error 写终态；成功则 token 累加 + 持久化
-        messages + 写 result.md，再 parse(坏JSON→completed "no changes")+apply→summary_line。
+        后处理）。直接 build_profile(memory-curator)（恒无工具）+ _build_sub_agent(background=True)。
+        四态对称：cancel/timeout/error 写终态 run_record；成功则 token 累加 + parse(坏 JSON →
+        completed "no changes")+apply → summary_line 写入 run_record.resultSummary
+        （`inject_summary=True`，完成后摘要 PUSH 回父上下文）。
         """
         sub_agent = None
         description = "memory consolidation"
@@ -1121,21 +1123,19 @@ class SubAgentRunner:
                 host, sub_agent=sub_agent, agent_id=agent_id,
                 agent_type=host._MEMORY_CURATOR_TYPE,
                 description=description, prompt=user_message, model=eff_model, background=True,
-                context_mode="fresh", isolation="shared", worktree_path=None)
+                context_mode="fresh", isolation="shared", worktree_path=None,
+                inject_summary=True)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
                     sub_agent.run_once(user_message), timeout=timeout_ms / 1000.0)
             else:
                 result = await sub_agent.run_once(user_message)
         except asyncio.CancelledError:
-            host.task_manager.update_task(
-                task_id, status="cancelled",
-                result_summary="(cancelled by task_stop)")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
-                    error="cancelled")
+                    error="cancelled", result_summary="(cancelled by task_stop)")
                 host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             raise
@@ -1144,29 +1144,21 @@ class SubAgentRunner:
                 host._subagent_captured_text(sub_agent)
                 if sub_agent is not None else f"(timed out after {timeout_ms}ms)"
             )
-            result_path = self.write_host_task_result(host, task_id, text)
-            host.task_manager.update_task(
-                task_id, status="timed_out",
-                result_path=result_path,
-                result_summary=f"(timed out after {timeout_ms}ms)")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="timed_out",
-                    result_text=text, error=None)
+                    result_text=text, error=None,
+                    result_summary=f"(timed out after {timeout_ms}ms)")
                 host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
         except Exception as e:
             text = host._subagent_captured_text(sub_agent) if sub_agent is not None else f"(curator error: {e})"
-            result_path = self.write_host_task_result(host, task_id, text)
-            host.task_manager.update_task(
-                task_id, status="failed", error=str(e),
-                result_path=result_path,
-                result_summary=f"(curator error: {e})")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="failed",
-                    result_text=text, error=str(e))
+                    result_text=text, error=str(e),
+                    result_summary=f"(curator error: {e})")
                 host._close_child_session(agent_id, sub_agent)
             else:
                 self.create_failed_run_record(
@@ -1178,37 +1170,35 @@ class SubAgentRunner:
             host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
 
-        # curator 成功产出 JSON 提案：token 累加 + run record + host task result 副本
+        # curator 成功产出 JSON 提案：token 累加 + 确定性 parse+apply（宿主 Python，可回滚）。
+        # 坏 JSON 不让 run failed，标 completed "no changes"。
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
-        self.finish_run_record(
-            sub_agent=sub_agent, status="completed",
-            result_text=text, tokens=result["tokens"])
-        result_path = self.write_host_task_result(host, task_id, text)
-        host._close_child_session(agent_id, sub_agent)
-
-        # 确定性 parse+apply（宿主 Python，可回滚）。坏 JSON 不让 task failed，标 completed。
         try:
             plan = parse_consolidation_plan(text)
         except Exception:
-            host.task_manager.update_task(
-                task_id, status="completed", result_path=result_path,
+            self.finish_run_record(
+                sub_agent=sub_agent, status="completed", result_text=text,
+                tokens=result["tokens"],
                 result_summary="Consolidation: no changes (unparseable plan)")
+            host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
             return
 
         apply_result = apply_plan(plan)
-        host.task_manager.update_task(
-            task_id, status="completed", result_path=result_path,
-            result_summary=apply_result.summary_line())
+        self.finish_run_record(
+            sub_agent=sub_agent, status="completed", result_text=text,
+            tokens=result["tokens"], result_summary=apply_result.summary_line())
+        host._close_child_session(agent_id, sub_agent)
         host.emit(SubAgentEnded(agent_type=host._MEMORY_CURATOR_TYPE, description=description))
 
     # ─── Memory eval candidate generation (EVAL-mode curator) ──
 
     async def spawn_memory_eval(self, host) -> str:
         """触发 eval 候选生成：EVAL-mode curator 子 agent 出候选 JSON →
-        宿主逐条 add_pending（非法跳过）。无记忆短路。"""
+        宿主逐条 add_pending（非法跳过）。无记忆短路。单账本 = child-session run_record
+        （`inject_summary=True`），不再镜像 host TaskManager（docs/25 A2）。"""
         from ..memory.eval_source import build_eval_curator_message
         svc = getattr(host, "_memory_service", None)
         backend = getattr(svc, "backend", None) if svc is not None else None
@@ -1222,26 +1212,26 @@ class SubAgentRunner:
         # 否则 add_pending 校验会拒掉全部候选。REPL 命令不走 chat()，在此显式落盘。
         host._persist_state()
 
-        description = "memory eval generation"
         child_id = self.new_child_session_id()
         self.record_subagent_spawn_leaf(host, child_id)
-        task_rec = host.task_manager.create_task(
-            "memory_eval", description, owner_agent_id=child_id)
-        host.emit(SubAgentStarted(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
+        host.emit(SubAgentStarted(agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
+                                  description="memory eval generation"))
         task = asyncio.create_task(host._run_memory_eval(
-            agent_id=child_id, task_id=task_rec.id, user_message=user_message))
-        task._nanocode_task_id = task_rec.id
+            agent_id=child_id, user_message=user_message))
+        task._nanocode_run_id = child_id
         host._background_tasks.add(task)
         task.add_done_callback(host._background_tasks.discard)
-        return (f"Started memory eval generation task {task_rec.id}. It will report completion later. "
-                f"Use task_output with task_id={task_rec.id} to inspect generated candidates.")
+        return (f"Started memory eval generation run {child_id}. It will report completion later "
+                f"(summary auto-injected on completion; run_status {child_id} to inspect "
+                f"generated candidates).")
 
-    async def run_memory_eval(self, host, *, agent_id: str, task_id: str,
+    async def run_memory_eval(self, host, *, agent_id: str,
                                user_message: str, timeout_ms: int | None = None) -> None:
-        """detached 协程：curator 出候选 JSON → 宿主逐条 eval_store.add_pending。
+        """detached 协程：curator 出候选 JSON → 宿主逐条 eval_store.add_pending。单账本 =
+        child-session run_record（docs/25 A2，不再镜像 host TaskManager）。
 
         宿主强制 source.session_id = host.session_id（不信任 curator）。校验失败的
-        候选计入 skipped，不让 task failed。坏 JSON → completed 0 candidates。"""
+        候选计入 skipped，不让 run failed。坏 JSON → completed 0 candidates。"""
         from ..memory import eval_store
         sub_agent = None
         description = "memory eval generation"
@@ -1263,21 +1253,19 @@ class SubAgentRunner:
                 host, sub_agent=sub_agent, agent_id=agent_id,
                 agent_type=host._MEMORY_EVAL_CURATOR_TYPE,
                 description=description, prompt=user_message, model=eff_model, background=True,
-                context_mode="fresh", isolation="shared", worktree_path=None)
+                context_mode="fresh", isolation="shared", worktree_path=None,
+                inject_summary=True)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
                     sub_agent.run_once(user_message), timeout=timeout_ms / 1000.0)
             else:
                 result = await sub_agent.run_once(user_message)
         except asyncio.CancelledError:
-            host.task_manager.update_task(
-                task_id, status="cancelled",
-                result_summary="(cancelled by task_stop)")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
-                    error="cancelled")
+                    error="cancelled", result_summary="(cancelled by task_stop)")
                 host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             raise
@@ -1286,29 +1274,21 @@ class SubAgentRunner:
                 host._subagent_captured_text(sub_agent)
                 if sub_agent is not None else f"(timed out after {timeout_ms}ms)"
             )
-            result_path = self.write_host_task_result(host, task_id, text)
-            host.task_manager.update_task(
-                task_id, status="timed_out",
-                result_path=result_path,
-                result_summary=f"(timed out after {timeout_ms}ms)")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="timed_out",
-                    result_text=text, error=None)
+                    result_text=text, error=None,
+                    result_summary=f"(timed out after {timeout_ms}ms)")
                 host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             return
         except Exception as e:
             text = host._subagent_captured_text(sub_agent) if sub_agent is not None else f"(eval curator error: {e})"
-            result_path = self.write_host_task_result(host, task_id, text)
-            host.task_manager.update_task(
-                task_id, status="failed", error=str(e),
-                result_path=result_path,
-                result_summary=f"(eval curator error: {e})")
             if sub_agent is not None:
                 self.finish_run_record(
                     sub_agent=sub_agent, status="failed",
-                    result_text=text, error=str(e))
+                    result_text=text, error=str(e),
+                    result_summary=f"(eval curator error: {e})")
                 host._close_child_session(agent_id, sub_agent)
             else:
                 self.create_failed_run_record(
@@ -1323,11 +1303,6 @@ class SubAgentRunner:
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
-        self.finish_run_record(
-            sub_agent=sub_agent, status="completed",
-            result_text=text, tokens=result["tokens"])
-        result_path = self.write_host_task_result(host, task_id, text)
-        host._close_child_session(agent_id, sub_agent)
 
         # 确定性后处理：解析候选并逐条 add_pending（坏 JSON / 缺 candidates → 0）。
         added = 0
@@ -1337,9 +1312,11 @@ class SubAgentRunner:
             data = json.loads(extract_json_object(text))
             candidates = data.get("candidates", []) if isinstance(data, dict) else []
         except Exception:
-            host.task_manager.update_task(
-                task_id, status="completed", result_path=result_path,
+            self.finish_run_record(
+                sub_agent=sub_agent, status="completed", result_text=text,
+                tokens=result["tokens"],
                 result_summary="Generated 0 pending eval candidates (unparseable output)")
+            host._close_child_session(agent_id, sub_agent)
             host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
             return
 
@@ -1366,9 +1343,10 @@ class SubAgentRunner:
         summary = f"Generated {added} pending eval candidate(s)"
         if skipped:
             summary += f" ({skipped} skipped)"
-        host.task_manager.update_task(
-            task_id, status="completed", result_path=result_path,
-            result_summary=summary)
+        self.finish_run_record(
+            sub_agent=sub_agent, status="completed", result_text=text,
+            tokens=result["tokens"], result_summary=summary)
+        host._close_child_session(agent_id, sub_agent)
         host.emit(SubAgentEnded(agent_type=host._MEMORY_EVAL_CURATOR_TYPE, description=description))
 
     # ─── Memory optimization (EvolveMem) ──────────────────────
@@ -1378,11 +1356,17 @@ class SubAgentRunner:
     async def run_reserved_agent(self, host, *, agent_type: str, prompt: str,
                                  model: "str | None" = None,
                                  timeout_ms: "int | None" = None) -> str:
+        """Reserved-agent spawn（如 memory retrieval diagnostician）。
+
+        走与普通 subagent 一致的 child-session run_record 体系（**无 host task**，
+        故不再触 TaskManager）。四态对称：completed 返回 text；cancelled/timeout/error
+        先写终态 run_record + 折 token + close child，再向上抛（调用方按 best-effort 处理）。
+        """
         profile = build_profile(agent_type)
-        rec = host.task_manager.create_subagent(
-            type=agent_type, description=agent_type, model=model or host.model,
-            provider=host._current_provider())
-        host.task_manager.update_subagent(rec.id, status="running")
+        eff_model = model or profile.model or host.model
+        description = agent_type
+        child_id = self.new_child_session_id()
+        self.record_subagent_spawn_leaf(host, child_id)
         sub_agent = None
         try:
             sub_agent = host._build_sub_agent(
@@ -1390,21 +1374,52 @@ class SubAgentRunner:
                 tools=child_tools(host, profile, background=True),
                 agent_type=agent_type, background=True,
                 max_turns=host._subagents.bounded_max_turns(profile.max_turns or 1),
-                model=model, artifact_id=rec.id, agent_source=profile.source)
+                model=model, artifact_id=child_id, agent_source=profile.source)
+            self.begin_run_record(
+                host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
+                description=description, prompt=prompt, model=eff_model, background=True,
+                context_mode="fresh", isolation="shared", worktree_path=None)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
                     sub_agent.run_once(prompt), timeout=timeout_ms / 1000.0)
             else:
                 result = await sub_agent.run_once(prompt)
-        except BaseException:
+        except asyncio.CancelledError:
             if sub_agent is not None:
                 host._fold_subagent_tokens(sub_agent)
-                host._close_child_session(rec.id, sub_agent)
-            host.task_manager.update_subagent(rec.id, status="failed")
+                self.finish_run_record(
+                    sub_agent=sub_agent, status="cancelled",
+                    result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
+                    error="cancelled")
+                host._close_child_session(child_id, sub_agent)
+            raise
+        except asyncio.TimeoutError:
+            if sub_agent is not None:
+                host._fold_subagent_tokens(sub_agent)
+                self.finish_run_record(
+                    sub_agent=sub_agent, status="timed_out",
+                    result_text=host._subagent_captured_text(sub_agent)
+                    or f"(timed out after {timeout_ms}ms)", error=None)
+                host._close_child_session(child_id, sub_agent)
+            raise
+        except Exception as e:
+            if sub_agent is not None:
+                host._fold_subagent_tokens(sub_agent)
+                self.finish_run_record(
+                    sub_agent=sub_agent, status="failed",
+                    result_text=host._subagent_captured_text(sub_agent)
+                    or f"(reserved-agent error: {e})", error=str(e))
+                host._close_child_session(child_id, sub_agent)
+            else:
+                self.create_failed_run_record(
+                    host, child_session_id=child_id, agent_type=agent_type,
+                    description=description, prompt=prompt, model=eff_model, background=True,
+                    context_mode="fresh", isolation="shared", worktree_path=None, error=str(e))
             raise
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
-        host.task_manager.update_subagent(rec.id, status="completed")
-        host._close_child_session(rec.id, sub_agent)
+        self.finish_run_record(
+            sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"])
+        host._close_child_session(child_id, sub_agent)
         return text

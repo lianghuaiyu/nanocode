@@ -36,3 +36,19 @@ def collect_pending_injections(manager) -> list:
     pending = [t for t in manager.list_tasks()
                if t.status in TERMINAL_TASK_STATUSES and not t.injected]
     return sorted(pending, key=lambda t: t.id)
+
+
+def render_run_reminder(run) -> str:
+    """子 agent run（A2：memory curator/eval 等 inject_summary=True 的后台 run）的完成提醒。
+
+    权威记录在 child-session run_record（非 TaskManager）；按 duck-typed AgentRunRecord 字段
+    渲染（run_id/agent_type/description/result_summary/result_path）。
+    """
+    return ("<system-reminder>\n"
+            f"Background run {run.run_id} {run.status}.\n\n"
+            f"Kind: {run.agent_type}\n"
+            f"Description: {run.description}\n"
+            f"Summary:\n{run.result_summary or '(none)'}\n\n"
+            f"Full result:\n{run.result_path or '(none)'}\n"
+            "(read_file the full result for the proposal + outcome.)\n"
+            "</system-reminder>")

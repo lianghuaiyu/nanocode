@@ -216,8 +216,8 @@ class RunsCap:
         return await self._host.run_cancel(child_session_id)
 
     def send(self, child_session_id: str, prompt: str, *,
-             delivery: str = "steer", wake: bool = False) -> str:
-        return self._host.run_send(child_session_id, prompt, delivery=delivery, wake=wake)
+             delivery: str = "steer") -> str:
+        return self._host.run_send(child_session_id, prompt, delivery=delivery)
 
 
 @dataclass(frozen=True)
