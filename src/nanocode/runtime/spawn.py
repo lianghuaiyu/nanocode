@@ -249,6 +249,9 @@ class SubAgentRunner:
             # narrow_policy_for_context 再按 is_subagent/background/hook 上下文收紧）。
             sandbox_profile=getattr(host, "_sandbox_profile", "default"),
         )
+        # docs/23 Step 7-S4：sandbox manager per-runtime 共享（无状态）——子 agent 复用 host 的实例，
+        # 不再各自 new（Agent.__init__ 已建一个，作未装配场景的兜底；profile 仍经 ctor per-agent 继承）。
+        sub._sandbox = host._sandbox
         if artifact_id and artifact_id != "main":
             from ..session.lease import SessionLease
             sub._tree_session_id = host.child_session_id(artifact_id)

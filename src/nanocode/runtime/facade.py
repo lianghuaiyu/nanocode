@@ -192,6 +192,9 @@ class RuntimeServices:
     context_sources: object
     extension_host: object | None = None
     diagnostics: tuple[str, ...] = ()
+    # docs/23 Step 7-S4：sandbox manager 归 runtime 所有（per-runtime 共享，无状态）。
+    # profile 仍 per-agent（AgentConfig.sandbox_profile）；per-call HostContext 现场收窄。
+    sandbox: object | None = None
 
     @classmethod
     def create(cls, config: AgentConfig, *, cwd: str | None = None) -> "RuntimeServices":
@@ -237,6 +240,8 @@ class RuntimeServices:
         with _push_cwd(resolved):
             extension_host = ExtensionHost.load_system_extensions().activate_all()
 
+        from ..capabilities.sandbox import SandboxManager
+
         trusted = config.workspace_trusted if str(Path(config.cwd or resolved).resolve()) == resolved else is_trusted(Path(resolved))
         return cls(
             cwd=resolved,
@@ -250,6 +255,7 @@ class RuntimeServices:
             ),
             extension_host=extension_host,
             diagnostics=tuple(diagnostics),
+            sandbox=SandboxManager(),
         )
 
 
@@ -257,6 +263,10 @@ def _apply_runtime_services(agent, services: RuntimeServices) -> None:
     agent._runtime_services = services
     agent._memory_service = services.memory_service
     agent.workspace_trusted = services.workspace_trusted
+    # docs/23 Step 7-S4：采用 runtime 所有的 sandbox manager（无状态、per-runtime 共享）。
+    # 缺省 None 时保留 Agent.__init__ 自建的实例（未经 runtime 装配的白盒/测试 agent）。
+    if getattr(services, "sandbox", None) is not None:
+        agent._sandbox = services.sandbox
     with _push_cwd(services.cwd):
         from ..prompt import build_system_prompt
         agent._base_system_prompt = build_system_prompt()

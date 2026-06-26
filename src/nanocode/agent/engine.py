@@ -142,9 +142,12 @@ class Agent(PlanModeMixin):
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         self.workspace_trusted = workspace_trusted
-        # docs/19：sandbox profile（default/read-only/strict/vm/danger-full-access）+ 单一 SandboxManager。
+        # docs/19：sandbox profile（default/read-only/strict/vm/danger-full-access）。
         # profile 是 public runtime config（AgentConfig.sandbox_profile）；模型无法影响。
         self._sandbox_profile = sandbox_profile
+        # docs/23 Step 7-S4：SandboxManager 归 runtime 所有（RuntimeServices.sandbox，per-runtime
+        # 共享、无状态）——主 agent 经 _apply_runtime_services、子 agent 经 build_sub_agent 采用该实例。
+        # 此处自建一个作兜底（未经 runtime 装配的白盒/测试 agent）；彻底移除待 S6（__init__ 接 bundle）。
         from ..capabilities.sandbox import SandboxManager
         self._sandbox = SandboxManager()
         self.effective_window = _get_context_window(model) - 20000
