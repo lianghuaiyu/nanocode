@@ -17,7 +17,6 @@ from ..tools import (
     ToolDef,
 )
 from ..capabilities.validation import validate_tool_input
-from ..capabilities.sandbox import SandboxManager
 from .events import (
     AssistantDelta,
     ApprovalRequested,
@@ -28,14 +27,6 @@ from .events import (
     ToolCallAuthorized,
 )
 from ..prompt import build_system_prompt
-from ..skills.discovery import (
-    register_nested_skill_dirs,
-    path_activates_skill,
-    discover_skills,
-)
-from ..mcp import McpManager
-from ..tasks.manager import TaskManager
-from ..tasks.runner import run_shell_background_task
 from ..session import v2 as _session_v2
 
 from .models import (
@@ -154,6 +145,7 @@ class Agent(PlanModeMixin):
         # docs/19：sandbox profile（default/read-only/strict/vm/danger-full-access）+ 单一 SandboxManager。
         # profile 是 public runtime config（AgentConfig.sandbox_profile）；模型无法影响。
         self._sandbox_profile = sandbox_profile
+        from ..capabilities.sandbox import SandboxManager
         self._sandbox = SandboxManager()
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = session_id or uuid.uuid4().hex[:8]
@@ -214,7 +206,11 @@ class Agent(PlanModeMixin):
         self._context_ledger = None
 
         # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
-        self.task_manager = task_manager if task_manager is not None else TaskManager()
+        if task_manager is not None:
+            self.task_manager = task_manager
+        else:
+            from ..tasks.manager import TaskManager
+            self.task_manager = TaskManager()
         self._background_tasks: set[asyncio.Task] = set()
         self._background_run_queue: list[str] = []
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
@@ -262,6 +258,7 @@ class Agent(PlanModeMixin):
         self._files_modified: set[str] = set()
 
         # MCP integration
+        from ..mcp import McpManager
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
 
@@ -595,6 +592,11 @@ class Agent(PlanModeMixin):
             self._files_read.add(abspath)
         elif name in ("write_file", "edit_file"):
             self._files_modified.add(abspath)
+        from ..skills.discovery import (
+            register_nested_skill_dirs,
+            path_activates_skill,
+            discover_skills,
+        )
         touched = Path(fp)
         cwd = Path.cwd()
         register_nested_skill_dirs(touched, cwd)        # 先嵌套发现
@@ -618,6 +620,7 @@ class Agent(PlanModeMixin):
         # 时快照（cwd/session 固定）；microVM/无后端 → blocked（fail-closed，不裸跑）。
         # background 不支持 escalate（permission 层已拒 run_in_background+escalate）→ approval 恒不批。
         from ..capabilities.sandbox import ShellRequest, ApprovalDecision
+        from ..tasks.runner import run_shell_background_task
         request = ShellRequest(command=command, timeout_ms=timeout_ms or 0, run_in_background=True)
         host = self.host_context(background=True)
         policy = self.sandbox_policy(background=True)

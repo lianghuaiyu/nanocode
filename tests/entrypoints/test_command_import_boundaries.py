@@ -113,6 +113,37 @@ def test_agent_engine_import_does_not_pull_runtime():
     assert proc.returncode == 0, proc.stderr
 
 
+def test_agent_engine_import_does_not_pull_host_services():
+    """``import nanocode.agent.engine`` must not drag in layer-③ host services that
+    engine.py previously imported at module top level (mcp, sandbox). Construction-
+    time / first-use lazy imports keep those off the static import graph (docs/23
+    Step 7-S2). runtime is covered by ``test_agent_engine_import_does_not_pull_runtime``."""
+    src = Path(__file__).resolve().parents[2] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src) + os.pathsep + env.get("PYTHONPATH", "")
+    code = textwrap.dedent(
+        """
+        import sys
+        import nanocode.agent.engine
+        blocked_prefixes = (
+            "nanocode.mcp",
+            "nanocode.capabilities.sandbox",
+        )
+        leaked = sorted(
+            name for name in sys.modules
+            if any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in blocked_prefixes
+            )
+        )
+        assert not leaked, leaked
+        """
+    )
+    proc = subprocess.run([sys.executable, "-c", code], env=env, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_cli_help_lists_runtime_shell_escape():
     from nanocode.entrypoints import cli
 
