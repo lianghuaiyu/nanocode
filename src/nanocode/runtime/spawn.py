@@ -611,13 +611,18 @@ class SubAgentRunner:
             return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
                     f"cannot spawn a sub-agent at depth {host.depth + 1}.")
 
-        # ── chain / parallel：编排策略上提 layer④ orchestration 扩展（docs/26 §0.6 阶段1）──
-        # 内核只保留早期形状校验 + spawn 原语；序列化/{previous}/fan-in/fail-stop/group 全在扩展。
-        if inp.get("steps") is not None or inp.get("tasks") is not None:
-            if inp.get("steps") is not None and inp.get("tasks") is not None:
-                return "Error: 'steps' (chain) and 'tasks' (parallel) cannot be combined."
+        # ── 编排形状：策略上提 layer④ orchestration 扩展（docs/26 §0.6 阶段1/策略库）──
+        # 内核只做形状互斥/前台校验 + spawn 原语;chain/parallel/accept/plan_fanout 策略全在扩展。
+        orch_keys = [k for k in ("steps", "tasks", "accept", "plan_fanout") if inp.get(k) is not None]
+        if orch_keys:
+            if len(orch_keys) > 1:
+                return ("Error: orchestration shapes 'steps'/'tasks'/'accept'/'plan_fanout' "
+                        "are mutually exclusive.")
             if resume_id or steer_id:
-                return "Error: steps/tasks cannot be combined with resume or steer."
+                return "Error: orchestration cannot be combined with resume or steer."
+            if orch_keys[0] in ("accept", "plan_fanout") and inp.get("run_in_background"):
+                return (f"Error: '{orch_keys[0]}' runs foreground only "
+                        f"(not compatible with run_in_background).")
             return await host._run_orchestration(inp)
 
         if steer_id:

@@ -139,11 +139,14 @@ class SpawnCap(_StaleGuard):
             agent_type, prompt, description=description, timeout_ms=timeout_ms,
             context_mode=context_mode, isolation=isolation, parallel=parallel)
 
-    async def run_step(self, agent_type: str, prompt: str, *, group_id: str,
-                       description: "str | None" = None, inject_summary: bool = True,
+    async def run_step(self, agent_type: str, prompt: str, *, group_id: "str | None" = None,
+                       description: "str | None" = None, inject_summary: bool = False,
                        result_summary: "str | None" = None, timeout_ms: "int | None" = None,
                        context_mode: str = "fresh") -> str:
-        """后台 chain 步：await 子完成,返回原始 text（供 {previous}）；带 group/inject。"""
+        """await 子完成，返回**原始 text**（内核 spawn_subagent）。两用途（docs/26 §0.6 阶段1/策略库）：
+        - 后台 chain 步：传 `group_id=gid, inject_summary=True`（带 group 标记 + 逐步 PUSH）；
+        - 前台验证成员（acceptance worker/reviewer、fanout planner）：默认 group_id=None/inject=False，
+          纯取原始 text 供解析/裁决（不入组、不注入）。"""
         self._ensure_orchestrate()
         self._reject_reserved(agent_type)
         return await self._thread.run_orchestration_step(

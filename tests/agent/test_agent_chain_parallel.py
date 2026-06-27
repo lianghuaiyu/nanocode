@@ -132,7 +132,7 @@ def test_steps_tasks_mutual_exclusions():
     _stub_build(parent)
     r = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "steps": [{"prompt": "x"}], "tasks": [{"prompt": "y"}]}))
-    assert "cannot be combined" in r
+    assert "mutually exclusive" in r          # 四形状互斥（含 accept/plan_fanout）
     # D6：steps/tasks + run_in_background 不再互斥——派后台编排，立即返回 group id。
     r = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "steps": [{"prompt": "x"}], "run_in_background": True}))

@@ -999,13 +999,15 @@ class RuntimeThread:
             timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation,
             parallel=parallel)
 
-    async def run_orchestration_step(self, agent_type: str, prompt: str, *, group_id: str,
+    async def run_orchestration_step(self, agent_type: str, prompt: str, *,
+                                     group_id: "str | None" = None,
                                      description: "str | None" = None,
-                                     inject_summary: bool = True,
+                                     inject_summary: bool = False,
                                      result_summary: "str | None" = None,
                                      timeout_ms: "int | None" = None,
                                      context_mode: str = "fresh") -> str:
-        """后台 chain 步：内核 spawn_subagent（await + group/inject），返回原始 text（层③）。"""
+        """编排成员（原始 text）：内核 spawn_subagent。bg chain 步传 group/inject；前台验证成员
+        默认无 group/inject（纯取 text 供解析/裁决）。层③。"""
         from ..agents.registry import build_profile
         from .spawn import _normalize_agent_type
         profile = build_profile(_normalize_agent_type(agent_type))
