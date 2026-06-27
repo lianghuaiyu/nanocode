@@ -19,7 +19,9 @@ SCHEMA = {
         "'general'/'coder' (full tools). Orchestration: pass 'steps' to run a CHAIN of sub-agents "
         "sequentially (each step's prompt may contain the literal {previous} placeholder, replaced "
         "with the previous step's result envelope), or 'tasks' to fan out independent sub-agents in "
-        "PARALLEL and gather their bounded results."
+        "PARALLEL and gather their bounded results. Add run_in_background to either to run the whole "
+        "orchestration detached: it returns immediately with a group id, each member's summary is "
+        "auto-injected on completion, and 'run_cancel <group_id>' cancels the entire group."
     ),
     "input_schema": {
         "type": "object",
@@ -32,16 +34,16 @@ SCHEMA = {
             "resume": {"type": "string", "description": "Resume a child-session sub-agent by child_session_id and append this prompt"},
             "steer": {"type": "string", "description": "Queue a steering prompt for a running child session id without creating a new child."},
             "delivery": {"type": "string", "description": "For steer: steer or follow_up. Default: steer."},
-            "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false). The host reports completion later; do not sleep, poll, or proactively check progress."},
+            "run_in_background": {"type": "boolean", "description": "Run the sub-agent in the background instead of blocking (default: false). The host reports completion later; do not sleep, poll, or proactively check progress. May be combined with steps/tasks to run the whole chain/parallel orchestration detached (returns a group id)."},
             "timeout_ms": {"type": "integer", "description": "Wall-clock timeout in ms for this sub-agent run. If omitted, the agent definition's timeout-ms (if any) is used; otherwise no wall-clock limit (a turn ceiling still bounds it)."},
             "steps": {
                 "type": "array",
-                "description": "CHAIN mode: run these steps sequentially, each as an independent sub-agent. {previous} in a step prompt is replaced with the previous step's result. Mutually exclusive with prompt/tasks/resume/run_in_background.",
+                "description": "CHAIN mode: run these steps sequentially, each as an independent sub-agent. {previous} in a step prompt is replaced with the previous step's result. Mutually exclusive with prompt/tasks/resume; with run_in_background it runs detached and returns a group id (run_cancel <group_id> cancels the chain).",
                 "items": {"type": "object", "properties": _STEP_PROPS, "required": ["prompt"]},
             },
             "tasks": {
                 "type": "array",
-                "description": "PARALLEL mode: fan out these independent sub-agents concurrently and gather their bounded results. Mutually exclusive with prompt/steps/resume/run_in_background.",
+                "description": "PARALLEL mode: fan out these independent sub-agents concurrently and gather their bounded results. Mutually exclusive with prompt/steps/resume; with run_in_background it runs detached and returns a group id (run_cancel <group_id> cancels the whole group).",
                 "items": {"type": "object", "properties": _STEP_PROPS, "required": ["prompt"]},
             },
         },

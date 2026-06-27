@@ -798,10 +798,22 @@ class Agent(PlanModeMixin):
         )
 
     async def run_cancel(self, child_session_id: str) -> str:
+        # D6：取消所有 _nanocode_run_id==id **或** _nanocode_group_id==id 的 task（单子 / 整组
+        # 级联，fixpoint，O3）。group cancel 命中 N 个 detached 成员（parallel，含 queued——其在
+        # wait_for_background_slot 被 cancel → run_background_subagent except-CancelledError 移出
+        # 队列 + 写 cancelled）或 chain coordinator（其在飞步经 await 链收到 CancelledError →
+        # spawn_subagent 写 cancelled + 重抛）。单 id 只命中一个，兄弟不受影响。
+        cancelled = 0
         for task in list(self._background_tasks):
-            if getattr(task, "_nanocode_run_id", None) == child_session_id:
+            if (getattr(task, "_nanocode_run_id", None) == child_session_id
+                    or getattr(task, "_nanocode_group_id", None) == child_session_id):
                 task.cancel()
-                return f"Requested cancel of run {child_session_id}."
+                cancelled += 1
+        if cancelled == 1:
+            return f"Requested cancel of run {child_session_id}."
+        if cancelled > 1:
+            return (f"Requested cancel of group {child_session_id} "
+                    f"({cancelled} live task(s)).")
         from ..runs.models import TERMINAL_RUN_STATUSES
         try:
             rec = self._run_runtime.status(child_session_id)
@@ -1273,22 +1285,28 @@ class Agent(PlanModeMixin):
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
                                          prompt: str, timeout_ms: int | None = None,
                                          context_mode: str = "fresh",
-                                         isolation: str | None = None) -> str:
+                                         isolation: str | None = None,
+                                         group_id: str | None = None,
+                                         inject_summary: bool = False,
+                                         result_summary: str | None = None) -> str:
         """注册 subagent + task + detached 协程（实现在 runtime/spawn.py）。"""
         return await self._spawn.spawn_background_subagent(
             self, agent_type=agent_type, description=description, prompt=prompt,
-            timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation)
+            timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation,
+            group_id=group_id, inject_summary=inject_summary, result_summary=result_summary)
 
     async def _run_background_subagent(self, *, agent_id: str, agent_type: str,
                                        description: str, prompt: str,
                                        timeout_ms: int | None, sub_agent=None,
                                        worktree_path: str | None = None,
-                                       queued: bool = False) -> None:
+                                       queued: bool = False,
+                                       result_summary: str | None = None) -> None:
         """detached 后台子 agent 协程（实现在 runtime/spawn.py）。"""
         return await self._spawn.run_background_subagent(
             self, agent_id=agent_id, agent_type=agent_type,
             description=description, prompt=prompt, timeout_ms=timeout_ms,
-            sub_agent=sub_agent, worktree_path=worktree_path, queued=queued)
+            sub_agent=sub_agent, worktree_path=worktree_path, queued=queued,
+            result_summary=result_summary)
 
     
     # ─── Memory curator spawns（实现搬迁到 runtime/spawn.py；以下为薄委托）──────────

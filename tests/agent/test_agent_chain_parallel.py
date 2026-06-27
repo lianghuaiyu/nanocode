@@ -126,12 +126,18 @@ def test_parallel_fans_out_and_gathers_in_task_order():
 
 def test_steps_tasks_mutual_exclusions():
     parent = _agent()
+    _stub_build(parent)
     r = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "steps": [{"prompt": "x"}], "tasks": [{"prompt": "y"}]}))
     assert "cannot be combined" in r
+    # D6：steps/tasks + run_in_background 不再互斥——派后台编排，立即返回 group id。
     r = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "steps": [{"prompt": "x"}], "run_in_background": True}))
-    assert "cannot be combined" in r
+    assert "orch_" in r and "background chain group" in r
+    r = asyncio.run(parent._execute_agent_tool(
+        {"description": "d", "tasks": [{"prompt": "y"}], "run_in_background": True}))
+    assert "orch_" in r and "background parallel group" in r
+    # 仍互斥：steps/tasks 与 resume/steer。
     r = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "tasks": [{"prompt": "x"}], "resume": "agent-001"}))
     assert "cannot be combined" in r

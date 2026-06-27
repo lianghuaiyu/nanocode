@@ -356,7 +356,8 @@ class SubAgentRunner:
     def begin_run_record(self, host, *, sub_agent, agent_id: str, agent_type: str,
                          description: str, prompt: str, model: str, background: bool,
                          context_mode: str, isolation: str, worktree_path: str | None,
-                         status: str = "running", inject_summary: bool = False) -> str:
+                         status: str = "running", inject_summary: bool = False,
+                         group_id: str | None = None) -> str:
         self.materialize_child_session(sub_agent)
         child_session_id = sub_agent._tree_session_id
         run_record.create_run_record(
@@ -374,6 +375,7 @@ class SubAgentRunner:
             prompt=prompt,
             status=status,
             inject_summary=inject_summary,
+            group_id=group_id,
         )
         self.attach_run_record_projector(sub_agent, child_session_id)
         run_record.append_event(child_session_id, "session_ready")
@@ -613,8 +615,13 @@ class SubAgentRunner:
         if inp.get("steps") is not None or inp.get("tasks") is not None:
             if inp.get("steps") is not None and inp.get("tasks") is not None:
                 return "Error: 'steps' (chain) and 'tasks' (parallel) cannot be combined."
-            if resume_id or steer_id or inp.get("run_in_background"):
-                return "Error: steps/tasks cannot be combined with resume, steer, or run_in_background."
+            if resume_id or steer_id:
+                return "Error: steps/tasks cannot be combined with resume or steer."
+            if inp.get("run_in_background"):
+                # D6：后台编排——派 detached driver，立即返回 group id（run_cancel <gid> 整组取消）。
+                if inp.get("steps") is not None:
+                    return await self.execute_agent_chain_background(host, inp, fleet_cfg)
+                return await self.execute_agent_parallel_background(host, inp, fleet_cfg)
             if inp.get("steps") is not None:
                 return await self.execute_agent_chain(host, inp, fleet_cfg)
             return await self.execute_agent_parallel(host, inp, fleet_cfg)
@@ -941,6 +948,126 @@ class SubAgentRunner:
         sections = await asyncio.gather(*[_one(i, t) for i, t in enumerate(tasks, 1)])
         return "\n\n".join(sections)
 
+    # ─── 后台编排（D6：detached chain/parallel；内核原语 + group_id tag）────────────
+
+    def _new_group_id(self) -> str:
+        """编排分组 id（orch_<hex>）：仅入 run_record.groupId + task._nanocode_group_id（整组
+        cancel/识别 key）；**不是** child session id、**不是**合成记录节点（对标 OpenCode jobs
+        的 {sessionId,parentSessionId} 元数据 fixpoint，不发明 record kind）。"""
+        return _tree.new_id("orch")
+
+    async def execute_agent_parallel_background(self, host, inp: dict, fleet_cfg: dict) -> str:
+        """parallel 后台编排（D6）：派 N 个独立 detached run，立即返回 group id。
+
+        复用 `spawn_background_subagent`（无 coordinator，N 个各自独立的 detached run；N>max_threads
+        经现有队列处理）。每个子 `inject_summary=True` → 完成即把一行 result_summary PUSH 回父上下文
+        （全文仍在 result.md）。**all-or-nothing 预校验**：先校验所有 task 的 context/prompt，再
+        spawn，避免 spawn 一半遇坏 item 留下孤儿 detached run。"""
+        tasks = inp.get("tasks")
+        err = self._validate_orchestration_items(tasks, what="tasks", cap=self.MAX_PARALLEL_TASKS)
+        if err:
+            return err
+        n = len(tasks)
+        # 预校验所有 item（all-or-nothing，不留孤儿子）。
+        prepared: list[tuple] = []
+        for i, t in enumerate(tasks, 1):
+            agent_type = _normalize_agent_type(t.get("type", "general"))
+            description = t.get("description") or f"parallel task {i}/{n}"
+            task_context = t.get("context") or {"mode": "fresh"}
+            try:
+                task_context_mode = _context_mode(task_context)
+                task_prompt = _project_prompt(str(t["prompt"]), task_context)
+            except ValueError as e:
+                return f"Error: tasks[{i}]: {e}"
+            bg_timeout = t.get("timeout_ms") or inp.get("timeout_ms")
+            if bg_timeout is None:
+                bg_timeout = build_profile(agent_type).timeout_ms
+            if bg_timeout is None:
+                bg_timeout = fleet_cfg.get("background_timeout_ms")
+            prepared.append((i, agent_type, description, task_prompt,
+                             task_context_mode, t.get("isolation"), bg_timeout))
+        gid = self._new_group_id()
+        run_ids: list[str] = []
+        for (i, agent_type, description, task_prompt,
+             task_context_mode, isolation, bg_timeout) in prepared:
+            run_id = await self.spawn_background_subagent(
+                host, agent_type=agent_type, description=description, prompt=task_prompt,
+                timeout_ms=bg_timeout, context_mode=task_context_mode, isolation=isolation,
+                group_id=gid, inject_summary=True,
+                result_summary=f"parallel task {i}/{n}: {description}")
+            run_ids.append(run_id)
+        listed = "\n".join(f"  - {rid}" for rid in run_ids)
+        return (f"Started background parallel group {gid} with {n} task(s):\n{listed}\n"
+                f"Each reports completion later (summary auto-injected); do not poll or duplicate "
+                f"their work. Cancel the whole group: run_cancel {gid}")
+
+    async def execute_agent_chain_background(self, host, inp: dict, fleet_cfg: dict) -> str:
+        """chain 后台编排（D6）：一个 detached coordinator 顺序跑 N 步，{previous} 串接。
+
+        复用内核 `spawn_subagent`（await 返 SubagentOutcome.text 供 {previous}）。coordinator 自身
+        **不持 run_record**（纯 plumbing，无 _nanocode_run_id → 不污染 _live_run_ids/
+        running_background_count；步骤才是 run）；打 _nanocode_group_id=gid 供整组 cancel。
+        每步 `inject_summary=True` → 逐步 PUSH 摘要回父。**fail-stop**：步 timeout/error → 停余下
+        步 + NoticeRaised；CancelledError 重抛（在飞步已写 cancelled，供 cancel 级联）。
+        **all-or-nothing 预校验**所有步的 context/prompt（{previous} 替换延到运行期）。"""
+        steps = inp.get("steps")
+        err = self._validate_orchestration_items(steps, what="steps", cap=self.MAX_CHAIN_STEPS)
+        if err:
+            return err
+        n = len(steps)
+        for i, step in enumerate(steps, 1):
+            step_context = step.get("context") or {"mode": "fresh"}
+            try:
+                _context_mode(step_context)
+                _project_prompt(
+                    str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, "(previous)"),
+                    step_context)
+            except ValueError as e:
+                return f"Error: steps[{i}]: {e}"
+        gid = self._new_group_id()
+
+        async def _chain_coordinator() -> None:
+            previous = "(no previous step)"
+            for i, step in enumerate(steps, 1):
+                agent_type = _normalize_agent_type(step.get("type", "general"))
+                description = step.get("description") or f"chain step {i}/{n}"
+                step_context = step.get("context") or {"mode": "fresh"}
+                step_context_mode = _context_mode(step_context)
+                prompt = _project_prompt(
+                    str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, previous),
+                    step_context)
+                timeout_ms = step.get("timeout_ms") or inp.get("timeout_ms")
+                if timeout_ms is None:
+                    timeout_ms = build_profile(agent_type).timeout_ms
+                if timeout_ms is None:
+                    timeout_ms = fleet_cfg.get("background_timeout_ms")
+                try:
+                    outcome = await self.spawn_subagent(
+                        host, profile=build_profile(agent_type), prompt=prompt,
+                        description=description, timeout_ms=timeout_ms,
+                        context_mode=step_context_mode, group_id=gid, inject_summary=True,
+                        result_summary=f"chain step {i}/{n}: {description}",
+                        emit_lifecycle=True)
+                except asyncio.CancelledError:
+                    raise   # 在飞步已写 cancelled 终态；重抛供 run_cancel 级联
+                except Exception as e:  # noqa: BLE001 — 步失败 fail-stop（步已写终态 record）
+                    host.emit(NoticeRaised(
+                        text=(f"Background chain group {gid} stopped at step {i}/{n} "
+                              f"({description}): {e}"),
+                        level="warn"))
+                    return
+                previous = outcome.text
+            host.emit(NoticeRaised(
+                text=f"Background chain group {gid} completed all {n} step(s)."))
+
+        task = asyncio.create_task(_chain_coordinator())
+        task._nanocode_group_id = gid
+        host._background_tasks.add(task)
+        task.add_done_callback(host._background_tasks.discard)
+        return (f"Started background chain group {gid} with {n} step(s). Steps run sequentially "
+                f"({{previous}} threaded); each reports completion later (summary auto-injected). "
+                f"Cancel the whole chain: run_cancel {gid}")
+
     # ─── 后台 detached 子 agent（auto-deny-but-continue,搬迁自 engine）────────────
 
     async def wait_for_background_slot(self, host, run_id: str) -> None:
@@ -965,8 +1092,15 @@ class SubAgentRunner:
     async def spawn_background_subagent(self, host, *, agent_type: str, description: str,
                                         prompt: str, timeout_ms: "int | None" = None,
                                         context_mode: str = "fresh",
-                                        isolation: str | None = None) -> str:
-        """注册 child-session run + detached 协程,立即返回 child_session_id。"""
+                                        isolation: str | None = None,
+                                        group_id: str | None = None,
+                                        inject_summary: bool = False,
+                                        result_summary: str | None = None) -> str:
+        """注册 child-session run + detached 协程,立即返回 child_session_id。
+
+        编排参数（D6，默认值保持既有单发调用方逐字不变）：``group_id`` 打 run_record.groupId
+        + task._nanocode_group_id（整组 cancel/识别）；``inject_summary`` 令完成摘要 PUSH 回父
+        上下文；``result_summary`` 是完成时写入的一行摘要（透传到 run_background_subagent）。"""
         eff_model = build_profile(agent_type).model or host.model
         child_id = self.new_child_session_id()
         selected_isolation = should_isolate(agent_type=agent_type, parallel=False,
@@ -1007,6 +1141,8 @@ class SubAgentRunner:
             description=description, prompt=prompt, model=eff_model, background=True,
             context_mode=context_mode, isolation=selected_isolation,
             worktree_path=worktree_path,
+            inject_summary=inject_summary,
+            group_id=group_id,
             status=(
                 "queued"
                 if host._subagents.max_threads() > 0
@@ -1020,8 +1156,10 @@ class SubAgentRunner:
             run_record.append_event(run_id, "worktree_created", worktreePath=worktree_path)
         task = asyncio.create_task(host._run_background_subagent(agent_id=child_id, agent_type=agent_type,
             description=description, prompt=prompt, timeout_ms=timeout_ms, sub_agent=sub_agent,
-            worktree_path=worktree_path, queued=queued))
+            worktree_path=worktree_path, queued=queued, result_summary=result_summary))
         task._nanocode_run_id = run_id
+        if group_id is not None:
+            task._nanocode_group_id = group_id
         host._background_tasks.add(task)
         task.add_done_callback(host._background_tasks.discard)
         return run_id
@@ -1029,8 +1167,10 @@ class SubAgentRunner:
     async def run_background_subagent(self, host, *, agent_id: str, agent_type: str,
                                       description: str, prompt: str, timeout_ms: "int | None",
                                       sub_agent=None, worktree_path: str | None = None,
-                                      queued: bool = False) -> None:
-        """detached 协程：构造 background 子 agent,跑 run_once,落终态 + 持久化。"""
+                                      queued: bool = False,
+                                      result_summary: str | None = None) -> None:
+        """detached 协程：构造 background 子 agent,跑 run_once,落终态 + 持久化。
+        ``result_summary``（D6 编排）在 completed 分支写入 run_record（供 inject_summary PUSH）。"""
         def _ended(status: str, tokens: "dict | None" = None) -> None:
             host.emit(SubAgentEnded(
                 agent_type=agent_type, description=description, run_id=agent_id,
@@ -1100,7 +1240,8 @@ class SubAgentRunner:
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
         self.finish_run_record(
-            sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"])
+            sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"],
+            result_summary=result_summary)
         if worktree_path:
             run_record.append_event(agent_id, "worktree_finalized",
                                     diffSummary=diff_summary(worktree_path))
@@ -1405,14 +1546,20 @@ class SubAgentRunner:
                              description: "str | None" = None, model: "str | None" = None,
                              timeout_ms: "int | None" = None, context_mode: str = "fresh",
                              isolation: str = "shared", max_turns: "int | None" = None,
-                             emit_lifecycle: bool = True) -> SubagentOutcome:
+                             emit_lifecycle: bool = True,
+                             group_id: str | None = None,
+                             inject_summary: bool = False,
+                             result_summary: str | None = None) -> SubagentOutcome:
         """内核单发 spawn 原语（docs/26 阶段1 ①）。
 
         只收已解析的 `profile`（不收 raw tools/sandbox）——子工具经 child_tools/
         effective_child_tools 内核派生（allow∩/deny∪/剔 agent），sandbox 继承父 profile，
         故扩展/编排消费方**结构上无法提权**。走 child-session run_record（无 host task）。
         四态对称：completed 返回 SubagentOutcome；cancelled/timeout/error 先写终态 record +
-        折 token + close child + emit lifecycle，再向上抛（与旧 run_reserved_agent 逐字等价）。"""
+        折 token + close child + emit lifecycle，再向上抛（与旧 run_reserved_agent 逐字等价）。
+
+        编排参数（D6，默认值保持 reserved/编排外调用方逐字不变）：``group_id`` 打 run_record.groupId；
+        ``inject_summary`` 令完成摘要 PUSH 回父；``result_summary`` 是完成时写入的一行摘要。"""
         agent_type = profile.name
         eff_model = model or profile.model or host.model
         description = description or agent_type
@@ -1441,7 +1588,8 @@ class SubAgentRunner:
             self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
                 description=description, prompt=prompt, model=eff_model, background=True,
-                context_mode=context_mode, isolation=isolation, worktree_path=None)
+                context_mode=context_mode, isolation=isolation, worktree_path=None,
+                inject_summary=inject_summary, group_id=group_id)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
                     sub_agent.run_once(prompt), timeout=timeout_ms / 1000.0)
@@ -1487,7 +1635,8 @@ class SubAgentRunner:
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
         result_path = self.finish_run_record(
-            sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"])
+            sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"],
+            result_summary=result_summary)
         host._close_child_session(child_id, sub_agent)
         _ended("completed", tokens=result["tokens"])
         return SubagentOutcome(run_id=child_id, status="completed", text=text,

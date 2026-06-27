@@ -72,6 +72,7 @@ class AgentRunRecord:
     context_mode: str = "fresh"
     isolation: str = "shared"
     worktree_path: str | None = None
+    group_id: str | None = None  # 编排分组 tag（D6：orch_*，整组 cancel/识别用；非 session id、非合成记录）
     metrics: RunMetrics = field(default_factory=RunMetrics)
     result_path: str | None = None
     result_entry_id: str | None = None
@@ -103,6 +104,7 @@ class AgentRunRecord:
             context_mode=status.get("contextMode") or "fresh",
             isolation=status.get("isolation") or "shared",
             worktree_path=status.get("worktreePath"),
+            group_id=status.get("groupId"),
             metrics=RunMetrics.from_dict(status.get("metrics")),
             result_path=status.get("resultPath"),
             result_entry_id=status.get("resultEntryId"),

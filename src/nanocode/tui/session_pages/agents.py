@@ -114,6 +114,9 @@ class ConversationModel(TextViewerModel):
             first += f"  {_DIM}{desc}{_RESET}"
         second = " · ".join(p for p in [status, stats, self.record["child_session_id"]] if p)
         rows = [first, f"{_DIM}{second}{_RESET}"]
+        group_id = self.record.get("group_id")
+        if group_id:
+            rows.append(f"{_DIM}group: {group_id}{_RESET}")
         pa = self.record.get("pending_approval")
         if isinstance(pa, dict):
             rows.append(f"⏸ awaiting approval: {pa.get('command', '')}")

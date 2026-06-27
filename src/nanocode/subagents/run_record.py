@@ -311,6 +311,7 @@ def create_run_record(
     prompt: str,
     status: str = "running",
     inject_summary: bool = False,
+    group_id: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
     rd = run_dir(child_session_id)
@@ -342,6 +343,7 @@ def create_run_record(
         "contextMode": context_mode,
         "isolation": isolation,
         "worktreePath": worktree_path,
+        "groupId": group_id,
         "model": model,
         "createdAt": now,
         "startedAt": now if status == "running" else None,
