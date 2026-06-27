@@ -31,11 +31,12 @@ from .registry import ContributionRegistry
 
 
 def _system_manifests() -> list[ExtensionManifest]:
-    """Built-in system extension manifests. First version: memory-evolution only.
+    """Built-in system extension manifests.
 
     No project/user/`.nanocode/extensions` discovery (docs/22 §1.2 reject #1)."""
     from .memory_evolution.manifest import MANIFEST as MEMORY_EVOLUTION_MANIFEST
-    return [MEMORY_EVOLUTION_MANIFEST]
+    from .orchestration.manifest import MANIFEST as ORCHESTRATION_MANIFEST
+    return [MEMORY_EVOLUTION_MANIFEST, ORCHESTRATION_MANIFEST]
 
 
 def _resolve_entrypoint(entrypoint: str):
@@ -195,6 +196,11 @@ class ExtensionHost:
             name for name, (_profile, ext_id) in self.registry.hidden_agents.items()
             if ext_id in granted)
 
+    def _orchestrate_granted(self) -> bool:
+        """docs/26 §0.6 阶段1：是否有 active 扩展声明了 `spawn:orchestrate`（解锁编排原语）。"""
+        from .manifest import SPAWN_ORCHESTRATE
+        return any(SPAWN_ORCHESTRATE in m.capabilities for m in self.manifests)
+
     def _build_context_fields(self) -> dict:
         if not self._active:
             raise ExtensionRuntimeError(
@@ -206,6 +212,7 @@ class ExtensionHost:
         session = thread.readonly_session() if thread is not None else None
         host_model = getattr(thread, "model", "") or ""
         allowed_spawn = self._spawn_allowed_agent_types()
+        can_orchestrate = self._orchestrate_granted()
         return dict(
             host=self,
             cwd=(services.cwd if services is not None else ""),
@@ -216,8 +223,9 @@ class ExtensionHost:
             models=ExtensionModelRouter(self, host_model=host_model,
                                         roles=dict(self.registry.model_roles)),
             events=EventSink(self, agent.emit) if agent is not None else None,
-            spawn=(SpawnCap(self, thread, allowed_agent_types=allowed_spawn)
-                   if thread is not None and allowed_spawn else None),
+            spawn=(SpawnCap(self, thread, allowed_agent_types=allowed_spawn,
+                            can_orchestrate=can_orchestrate)
+                   if thread is not None and (allowed_spawn or can_orchestrate) else None),
         )
 
     def create_context(self) -> ExtensionContext:
@@ -244,6 +252,21 @@ class ExtensionHost:
         handler, _ext = entry
         ctx = self.create_context()
         await handler(ctx, payload, task_id=task_id)
+
+    # ── orchestration dispatch (docs/26 §0.6 阶段1) ───────────────────
+    async def run_orchestrator(self, payload: dict) -> str:
+        """Invoke the registered orchestration handler with a fresh spawn-capable
+        context, returning its aggregated result string.
+
+        Foreground (blocking) orchestration awaits this directly; background
+        orchestration runs it inside a detached task (the caller tags the task with
+        the group id). No orchestrator registered ⟹ fail loud — there is no in-kernel
+        chain/parallel fallback (the policy lives only in the extension)."""
+        if self.registry.orchestrator is None:
+            raise ExtensionRuntimeError("no orchestration extension is registered")
+        handler, _ext = self.registry.orchestrator
+        ctx = self.create_context()
+        return await handler(ctx, payload)
 
     # ── lifecycle dispatch ────────────────────────────────────────────
     async def emit(self, event: str, payload: dict | None = None) -> None:

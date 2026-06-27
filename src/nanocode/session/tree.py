@@ -56,19 +56,6 @@ BUDGET_EXCEEDED = "budget_exceeded"
 TURN_END = "turn_end"
 LLM_REQUEST = "llm_request"
 
-# docs/15 §12 TeamRuntime 预留 entry 类型（多 agent 协作的 team session）。骨架阶段保留 schema：
-# 非 FOLD_TYPES（对 LLM 不可见、不进父对话 branch）、非 leaf-affecting（注解型,见 leaf_id_after_entry）。
-# 刻意**不**复用 task_update / 父 tool result（§12：不得 overload）。实现见 runtime/teams.py。
-TEAM_START = "team_start"
-TEAM_TASK_UPDATE = "team_task_update"
-TEAM_MESSAGE = "team_message"
-TEAM_CLAIM = "team_claim"
-TEAM_RESULT = "team_result"
-AGENT_MAILBOX_MESSAGE = "agent_mailbox_message"
-TEAM_ENTRY_TYPES = frozenset({
-    TEAM_START, TEAM_TASK_UPDATE, TEAM_MESSAGE, TEAM_CLAIM, TEAM_RESULT, AGENT_MAILBOX_MESSAGE,
-})
-
 # fold 进上下文的 entry（消息族 + 派生上下文）。设置类只参与标量 fold；其余对 LLM 不可见。
 FOLD_TYPES = frozenset({MESSAGE, CUSTOM_MESSAGE, COMPACTION, BRANCH_SUMMARY})
 
@@ -127,8 +114,7 @@ def leaf_id_after_entry(e: Entry) -> Any:
     if e.type == LEAF:
         return e.data.get("targetId")
     if e.type in (SESSION_START, LABEL, SESSION_INFO,
-                  PERMISSION_DECISION, TOOL_BLOCKED, BUDGET_EXCEEDED, TURN_END, SESSION_END, LLM_REQUEST,
-                  TEAM_START, TEAM_TASK_UPDATE, TEAM_MESSAGE, TEAM_CLAIM, TEAM_RESULT, AGENT_MAILBOX_MESSAGE):
+                  PERMISSION_DECISION, TOOL_BLOCKED, BUDGET_EXCEEDED, TURN_END, SESSION_END, LLM_REQUEST):
         return _UNCHANGED
     return e.id
 

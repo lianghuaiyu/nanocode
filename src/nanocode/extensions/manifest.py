@@ -20,6 +20,12 @@ from typing import Literal
 # 挂上 `ctx.spawn`（仅能 spawn 该扩展自己贡献的 reserved/hidden agent；子 caps 由内核派生）。
 SPAWN_RESERVED = "spawn:reserved"
 
+# docs/26 §0.6 阶段1：编排级受信 spawn 槽 capability。声明此 capability 的扩展，其 `ctx.spawn`
+# 额外解锁**非提权**的编排原语（run/run_background/new_group/cancel_group）——可 spawn 通用
+# 模型类型(general/coder/explore/plan/custom，**拒 reserved**)，子工具/sandbox 仍由内核派生。
+# 仅授予 first-party orchestration 扩展（编排策略上提层④的命门，O5）。
+SPAWN_ORCHESTRATE = "spawn:orchestrate"
+
 
 @dataclass(frozen=True)
 class CommandContribution:

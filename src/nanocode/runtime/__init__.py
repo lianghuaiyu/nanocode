@@ -21,26 +21,11 @@ _FACADE_EXPORTS = {
     "serialize_event_envelope",
 }
 
-_TEAM_EXPORTS = {
-    "TeamRuntime",
-    "TeamSession",
-    "TeamTaskBoard",
-    "TeamTask",
-    "ClaimLock",
-    "AgentMailbox",
-    "MailboxMessage",
-    "SharedArtifactStore",
-    "TeamEventStream",
-}
-
-__all__ = sorted(_FACADE_EXPORTS | _TEAM_EXPORTS)
+__all__ = sorted(_FACADE_EXPORTS)
 
 
 def __getattr__(name: str):
     if name in _FACADE_EXPORTS:
         from . import facade as _facade
         return getattr(_facade, name)
-    if name in _TEAM_EXPORTS:
-        from . import teams as _teams
-        return getattr(_teams, name)
     raise AttributeError(name)

@@ -79,13 +79,20 @@ class SpawnCap(_StaleGuard):
     的 allow∩/deny∪/剔 agent + 父 sandbox 继承）。本视图**签名无 tools/sandbox 参数**——提权在
     类型层就不可能：扩展永远拿不到「给子裸配工具」的权力（docs/26 §0.3 O5 命门）。
 
+    `can_orchestrate`（docs/26 §0.6 阶段1，capability `spawn:orchestrate`）额外解锁编排原语
+    `run`/`run_background`/`new_group`/`cancel_group`——可 spawn 通用模型类型（general/coder/
+    explore/plan/custom），但**拒 reserved**类型；子 caps 同样由内核派生（仍非提权）。未授予
+    该 capability 时这些方法 fail loud。
+
     与 UNTRUSTED 工具封印一致性：UNTRUSTED 只封印模型可调的扩展**工具** ctx 槽；本槽在
     context-view 侧（与 tasks/events/models 同类），由 host 仅向声明 capability 的扩展授予。"""
 
-    def __init__(self, host, thread, *, allowed_agent_types: "frozenset[str]") -> None:
+    def __init__(self, host, thread, *, allowed_agent_types: "frozenset[str]",
+                 can_orchestrate: bool = False) -> None:
         self._host = host
         self._thread = thread
         self._allowed = frozenset(allowed_agent_types)
+        self._can_orchestrate = can_orchestrate
 
     async def reserved(self, agent_type: str, prompt: str, *,
                        model: "str | None" = None,
@@ -97,6 +104,77 @@ class SpawnCap(_StaleGuard):
                 f"(granted reserved set: {sorted(self._allowed)})")
         return await self._thread.run_reserved_subagent(
             agent_type, prompt, model=model, timeout_ms=timeout_ms)
+
+    # ── 编排原语（capability spawn:orchestrate；子 caps 仍内核派生，非提权）──────────
+    # 三类成员原语逐一对应内核三原语（行为保真，docs/26 §0.6 阶段1）：
+    #   run_fresh        → run_fresh_subagent        （前台,bounded envelope）
+    #   run_step         → spawn_subagent            （后台 chain 步:await + group/inject）
+    #   run_background   → spawn_background_subagent  （后台 parallel 成员:detached）
+    # 外加 new_group / cancel_group / launch_coordinator（后台 chain 的 detached coordinator）。
+    def _ensure_orchestrate(self) -> None:
+        self._ensure_active()
+        if not self._can_orchestrate:
+            raise ExtensionRuntimeError(
+                "extension was not granted the 'spawn:orchestrate' capability")
+
+    @staticmethod
+    def _reject_reserved(agent_type: str) -> None:
+        """编排不得 spawn reserved/hidden agent（它们是内核/扩展私有的特权类型）。"""
+        from ..agents.registry import RESERVED_AGENT_TYPES
+        if agent_type in RESERVED_AGENT_TYPES:
+            raise ExtensionRuntimeError(
+                f"orchestration may not spawn reserved agent_type {agent_type!r}")
+
+    def new_group(self) -> str:
+        self._ensure_orchestrate()
+        return self._thread.new_orchestration_group()
+
+    async def run_fresh(self, agent_type: str, prompt: str, *, description: "str | None" = None,
+                        timeout_ms: "int | None" = None, context_mode: str = "fresh",
+                        isolation: "str | None" = None, parallel: bool = False) -> str:
+        """前台编排成员：返回 bounded ResultEnvelope（供 {previous} 串接 / fan-in 聚合）。"""
+        self._ensure_orchestrate()
+        self._reject_reserved(agent_type)
+        return await self._thread.run_orchestration_member(
+            agent_type, prompt, description=description, timeout_ms=timeout_ms,
+            context_mode=context_mode, isolation=isolation, parallel=parallel)
+
+    async def run_step(self, agent_type: str, prompt: str, *, group_id: str,
+                       description: "str | None" = None, inject_summary: bool = True,
+                       result_summary: "str | None" = None, timeout_ms: "int | None" = None,
+                       context_mode: str = "fresh") -> str:
+        """后台 chain 步：await 子完成,返回原始 text（供 {previous}）；带 group/inject。"""
+        self._ensure_orchestrate()
+        self._reject_reserved(agent_type)
+        return await self._thread.run_orchestration_step(
+            agent_type, prompt, group_id=group_id, description=description,
+            inject_summary=inject_summary, result_summary=result_summary,
+            timeout_ms=timeout_ms, context_mode=context_mode)
+
+    async def run_background(self, agent_type: str, prompt: str, *,
+                             group_id: "str | None" = None, description: "str | None" = None,
+                             inject_summary: bool = True,
+                             result_summary: "str | None" = None,
+                             timeout_ms: "int | None" = None, context_mode: str = "fresh",
+                             isolation: "str | None" = None) -> str:
+        """后台 parallel 成员：detached run，返回 run_id（完成摘要按 inject_summary PUSH 回父）。"""
+        self._ensure_orchestrate()
+        self._reject_reserved(agent_type)
+        return await self._thread.spawn_orchestration_background(
+            agent_type, prompt, group_id=group_id, description=description,
+            inject_summary=inject_summary, result_summary=result_summary,
+            timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation)
+
+    def launch_coordinator(self, coro, *, group_id: str) -> None:
+        """把扩展的后台 chain coordinator 协程登记为内核追踪的 detached task（tagged group_id
+        供整组 cancel）。coordinator 自身不持 run_record（步骤才是 run）。"""
+        self._ensure_orchestrate()
+        self._thread.launch_orchestration_coordinator(coro, group_id=group_id)
+
+    async def cancel_group(self, group_id: str) -> str:
+        """级联取消整组（run_cancel 的 _nanocode_group_id 不动点扫描）。"""
+        self._ensure_orchestrate()
+        return await self._thread.cancel_runs(group_id)
 
 
 class ExtensionModelRouter(_StaleGuard):

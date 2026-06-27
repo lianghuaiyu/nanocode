@@ -59,3 +59,23 @@ def attach_runtime_agent(agent):
     agent._session_lease = lease
     agent._session_mgr = lease.manager
     return agent
+
+
+def attach_orchestration(agent, *, cwd="."):
+    """给已构造的 Agent 接上 RuntimeThread + bound ExtensionHost（含 orchestration 扩展），
+    使 `agent._execute_agent_tool` 的 steps/tasks 能委托到 layer④ orchestration 扩展
+    （docs/26 §0.6 阶段1）。设 `agent._runtime_services`（真 RuntimeServices，非 SimpleNamespace
+    ——子 spawn 经 dataclasses.replace 派生）。返回 (thread, host)。"""
+    from nanocode.runtime import AgentRuntime, RuntimeServices, RuntimeThread
+    from nanocode.session.agent import AgentSession
+    from nanocode.extensions import ExtensionHost
+    rt = AgentRuntime()
+    thread = rt.register(RuntimeThread(rt, agent, AgentSession(agent)))
+    host = ExtensionHost.load_system_extensions().activate_all()
+    services = RuntimeServices(
+        cwd=cwd, agent_dir=cwd, workspace_trusted=True,
+        memory_service=None, context_sources=None, extension_host=host)
+    thread._extension_host = host
+    host.bind_runtime(thread, services)
+    agent._runtime_services = services
+    return thread, host

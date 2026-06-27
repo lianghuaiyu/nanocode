@@ -247,6 +247,33 @@ class SubAgentEnded:
 
 
 @dataclass(frozen=True)
+class SubAgentSteered:
+    """子 agent 被 steer / follow-up（docs/26 §0.6 阶段1 O6 typed lifecycle）。父事件流可见;
+    桥成稳定扩展事件 `subagent.steered`,供编排扩展观测在飞子的引导。"""
+
+    agent_type: str
+    description: str
+    run_id: str = ""
+    child_session_id: str = ""
+    delivery: str = "steer"
+    kind: str = "sub_agent_steered"
+
+
+@dataclass(frozen=True)
+class SubAgentBlockedPendingApproval:
+    """后台子 agent 危险动作待父审批（docs/26 §0.6 阶段1 O6 + D3）。父事件流可见;桥成
+    `subagent.blocked`,供编排扩展观测「子卡在审批」(非终态,run_record pendingApproval)。"""
+
+    agent_type: str
+    description: str
+    run_id: str = ""
+    child_session_id: str = ""
+    approval_id: str = ""
+    command: str = ""
+    kind: str = "sub_agent_blocked"
+
+
+@dataclass(frozen=True)
 class ApprovalRequested:
     """危险动作待审批（旧 self._sink.confirmation）——**显示**事件，订阅端据此渲染告警。
     实际决策仍经注入的 confirm_fn 往返（interactive：TUI choice；RPC：stdout 请求 + stdin 响应）。
@@ -279,6 +306,8 @@ AgentEvent = Union[
     RetryRaised,
     SubAgentStarted,
     SubAgentEnded,
+    SubAgentSteered,
+    SubAgentBlockedPendingApproval,
     ApprovalRequested,
 ]
 
@@ -287,7 +316,8 @@ ALL_AGENT_EVENTS: tuple[type, ...] = (
     ToolCallRequested, ToolCallAuthorized, ToolResultCompleted, ToolResultObserved,
     ToolBlocked, BudgetExceeded,
     CompactionRequested, ContextInjected, TurnCompleted, TurnAborted, ErrorRaised,
-    NoticeRaised, RetryRaised, SubAgentStarted, SubAgentEnded, ApprovalRequested,
+    NoticeRaised, RetryRaised, SubAgentStarted, SubAgentEnded, SubAgentSteered,
+    SubAgentBlockedPendingApproval, ApprovalRequested,
 )
 
 # 事件 kind → 对应的 canonical 树 entry 持久化通道（None = 仅 UI / 无树等价物）。
@@ -314,6 +344,8 @@ DURABLE_ENTRY_FOR_EVENT: dict[str, str | None] = {
     "retry_raised": None,
     "sub_agent_started": None,
     "sub_agent_ended": None,
+    "sub_agent_steered": None,
+    "sub_agent_blocked": None,
     "approval_requested": None,
 }
 

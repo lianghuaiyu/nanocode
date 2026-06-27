@@ -15,10 +15,14 @@ from nanocode.agent.engine import Agent
 from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.subagents import run_record
 
+from .._helpers import attach_orchestration
+
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="orchsid", **kw)
+    a = Agent(api_key="test", session_id="orchsid", **kw)
+    attach_orchestration(a)            # steps/tasks 委托到 layer④ orchestration 扩展
+    return a
 
 
 def _spy_build(parent, *, run_once=None, text="done", record=None):

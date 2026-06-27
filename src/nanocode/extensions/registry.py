@@ -23,6 +23,9 @@ from .manifest import CommandContribution
 CommandHandler = Callable[..., Awaitable[object]]
 TaskHandler = Callable[..., Awaitable[None]]
 LifecycleHandler = Callable[..., Awaitable[None]]
+# docs/26 §0.6 阶段1：编排 handler `orchestrate(ctx, payload) -> str`。单一注册（编排策略上提
+# 层④的唯一入口）；前台返聚合 envelope，后台经 detached task 跑（dispatch 在 engine/host）。
+OrchestratorHandler = Callable[..., Awaitable[str]]
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,7 @@ class ContributionRegistry:
     lifecycle_handlers: dict[str, list[tuple[LifecycleHandler, str]]] = field(default_factory=dict)
     model_roles: dict[str, tuple[ModelRolePolicy, str]] = field(default_factory=dict)
     tools: dict[str, RegisteredTool] = field(default_factory=dict)
+    orchestrator: "tuple[OrchestratorHandler, str] | None" = None
 
     # ── command ───────────────────────────────────────────────────────
     # Note: builtin-vs-extension command collisions are enforced by the
@@ -129,6 +133,16 @@ class ContributionRegistry:
                 f"extension {extension_id!r}: model role {role!r} already registered "
                 f"by extension {existing[1]!r}")
         self.model_roles[role] = (policy, extension_id)
+
+    # ── orchestrator (docs/26 §0.6 阶段1) ─────────────────────────────
+    def add_orchestrator(self, handler: "OrchestratorHandler", *, extension_id: str) -> None:
+        """登记唯一编排 handler（dup fail-loud）。编排策略上提层④的单一入口；内置 `agent`
+        工具的 steps/tasks 经 host.run_orchestrator 委托到它（子 caps 仍内核派生）。"""
+        if self.orchestrator is not None:
+            raise ExtensionLoadError(
+                f"extension {extension_id!r}: orchestrator already registered "
+                f"by extension {self.orchestrator[1]!r}")
+        self.orchestrator = (handler, extension_id)
 
     # ── tool (docs/24 Phase 4b) ───────────────────────────────────────
     def add_tool(self, name: str, schema: dict, handler: ToolHandler, *,

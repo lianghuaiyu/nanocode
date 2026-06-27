@@ -19,7 +19,7 @@ from __future__ import annotations
 from .manifest import CommandContribution
 from .registry import (
     CommandHandler, ContributionRegistry, HiddenAgentProfile, LifecycleHandler,
-    ModelRolePolicy, TaskHandler, ToolHandler,
+    ModelRolePolicy, OrchestratorHandler, TaskHandler, ToolHandler,
 )
 
 
@@ -38,6 +38,14 @@ class ExtensionAPI:
 
     def register_task_kind(self, kind: str, handler: TaskHandler) -> None:
         self._registry.add_task_kind(kind, handler, extension_id=self._extension_id)
+
+    def register_orchestrator(self, handler: OrchestratorHandler) -> None:
+        """Register the single orchestration handler (docs/26 §0.6 阶段1).
+
+        `handler(ctx, payload) -> str` owns chain/parallel policy and drives subagents
+        through `ctx.spawn.*` (kernel derives child caps). Only one orchestrator may be
+        registered host-wide; a second registration fails loud."""
+        self._registry.add_orchestrator(handler, extension_id=self._extension_id)
 
     def register_hidden_agent(self, profile: HiddenAgentProfile) -> None:
         self._registry.add_hidden_agent(profile, extension_id=self._extension_id)

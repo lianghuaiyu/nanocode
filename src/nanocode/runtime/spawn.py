@@ -611,20 +611,14 @@ class SubAgentRunner:
             return (f"Error: max sub-agent depth ({fleet_cfg.get('max_depth')}) reached; "
                     f"cannot spawn a sub-agent at depth {host.depth + 1}.")
 
-        # ── chain / parallel fan-in（docs/16 #9：审计过的 host 原语）──
+        # ── chain / parallel：编排策略上提 layer④ orchestration 扩展（docs/26 §0.6 阶段1）──
+        # 内核只保留早期形状校验 + spawn 原语；序列化/{previous}/fan-in/fail-stop/group 全在扩展。
         if inp.get("steps") is not None or inp.get("tasks") is not None:
             if inp.get("steps") is not None and inp.get("tasks") is not None:
                 return "Error: 'steps' (chain) and 'tasks' (parallel) cannot be combined."
             if resume_id or steer_id:
                 return "Error: steps/tasks cannot be combined with resume or steer."
-            if inp.get("run_in_background"):
-                # D6：后台编排——派 detached driver，立即返回 group id（run_cancel <gid> 整组取消）。
-                if inp.get("steps") is not None:
-                    return await self.execute_agent_chain_background(host, inp, fleet_cfg)
-                return await self.execute_agent_parallel_background(host, inp, fleet_cfg)
-            if inp.get("steps") is not None:
-                return await self.execute_agent_chain(host, inp, fleet_cfg)
-            return await self.execute_agent_parallel(host, inp, fleet_cfg)
+            return await host._run_orchestration(inp)
 
         if steer_id:
             if resume_id:
@@ -849,224 +843,16 @@ class SubAgentRunner:
                                 status="completed", tokens=result["tokens"]))
         return host._finalize_foreground_result(sub_agent, result, result_path, child_id)
 
-    # ─── chain / parallel fan-in（docs/16 #9：借 pi {previous} 与 fan-in 的编排点子）──
-    #
-    # 审计过的 host 原语：每步/每任务都经 run_fresh_subagent（独立 child session +
-    # run record、bounded ResultEnvelope、同一 fail-closed allowlist/确认链）；
-    # **不耦合** TeamRuntime（其 team_* entry 保持 non-FOLD/non-leaf，与此无涉）。
-    # 上限防御：步数/任务数封顶；parallel 并发受 settings [agents].max_threads 约束。
-
-    MAX_CHAIN_STEPS = 10
-    MAX_PARALLEL_TASKS = 8
-    PREVIOUS_PLACEHOLDER = "{previous}"
-
-    @staticmethod
-    def _validate_orchestration_items(items, *, what: str, cap: int) -> "str | None":
-        if not isinstance(items, list) or not items:
-            return f"Error: '{what}' must be a non-empty array of {{type?, description?, prompt}} objects."
-        if len(items) > cap:
-            return f"Error: too many {what} ({len(items)} > {cap})."
-        for i, it in enumerate(items, 1):
-            if not isinstance(it, dict) or not str(it.get("prompt") or "").strip():
-                return f"Error: {what}[{i}] must be an object with a non-empty 'prompt'."
-        return None
-
-    async def execute_agent_chain(self, host, inp: dict, fleet_cfg: dict) -> str:
-        """chain：按序跑 N 个独立子 agent；步 prompt 里的 {previous} 替换为上一步的
-        bounded envelope（pi index.ts:530 的 {previous} 点子）。abort 在步边界生效。"""
-        steps = inp.get("steps")
-        err = self._validate_orchestration_items(steps, what="steps", cap=self.MAX_CHAIN_STEPS)
-        if err:
-            return err
-        n = len(steps)
-        previous = "(no previous step)"
-        sections: list[str] = []
-        for i, step in enumerate(steps, 1):
-            if host._aborted:
-                sections.append(f"## Step {i}/{n} — skipped (turn aborted)")
-                break
-            agent_type = _normalize_agent_type(step.get("type", "general"))
-            description = step.get("description") or f"chain step {i}/{n}"
-            step_context = step.get("context") or {"mode": "fresh"}
-            try:
-                step_context_mode = _context_mode(step_context)
-                prompt = _project_prompt(
-                    str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, previous),
-                    step_context,
-                )
-            except ValueError as e:
-                return f"Error: {e}"
-            try:
-                envelope = await self.run_fresh_subagent(
-                    host, agent_type=agent_type, description=description, prompt=prompt,
-                    tool_timeout_ms=step.get("timeout_ms") or inp.get("timeout_ms"),
-                    fleet_cfg=fleet_cfg,
-                    context_mode=step_context_mode,
-                    isolation=step.get("isolation"),
-                    parallel=False)
-            except Exception as e:
-                envelope = f"Sub-agent error: {e}"
-            previous = envelope
-            sections.append(f"## Step {i}/{n} [{agent_type}] {description}\n{envelope}")
-        return "\n\n".join(sections)
-
-    async def execute_agent_parallel(self, host, inp: dict, fleet_cfg: dict) -> str:
-        """parallel fan-in：并发跑 N 个独立子 agent，按任务序聚合 bounded envelope。
-        并发上限 = settings [agents].max_threads（<=0 视为不限）；取消经 gather 传播到
-        全部子任务（各自的 CancelledError 处理落终态后再上抛）。"""
-        tasks = inp.get("tasks")
-        err = self._validate_orchestration_items(tasks, what="tasks", cap=self.MAX_PARALLEL_TASKS)
-        if err:
-            return err
-        n = len(tasks)
-        cap = host._subagents.max_threads()
-        sem = asyncio.Semaphore(cap if cap and cap > 0 else n)
-
-        async def _one(i: int, t: dict) -> str:
-            agent_type = _normalize_agent_type(t.get("type", "general"))
-            description = t.get("description") or f"parallel task {i}/{n}"
-            task_context = t.get("context") or {"mode": "fresh"}
-            try:
-                task_context_mode = _context_mode(task_context)
-                task_prompt = _project_prompt(str(t["prompt"]), task_context)
-            except ValueError as e:
-                return f"Error: {e}"
-            async with sem:
-                try:
-                    envelope = await self.run_fresh_subagent(
-                        host, agent_type=agent_type, description=description,
-                        prompt=task_prompt,
-                        tool_timeout_ms=t.get("timeout_ms") or inp.get("timeout_ms"),
-                        fleet_cfg=fleet_cfg,
-                        context_mode=task_context_mode,
-                        isolation=t.get("isolation"),
-                        parallel=True)
-                except Exception as e:
-                    envelope = f"Sub-agent error: {e}"
-            return f"## Task {i}/{n} [{agent_type}] {description}\n{envelope}"
-
-        sections = await asyncio.gather(*[_one(i, t) for i, t in enumerate(tasks, 1)])
-        return "\n\n".join(sections)
-
-    # ─── 后台编排（D6：detached chain/parallel；内核原语 + group_id tag）────────────
+    # ─── 编排分组 id（chain/parallel 编排策略已上提 orchestration 扩展，docs/26 §0.6 阶段1）──
+    # 本文件只保留 spawn 原语（run_fresh_subagent / spawn_subagent / spawn_background_subagent /
+    # run_cancel）+ group id 铸造；序列化/{previous}/fan-in/fail-stop/group 全在 extensions/
+    # orchestration/policy.py，经受信槽 ctx.spawn 驱动（子 caps 仍内核派生）。
 
     def _new_group_id(self) -> str:
         """编排分组 id（orch_<hex>）：仅入 run_record.groupId + task._nanocode_group_id（整组
         cancel/识别 key）；**不是** child session id、**不是**合成记录节点（对标 OpenCode jobs
         的 {sessionId,parentSessionId} 元数据 fixpoint，不发明 record kind）。"""
         return _tree.new_id("orch")
-
-    async def execute_agent_parallel_background(self, host, inp: dict, fleet_cfg: dict) -> str:
-        """parallel 后台编排（D6）：派 N 个独立 detached run，立即返回 group id。
-
-        复用 `spawn_background_subagent`（无 coordinator，N 个各自独立的 detached run；N>max_threads
-        经现有队列处理）。每个子 `inject_summary=True` → 完成即把一行 result_summary PUSH 回父上下文
-        （全文仍在 result.md）。**all-or-nothing 预校验**：先校验所有 task 的 context/prompt，再
-        spawn，避免 spawn 一半遇坏 item 留下孤儿 detached run。"""
-        tasks = inp.get("tasks")
-        err = self._validate_orchestration_items(tasks, what="tasks", cap=self.MAX_PARALLEL_TASKS)
-        if err:
-            return err
-        n = len(tasks)
-        # 预校验所有 item（all-or-nothing，不留孤儿子）。
-        prepared: list[tuple] = []
-        for i, t in enumerate(tasks, 1):
-            agent_type = _normalize_agent_type(t.get("type", "general"))
-            description = t.get("description") or f"parallel task {i}/{n}"
-            task_context = t.get("context") or {"mode": "fresh"}
-            try:
-                task_context_mode = _context_mode(task_context)
-                task_prompt = _project_prompt(str(t["prompt"]), task_context)
-            except ValueError as e:
-                return f"Error: tasks[{i}]: {e}"
-            bg_timeout = t.get("timeout_ms") or inp.get("timeout_ms")
-            if bg_timeout is None:
-                bg_timeout = build_profile(agent_type).timeout_ms
-            if bg_timeout is None:
-                bg_timeout = fleet_cfg.get("background_timeout_ms")
-            prepared.append((i, agent_type, description, task_prompt,
-                             task_context_mode, t.get("isolation"), bg_timeout))
-        gid = self._new_group_id()
-        run_ids: list[str] = []
-        for (i, agent_type, description, task_prompt,
-             task_context_mode, isolation, bg_timeout) in prepared:
-            run_id = await self.spawn_background_subagent(
-                host, agent_type=agent_type, description=description, prompt=task_prompt,
-                timeout_ms=bg_timeout, context_mode=task_context_mode, isolation=isolation,
-                group_id=gid, inject_summary=True,
-                result_summary=f"parallel task {i}/{n}: {description}")
-            run_ids.append(run_id)
-        listed = "\n".join(f"  - {rid}" for rid in run_ids)
-        return (f"Started background parallel group {gid} with {n} task(s):\n{listed}\n"
-                f"Each reports completion later (summary auto-injected); do not poll or duplicate "
-                f"their work. Cancel the whole group: run_cancel {gid}")
-
-    async def execute_agent_chain_background(self, host, inp: dict, fleet_cfg: dict) -> str:
-        """chain 后台编排（D6）：一个 detached coordinator 顺序跑 N 步，{previous} 串接。
-
-        复用内核 `spawn_subagent`（await 返 SubagentOutcome.text 供 {previous}）。coordinator 自身
-        **不持 run_record**（纯 plumbing，无 _nanocode_run_id → 不污染 _live_run_ids/
-        running_background_count；步骤才是 run）；打 _nanocode_group_id=gid 供整组 cancel。
-        每步 `inject_summary=True` → 逐步 PUSH 摘要回父。**fail-stop**：步 timeout/error → 停余下
-        步 + NoticeRaised；CancelledError 重抛（在飞步已写 cancelled，供 cancel 级联）。
-        **all-or-nothing 预校验**所有步的 context/prompt（{previous} 替换延到运行期）。"""
-        steps = inp.get("steps")
-        err = self._validate_orchestration_items(steps, what="steps", cap=self.MAX_CHAIN_STEPS)
-        if err:
-            return err
-        n = len(steps)
-        for i, step in enumerate(steps, 1):
-            step_context = step.get("context") or {"mode": "fresh"}
-            try:
-                _context_mode(step_context)
-                _project_prompt(
-                    str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, "(previous)"),
-                    step_context)
-            except ValueError as e:
-                return f"Error: steps[{i}]: {e}"
-        gid = self._new_group_id()
-
-        async def _chain_coordinator() -> None:
-            previous = "(no previous step)"
-            for i, step in enumerate(steps, 1):
-                agent_type = _normalize_agent_type(step.get("type", "general"))
-                description = step.get("description") or f"chain step {i}/{n}"
-                step_context = step.get("context") or {"mode": "fresh"}
-                step_context_mode = _context_mode(step_context)
-                prompt = _project_prompt(
-                    str(step["prompt"]).replace(self.PREVIOUS_PLACEHOLDER, previous),
-                    step_context)
-                timeout_ms = step.get("timeout_ms") or inp.get("timeout_ms")
-                if timeout_ms is None:
-                    timeout_ms = build_profile(agent_type).timeout_ms
-                if timeout_ms is None:
-                    timeout_ms = fleet_cfg.get("background_timeout_ms")
-                try:
-                    outcome = await self.spawn_subagent(
-                        host, profile=build_profile(agent_type), prompt=prompt,
-                        description=description, timeout_ms=timeout_ms,
-                        context_mode=step_context_mode, group_id=gid, inject_summary=True,
-                        result_summary=f"chain step {i}/{n}: {description}",
-                        emit_lifecycle=True)
-                except asyncio.CancelledError:
-                    raise   # 在飞步已写 cancelled 终态；重抛供 run_cancel 级联
-                except Exception as e:  # noqa: BLE001 — 步失败 fail-stop（步已写终态 record）
-                    host.emit(NoticeRaised(
-                        text=(f"Background chain group {gid} stopped at step {i}/{n} "
-                              f"({description}): {e}"),
-                        level="warn"))
-                    return
-                previous = outcome.text
-            host.emit(NoticeRaised(
-                text=f"Background chain group {gid} completed all {n} step(s)."))
-
-        task = asyncio.create_task(_chain_coordinator())
-        task._nanocode_group_id = gid
-        host._background_tasks.add(task)
-        task.add_done_callback(host._background_tasks.discard)
-        return (f"Started background chain group {gid} with {n} step(s). Steps run sequentially "
-                f"({{previous}} threaded); each reports completion later (summary auto-injected). "
-                f"Cancel the whole chain: run_cancel {gid}")
 
     # ─── 后台 detached 子 agent（auto-deny-but-continue,搬迁自 engine）────────────
 

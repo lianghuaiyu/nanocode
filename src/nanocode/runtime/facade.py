@@ -469,6 +469,8 @@ class RuntimeThread:
     _SUBAGENT_LIFECYCLE_EVENT = {
         "sub_agent_started": "subagent.started",
         "sub_agent_ended": "subagent.ended",
+        "sub_agent_steered": "subagent.steered",
+        "sub_agent_blocked": "subagent.blocked",
     }
 
     def _bridge_subagent_lifecycle(self, kind: str, event) -> None:
@@ -483,9 +485,14 @@ class RuntimeThread:
         }
         if kind == "sub_agent_started":
             payload["background"] = bool(getattr(event, "background", False))
-        else:
+        elif kind == "sub_agent_ended":
             payload["status"] = getattr(event, "status", "") or ""
             payload["tokens"] = getattr(event, "tokens", None)
+        elif kind == "sub_agent_steered":
+            payload["delivery"] = getattr(event, "delivery", "") or ""
+        elif kind == "sub_agent_blocked":
+            payload["approval_id"] = getattr(event, "approval_id", "") or ""
+            payload["command"] = getattr(event, "command", "") or ""
         try:
             asyncio.get_running_loop().create_task(
                 host.emit(self._SUBAGENT_LIFECYCLE_EVENT[kind], payload))
@@ -971,6 +978,69 @@ class RuntimeThread:
                                     timeout_ms: "int | None" = None) -> str:
         return await self._agent._run_reserved_agent(
             agent_type=agent_type, prompt=prompt, model=model, timeout_ms=timeout_ms)
+
+    # ── 编排原语（供 ctx.spawn 编排槽调用；策略在 orchestration 扩展，docs/26 §0.6 阶段1）──
+    def new_orchestration_group(self) -> str:
+        return self._agent._spawn._new_group_id()
+
+    def is_turn_aborted(self) -> bool:
+        """前台编排在步/任务边界查 turn abort（取代旧 host._aborted 直读，层③暴露）。"""
+        return bool(getattr(self._agent, "_aborted", False))
+
+    async def run_orchestration_member(self, agent_type: str, prompt: str, *,
+                                       description: "str | None" = None,
+                                       timeout_ms: "int | None" = None,
+                                       context_mode: str = "fresh",
+                                       isolation: "str | None" = None,
+                                       parallel: bool = False) -> str:
+        """前台编排成员：bounded ResultEnvelope（内核 run_fresh_subagent，层③）。"""
+        return await self._agent._run_fresh_subagent(
+            agent_type=agent_type, description=description or agent_type, prompt=prompt,
+            timeout_ms=timeout_ms, context_mode=context_mode, isolation=isolation,
+            parallel=parallel)
+
+    async def run_orchestration_step(self, agent_type: str, prompt: str, *, group_id: str,
+                                     description: "str | None" = None,
+                                     inject_summary: bool = True,
+                                     result_summary: "str | None" = None,
+                                     timeout_ms: "int | None" = None,
+                                     context_mode: str = "fresh") -> str:
+        """后台 chain 步：内核 spawn_subagent（await + group/inject），返回原始 text（层③）。"""
+        from ..agents.registry import build_profile
+        from .spawn import _normalize_agent_type
+        profile = build_profile(_normalize_agent_type(agent_type))
+        outcome = await self._agent._spawn_subagent(
+            profile=profile, prompt=prompt, description=description,
+            timeout_ms=timeout_ms, context_mode=context_mode, group_id=group_id,
+            inject_summary=inject_summary, result_summary=result_summary,
+            emit_lifecycle=True)
+        return outcome.text
+
+    async def spawn_orchestration_background(self, agent_type: str, prompt: str, *,
+                                             group_id: "str | None" = None,
+                                             description: "str | None" = None,
+                                             inject_summary: bool = True,
+                                             result_summary: "str | None" = None,
+                                             timeout_ms: "int | None" = None,
+                                             context_mode: str = "fresh",
+                                             isolation: "str | None" = None) -> str:
+        """后台 parallel 成员：detached run（内核 spawn_background_subagent，层③）。"""
+        return await self._agent._spawn_background_subagent(
+            agent_type=agent_type, description=description or result_summary or agent_type,
+            prompt=prompt, timeout_ms=timeout_ms, context_mode=context_mode,
+            isolation=isolation, group_id=group_id, inject_summary=inject_summary,
+            result_summary=result_summary)
+
+    def launch_orchestration_coordinator(self, coro, *, group_id: str) -> None:
+        """把扩展后台 chain coordinator 协程登记为内核追踪 detached task（tagged group_id）。"""
+        task = asyncio.create_task(coro)
+        task._nanocode_group_id = group_id
+        self._agent._background_tasks.add(task)
+        task.add_done_callback(self._agent._background_tasks.discard)
+
+    async def cancel_runs(self, group_id: str) -> str:
+        """级联取消整组（内核 run_cancel 的 group/单子不动点扫描，层③）。"""
+        return await self._agent.run_cancel(group_id)
 
     async def run_extension_task(self, kind: str, payload: dict) -> str:
         import asyncio

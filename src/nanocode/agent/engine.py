@@ -21,8 +21,10 @@ from .events import (
     AssistantDelta,
     ApprovalRequested,
     NoticeRaised,
+    SubAgentBlockedPendingApproval,
     SubAgentEnded,
     SubAgentStarted,
+    SubAgentSteered,
     ToolBlocked,
     ToolCallAuthorized,
 )
@@ -843,6 +845,13 @@ class Agent(PlanModeMixin):
                 run_record.set_pending_approval(run_id, approval_id=approval_id, command=message)
             except Exception:
                 pass  # sidecar 仅 UI 投影；写失败不应阻断审批往返
+            try:
+                _st = run_record.read_status(run_id)
+            except Exception:
+                _st = {}
+            self.emit(SubAgentBlockedPendingApproval(
+                agent_type=_st.get("agentType", "") or "", description=_st.get("description", "") or "",
+                run_id=run_id, child_session_id=run_id, approval_id=approval_id, command=message))
             self.emit(NoticeRaised(
                 text=f"Sub-agent {run_id} requests approval: {message}  "
                      f"(/agents → open run → a approve / d deny)",
@@ -881,6 +890,14 @@ class Agent(PlanModeMixin):
             queued = self._run_runtime.send(child_session_id, prompt, delivery=delivery)
         except Exception as e:
             return f"Error: {e}"
+        try:
+            _st = self._run_runtime.status(child_session_id)
+            self.emit(SubAgentSteered(
+                agent_type=getattr(_st, "agent_type", "") or "",
+                description=getattr(_st, "description", "") or "",
+                run_id=child_session_id, child_session_id=child_session_id, delivery=delivery))
+        except Exception:
+            pass  # lifecycle 事件 fire-and-forget，绝不阻断 steer 投递
         return json.dumps(queued, ensure_ascii=False, indent=2)
 
     def _tool_blocked_by_allowlist(self, name: str) -> bool:
@@ -1282,6 +1299,18 @@ class Agent(PlanModeMixin):
         return self._spawn.finalize_foreground_result(
             self, sub_agent, result, result_path, record_id)
 
+    async def _run_fresh_subagent(self, *, agent_type: str, description: str,
+                                  prompt: str, timeout_ms: int | None = None,
+                                  context_mode: str = "fresh",
+                                  isolation: str | None = None,
+                                  parallel: bool = False) -> str:
+        """fresh 前台子 agent 单步原语（编排扩展经 facade 调用；实现在 runtime/spawn.py）。"""
+        from ..tools import load_agents_config
+        return await self._spawn.run_fresh_subagent(
+            self, agent_type=agent_type, description=description, prompt=prompt,
+            tool_timeout_ms=timeout_ms, fleet_cfg=load_agents_config(),
+            context_mode=context_mode, isolation=isolation, parallel=parallel)
+
     async def _spawn_background_subagent(self, *, agent_type: str, description: str,
                                          prompt: str, timeout_ms: int | None = None,
                                          context_mode: str = "fresh",
@@ -1344,6 +1373,21 @@ class Agent(PlanModeMixin):
     async def _execute_agent_tool(self, inp: dict) -> str:
         """`agent` 工具主入口（fresh/resume/background 分派；实现在 runtime/spawn.py）。"""
         return await self._spawn.execute_agent_tool(self, inp)
+
+    async def _run_orchestration(self, inp: dict) -> str:
+        """steps/tasks 编排委托到 layer④ orchestration 扩展（docs/26 §0.6 阶段1）。
+
+        编排**策略**（序列化/{previous}/fan-in/fail-stop/group）住在扩展;内核只提供 spawn 原语
+        （经 ctx.spawn 受信槽）+ 本委托。无 orchestration 扩展（未加载/未 bound/未注册）→ 直接报错
+        （**无内核 fallback**）。前台阻塞返回聚合 envelope;后台编排由扩展 handler 同步做完
+        all-or-nothing 预校验后 detached（经 ctx.spawn.run_background / launch_coordinator）再立即
+        返回 group 提示——故此处对前/后台都只是 `await` 委托。"""
+        services = getattr(self, "_runtime_services", None)
+        eh = getattr(services, "extension_host", None) if services is not None else None
+        if eh is None or not eh.is_active or eh.registry.orchestrator is None:
+            return ("Error: orchestration extension is not available for this session; "
+                    "steps/tasks orchestration cannot run.")
+        return await eh.run_orchestrator(inp)
 
     async def _authorize_dispatch(self, name: str, inp: dict) -> "tuple[bool, str | None]":
         """两后端派发前共用的授权 + 审批交互（单一入口，de-dup）。返回 ``(allowed, denial)``。

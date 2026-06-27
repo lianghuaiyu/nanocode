@@ -43,6 +43,8 @@ def test_spawn_cap_granted_to_capability_extension():
     assert isinstance(ctx.spawn, SpawnCap)
     # memory_evolution 声明 spawn:reserved 且贡献 diagnostician → 仅它在授予集。
     assert ctx.spawn._allowed == frozenset({MEMORY_DIAGNOSTICIAN_TYPE})
+    # orchestration 扩展声明 spawn:orchestrate → 同一槽也解锁编排原语（docs/26 §0.6 阶段1）。
+    assert ctx.spawn._can_orchestrate is True
 
 
 def test_spawn_cap_reserved_delegates_to_kernel():

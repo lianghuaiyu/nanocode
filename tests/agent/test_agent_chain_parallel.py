@@ -11,11 +11,14 @@ import json
 
 from nanocode.agent.engine import Agent
 
+from .._helpers import attach_orchestration
+
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
     a = Agent(api_key="test", session_id="chainsid", **kw)
     a._mcp_initialized = True
+    attach_orchestration(a)            # steps/tasks 委托到 layer④ orchestration 扩展
     return a
 
 
