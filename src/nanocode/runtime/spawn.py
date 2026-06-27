@@ -117,7 +117,7 @@ def _normalize_agent_type(agent_type: str) -> str:
 
 
 def _model_snapshot(host, model: str) -> dict:
-    return {"provider": host._current_provider(), "modelId": model}
+    return {"provider": host.provider_runtime_config.name, "modelId": model}
 
 
 def _context_mode(context) -> str:
@@ -210,10 +210,7 @@ def child_tools(host, profile: AgentProfile, *, background: bool = False) -> lis
 class SubAgentRunner:
     """子 agent 构造 + 落盘机器（无状态;每 Agent 持一个,方法经 host 注入 collaborators）。"""
 
-    # ─── provider / child id ──────────────────────────────────────────────────
-    def current_provider(self, host) -> str:
-        return "openai" if host.use_openai else "anthropic"
-
+    # ─── child id ─────────────────────────────────────────────────────────────
     def child_session_id(self, host, agent_id: str) -> str:
         """Return the child-session id for a sub-agent run.
 
@@ -241,9 +238,13 @@ class SubAgentRunner:
         confirm_fn = _auto_deny_confirm if background else host.confirm_fn
         confirmed_paths = set() if background else host._confirmed_paths
         allowed_tool_names = {t["name"] for t in safe_tools}
+        provider_cfg = host.provider_runtime_config
         sub = Agent(
             model=model or host.model,
-            api_base=str(host._openai_client.base_url) if host.use_openai and host._openai_client else None,
+            provider=provider_cfg.name,
+            api_key=provider_cfg.api_key,
+            api_base=provider_cfg.api_base,
+            anthropic_base_url=provider_cfg.anthropic_base_url,
             custom_system_prompt=system_prompt,
             custom_tools=safe_tools,
             is_sub_agent=True,
@@ -671,11 +672,12 @@ class SubAgentRunner:
             if run.status == "running":
                 return (f"Error: sub-agent '{resume_id}' is still running; cannot resume an in-flight "
                         f"sub-agent. Send a steer message if you need to adjust it; otherwise wait for completion.")
+            current_provider = host.provider_runtime_config.name
             rec_provider = (run.model or {}).get("provider")
             rec_model = (run.model or {}).get("modelId")
-            if rec_provider and rec_provider != host._current_provider():
+            if rec_provider and rec_provider != current_provider:
                 return (f"Error: provider mismatch — sub-agent '{resume_id}' was created with "
-                        f"provider '{rec_provider}' but current provider is '{host._current_provider()}'. "
+                        f"provider '{rec_provider}' but current provider is '{current_provider}'. "
                         f"Cannot resume across providers.")
             profile = build_profile(run.agent_type)
             current_eff_model = profile.model or host.model

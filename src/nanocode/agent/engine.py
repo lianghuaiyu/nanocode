@@ -117,10 +117,16 @@ class Agent(PlanModeMixin):
         self._base_permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
-        # B1 provider seam：provider name 是单一真源（= 旧 bool(api_base)）；client/adapter/capture
-        # api/system 放置都从 providers.SPECS[provider] 派生。显式 provider 优先，否则按 api_base 解析。
-        from .providers import resolve_provider_name
-        self._provider_name = provider or resolve_provider_name(api_base=api_base)
+        # B1 provider seam：provider runtime config 是 provider bootstrap 的单一真源。
+        # 显式 provider 优先；未显式给出时，CLI/SDK 仍可用 api_base 选择 openai-compatible provider。
+        from .providers import ProviderRuntimeConfig, resolve_provider_name
+        provider_name = provider or resolve_provider_name(api_base=api_base)
+        self._provider_runtime = ProviderRuntimeConfig(
+            name=provider_name,
+            api_key=api_key,
+            api_base=api_base,
+            anthropic_base_url=anthropic_base_url,
+        )
         self.is_sub_agent = is_sub_agent
         # P4 call-time allowlist：本 agent 准许运行的**真实**工具名集合。
         # None = 不约束（主 agent 恒 None）；子 agent 由 _build_sub_agent 传入其有效
@@ -304,30 +310,24 @@ class Agent(PlanModeMixin):
 
         # Initialize clients. Provider SDK imports are intentionally lazy so
         # embedding/import-boundary users can construct runtime/test Agents
-        # without installing every provider package. B1：client 工厂归 providers.SPECS
-        # （ModuleNotFoundError → None，逐字保留旧 inline 行为）；engine 只持单一活跃 client。
+        # without installing every provider package. B1：client 工厂归 providers.SPECS；
+        # engine 只持单一活跃 adapter/client。
         from .providers import SPECS, make_provider_adapter
-        spec = SPECS[self._provider_name]
+        spec = SPECS[self._provider_runtime.name]
         client = spec.build_client(
             api_key=api_key, api_base=api_base, anthropic_base_url=anthropic_base_url)
-        # 兼容旧读者（spawn.py / 测试）：保留按 provider 命名的 client 属性，非活跃侧为 None。
-        self._openai_client = client if self._provider_name == "openai" else None
-        self._anthropic_client = client if self._provider_name == "anthropic" else None
 
         # docs/15 STEP B：provider 流式 + 完成归一收敛到 ProviderAdapter（backend mixin 经 self._provider
         # .stream 委托,engine 不再持 _call_*_stream）。clients 在 rebind 不变,故 _provider 跨 rebind 有效。
         # G2：active-tool 过滤已上移到 ②b（_loop_config 的 cfg.resolve_tools），adapter 不再持 registry。
         self._provider = make_provider_adapter(
-            provider=self._provider_name, client=client)
+            provider=self._provider_runtime.name, client=client)
         # docs/15 STEP C：模型循环上移到 AgentCore（host=self 注入 collaborators）。无状态,可共享。
         self._core = AgentCore()
 
     @property
-    def use_openai(self) -> bool:
-        """B1：迁移期 read-only 兼容垫——provider 真源是 self._provider.name。外部读者（spawn.py /
-        cli.py / turn-loop 选择）仍可读；15 个行为站点已改读 self._provider 的 capture_api /
-        places_system_in_messages，不再读此属性。"""
-        return self._provider.name == "openai"
+    def provider_runtime_config(self):
+        return self._provider_runtime
 
     def _apply_permission_mode_prompt(self) -> None:
         """按当前 permission_mode 设 _plan_file_path + _system_prompt（__init__ 与 rebind_session 共用）。
@@ -354,8 +354,8 @@ class Agent(PlanModeMixin):
 
     def _build_side_query(self):
         """Build a sideQuery callable for memory recall, works with both backends."""
-        if self._anthropic_client:
-            client = self._anthropic_client
+        client = self._provider.client
+        if self._provider.name == "anthropic" and client is not None:
             model = self.model
             async def _sq(system: str, user_message: str) -> str:
                 resp = await client.messages.create(
@@ -364,8 +364,7 @@ class Agent(PlanModeMixin):
                 )
                 return "".join(b.text for b in resp.content if b.type == "text")
             return _sq
-        if self._openai_client:
-            client = self._openai_client
+        if self._provider.name == "openai" and client is not None:
             model = self.model
             async def _sq_oai(system: str, user_message: str) -> str:
                 resp = await client.chat.completions.create(
@@ -477,7 +476,7 @@ class Agent(PlanModeMixin):
     # owner）；engine 只保留两个 summarizer LLM 调用点作 per-instance monkeypatch 锚（B1 后实现下沉到
     # ProviderAdapter.summarize，summarizer 输入 = 树渲染）。/compact 与 auto-compact 都走
     # agent_session.compact()。这四个薄 delegator 是 monkeypatch 锚（~40 处测试 patch 之），故保留：
-    # 调用点经 Agent._compact / Agent._summarize 选锚（按 provider name，非 use_openai），锚体经
+    # 调用点经 Agent._compact / Agent._summarize 选锚（按 provider name），锚体经
     # self._provider.summarize 落地（provider 差异下沉 adapter，行为 byte-equivalent）。
     _COMPACT_PERSONA = ("You are a coding-session summarizer. Follow the user's summary format "
                         "exactly; be thorough but do not pad.")
@@ -527,7 +526,7 @@ class Agent(PlanModeMixin):
 
     async def _compact(self, messages: "list | None",
                        instructions: str | None = None) -> "str | None":
-        """compaction summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。
+        """compaction summarizer 调用点：按 provider name 选 monkeypatch 锚。
         锚仍是 _compact_anthropic / _compact_openai（patch 点存活）；分支只剩 provider name 选择。
         instructions 只在 truthy 时作位置参数传入——逐字保留旧调用点的两形态签名（monkeypatch fake
         可声明单参 _fake(messages)，与旧 `_compact_anthropic(prefix)` 调用形态一致）。"""
@@ -537,7 +536,7 @@ class Agent(PlanModeMixin):
         return await target(messages)
 
     async def _summarize(self, messages: "list | None", prompt_text: str) -> "str | None":
-        """branch-summary summarizer 调用点（去 use_openai 分支）：按 provider name 选 monkeypatch 锚。"""
+        """branch-summary summarizer 调用点：按 provider name 选 monkeypatch 锚。"""
         if self._provider.name == "openai":
             return await self._summarize_openai(messages, prompt_text)
         return await self._summarize_anthropic(messages, prompt_text)
@@ -959,7 +958,8 @@ class Agent(PlanModeMixin):
         - SESSION_READ → runs（child-session run record）
         - MEMORY → memory；SPAWN → spawn
         - SET_MODE → set_mode，**但子 agent 时强制 None**（保住 plan-mode 主 agent-only 门）
-        把手内部持 host(self) 引用做薄转发；ToolContext 本身无任何字段通向 raw Agent/_session_mgr/lease。"""
+        ExecCap 经窄 callable 进入 SandboxManager；其余把手持 host(self) 做薄转发。
+        ToolContext 本身无任何字段通向 raw Agent/_session_mgr/lease。"""
         from ..tools.context import (
             ToolContext, FsReadCap, FsWriteCap, FsListCap,
             ExecCap, TasksCap, RunsCap, MemoryCap, SpawnCap, SetModeCap,
@@ -971,7 +971,11 @@ class Agent(PlanModeMixin):
         fs_read = FsReadCap(fs_policy) if Capability.FS_READ in granted else None
         fs_list = FsListCap(fs_policy) if Capability.FS_READ in granted else None
         fs_write = FsWriteCap(fs_policy) if Capability.FS_WRITE in granted else None
-        exec_cap = ExecCap(self) if Capability.EXEC in granted else None
+        async def execute_shell(request, approval) -> str:
+            return await self._sandbox.execute_shell(
+                request, self.host_context(), self.sandbox_policy(), approval)
+
+        exec_cap = ExecCap(execute_shell) if Capability.EXEC in granted else None
         tasks_cap = TasksCap(self) if Capability.TASKS in granted else None
         runs_cap = RunsCap(self) if Capability.SESSION_READ in granted else None
         memory_cap = MemoryCap(self) if Capability.MEMORY in granted else None
@@ -1266,9 +1270,6 @@ class Agent(PlanModeMixin):
 
         self._pending_skill_bodies.append((inp.get("skill_name", ""), result["prompt"]))
         return f'[skill "{inp.get("skill_name", "")}" loaded — its instructions follow in the next message]'
-
-    def _current_provider(self) -> str:
-        return self._spawn.current_provider(self)
 
     def _close_child_session(self, agent_id: str, sub_agent: "Agent") -> None:
         """Close 子 agent 的 child 写者租约（docs/15 Phase 6：实现在 runtime/spawn.py）。"""

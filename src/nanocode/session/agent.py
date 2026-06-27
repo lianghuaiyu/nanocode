@@ -126,6 +126,7 @@ class AgentSession:
         execute_tool 必须是 allowlist fail-closed 咽喉点入口（_execute_tool_call→router.dispatch）。"""
         from ..agent.loop import AgentLoopConfig
         from ..tools import get_active_tool_definitions
+        from ..tools.permissions import CONCURRENCY_SAFE_TOOLS
         a = self.agent
 
         def note_api_call() -> None:
@@ -169,6 +170,7 @@ class AgentSession:
             tool_result_messages=a._provider.tool_result_messages,
             execute_tool=a._execute_tool_call,
             authorize=a._authorize_dispatch,
+            is_concurrency_safe=lambda name: name in CONCURRENCY_SAFE_TOOLS,
             persist_large_result=a._persist_large_result,
             check_budget=a._check_budget,
             bump_turn=bump_turn, note_api_call=note_api_call, add_usage=add_usage,

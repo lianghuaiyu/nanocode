@@ -140,10 +140,10 @@ class AgentConfig:
     max_cost_usd: float | None = None
     max_turns: int | None = None
     api_key: str | None = None
-    api_base: str | None = None            # openai-compatible base（非空 → use_openai）
+    api_base: str | None = None            # openai-compatible base
     anthropic_base_url: str | None = None
-    # B1 provider seam：显式 provider name（"anthropic"/"openai"）。None → 按 api_base 解析
-    # （resolve_provider_name，= 旧 bool(api_base)）。显式值优先，使非 api_base 触发的 provider 选择成为可能。
+    # B1 provider seam：显式 provider name（"anthropic"/"openai"）。None → 按 api_base 解析。
+    # 显式值优先，使非 api_base 触发的 provider 选择成为可能。
     provider: str | None = None
     trajectory_enabled: bool = False
     trajectory_level: str = "summary"

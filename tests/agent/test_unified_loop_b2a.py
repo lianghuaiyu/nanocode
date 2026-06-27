@@ -40,7 +40,7 @@ def _agent(sid, **kw):
     kw.setdefault("permission_mode", "bypassPermissions")
     a = Agent(api_key="test", session_id=sid, **kw)
     a._mcp_initialized = True
-    if not a.use_openai:
+    if a.provider_runtime_config.name != "openai":
         a.model = "claude-x"
     attach_runtime_agent(a)   # docs/23 Phase 4: inject session-writer lease (was a.chat() pre-cutover)
     return a

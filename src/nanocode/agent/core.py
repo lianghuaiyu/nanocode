@@ -119,7 +119,7 @@ class AgentCore:
             # Phase 2：分组并执行（连续并发安全工具并行 → asyncio.gather；其余串行）。
             results: list[dict] = []          # [{tool_call_id, name, content, is_error, latency_ms}]
             context_break = False
-            for batch in group_tool_batches(checked):
+            for batch in group_tool_batches(checked, is_concurrency_safe=cfg.is_concurrency_safe):
                 if context_break or cfg.is_aborted():
                     break
 
@@ -184,4 +184,3 @@ class AgentCore:
     # _compact_prompt（prompt 选择，仍被 engine.py 的 delegator 经 self._core._compact_prompt 活跃调用）。
     #
     # B2-a：block_to_dict 下沉到 AnthropicAdapter._block_to_dict（providers.py，complete() 内用）。
-

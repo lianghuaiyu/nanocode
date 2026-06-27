@@ -20,9 +20,9 @@ from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 
 
-def _agent(sid, *, use_openai=False):
+def _agent(sid, *, provider="anthropic"):
     kw = dict(api_key="test", session_id=sid, permission_mode="bypassPermissions")
-    if use_openai:
+    if provider == "openai":
         kw.update(api_base="http://localhost:1/v1", model="gpt-test")
     return Agent(**kw)
 
@@ -81,17 +81,16 @@ OPENAI_CORPUS = [
 # （参照侧原是 engine._tree_record 的内联 capture；该方法已删（docs/16 #3b），
 #   此处在测试内重建同一参照路径，继续锚定 #0 工厂不漂移。）
 
-@pytest.mark.parametrize("use_openai,corpus", [(False, ANTHROPIC_CORPUS), (True, OPENAI_CORPUS)],
+@pytest.mark.parametrize("provider,corpus", [("anthropic", ANTHROPIC_CORPUS), ("openai", OPENAI_CORPUS)],
                          ids=["anthropic", "openai"])
-def test_tree_parity_with_inline_tree_record(use_openai, corpus):
+def test_tree_parity_with_inline_tree_record(provider, corpus):
     from nanocode.session import capture
-    provider = "openai" if use_openai else "anthropic"
-    a1 = _agent(f"cap0a_{provider}", use_openai=use_openai)
+    a1 = _agent(f"cap0a_{provider}", provider=provider)
     a1._session_mgr = SessionManager.create(f"cap0a_{provider}")
-    a2 = _agent(f"cap0b_{provider}", use_openai=use_openai)
+    a2 = _agent(f"cap0b_{provider}", provider=provider)
     a2._session_mgr = SessionManager.create(f"cap0b_{provider}")
 
-    cap = capture.capture_openai if use_openai else capture.capture_anthropic
+    cap = capture.capture_openai if provider == "openai" else capture.capture_anthropic
     for msg, kw in corpus:
         neutral_sr = capture.neutral_stop_reason(provider, kw.get("stop_reason"))
         for neutral in cap(msg, model=a1.model, stop_reason=neutral_sr,        # 参照：直接 capture 路径

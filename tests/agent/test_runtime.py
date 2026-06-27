@@ -26,14 +26,14 @@ def test_agent_config_build_agent_applies_fields():
     assert isinstance(a, Agent)
     assert a.model == "claude-x" and a.session_id == "cfgsid"
     assert a.max_turns == 7 and a.permission_mode == "bypassPermissions"
-    assert a.use_openai is False                      # 无 api_base → anthropic
+    assert a.provider_runtime_config.name == "anthropic"
 
 
 def test_agent_config_api_base_selects_openai():
     cfg = AgentConfig(api_key="test", api_base="https://x/v1", session_id="cfgoa",
                       permission_mode="bypassPermissions")
     a = cfg.build_agent()
-    assert a.use_openai is True
+    assert a.provider_runtime_config.name == "openai"
 
 
 def test_thread_start_builds_and_registers_thread():

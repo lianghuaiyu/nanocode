@@ -24,8 +24,10 @@ tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
+    kw.setdefault("api_key", "test")
+    kw.setdefault("session_id", "secsid")
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="secsid", **kw)
+    return Agent(**kw)
 
 
 def _write(d, name, body):
@@ -54,6 +56,22 @@ def test_build_sub_agent_with_empty_tools_yields_no_tools():
     parent = _agent()
     sub = parent._build_sub_agent(system_prompt="x", tools=[], agent_type="coder")
     assert sub.tools == []
+
+
+def test_build_sub_agent_inherits_provider_runtime_config():
+    parent = _agent(
+        api_key="secret",
+        api_base="https://example.com/v1",
+        model="gpt-test",
+    )
+    sub = parent._build_sub_agent(system_prompt="x", tools=[], agent_type="coder")
+    assert parent.provider_runtime_config.name == "openai"
+    assert sub.provider_runtime_config.name == "openai"
+    assert sub.provider_runtime_config.api_key == "secret"
+    assert sub.provider_runtime_config.api_base == "https://example.com/v1"
+    assert not hasattr(parent, "use_openai")
+    assert not hasattr(parent, "_openai_client")
+    assert not hasattr(parent, "_anthropic_client")
 
 
 def test_curator_profile_is_toolless_and_does_not_widen():
@@ -143,7 +161,7 @@ def test_resume_reserved_curator_record_is_rejected():
         context_mode="fresh",
         isolation="shared",
         worktree_path=None,
-        model={"provider": parent._current_provider(), "modelId": parent.model},
+        model={"provider": parent.provider_runtime_config.name, "modelId": parent.model},
         prompt="curate",
     )
     res = asyncio.run(parent._execute_agent_tool(

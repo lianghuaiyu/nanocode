@@ -224,7 +224,7 @@ def test_resume_model_mismatch_errors(monkeypatch):
     run_id = _only_run_id(parent)
     from nanocode.subagents import run_record
     run_record.update_status(
-        run_id, model={"provider": parent._current_provider(), "modelId": "some-other-model"})
+        run_id, model={"provider": parent.provider_runtime_config.name, "modelId": "some-other-model"})
     res = asyncio.run(parent._execute_agent_tool(
         {"description": "d", "prompt": "p", "resume": run_id}))
     assert "model" in res.lower()
@@ -263,19 +263,19 @@ def test_run_in_background_with_resume_errors():
     assert json.loads(parent.run_list()) == []
 
 
-# ─── _current_provider 基础 ──────────────────────────────────
+# ─── provider runtime config 基础 ─────────────────────────────
 
 
-def test_current_provider_anthropic():
+def test_provider_runtime_config_anthropic():
     parent = _agent()
-    assert parent._current_provider() == "anthropic"
+    assert parent.provider_runtime_config.name == "anthropic"
 
 
-def test_current_provider_openai():
+def test_provider_runtime_config_openai():
     parent = Agent(api_key="test",
                    permission_mode="bypassPermissions",
                    api_base="https://example.com/v1", session_id="osid")
-    assert parent._current_provider() == "openai"
+    assert parent.provider_runtime_config.name == "openai"
 
 
 def test_resume_rejects_in_flight_subagent():

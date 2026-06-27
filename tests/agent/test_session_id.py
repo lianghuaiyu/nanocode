@@ -56,6 +56,9 @@ def test_host_context_carries_session_id():
 def test_run_shell_input_has_no_injected_keys(monkeypatch, tmp_path):
     """run_shell 抵达 SandboxManager 时，HostContext 持 cwd/session；inp 不被注入 _cwd/_session_id。"""
     a = _agent(session_id="injsid", permission_mode="bypassPermissions")
+    ctx = a.mint_tool_context("run_shell")
+    assert ctx.exec is not None
+    assert not hasattr(ctx.exec, "_host")
     captured = {}
 
     async def fake_exec(request, host, policy, approval):

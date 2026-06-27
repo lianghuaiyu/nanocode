@@ -14,8 +14,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from ..tools import CONCURRENCY_SAFE_TOOLS
-
 
 @dataclass
 class AgentLoopConfig:
@@ -43,6 +41,7 @@ class AgentLoopConfig:
     # ── 工具派发 ──
     execute_tool: Callable[[str, dict], Awaitable[str]]
     authorize: Callable[[str, dict], Awaitable[tuple]]
+    is_concurrency_safe: Callable[[str], bool]
     persist_large_result: Callable[[str, str], str]
     # ── 预算 / 计数 writeback ──
     check_budget: Callable[[], dict]
@@ -61,7 +60,7 @@ class AgentLoopConfig:
     poll_memory: Callable[[], None]                   # memory prefetch settle → ContextInjected
 
 
-def group_tool_batches(checked: list[dict]) -> list[dict]:
+def group_tool_batches(checked: list[dict], *, is_concurrency_safe: Callable[[str], bool]) -> list[dict]:
     """post-stream Phase 2 grouping（B2-a，对两 provider 统一适用）：把 serial-checked 的 tool calls
     分组——连续的 allowed + concurrency-safe 工具并成一个并行 batch,其余各自成串行 batch
     （移植自旧 openai loop 的 group_openai_batches,逻辑逐字一致；仅更名以示 provider-agnostic）。
@@ -71,7 +70,7 @@ def group_tool_batches(checked: list[dict]) -> list[dict]:
     """
     batches: list[dict] = []
     for ct in checked:
-        safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+        safe = ct["allowed"] and is_concurrency_safe(ct["fn"])
         if safe and batches and batches[-1]["concurrent"]:
             batches[-1]["items"].append(ct)
         else:

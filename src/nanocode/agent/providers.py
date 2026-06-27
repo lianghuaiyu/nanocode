@@ -84,6 +84,20 @@ class StreamCallbacks:
     retry: "Callable[[int, int, str], None] | None" = None
 
 
+@dataclass(frozen=True)
+class ProviderRuntimeConfig:
+    """Provider bootstrap data shared with host services that need child agents.
+
+    This is configuration, not a provider SDK object. Host/runtime code may pass it
+    back into Agent construction, but must not inspect adapter/client internals.
+    """
+
+    name: str
+    api_key: "str | None" = None
+    api_base: "str | None" = None
+    anthropic_base_url: "str | None" = None
+
+
 class ProviderAdapter:
     """provider 适配器基类。持 client；stream() 做 SDK 流式;complete() 归一完成载荷。
 
@@ -439,7 +453,7 @@ SPECS: dict[str, ProviderSpec] = {
 
 
 def resolve_provider_name(*, api_base: "str | None") -> str:
-    """provider 名解析（= 旧 bool(api_base)）：openai-compatible base 非空 → openai，否则 anthropic。"""
+    """provider 名解析：openai-compatible base 非空 → openai，否则 anthropic。"""
     return "openai" if api_base else "anthropic"
 
 

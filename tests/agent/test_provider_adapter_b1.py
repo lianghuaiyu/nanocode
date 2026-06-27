@@ -2,17 +2,15 @@
 
 把 provider-specific 行为下沉到 ProviderAdapter 缝之下后，turn/压缩/摘要/系统提示词的调用点不再
 分支 provider。这些测试钉住 B1 的等价契约（同一 model，两 provider）：
-- adapter 三标志（name / capture_api / places_system_in_messages）与旧 use_openai 派生串一致；
+- adapter 三标志（name / capture_api / places_system_in_messages）由 provider spec 暴露；
 - summarize（compaction + branch-summary）两路在 system 放置 / messages[1:] 切片 / 长度守卫 /
   fallback 上 byte-equivalent（**parity 雷 A/B**）；
 - capture 串经 adapter.capture_api 选表（与旧 "openai"/"anthropic" + api 串一致）；
-- AgentConfig.provider 显式覆盖 + resolve_provider_name 与旧 bool(api_base) 等价；
-- use_openai 退化为 read-only property（= self._provider.name == "openai"）。
+- AgentConfig.provider 显式覆盖 + resolve_provider_name 的 api_base 推断；
+- Agent 暴露明确的 provider runtime config，不暴露 provider-specific client 兼容属性。
 """
 
 import asyncio
-
-import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.providers import (
@@ -24,9 +22,9 @@ from nanocode.agent.providers import (
 )
 
 
-def _agent(*, use_openai=False, sid="b1"):
+def _agent(*, provider_name="anthropic", sid="b1"):
     kw = dict(api_key="test", session_id=sid, permission_mode="bypassPermissions")
-    if use_openai:
+    if provider_name == "openai":
         kw.update(api_base="http://localhost:1/v1", model="gpt-test")
     return Agent(**kw)
 
@@ -88,7 +86,7 @@ class _FakeOpenAIClient:
 
 # ── adapter 三标志 ───────────────────────────────────────────────────────────
 
-def test_spec_flags_match_legacy_derivation():
+def test_spec_flags_define_provider_projection():
     assert SPECS["anthropic"].capture_api == "anthropic"
     assert SPECS["anthropic"].places_system_in_messages is False
     assert SPECS["openai"].capture_api == "openai-completions"
@@ -102,7 +100,7 @@ def test_adapter_class_flags():
     assert (o.name, o.capture_api, o.places_system_in_messages) == ("openai", "openai-completions", True)
 
 
-def test_resolve_provider_name_equiv_bool_api_base():
+def test_resolve_provider_name_from_api_base():
     assert resolve_provider_name(api_base=None) == "anthropic"
     assert resolve_provider_name(api_base="") == "anthropic"
     assert resolve_provider_name(api_base="http://x/v1") == "openai"
@@ -113,18 +111,11 @@ def test_make_provider_adapter_by_name():
     assert isinstance(make_provider_adapter(provider="openai", client=None), OpenAIAdapter)
 
 
-# ── use_openai property ──────────────────────────────────────────────────────
-
-def test_use_openai_is_readonly_property():
-    assert _agent().use_openai is False
-    assert _agent(use_openai=True).use_openai is True
-    with pytest.raises(AttributeError):
-        _agent().use_openai = True
-
-
 def test_agent_provider_attrs_track_adapter():
     a_anthropic = _agent()
-    a_openai = _agent(use_openai=True)
+    a_openai = _agent(provider_name="openai")
+    assert a_anthropic.provider_runtime_config.name == "anthropic"
+    assert a_openai.provider_runtime_config.name == "openai"
     assert a_anthropic._provider.name == "anthropic"
     assert a_anthropic._provider.capture_api == "anthropic"
     assert a_anthropic._provider.places_system_in_messages is False
@@ -151,7 +142,7 @@ def test_compact_system_placement_and_slice_parity():
     """同一 prefix（OpenAI 渲染时带 system[0]），两 provider 的 compaction summarizer 等价：
     Anthropic system 走 out-of-band kwarg、不切片；OpenAI system 进 messages[0]、切 messages[1:]。"""
     a_an = _agent(sid="cmp_an")
-    a_oai = _agent(use_openai=True, sid="cmp_oai")
+    a_oai = _agent(provider_name="openai", sid="cmp_oai")
     fake_an = _FakeAnthropicClient()
     fake_oai = _FakeOpenAIClient()
     a_an._provider.client = fake_an
@@ -190,7 +181,7 @@ def test_compact_system_placement_and_slice_parity():
 def test_compact_length_guard_parity():
     """parity 雷 B：<3（anthropic）/ <4（openai，含 render system[0]）守卫原样保——None 不触 API。"""
     a_an = _agent(sid="g_an")
-    a_oai = _agent(use_openai=True, sid="g_oai")
+    a_oai = _agent(provider_name="openai", sid="g_oai")
     fake_an = _FakeAnthropicClient()
     fake_oai = _FakeOpenAIClient()
     a_an._provider.client = fake_an
@@ -212,7 +203,7 @@ def test_compact_length_guard_parity():
 
 def test_branch_summary_no_slice_parity():
     a_an = _agent(sid="br_an")
-    a_oai = _agent(use_openai=True, sid="br_oai")
+    a_oai = _agent(provider_name="openai", sid="br_oai")
     fake_an = _FakeAnthropicClient()
     fake_oai = _FakeOpenAIClient()
     a_an._provider.client = fake_an
@@ -236,7 +227,7 @@ def test_branch_summary_no_slice_parity():
 
 def test_branch_summary_empty_returns_none():
     a_an = _agent(sid="be_an")
-    a_oai = _agent(use_openai=True, sid="be_oai")
+    a_oai = _agent(provider_name="openai", sid="be_oai")
     fake_an = _FakeAnthropicClient()
     fake_oai = _FakeOpenAIClient()
     a_an._provider.client = fake_an
@@ -250,7 +241,7 @@ def test_branch_summary_empty_returns_none():
 
 def test_capture_api_exposed_by_adapter():
     a_an = _agent(sid="cap_an")
-    a_oai = _agent(use_openai=True, sid="cap_oai")
+    a_oai = _agent(provider_name="openai", sid="cap_oai")
     assert a_an._provider.capture_api == "anthropic"
     assert a_oai._provider.capture_api == "openai-completions"
     # G2：adapter 不再持 capture/neutral_stop_reason 方法——消息归一在 ②b（events.py 的 record

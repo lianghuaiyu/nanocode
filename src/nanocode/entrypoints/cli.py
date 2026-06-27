@@ -615,24 +615,24 @@ Examples:
     # Resolve API config
     resolved_api_base = api_base
     resolved_api_key: str | None = None
-    resolved_use_openai = bool(api_base)
+    resolved_provider = "openai" if api_base else "anthropic"
 
     if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
         resolved_api_key = os.environ["OPENAI_API_KEY"]
         resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
-        resolved_use_openai = True
+        resolved_provider = "openai"
     elif os.environ.get("ANTHROPIC_API_KEY"):
         resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
         resolved_api_base = resolved_api_base or os.environ.get("ANTHROPIC_BASE_URL")
-        resolved_use_openai = False
+        resolved_provider = "anthropic"
     elif os.environ.get("OPENAI_API_KEY"):
         resolved_api_key = os.environ["OPENAI_API_KEY"]
         resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
-        resolved_use_openai = True
+        resolved_provider = "openai"
 
     if not resolved_api_key and api_base:
         resolved_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-        resolved_use_openai = True
+        resolved_provider = "openai"
 
     if not resolved_api_key:
         print_error(
@@ -712,8 +712,9 @@ Examples:
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
-        api_base=resolved_api_base if resolved_use_openai else None,
-        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
+        provider=resolved_provider,
+        api_base=resolved_api_base if resolved_provider == "openai" else None,
+        anthropic_base_url=resolved_api_base if resolved_provider == "anthropic" else None,
         api_key=resolved_api_key,
         trajectory_enabled=traj_on,
         trajectory_level=traj_lvl,

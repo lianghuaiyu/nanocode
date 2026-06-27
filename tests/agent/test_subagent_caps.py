@@ -51,7 +51,7 @@ def _stub_running_bg_subagent(parent):
         context_mode="fresh",
         isolation="shared",
         worktree_path=None,
-        model={"provider": parent._current_provider(), "modelId": parent.model},
+        model={"provider": parent.provider_runtime_config.name, "modelId": parent.model},
         prompt="bg",
     )
 
@@ -274,7 +274,7 @@ def _stub_running_curator(parent):
         context_mode="fresh",
         isolation="shared",
         worktree_path=None,
-        model={"provider": parent._current_provider(), "modelId": parent.model},
+        model={"provider": parent.provider_runtime_config.name, "modelId": parent.model},
         prompt="curate",
         inject_summary=True,
     )

@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Protocol
 
 from ..capabilities.sandbox import UNRESTRICTED, FileSystemPolicy
 
@@ -154,9 +154,14 @@ class FsListCap:
 
 # ─── host-routed 能力把手（docs/24 §4.4 Phase 3：薄转发到 host 服务方法）─────────────
 #
-# 这些把手是**独立对象**，内部各持一个 host 引用做转发；但 ToolContext 本身不暴露任何通向
-# raw Agent / _session_mgr / lease 的字段——工具只见把手，够不到底层（边界命根子）。把手语义
-# 与今天 router 的 host-routed 分支**逐项等价**（纯转发，不加宽、不收窄）。
+# 这些把手是**独立对象**；ExecCap 经窄 ShellExecutor 协议执行，其余把手仍持 host 做薄转发。
+# ToolContext 本身不暴露任何通向 raw Agent / _session_mgr / lease 的字段——工具只见把手，够不到底层
+# （边界命根子）。把手语义与今天 router 的 host-routed 分支**逐项等价**（纯转发，不加宽、不收窄）。
+
+
+class ShellExecutor(Protocol):
+    def __call__(self, request: Any, approval: Any) -> Awaitable[str]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -167,13 +172,12 @@ class ExecCap:
     据 request.escalate 构造——escalate 抵达此处 ⟹ 咽喉点 _authorize_dispatch 已 gate 并批准。
     """
 
-    _host: Any
+    _execute_shell: ShellExecutor
 
     async def run(self, request: Any) -> str:
         from ..capabilities.sandbox import ApprovalDecision
         approval = ApprovalDecision(approved=request.escalate)
-        return await self._host._sandbox.execute_shell(
-            request, self._host.host_context(), self._host.sandbox_policy(), approval)
+        return await self._execute_shell(request, approval)
 
 
 @dataclass(frozen=True)
