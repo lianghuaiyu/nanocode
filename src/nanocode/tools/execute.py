@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 
-from .registry import REGISTRY
 from .shared import _truncate_result
 
 # docs/24 Phase 2：dispatch 在咽喉点（engine._run_real_tool）按「needs ∩ 信任档策略」铸造
@@ -18,30 +17,16 @@ from .shared import _truncate_result
 # host-routed 工具 run=None，不经此（更早分支截走）。
 
 
-def _default_ctx():
-    """无传入 ctx 时的退路：宽松 fs 把手（与今天裸 Path/os 行为等价）。
-
-    保留供旧调用点 / 直接单测（tests/tools/test_execute.py）使用——它们不构造 ctx；
-    engine 真实派发总是显式传 ctx。Phase 2 零行为变更：默认 policy 不收紧。
-    """
-    from .context import default_tool_context
-    return default_tool_context()
-
-
 async def execute_tool(
     name: str,
     inp: dict,
     read_file_state: dict[str, float] | None = None,
     *,
-    ctx=None,
-    registry=None,
+    ctx,
+    registry,
 ) -> str:
-    # docs/24 Phase 4a：per-agent overlay registry 经此参数线穿过（engine._run_real_tool 传
-    # self._registry）；直接调用 / 旧单测不传 → 退回全局 REGISTRY（builtins-only，行为等价）。
-    if registry is None:
-        registry = REGISTRY
-    if ctx is None:
-        ctx = _default_ctx()
+    # docs/24 Phase 4a：per-agent overlay registry 经此参数线穿过；ctx 由 dispatch 咽喉点按
+    # 当前 sandbox policy 铸造。二者都是执行契约，不在工具层补全。
     # ─── read-before-edit + mtime freshness checks ───────────
     if name == "read_file":
         result = registry.get("read_file").run(ctx, inp)

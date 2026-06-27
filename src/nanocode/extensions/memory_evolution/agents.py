@@ -32,7 +32,7 @@ def build_diagnose_fn(ctx, loop):
                   "adjustments.\n\n" + json.dumps(failure_report, ensure_ascii=False, indent=2))
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                ctx.thread.run_reserved_subagent(
+                ctx.spawn.reserved(
                     MEMORY_DIAGNOSTICIAN_TYPE, prompt, model=model,
                     timeout_ms=_DIAGNOSE_TIMEOUT_MS),
                 loop)

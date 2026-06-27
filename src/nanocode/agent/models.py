@@ -6,8 +6,6 @@ from __future__ import annotations
 import asyncio
 import time
 
-from ..tools import ToolDef
-
 # ─── Retry with exponential backoff ──────────────────────────
 
 
@@ -89,7 +87,7 @@ def _get_max_output_tokens(model: str) -> int:
 # ─── Convert tools to OpenAI format ─────────────────────────
 
 
-def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
+def _to_openai_tools(tools: list[dict]) -> list[dict]:
     return [
         {
             "type": "function",

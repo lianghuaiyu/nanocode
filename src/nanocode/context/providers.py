@@ -50,7 +50,7 @@ class ContextRequest:
     map_refresh: str = "auto"              # aider refresh 档（map 结果缓存策略）
     map_multiplier_no_files: float = 2.0
     # docs/24 Phase 4a：DeferredToolsProvider 据此读 per-agent overlay 的激活集（tool_search
-    # 激活落在 agent registry 上）。None → 全局 REGISTRY（行为等价）。
+    # 激活落在 agent registry 上）。include_deferred_tools=True 时调用方必须显式提供。
     tool_registry: object | None = None
 
 
@@ -169,7 +169,10 @@ class DeferredToolsProvider:
 
     async def collect(self, request):
         from ..tools import get_deferred_tool_names
-        names = get_deferred_tool_names(registry=getattr(request, "tool_registry", None))
+        registry = request.tool_registry
+        if registry is None:
+            raise RuntimeError("DeferredToolsProvider requires ContextRequest.tool_registry")
+        names = get_deferred_tool_names(registry=registry)
         if not names:
             return None
         text = ("The following deferred tools are available via tool_search: "

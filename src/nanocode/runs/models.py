@@ -83,6 +83,7 @@ class AgentRunRecord:
     ended_at: str | None = None
     error: str | None = None
     pending_steer_count: int = 0
+    pending_approval: dict[str, Any] | None = None  # {"approvalId","command"} | None（D3：待父审批，非终态）
     result_summary: str | None = None
     inject_summary: bool = False
     injected: bool = False
@@ -113,6 +114,7 @@ class AgentRunRecord:
             ended_at=status.get("endedAt"),
             error=status.get("error"),
             pending_steer_count=int(status.get("pendingSteerCount") or 0),
+            pending_approval=status.get("pendingApproval"),
             result_summary=status.get("resultSummary"),
             inject_summary=bool(status.get("injectSummary")),
             injected=bool(status.get("injected")),

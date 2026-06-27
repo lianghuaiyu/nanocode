@@ -22,7 +22,7 @@ def test_subagent_compaction_writes_to_its_child_tree(monkeypatch):
     sub = _agent("scx", is_sub_agent=True)
     sub._tree_session_id = parent.child_session_id("a1")
     sub._child_parent_session = {"sessionId": "CPX", "entryId": None, "taskId": "a1", "agentId": "a1"}
-    sub._session_mgr = SessionManager.create(sub._tree_session_id, parent_session=sub._child_parent_session)
+    sub._session_mgr = SessionManager.create(sub._tree_session_id, spawned_by=sub._child_parent_session)
     sub._session_mgr.append_message(T.user_message("u"))      # leaf == last user
 
     async def fake(_messages=None):

@@ -18,11 +18,11 @@ def test_get_latest_resolves_canonical_session_without_legacy_json():
 
 
 def test_get_latest_excludes_child_sessions():
-    # child session（有 parentSession header）不作 latest resume 目标。
+    # subagent child（有 spawnedBy header）不作 latest resume 目标（docs/26 C2）。
     SessionManager.create("PARENTL")
     time.sleep(0.01)
     SessionManager.create("PARENTL.agent-001",
-                          parent_session={"sessionId": "PARENTL", "entryId": None})
+                          spawned_by={"sessionId": "PARENTL", "entryId": None})
     latest = get_latest_session_id()
     assert latest == "PARENTL"              # child 被排除，即便它更晚
 

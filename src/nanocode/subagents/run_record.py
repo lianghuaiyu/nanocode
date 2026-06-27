@@ -354,6 +354,7 @@ def create_run_record(
         "injectSummary": inject_summary,
         "injected": False,
         "pendingSteerCount": 0,
+        "pendingApproval": None,
         "metrics": {
             "toolUses": 0,
             "usage": {},
@@ -414,3 +415,14 @@ def complete_run(
 def mark_injected(child_session_id: str) -> dict[str, Any]:
     """标记该 run 的完成摘要已注入回父上下文（finished-task PUSH 去重，docs/25 A2）。"""
     return update_status(child_session_id, injected=True)
+
+
+def set_pending_approval(child_session_id: str, *, approval_id: str, command: str) -> dict[str, Any]:
+    """标记该 run 正等待父审批（D3）。run 仍 running，仅 UI 据此显示并提供 allow/deny。"""
+    return update_status(
+        child_session_id, pendingApproval={"approvalId": approval_id, "command": command})
+
+
+def clear_pending_approval(child_session_id: str) -> dict[str, Any]:
+    """父已应答 / run 终止 —— 清除待审批标记（D3）。"""
+    return update_status(child_session_id, pendingApproval=None)

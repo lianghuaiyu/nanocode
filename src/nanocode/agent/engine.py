@@ -242,6 +242,9 @@ class Agent(PlanModeMixin):
 
         # Permission whitelist (shared with sub-agents via ctor param)
         self._confirmed_paths: set[str] = confirmed_paths if confirmed_paths is not None else set()
+        # D3：后台子 agent 的"需确认"升级——父持待审批 Future（approval_id → (run_id, fut)）。
+        # in-process transport（同 loop），父经 run_approve 解；run 终止/取消时 finally 清理。
+        self._pending_approvals: dict[str, tuple[str, "asyncio.Future"]] = {}
 
         # Plan mode state
         self._pre_plan_mode: str | None = None
@@ -309,10 +312,11 @@ class Agent(PlanModeMixin):
         self._openai_client = client if self._provider_name == "openai" else None
         self._anthropic_client = client if self._provider_name == "anthropic" else None
 
-        # docs/15 STEP B：provider 流式 + capture 收敛到 ProviderAdapter（backend mixin 经 self._provider
+        # docs/15 STEP B：provider 流式 + 完成归一收敛到 ProviderAdapter（backend mixin 经 self._provider
         # .stream 委托,engine 不再持 _call_*_stream）。clients 在 rebind 不变,故 _provider 跨 rebind 有效。
+        # G2：active-tool 过滤已上移到 ②b（_loop_config 的 cfg.resolve_tools），adapter 不再持 registry。
         self._provider = make_provider_adapter(
-            provider=self._provider_name, client=client, registry=self._registry)
+            provider=self._provider_name, client=client)
         # docs/15 STEP C：模型循环上移到 AgentCore（host=self 注入 collaborators）。无状态,可共享。
         self._core = AgentCore()
 
@@ -811,6 +815,52 @@ class Agent(PlanModeMixin):
         )
         return f"Run {child_session_id}: no live coroutine found; marked lost."
 
+    # ─── D3：后台子 agent 确认升级回父 ────────────────────────────────────────────
+    def make_escalating_confirm(self, run_id: str):
+        """后台子 agent 的升级式 confirm_fn 工厂（取代 _auto_deny_confirm）。
+
+        危险操作不再静默拒绝，而是：登记待审批 Future（父 owns）+ 写 run_record pendingApproval +
+        发父可见 NoticeRaised（非 modal，不劫持父输入），await 父应答（/agents a 批 / d 拒）。
+        finally 清 registry + sidecar（含被 cancel/超时时）。run_id == child_session_id。"""
+        async def _escalating_confirm(message: str) -> bool:
+            from ..subagents import run_record
+            approval_id = uuid.uuid4().hex[:8]
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending_approvals[approval_id] = (run_id, fut)
+            try:
+                run_record.set_pending_approval(run_id, approval_id=approval_id, command=message)
+            except Exception:
+                pass  # sidecar 仅 UI 投影；写失败不应阻断审批往返
+            self.emit(NoticeRaised(
+                text=f"Sub-agent {run_id} requests approval: {message}  "
+                     f"(/agents → open run → a approve / d deny)",
+                level="warn"))
+            try:
+                return await fut
+            finally:
+                self._pending_approvals.pop(approval_id, None)
+                try:
+                    run_record.clear_pending_approval(run_id)
+                except Exception:
+                    pass
+        return _escalating_confirm
+
+    def _resolve_pending_approvals(self, child_session_id: str, decision: bool) -> int:
+        resolved = 0
+        for _aid, (rid, fut) in list(self._pending_approvals.items()):
+            if rid == child_session_id and not fut.done():
+                fut.set_result(decision)
+                resolved += 1
+        return resolved
+
+    def run_approve(self, child_session_id: str, decision: bool) -> str:
+        """父应答后台子 agent 的待审批请求（D3，单次）。解阻塞中的升级 Future。"""
+        resolved = self._resolve_pending_approvals(child_session_id, decision)
+        if resolved == 0:
+            return f"Run {child_session_id}: no pending approval."
+        verb = "Approved" if decision else "Denied"
+        return f"{verb} {resolved} pending approval(s) for run {child_session_id}."
+
     def run_send(self, child_session_id: str, prompt: str, *,
                  delivery: str = "steer") -> str:
         import json
@@ -1256,6 +1306,10 @@ class Agent(PlanModeMixin):
 
     async def _run_reserved_agent(self, **kw) -> str:
         return await self._spawn.run_reserved_agent(self, **kw)
+
+    async def _spawn_subagent(self, **kw):
+        """内核 spawn 原语委托（docs/26 阶段1 ①）：返回 SubagentOutcome。"""
+        return await self._spawn.spawn_subagent(self, **kw)
 
     async def _await_subagent_run(self, sub_agent: "Agent", prompt: str,
                                   timeout_ms: int | None) -> tuple[str, object]:

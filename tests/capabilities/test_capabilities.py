@@ -10,6 +10,7 @@ from nanocode.capabilities import (
     is_always_allowed_meta, router_allowlist_blocks,
 )
 from nanocode.capabilities.router import CapabilityRouter
+from nanocode.tools import REGISTRY
 
 
 # ─── PermissionContext（不可变,decouple from Agent）──────────────────────────
@@ -86,6 +87,7 @@ def test_router_task_meta_uses_service_methods_without_task_manager():
     class Host:
         session_id = "s"
         is_sub_agent = False
+        registry = REGISTRY
 
         def tool_blocked_by_allowlist(self, name): return False
         def emit(self, event): return True

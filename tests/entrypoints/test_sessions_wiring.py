@@ -205,7 +205,7 @@ def test_resume_current_rename_uses_runtime_callback():
 def test_scan_sessions_hides_unnamed_header_only_sessions():
     empty = SessionManager.create("EMPTYTOP")
     empty.close()
-    child_empty = SessionManager.create("EMPTYCHILD", parent_session={"sessionId": "P", "entryId": "x"})
+    child_empty = SessionManager.create("EMPTYCHILD", forked_from={"sessionId": "P", "entryId": "x"})
     child_empty.close()
     named = SessionManager.create("NAMEDEMPTY")
     named.append_session_info("keep me")
@@ -226,7 +226,7 @@ def test_scan_sessions_hides_subagent_children_but_keeps_forks():
     root.close()
     sub = SessionManager.create(
         "SUBCHILD",
-        parent_session={
+        spawned_by={
             "sessionId": "ROOTFORAGENTS",
             "entryId": "x",
             "taskId": "SUBCHILD",
@@ -237,7 +237,7 @@ def test_scan_sessions_hides_subagent_children_but_keeps_forks():
     sub.close()
     fork = SessionManager.create(
         "FORKCHILD",
-        parent_session={"sessionId": "ROOTFORAGENTS", "entryId": "x", "forkedBeforeEntryId": "x"},
+        forked_from={"sessionId": "ROOTFORAGENTS", "entryId": "x", "forkedBeforeEntryId": "x"},
     )
     fork.append_message(T.user_message("fork convo"))
     fork.close()
@@ -254,7 +254,7 @@ def test_resume_no_arg_non_interactive_nests(tmp_path, monkeypatch):
     root = SessionManager.create("ROOTSID")
     root.append_message(T.user_message("root convo"))
     root.close()
-    child = SessionManager.create("CHILDSID", parent_session={"sessionId": "ROOTSID",
+    child = SessionManager.create("CHILDSID", forked_from={"sessionId": "ROOTSID",
                                   "forkedBeforeEntryId": "x"})
     child.append_message(T.user_message("child convo"))
     child.close()

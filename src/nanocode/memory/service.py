@@ -366,7 +366,7 @@ class MemoryService:
             return GenerationResult.skip(f"backend {self.backend_name} has no generation engine")
         try:
             turns = self._turns_from_session(session_mgr)
-            is_root = session_mgr.parent_session() is None
+            is_root = session_mgr.spawned_by() is None and session_mgr.forked_from() is None
         except Exception as e:
             return GenerationResult(ran=False, produced=0,
                                     error=f"session read failed: {e}")

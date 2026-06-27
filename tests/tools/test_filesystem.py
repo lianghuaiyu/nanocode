@@ -70,18 +70,6 @@ def test_list_files_limit_reports_overflow(tmp_path):
     assert "[2 entries limit reached. Use limit=4 for more]" in out
 
 
-def test_list_files_legacy_recursive_glob_lists_prefix_only(tmp_path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("x")
-    (tmp_path / "src" / "pkg").mkdir()
-    (tmp_path / "src" / "pkg" / "deep.py").write_text("x")
-    out = list_files.run(_CTX, {"pattern": "src/**/*", "path": str(tmp_path)})
-    assert "a.py" in out
-    assert "pkg/" in out
-    assert "deep.py" not in out
-
-
-
 def test_grep_search(tmp_path):
     (tmp_path / "g.txt").write_text("needle here\nother")
     out = grep_search.run(_CTX, {"pattern": "needle", "path": str(tmp_path)})

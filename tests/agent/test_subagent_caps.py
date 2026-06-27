@@ -36,8 +36,8 @@ def _stub_running_bg_subagent(parent):
     run_id = T.new_id("sess")
     child = SessionManager.create(
         run_id,
-        parent_session={"sessionId": parent.session_id, "entryId": None,
-                        "taskId": run_id, "agentId": run_id},
+        spawned_by={"sessionId": parent.session_id, "entryId": None,
+                    "taskId": run_id, "agentId": run_id},
     )
     child.close()
     run_record.create_run_record(
@@ -259,8 +259,8 @@ def _stub_running_curator(parent):
     run_id = T.new_id("sess")
     child = SessionManager.create(
         run_id,
-        parent_session={"sessionId": parent.session_id, "entryId": None,
-                        "taskId": run_id, "agentId": run_id},
+        spawned_by={"sessionId": parent.session_id, "entryId": None,
+                    "taskId": run_id, "agentId": run_id},
     )
     child.close()
     run_record.create_run_record(

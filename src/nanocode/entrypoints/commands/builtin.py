@@ -108,7 +108,7 @@ async def _context(ctx: CommandContext, args: str) -> Local:
                          map_tokens=map_tokens,
                          map_refresh=cfg["map_refresh"],
                          map_multiplier_no_files=cfg["map_multiplier_no_files"],
-                         tool_registry=getattr(getattr(ctx.thread, "agent", None), "registry", None))
+                         tool_registry=ctx.thread.tool_registry)
     services = getattr(ctx.thread, "services", None)
     plan = await ContextRuntime(budget=budget, sources=(services.context_sources if services is not None else None)).collect(req)
     return Local(output=plan.ledger.render_summary())
@@ -516,10 +516,11 @@ async def _name(ctx: CommandContext, args: str) -> Local:
 
 
 def _child_session_ids() -> set:
-    """有 parentSession 回指的 child session id 集合（docs/14 §6b）。/resume 列表隐藏它们、
-    且前缀匹配排除它们（只可经 exact id 或 /agents 进入），避免 child sid 污染父的短前缀解析。"""
+    """被 spawn 的 **subagent** child session id 集合（docs/26 C2）。/resume 列表隐藏它们、
+    且前缀匹配排除它们（只可经 exact id 或 /agents 进入）。fork/clone 不在此——它们是用户可
+    前缀解析的正常会话。"""
     from ...session.manager import _scan_headers
-    return {sid for sid, ps in _scan_headers() if ps}
+    return {sid for sid, sb, _ff in _scan_headers() if sb}
 
 
 async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
@@ -537,7 +538,7 @@ async def _resume(ctx: CommandContext, args: str) -> "Control | Local":
             return _error("Usage: /resume <id> [--fork]")
         # handler 只做候选 resolve（exact > prefix）；真正切换由 runtime 经 Control 完成（docs/14 §3.4）。
         # 候选只来自 canonical session.jsonl header（docs/16 C-3：legacy flat/v2 发现面已删）。
-        known = {sid for sid, _ps in _scan_headers()}
+        known = {sid for sid, _sb, _ff in _scan_headers()}
         cand = ([s for s in known if s == target]
                 or [s for s in known if s.startswith(target) and s not in _child_session_ids()])
         resolved = cand[0] if len(cand) == 1 else (target if SessionManager.exists(target) else None)
@@ -579,15 +580,15 @@ async def _session(ctx: CommandContext, args: str) -> Local:
     if mgr is None:
         return Local(output="No active session.")
     msgs = [e for e in mgr.entries() if e.type == _tree.MESSAGE]
-    ps = mgr.parent_session()
-    origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
+    ff = mgr.forked_from()
+    origin = "root" if not ff else ("fork" if ff.get("forkedBeforeEntryId") else "clone")
     st = ctx.thread.status()
     lines = [
         f"Session {sid}",
         f"  name     {mgr.name() or '(unnamed)'}",
         f"  cwd      {mgr._cwd()}",
         f"  model    {st['model']}",
-        f"  origin   {origin}" + (f"  (parent …{ps['sessionId'][-8:]})" if ps and ps.get('sessionId') else ""),
+        f"  origin   {origin}" + (f"  (parent …{ff['sessionId'][-8:]})" if ff and ff.get('sessionId') else ""),
         f"  entries  {len(msgs)} messages    leaf …{str(mgr.get_leaf())[-8:]}",
         f"  tokens   ↑{st['input_tokens']} ↓{st['output_tokens']}  ${st['cost_usd']:.4f}",
     ]

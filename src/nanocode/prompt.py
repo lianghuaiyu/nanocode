@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .skills.listing import SKILL_PROMPT_GUIDANCE
 from .agents.registry import build_agent_descriptions
-from .tools import get_deferred_tool_names
+from .tools import REGISTRY, get_deferred_tool_names
 
 # ─── System prompt template (externalized to system_prompt.md) ──────────────
 
@@ -152,7 +152,7 @@ def build_system_prompt() -> str:
     skills_section = SKILL_PROMPT_GUIDANCE
     agent_section = build_agent_descriptions()
 
-    deferred_names = get_deferred_tool_names()
+    deferred_names = get_deferred_tool_names(registry=REGISTRY)
     deferred_section = (
         f"\n\nThe following deferred tools are available via tool_search: {', '.join(deferred_names)}. Use tool_search to fetch their full schemas when needed."
         if deferred_names else ""

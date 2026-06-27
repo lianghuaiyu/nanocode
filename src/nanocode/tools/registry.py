@@ -104,10 +104,9 @@ class ToolRegistry:
     def schemas(self, active: set[str] | None = None) -> list[ToolDef]:
         """工具 schema 列表（原序）。
 
-        active is None → 全表 schema（保留 deferred 键，等价旧 tool_definitions）。
-        active 非 None → 旧 get_active_tool_definitions(active) 语义：剔未激活 deferred + strip
-        'deferred' 键。注：传入显式 active 集时仍以「该 schema 自身是否 deferred 且名在 active 中」
-        判定，与旧实现逐字节一致（旧实现读各 schema 的 deferred 键，不读 self._activated）。
+        active is None → 全表 schema（保留 deferred 键）。
+        active 非 None → 剔未激活 deferred + strip 'deferred' 键。注：传入显式 active 集时仍以
+        「该 schema 自身是否 deferred 且名在 active 中」判定。
         """
         if active is None:
             return [t.schema for t in self._tools.values()]
@@ -126,11 +125,11 @@ class ToolRegistry:
         self._activated.add(name)
 
     def active_schemas(self) -> list[ToolDef]:
-        """旧 get_active_tool_definitions()（无参）：以当前激活集过滤全表。"""
+        """以当前激活集过滤全表。"""
         return self.schemas(active=self._activated)
 
     def deferred_names(self) -> list[str]:
-        """旧 get_deferred_tool_names()：尚未激活的 deferred 工具名（原序）。"""
+        """尚未激活的 deferred 工具名（原序）。"""
         return [t.name for t in self._tools.values()
                 if t.deferred and t.name not in self._activated]
 
@@ -138,22 +137,20 @@ class ToolRegistry:
 REGISTRY = ToolRegistry.from_builtins(_ALL)
 
 
-# ─── 薄包装（委托给 REGISTRY；调用点逐步直改后可清，但不得保留旧数据全局）────────
+# ─── 激活状态 helper ─────────────────────────────────────────────
 
 def reset_activated_tools() -> None:
     REGISTRY.reset_activated()
 
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None,
-                                *, registry: "ToolRegistry | None" = None) -> list[ToolDef]:
-    """旧门面：剔除未激活 deferred + strip 'deferred' 键。
+                                *, registry: "ToolRegistry") -> list[ToolDef]:
+    """剔除未激活 deferred + strip 'deferred' 键。
 
-    all_tools 非 None（子 agent 传入自己的 schema 子集）时，沿用旧语义按各 schema 的 deferred
-    键 + `registry` 当前激活集过滤；为 None 时等价 `registry.active_schemas()`。
-
-    docs/24 Phase 4a：`registry` 指定时用 per-agent overlay 的激活集（tool_search 激活落在
-    agent registry 上，此处据同一表过滤）；None → 全局 REGISTRY（standalone / 旧单测，行为等价）。"""
-    reg = registry if registry is not None else REGISTRY
+    docs/24 Phase 4a：schema 查表与 deferred 激活状态必须来自同一个 registry（通常是
+    per-agent overlay）；不在 helper 内回退全局表，避免混读两个工具真相源。
+    """
+    reg = registry
     if all_tools is None:
         return reg.active_schemas()
     activated = reg._activated
@@ -165,11 +162,12 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None,
 
 
 def get_deferred_tool_names(all_tools: list[ToolDef] | None = None,
-                            *, registry: "ToolRegistry | None" = None) -> list[str]:
-    """旧门面：未激活 deferred 工具名。all_tools 非 None 时按传入 schema 列表算。
+                            *, registry: "ToolRegistry") -> list[str]:
+    """未激活 deferred 工具名。all_tools 非 None 时按传入 schema 列表算。
 
-    docs/24 Phase 4a：`registry` 指定时读 per-agent overlay 激活集；None → 全局 REGISTRY。"""
-    reg = registry if registry is not None else REGISTRY
+    docs/24 Phase 4a：`registry` 显式指定，确保读取 per-agent overlay 激活集。
+    """
+    reg = registry
     if all_tools is None:
         return reg.deferred_names()
     activated = reg._activated

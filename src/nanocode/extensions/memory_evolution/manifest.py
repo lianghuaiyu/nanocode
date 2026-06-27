@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..manifest import (
-    CommandContribution, ExtensionContributes, ExtensionManifest,
+    CommandContribution, ExtensionContributes, ExtensionManifest, SPAWN_RESERVED,
 )
 
 # Reserved hidden agent type registered by this extension (docs/22 §6).
@@ -36,5 +36,6 @@ MANIFEST = ExtensionManifest(
         "memory:write_retrieval_config",
         "task:create",
         "model:diagnose",
+        SPAWN_RESERVED,  # docs/26 阶段1 ②：授予 ctx.spawn 槽（仅可 spawn 本扩展的 diagnostician）
     }),
 )

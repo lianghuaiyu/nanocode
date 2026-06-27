@@ -127,9 +127,9 @@ def test_resume_reserved_curator_record_is_rejected():
     parent._session_mgr = SessionManager.create(parent.session_id)
     child_id = "sess_reserved_curator"
     lease = SessionLease.open_or_create(
-        child_id, parent_session={"sessionId": parent.session_id,
-                                  "entryId": parent._session_mgr.get_leaf(),
-                                  "taskId": child_id, "agentId": child_id})
+        child_id, spawned_by={"sessionId": parent.session_id,
+                              "entryId": parent._session_mgr.get_leaf(),
+                              "taskId": child_id, "agentId": child_id})
     lease.manager.rewrite_file()
     lease.close()
     run_record.create_run_record(

@@ -54,14 +54,14 @@ def test_runtime_startup_fork_clones_source_session():
 
     assert err is None and child_sid and child_sid != "forksrc"
     child = SessionManager.open(child_sid)
-    assert child.parent_session()["sessionId"] == "forksrc"
+    assert child.forked_from()["sessionId"] == "forksrc"
     assert "source prompt" in str(child.build_context().messages)
 
 
 def test_no_session_cleanup_removes_generated_session_and_children():
     root = SessionManager.create("ephemroot")
     root.close()
-    child = SessionManager.create("ephemchild", parent_session={"sessionId": "ephemroot"}, lock=False)
+    child = SessionManager.create("ephemchild", spawned_by={"sessionId": "ephemroot"}, lock=False)
 
     assert session_file("ephemroot").exists()
     assert session_file("ephemchild").exists()

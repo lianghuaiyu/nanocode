@@ -217,19 +217,32 @@ class RetryRaised:
 
 @dataclass(frozen=True)
 class SubAgentStarted:
-    """子 agent / skill-fork 开始（旧 host._sink.sub_agent_start）。父 agent 的事件流可见。"""
+    """子 agent / skill-fork 开始（旧 host._sink.sub_agent_start）。父 agent 的事件流可见。
+
+    run_id/child_session_id/background 为 docs/26 阶段1 additive 字段（默认空，向后兼容
+    旧 UI tap 的 _g 读取）；run_id 在作用域内的 spawn 路径补传，skill-fork 等保持默认空。"""
 
     agent_type: str
     description: str
+    run_id: str = ""
+    child_session_id: str = ""
+    background: bool = False
     kind: str = "sub_agent_started"
 
 
 @dataclass(frozen=True)
 class SubAgentEnded:
-    """子 agent / skill-fork 结束（旧 host._sink.sub_agent_end）。"""
+    """子 agent / skill-fork 结束（旧 host._sink.sub_agent_end）。
+
+    status/tokens 等为 docs/26 阶段1 additive 字段（默认空/None）：status 取 run_record 终态
+    (completed/failed/timed_out/cancelled)，故无需单独的 SubAgentCompleted/Failed 类型。"""
 
     agent_type: str
     description: str
+    run_id: str = ""
+    child_session_id: str = ""
+    status: str = ""
+    tokens: "dict | None" = None
     kind: str = "sub_agent_ended"
 
 

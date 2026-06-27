@@ -94,8 +94,11 @@ class ReadOnlySessionView:
     def name(self) -> str | None:
         return self._manager.name()
 
-    def parent_session(self) -> dict | None:
-        return self._manager.parent_session()
+    def spawned_by(self) -> dict | None:
+        return self._manager.spawned_by()
+
+    def forked_from(self) -> dict | None:
+        return self._manager.forked_from()
 
     def _cwd(self) -> str:
         return self._manager._cwd()
@@ -453,7 +456,41 @@ class RuntimeThread:
 
     def _on_agent_event(self, event) -> None:
         """agent.emit 扇出腿：typed AgentEvent → 信封 → ring buffer + listeners。"""
-        self._push(self._envelope(getattr(event, "kind", type(event).__name__), event))
+        kind = getattr(event, "kind", type(event).__name__)
+        self._push(self._envelope(kind, event))
+        if kind in self._SUBAGENT_LIFECYCLE_EVENT:
+            self._bridge_subagent_lifecycle(kind, event)
+
+    # docs/26 阶段1 ③：subagent lifecycle → 稳定 typed 扩展事件契约。
+    # 事件名**故意不等于** agent-bus 的 kind，让扩展契约与内部 UI 投影解耦。内核不 import 扩展
+    # host：桥放在运行时边界（RuntimeThread 已持 _extension_host 引用，facade 顶部赋值）。
+    # fire-and-forget：无 host / 未 bound / 无 running loop / handler 异常都不影响 turn 与事件流
+    # （ExtensionHost.emit 自身隔离 handler 异常，且无订阅者时即刻返回）。
+    _SUBAGENT_LIFECYCLE_EVENT = {
+        "sub_agent_started": "subagent.started",
+        "sub_agent_ended": "subagent.ended",
+    }
+
+    def _bridge_subagent_lifecycle(self, kind: str, event) -> None:
+        host = self._extension_host
+        if host is None or not getattr(host, "is_active", False):
+            return
+        payload = {
+            "run_id": getattr(event, "run_id", "") or "",
+            "child_session_id": getattr(event, "child_session_id", "") or "",
+            "agent_type": getattr(event, "agent_type", "") or "",
+            "description": getattr(event, "description", "") or "",
+        }
+        if kind == "sub_agent_started":
+            payload["background"] = bool(getattr(event, "background", False))
+        else:
+            payload["status"] = getattr(event, "status", "") or ""
+            payload["tokens"] = getattr(event, "tokens", None)
+        try:
+            asyncio.get_running_loop().create_task(
+                host.emit(self._SUBAGENT_LIFECYCLE_EVENT[kind], payload))
+        except RuntimeError:
+            pass  # 无 running loop（同步测试上下文等）：跳过，事件流仍经 _push 投递
 
     def push_boundary(self, type_: str, **fields) -> None:
         """非 turn 事件的流边界（如 rebind 的 session_switch）：event 槽是 plain dict。"""
@@ -560,19 +597,20 @@ class RuntimeThread:
         import os as _os
         a = self._agent
         mgr = getattr(a, "_session_mgr", None)
-        mode = getattr(a, "_thinking_mode", "disabled")
-        parent = mgr.parent_session() if mgr is not None else None
+        mode = a._thinking_mode
+        sb = mgr.spawned_by() if mgr is not None else None
+        ff = mgr.forked_from() if mgr is not None else None
         return {
             "session_id": a.session_id,
             "cwd": self.services.cwd if self.services is not None else (mgr._cwd() if mgr is not None else _os.getcwd()),
             "session_name": (mgr.name() if mgr is not None else None),
-            "parent_session_id": (parent or {}).get("sessionId"),
-            "is_subagent_session": bool((parent or {}).get("agentId")),
+            "parent_session_id": (sb or ff or {}).get("sessionId"),
+            "is_subagent_session": bool(sb),
             "input_tokens": a.total_input_tokens,
             "output_tokens": a.total_output_tokens,
-            "context_used": getattr(a, "last_input_token_count", 0),
+            "context_used": a.last_input_token_count,
             "cost_usd": a._get_current_cost_usd(),
-            "context_window": getattr(a, "effective_window", 0),
+            "context_window": a.effective_window,
             "model": a.model,
             "thinking": None if mode == "disabled" else mode,
         }
@@ -592,7 +630,7 @@ class RuntimeThread:
             else [str(p) for p in wr]
         )
         return {
-            "profile": getattr(a, "_sandbox_profile", "default"),
+            "profile": a._sandbox_profile,
             "engine": policy.engine.value,
             "network": policy.network.mode.value,
             "writable_roots": writable_roots,
@@ -705,15 +743,20 @@ class RuntimeThread:
 
     @property
     def effective_window(self) -> int:
-        return getattr(self._agent, "effective_window", 200000)
+        return self._agent.effective_window
 
     @property
     def model(self) -> str:
-        return getattr(self._agent, "model", "")
+        return self._agent.model
 
     @property
     def is_sub_agent(self) -> bool:
-        return getattr(self._agent, "is_sub_agent", False)
+        return self._agent.is_sub_agent
+
+    @property
+    def tool_registry(self):
+        """Per-agent tool registry for context providers that need deferred-tool state."""
+        return self._agent.registry
 
     def clear_history(self) -> None:
         self._agent.agent_session.clear_history()
@@ -846,6 +889,10 @@ class RuntimeThread:
 
     async def subagent_cancel(self, child_session_id: str) -> str:
         return await self._agent.run_cancel(child_session_id)
+
+    async def run_approve(self, child_session_id: str, decision: bool) -> str:
+        """D3：父应答后台子 agent 的待审批请求（/agents a 批 / d 拒，单次）。"""
+        return self._agent.run_approve(child_session_id, decision)
 
     def agent_detail(self, name: str) -> str:
         from ..tools.tasks_tool import agent_definition_detail_text, subagent_detail_text
@@ -1107,7 +1154,8 @@ class AgentRuntime:
     # ─── 生命周期替换：live switch via in-place rebind（docs/14 P2）────────────────
 
     def _switch_via_rebind(self, host, new_sid: str, *,
-                           parent_session: "dict | None" = None,
+                           spawned_by: "dict | None" = None,
+                           forked_from: "dict | None" = None,
                            reason: str = "replace") -> RuntimeThread:
         """把 host 当前 thread 的 Agent 原地 rebind 到 new_sid，建新 AgentSession+RuntimeThread
         包**同一** agent，经 host.replace_thread 切入（register 新 + dispose 旧）。返回新 thread。
@@ -1126,7 +1174,8 @@ class AgentRuntime:
         old_sid = agent.session_id
         current_services = getattr(host.current_thread, "services", None)
         target_cwd = current_services.cwd if current_services is not None else None
-        lease = SessionLease.open_or_create(new_sid, parent_session=parent_session, cwd=target_cwd)
+        lease = SessionLease.open_or_create(new_sid, spawned_by=spawned_by,
+                                            forked_from=forked_from, cwd=target_cwd)
         try:
             lease.manager.build_context()       # 校验目标树可折叠（在 finalize 旧 session 之前）
             config = self._config or AgentConfig(
@@ -1216,7 +1265,7 @@ class AgentRuntime:
                 return None, str(e)
             child = SessionManager.create(
                 cwd=src._cwd(),
-                parent_session={"sessionId": source_sid, "entryId": src.get_leaf()},
+                forked_from={"sessionId": source_sid, "entryId": src.get_leaf()},
                 lock=False,
             )
             return child.session_id, None
@@ -1246,8 +1295,8 @@ class AgentRuntime:
         if cut is None or all(e.type == _tree.SESSION_START for e in src.get_branch(cut)):
             return self._switch_via_rebind(
                 host, self._mint_session_id(),
-                parent_session={"sessionId": source_sid, "entryId": cut,
-                                "forkedBeforeEntryId": user_entry_id},
+                forked_from={"sessionId": source_sid, "entryId": cut,
+                             "forkedBeforeEntryId": user_entry_id},
                 reason="fork")
         try:
             child = src.clone(cut, parent_session_extra={"forkedBeforeEntryId": user_entry_id})

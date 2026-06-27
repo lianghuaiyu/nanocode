@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+# docs/26 阶段1 ②：受信 spawn 槽的 capability token。声明此 capability 的扩展，其 ctx 会被
+# 挂上 `ctx.spawn`（仅能 spawn 该扩展自己贡献的 reserved/hidden agent；子 caps 由内核派生）。
+SPAWN_RESERVED = "spawn:reserved"
+
+
 @dataclass(frozen=True)
 class CommandContribution:
     """One slash command an extension contributes.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 # 单次返回的默认最大条目数；对齐 Pi 的 ls 默认 limit。
@@ -24,42 +23,9 @@ SCHEMA = {
     },
 }
 
-
-def _legacy_pattern_prefix(pattern: str) -> str:
-    """Best-effort compatibility for older glob-shaped calls."""
-    normalized = pattern.replace("\\", "/").strip()
-    if not normalized:
-        return "."
-    absolute = normalized.startswith("/")
-    literal_parts: list[str] = []
-    for part in normalized.split("/"):
-        if part in ("", "."):
-            continue
-        if any(ch in part for ch in "*?["):
-            break
-        literal_parts.append(part)
-    if not literal_parts:
-        return os.sep if absolute else "."
-    prefix = os.path.join(*literal_parts)
-    return os.path.join(os.sep, prefix) if absolute else prefix
-
-
-def _requested_dir(inp: dict) -> Path:
-    base = Path(inp.get("path") or ".")
-    pattern = inp.get("pattern")
-    if not pattern:
-        return base
-    prefix = Path(_legacy_pattern_prefix(str(pattern)))
-    if prefix == Path("."):
-        return base
-    if prefix.is_absolute():
-        return prefix
-    return base / prefix
-
-
 def run(ctx, inp: dict) -> str:
     try:
-        dir_path = _requested_dir(inp)
+        dir_path = Path(inp.get("path") or ".")
         raw_limit = inp.get("limit")
         limit = int(DEFAULT_LIMIT if raw_limit is None else raw_limit)
 

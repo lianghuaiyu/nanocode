@@ -8,8 +8,8 @@ from ..paths import sessions_dir
 
 
 def get_latest_session_id() -> str | None:
-    """最近的 top-level canonical session（session.jsonl header timestamp 排序；child session——有
-    parentSession——不作 latest resume 目标）。"""
+    """最近的 top-level canonical session（session.jsonl header timestamp 排序）。被 spawn 的
+    subagent 子（有 spawnedBy）不作 latest resume 目标；fork/clone 可以（docs/26 C2）。"""
     candidates: list[tuple[str, str]] = []
     d = sessions_dir()
     if d.exists():
@@ -23,7 +23,7 @@ def get_latest_session_id() -> str | None:
                 h = json.loads(sj.open(encoding="utf-8").readline() or "{}")
             except Exception:
                 h = {}
-            if h.get("type") == "session_start" and not (h.get("data") or {}).get("parentSession"):
+            if h.get("type") == "session_start" and not (h.get("data") or {}).get("spawnedBy"):
                 candidates.append((h.get("timestamp", ""), h.get("sessionId") or entry.name))
     candidates = [(t, i) for t, i in candidates if i]
     if not candidates:

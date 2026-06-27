@@ -246,17 +246,15 @@ def test_branch_summary_empty_returns_none():
     assert fake_an.last is None and fake_oai.last is None
 
 
-# ── capture 串经 adapter 选表 ────────────────────────────────────────────────
+# ── capture api 串经 adapter 元数据暴露（G2：capture 本体归 ②b，adapter 只暴露 capture_api）──
 
-def test_capture_routes_by_adapter():
+def test_capture_api_exposed_by_adapter():
     a_an = _agent(sid="cap_an")
     a_oai = _agent(use_openai=True, sid="cap_oai")
-    an_msg = {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
-    oai_msg = {"role": "assistant", "content": "hi", "tool_calls": None}
-    an_out = a_an._provider.capture(an_msg, model="m", stop_reason="stop")
-    oai_out = a_oai._provider.capture(oai_msg, model="m", stop_reason="stop")
-    assert an_out[0]["api"] == "anthropic"
-    assert oai_out[0]["api"] == "openai-completions"
-    # neutral_stop_reason 也经 adapter.name 选表。
-    assert a_an._provider.neutral_stop_reason("end_turn") == "stop"
-    assert a_oai._provider.neutral_stop_reason("tool_calls") == "toolUse"
+    assert a_an._provider.capture_api == "anthropic"
+    assert a_oai._provider.capture_api == "openai-completions"
+    # G2：adapter 不再持 capture/neutral_stop_reason 方法——消息归一在 ②b（events.py 的 record
+    # 路径调 session.capture），① adapter 不 import session/tools。
+    assert not hasattr(a_an._provider, "capture")
+    assert not hasattr(a_an._provider, "neutral_stop_reason")
+    assert not hasattr(a_oai._provider, "capture")

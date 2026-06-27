@@ -63,7 +63,7 @@ class AgentCore:
             )
             try:
                 raw = await stream_fn(
-                    model=cfg.model, system=proj.system, tools=cfg.tools,
+                    model=cfg.model, system=proj.system, tools=cfg.resolve_tools(),
                     messages=messages, thinking_mode=cfg.thinking_mode, callbacks=cb)
             except Exception as e:
                 # docs/16 #10：provider 上下文溢出不再是死 turn——压缩后重试一次
@@ -170,21 +170,12 @@ class AgentCore:
     # docs/16 #10：summarizer 只吃 **prefix 投影**（kept-suffix 由 AgentSession 的 keepRecentTokens
     # cut-point 排除）——summary 与 fold 保留区绝不双计同一段内容。
 
-    _SUMMARIZE_PROMPT = ("Summarize the conversation so far in a concise paragraph, "
-                         "preserving key decisions, file paths, and context needed to continue the work.")
-
     @classmethod
     def _compact_prompt(cls, instructions: str | None = None, *, partial: bool = False) -> str:
         """docs/18 Phase 3：结构化 no-tools + <analysis>/<summary> prompt（summary_prompts）。
         instructions（来自 /compact [prompt]）进入 Additional Instructions section。partial=True（来自
-        prompt-too-long retry 丢弃最旧 round 后）走 partial_compact_prompt——告知模型这是被截断的部分视图。
-        原始一句话 _SUMMARIZE_PROMPT 仅作 import 失败时的保守兜底。"""
-        try:
-            from .summary_prompts import compact_prompt, partial_compact_prompt
-        except Exception:
-            instructions = (instructions or "").strip()
-            return cls._SUMMARIZE_PROMPT if not instructions else (
-                cls._SUMMARIZE_PROMPT + "\n\nCustom summary instructions: " + instructions)
+        prompt-too-long retry 丢弃最旧 round 后）走 partial_compact_prompt——告知模型这是被截断的部分视图。"""
+        from .summary_prompts import compact_prompt, partial_compact_prompt
         return (partial_compact_prompt if partial else compact_prompt)(instructions)
 
     # B1 provider seam：四个 _compact_*/_summarize_* 体已下沉到 ProviderAdapter.summarize（providers.py），

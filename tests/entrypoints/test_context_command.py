@@ -4,11 +4,13 @@ import asyncio
 
 from nanocode.entrypoints.commands.builtin import _context
 from nanocode.entrypoints.commands.types import Local
+from nanocode.tools import REGISTRY
 
 
 class _FakeThread:
     effective_window = 200000
     is_sub_agent = False
+    tool_registry = REGISTRY
 
 
 class _FakeCtx:

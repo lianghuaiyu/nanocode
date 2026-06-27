@@ -38,33 +38,12 @@ def is_run_query_tool(name: str) -> bool:
     return name in RUN_QUERY_TOOLS
 
 
-def _legacy_list_path(inp: dict) -> str:
-    path = inp.get("path") or "."
-    pattern = str(inp.get("pattern") or "").replace("\\", "/").strip()
-    if not pattern:
-        return path
-    absolute = pattern.startswith("/")
-    parts: list[str] = []
-    for part in pattern.split("/"):
-        if part in ("", "."):
-            continue
-        if any(ch in part for ch in "*?["):
-            break
-        parts.append(part)
-    if not parts:
-        return path
-    prefix = "/".join(parts)
-    if path in ("", "."):
-        return f"/{prefix}" if absolute else prefix
-    return f"{path.rstrip('/')}/{prefix}"
-
-
 def tool_summary(name: str, inp: dict) -> str:
     inp = inp or {}
     if name in ("read_file", "write_file", "edit_file"):
         return inp.get("file_path", "")
     if name == "list_files":
-        return _legacy_list_path(inp)
+        return inp.get("path") or "."
     if name == "grep_search":
         glob = inp.get("glob") or inp.get("include")
         suffix = f" ({glob})" if glob else ""

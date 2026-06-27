@@ -30,8 +30,11 @@ class AgentLoopConfig:
     # 循环不再读 provider，故不在 config 上保留该死字段。
     model: str
     thinking_mode: str
-    tools: list
     is_sub_agent: bool
+    # active-tool 解析器（G2）：每请求调用,读 agent registry 当前激活集（tool_search 可在 turn 内
+    # 激活工具,故不是 turn-start 快照）。过滤逻辑 get_active_tool_definitions 由 ②b 在 _loop_config
+    # 绑定（① adapter 不再 import ③ tools），① 收到的即最终请求工具表,直接发往 provider。
+    resolve_tools: Callable[[], list]
     # ── 请求构建 / 完成归一 / 消息落树 ──
     rebuild_snapshot: Callable[[], Any]               # () -> ProviderProjection（每请求树渲染）
     to_completion: Callable[[Any], Any]               # (raw stream() 返回) -> Completion（B2-a：provider 归一）

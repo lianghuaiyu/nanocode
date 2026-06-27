@@ -30,7 +30,7 @@ def _sub_with_child(parent, agent_id, spawn_leaf):
     sub._child_parent_session = {"sessionId": parent.session_id, "entryId": spawn_leaf,
                                  "taskId": agent_id, "agentId": agent_id}
     sub._session_mgr = SessionLease.open_or_create(
-        sub._tree_session_id, parent_session=sub._child_parent_session).manager
+        sub._tree_session_id, spawned_by=sub._child_parent_session).manager
     return sub
 
 
@@ -45,7 +45,7 @@ def test_subagent_writes_child_session_live_with_lineage():
     child_sid = parent.child_session_id("agent-001")
     assert SessionManager.exists(child_sid)
     child = SessionManager.open(child_sid)
-    ps = child.parent_session()
+    ps = child.spawned_by()
     assert ps["sessionId"] == "PARENT" and ps["entryId"] == spawn_leaf
     assert ps["taskId"] == "agent-001" and ps["agentId"] == "agent-001"
     contents = str([e.data for e in child.entries() if e.type == T.MESSAGE])
@@ -107,7 +107,7 @@ def test_child_session_id_navigates_to_child():
     from nanocode.entrypoints.commands.builtin import _agent as _agent_cmd
     parent = _agent("AGNAV")
     parent._session_mgr = SessionManager.create("AGNAV")
-    SessionManager.create("sess_child_nav", parent_session={"sessionId": "AGNAV", "entryId": None})
+    SessionManager.create("sess_child_nav", spawned_by={"sessionId": "AGNAV", "entryId": None})
     res = asyncio.run(_agent_cmd(_ctx(parent), "sess_child_nav"))
     assert isinstance(res, Control) and res.payload["sessionId"] == "sess_child_nav"
 
@@ -116,8 +116,8 @@ def test_agent_next_cycles_into_child_from_parent():
     from nanocode.entrypoints.commands.builtin import _agent as _agent_cmd
     parent = _agent("AGNEXT")
     parent._session_mgr = SessionManager.create("AGNEXT")
-    SessionManager.create("AGNEXT.a1", parent_session={"sessionId": "AGNEXT", "entryId": None})
-    SessionManager.create("AGNEXT.a2", parent_session={"sessionId": "AGNEXT", "entryId": None})
+    SessionManager.create("AGNEXT.a1", spawned_by={"sessionId": "AGNEXT", "entryId": None})
+    SessionManager.create("AGNEXT.a2", spawned_by={"sessionId": "AGNEXT", "entryId": None})
     res = asyncio.run(_agent_cmd(_ctx(parent), "next"))
     assert isinstance(res, Control) and res.payload["sessionId"] in ("AGNEXT.a1", "AGNEXT.a2")
 
@@ -134,7 +134,7 @@ def test_resume_short_prefix_resolves_parent_not_polluted_by_child():
     # P6 review #5：child sid 与父共享前缀；短前缀 /resume 应唯一解析到父（child 仅 exact id 可达）。
     from nanocode.entrypoints.commands.builtin import _resume
     SessionManager.create("abcd1234")
-    SessionManager.create("abcd1234.agent-001", parent_session={"sessionId": "abcd1234", "entryId": None})
+    SessionManager.create("abcd1234.agent-001", spawned_by={"sessionId": "abcd1234", "entryId": None})
     a = _agent("other")
     a._session_mgr = SessionManager.create("other")
     res = asyncio.run(_resume(_ctx(a), "abcd"))          # 短前缀 → 父（child 被排除）

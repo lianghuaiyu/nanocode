@@ -306,7 +306,7 @@ def tree_events(session_id: str) -> "list[TrajEvent]":
     """把一个 canonical session（+ 其子会话 fan-out）重建为统一 TrajEvent 流。
 
     取代 ``events.reader.merge_session_events``：父会话 → agent_id="main"；每个子会话 →
-    其 ``parent_session().agentId``（连字符，如 agent-001）。各 agent 内 seq 单调递增（branch 序），
+    其 ``spawned_by().agentId``（连字符，如 agent-001）。各 agent 内 seq 单调递增（branch 序），
     跨 agent 不承诺全序（与 wire 一致——配对在单 agent 内进行）。缺失会话 → 空流。绝不抛。
     """
     events: list[TrajEvent] = []
@@ -326,8 +326,8 @@ def tree_events(session_id: str) -> "list[TrajEvent]":
     for child_sid in child_ids:
         try:
             child = SessionManager.open(child_sid, lock=False)
-            ps = child.parent_session() or {}
-            aid = ps.get("agentId") or child_sid
+            sb = child.spawned_by() or {}
+            aid = sb.get("agentId") or child_sid
             events.extend(_branch_events(child, aid))
         except Exception:
             continue
@@ -376,8 +376,9 @@ def list_tree_sessions() -> "list[dict]":
         hdr = _header(sid)
         if hdr is None:
             continue
-        # 子会话（header 带 parentSession）不作为顶层 trajectory 列出。
-        if (hdr.get("data") or {}).get("parentSession"):
+        # 被 spawn 的 subagent 子（header 带 spawnedBy）不作为顶层 trajectory 列出；
+        # fork/clone 是各自独立的顶层轨迹（docs/26 C2）。
+        if (hdr.get("data") or {}).get("spawnedBy"):
             continue
         try:
             mgr = SessionManager.open(sid, lock=False)

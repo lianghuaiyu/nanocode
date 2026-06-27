@@ -1,13 +1,17 @@
-"""agent/providers.py — ProviderAdapter：把 provider-specific 的流式 + capture + 请求组装收敛到
+"""agent/providers.py — ProviderAdapter：把 provider-specific 的流式 + 完成归一 + 请求组装收敛到
 一个接口背后（docs/15 §5/§13#1）。
 
-STEP B（providers seam）：先**包裹**（不删）现有 `_call_anthropic_stream` / `_call_openai_stream`
-的 SDK 流式机制,使两后端 mixin 委托同一接口。这冻结两条流式行为、为 STEP C 把循环上移到
-`agent/core.py` 做准备。capture（provider msg → 中立 Message）与 neutral_stop_reason 也归口于此
-（§5：adapter 持有 build_request / stream / capture / cache 控制）。
+每个 adapter 持 client、做 SDK 流式（stream）、把原始完成载荷归一成 Completion（complete）、产出
+provider-shaped 的 tool-result 消息（tool_result_messages）、并跑一次性 summarizer（summarize）。
+
+G2 边界（模型层只做 I/O）：adapter **不** import ②b(session)/③(tools)——
+- 消息归一（provider msg → 中立 Message / neutral_stop_reason）属 ②b harness，由 `agent/events.py`
+  的 record 路径持有（capture 是 session/ 的纯函数），adapter 只交回 provider-shaped 完成载荷；
+- active-tool 过滤（tool_search 激活集）由 ②b 在 `AgentSession._loop_config` 现场解析后经
+  `cfg.resolve_tools()` 注入，adapter 收到的 `tools` 即最终请求工具表，直接发往 provider。
 
 不变量：adapter 无状态地持有 client；不写 session、不碰 AgentState 的 durable 事实——只做 SDK I/O
-+ provider 整形/归一。UI 副作用经 StreamCallbacks 注入（spinner/text/thinking/tool-block/retry）。
++ provider 整形/归一。UI 副作用经 StreamCallbacks 注入（spinner/text/thinking/retry）。
 """
 
 from __future__ import annotations
@@ -16,8 +20,6 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..session import capture
-from ..tools import get_active_tool_definitions
 from .models import _get_max_output_tokens, _to_openai_tools, _with_retry
 
 
@@ -83,11 +85,12 @@ class StreamCallbacks:
 
 
 class ProviderAdapter:
-    """provider 适配器基类。持 client；stream() 做 SDK 流式;capture/neutral_stop_reason 归一。
+    """provider 适配器基类。持 client；stream() 做 SDK 流式;complete() 归一完成载荷。
 
     B1（docs/16 provider seam）：provider-specific 的三件事下沉到 adapter 缝之下，turn-shell/
     压缩/摘要/系统提示词的调用点不再分支 provider：
-    - ``capture_api``：capture/render 的 api 串（anthropic / openai-completions）；
+    - ``capture_api``：record/render 的 api 串（anthropic / openai-completions）——②b 的 capture
+      路径据此选表（adapter 自身不再 import session.capture）；
     - ``places_system_in_messages``：system 是否进 messages[0]（openai=True，anthropic=False，
       走 out-of-band system kwarg）——render(system_prompt=...) 与 ProviderProjection.system 的
       放置规则真源；
@@ -99,14 +102,8 @@ class ProviderAdapter:
     capture_api: str = ""
     places_system_in_messages: bool = False
 
-    def __init__(self, client: Any, *, registry=None) -> None:
+    def __init__(self, client: Any) -> None:
         self.client = client
-        # docs/24 Phase 4a：per-agent overlay registry——active-tool 过滤读其激活集（tool_search
-        # 激活落在 agent registry 上）。None → 全局 REGISTRY（行为等价，旧路径/裸构造）。
-        self._registry = registry
-
-    def _active_tools(self, tools: list) -> list:
-        return get_active_tool_definitions(tools, registry=self._registry)
 
     async def stream(self, *, model: str, system: "str | None", tools: list,
                      messages: list, thinking_mode: str, callbacks: StreamCallbacks) -> Any:
@@ -150,15 +147,6 @@ class ProviderAdapter:
         per-provider override 逐字保留旧 _compact_*/_summarize_* 的并发体（in-band vs out-of-band
         system、messages[1:] 切片、长度守卫、max_tokens、解析、fallback 全部 byte-equivalent）。"""
         raise NotImplementedError
-
-    def neutral_stop_reason(self, raw: "str | None") -> "str | None":
-        return capture.neutral_stop_reason(self.name, raw)
-
-    def capture(self, msg: dict, *, model: str, stop_reason: "str | None" = None,
-                usage: "dict | None" = None, latency_ms: "int | None" = None) -> list[dict]:
-        """provider 消息 → 中立 Message[]（§5：capture 归 adapter）。stop_reason 须已是中立值。"""
-        cap = capture.capture_openai if self.name == "openai" else capture.capture_anthropic
-        return cap(msg, model=model, stop_reason=stop_reason, usage=usage, latency_ms=latency_ms)
 
     @staticmethod
     def _with_summary_request(messages: list, prompt_text: str) -> list:
@@ -210,7 +198,7 @@ class AnthropicAdapter(ProviderAdapter):
                 "model": model,
                 "max_tokens": max_output if thinking_mode != "disabled" else 16384,
                 "system": system,
-                "tools": get_active_tool_definitions(tools, registry=self._registry),
+                "tools": tools,
                 "messages": messages,
             }
             if thinking_mode in ("adaptive", "enabled"):
@@ -314,7 +302,7 @@ class OpenAIAdapter(ProviderAdapter):
         async def _do():
             stream = await self.client.chat.completions.create(
                 model=model,
-                tools=_to_openai_tools(get_active_tool_definitions(tools, registry=self._registry)),
+                tools=_to_openai_tools(tools),
                 messages=messages,
                 stream=True,
                 stream_options={"include_usage": True},
@@ -455,9 +443,7 @@ def resolve_provider_name(*, api_base: "str | None") -> str:
     return "openai" if api_base else "anthropic"
 
 
-def make_provider_adapter(*, provider: str, client, registry=None) -> ProviderAdapter:
-    """按 provider name 查 SPECS 建 adapter（engine.__init__ 与子 agent 构造共用）。
-
-    docs/24 Phase 4a：传入 agent 的 per-agent overlay registry，使 active-tool 过滤读其激活集。"""
+def make_provider_adapter(*, provider: str, client) -> ProviderAdapter:
+    """按 provider name 查 SPECS 建 adapter（engine.__init__ 与子 agent 构造共用）。"""
     spec = SPECS[provider]
-    return spec.adapter_cls(client, registry=registry)
+    return spec.adapter_cls(client)

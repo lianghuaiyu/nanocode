@@ -78,8 +78,8 @@ def scan_sessions() -> list[SessionInfo]:
     from .manager import SessionManager, _scan_headers, session_file
 
     out: list[SessionInfo] = []
-    for sid, ps in _scan_headers():
-        if ps and ps.get("agentId"):
+    for sid, sb, ff in _scan_headers():
+        if sb:                       # docs/26 C2：藏 subagent 子；fork/clone 仍列出
             continue
         path: Path = session_file(sid)
         try:
@@ -110,7 +110,7 @@ def scan_sessions() -> list[SessionInfo]:
         except Exception:
             mtime = 0.0
         modified = last_activity or created or mtime
-        origin = "root" if not ps else ("fork" if ps.get("forkedBeforeEntryId") else "clone")
+        origin = "root" if not ff else ("fork" if ff.get("forkedBeforeEntryId") else "clone")
         name = mgr.name()
         if name is None and not msgs:
             continue
@@ -124,7 +124,7 @@ def scan_sessions() -> list[SessionInfo]:
             created=created or mtime,
             modified=modified,
             cwd=mgr._cwd(),
-            parent_sid=(ps or {}).get("sessionId"),
+            parent_sid=(ff or {}).get("sessionId"),
             origin=origin,
             leaf=mgr.get_leaf(),
             latest_role=(last.data.get("message") or {}).get("role") if last else None,

@@ -84,10 +84,8 @@ class CapabilityRouter:
 
     async def dispatch(self, host: ToolHost, name: str, inp: dict) -> str:
         # docs/24 Phase 4a：本次派发用的 registry = host 的 per-agent overlay（real Agent.registry）；
-        # 极简 ToolHost 测试替身可能不暴露 registry → 退回全局 REGISTRY（builtins，行为等价）。
         # 同一 registry 贯穿 validate / host-routed tool.run 解析，绝不混读两个表。
-        from ..tools.registry import REGISTRY as _GLOBAL_REGISTRY
-        registry = getattr(host, "registry", None) or _GLOBAL_REGISTRY
+        registry = host.registry
         # docs/19 Phase 1：严格输入校验是真实执行前的第一道（覆盖流式早执行 + 直接/hook 调用）。
         # 拒下划线键（封死 _cwd/_session_id spoof）/ unknown key / 缺 required / 类型不符。
         verr = validate_tool_input(name, inp, registry=registry)

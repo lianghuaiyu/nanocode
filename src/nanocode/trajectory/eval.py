@@ -415,16 +415,15 @@ def attach_rewards(steps: "list", evals: "list[dict]") -> "list":
 
 def _copy_step(step):
     """浅拷贝一个 step（dataclass 用 replace；否则原样返回）。绝不抛。"""
-    try:
-        import copy
-        from dataclasses import is_dataclass
+    import copy
+    from dataclasses import is_dataclass
 
+    try:
         if is_dataclass(step):
             return copy.replace(step)  # py3.13+ dataclass replace（保留类型）
         return copy.copy(step)
     except Exception:
         try:
-            import copy
             return copy.copy(step)
         except Exception:
             return step

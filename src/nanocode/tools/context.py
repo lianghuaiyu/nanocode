@@ -15,8 +15,8 @@ raw `Agent` / `_session_mgr` / `lease`（边界命根子，docs/24 §8.1）。Ph
 取 `UNRESTRICTED` 哨兵 → 不拦（全宿主可写，与同档 shell 在宿主裸跑对齐）。
 一切以咽喉点注入的 `sandbox_policy().filesystem.writable_roots` 为准。
 
-退路 `default_tool_context()`（不经咽喉点的直接调用 / 旧单测）用 `UNRESTRICTED` 哨兵，跳过
-containment——它不是 read-only 档，而是「无策略 = 不收紧」，与历史裸写行为等价。
+`default_tool_context()` 只供显式的直接工具调用 / 单测使用，采用 `UNRESTRICTED` 哨兵，跳过
+containment——它不是 read-only 档，而是调用方主动选择的宽松本地上下文。
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from ..capabilities.sandbox import UNRESTRICTED, FileSystemPolicy
 
 # `writable_roots` 取 `UNRESTRICTED`（capabilities.sandbox 的类型内哨兵单例）= 不强制 containment。
 # 两种来源：(1) danger-full-access 档（全宿主可写，与同档 shell 对齐）；(2) `default_tool_context()`
-# 无策略退路（非 read-only 档，与历史裸写等价）。受限档铸真 roots 元组（含空元组 = read-only 拒所有写），
+# 显式直接调用上下文。受限档铸真 roots 元组（含空元组 = read-only 拒所有写），
 # `_check_writable` 据 `is UNRESTRICTED` 判别跳过——哨兵是类型而非字符串，误路由会被下游 fail-loud。
 
 
@@ -91,7 +91,7 @@ class FsWriteCap:
     - default / workspace-write 档 → 仅 workspace + temp 可写；
     - danger-full-access 档 `writable_roots=UNRESTRICTED` 哨兵 → 不拦（全宿主可写，与同档 shell 对齐）。
 
-    哨兵 `writable_roots is UNRESTRICTED`（danger-full-access 档 + `default_tool_context()` 退路）
+    哨兵 `writable_roots is UNRESTRICTED`（danger-full-access 档 + `default_tool_context()`）
     → 跳过 containment，与历史裸写等价（非 read-only 档）。
 
     protected-root 写策略**由咽喉点独占**（permissions.check_permission：默认/acceptEdits/bypass
@@ -292,10 +292,10 @@ class ToolContext:
 
 
 def default_tool_context() -> "ToolContext":
-    """宽松 fs 把手的退路 ToolContext（与今天裸 Path/os 行为等价）。
+    """显式直接工具调用用的宽松 fs ToolContext。
 
-    用于不经咽喉点的直接调用（旧单测、execute_tool 无 ctx 退路）。**不收紧**：writable_roots 取
-    `UNRESTRICTED` 哨兵（FsWriteCap 跳过 containment）；denied_roots 空（FsReadCap 不拦）。
+    用于不经咽喉点的直接调用。**不收紧**：writable_roots 取 `UNRESTRICTED` 哨兵
+    （FsWriteCap 跳过 containment）；denied_roots 空（FsReadCap 不拦）。
     真实派发由 engine._mint_tool_context 按 needs 用 `sandbox_policy().filesystem` 铸造（带真 roots）。
     """
     policy = FileSystemPolicy(readable_roots=(), writable_roots=UNRESTRICTED,

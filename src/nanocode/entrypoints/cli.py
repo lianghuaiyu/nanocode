@@ -253,7 +253,7 @@ def _resolve_session_arg(value: str) -> tuple[str | None, str | None]:
             return None, f"session path {path} is outside nanocode's managed session store"
         return sid, None
 
-    known = {sid for sid, _ps in _scan_headers()}
+    known = {sid for sid, _sb, _ff in _scan_headers()}
     matches = ([sid for sid in known if sid == raw] or [sid for sid in known if sid.startswith(raw)])
     if len(matches) == 1:
         return matches[0], None

@@ -21,7 +21,7 @@ import asyncio
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from ..memory.maintenance import (
     apply_plan,
@@ -39,6 +39,21 @@ from ..session import tree as _tree
 from ..session.manager import SessionManager
 from ..subagents import run_record
 from ..subagents.worktree import create_worktree, diff_summary, should_isolate
+
+
+@dataclass(frozen=True)
+class SubagentOutcome:
+    """内核 spawn_subagent 原语的轻量结果句柄（docs/26 阶段1 ①）。
+
+    区别于前台 `run_fresh_subagent` 返回的 bounded ResultEnvelope 字符串（面向模型）：
+    内核原语返回结构化句柄，reserved/扩展消费方拿 `text`（原始文本，供 JSON 解析），
+    编排/lifecycle 拿 `run_id`/`status`。不含 promote/inject 字段（那是 D6，已推迟）。"""
+
+    run_id: str            # == child_session_id
+    status: str            # TERMINAL_RUN_STATUSES 成员（completed 才是成功）
+    text: str              # 原始结果文本
+    tokens: dict           # {"input": int, "output": int}
+    result_path: "str | None"
 
 
 @contextmanager
@@ -260,7 +275,7 @@ class SubAgentRunner:
                                          "taskId": artifact_id, "agentId": artifact_id}
             cwd = _child_cwd(host)
             sub._session_lease = SessionLease.open_or_create(
-                sub._tree_session_id, parent_session=sub._child_parent_session, cwd=cwd)
+                sub._tree_session_id, spawned_by=sub._child_parent_session, cwd=cwd)
             sub._session_mgr = sub._session_lease.manager
             # docs/23 Step 7-S3：子 agent 携带一致的 RuntimeServices bundle（host 无 bundle → None,
             # 保持 bundle-less）。production 非 worktree 子 agent 自此持 cwd=host cwd 的 bundle,与旧
@@ -373,14 +388,14 @@ class SubAgentRunner:
                                  context_mode: str, isolation: str,
                                  worktree_path: str | None, error: str) -> str:
         from ..session.lease import SessionLease
-        parent_session = {
+        spawned_by = {
             "sessionId": host.session_id,
             "entryId": host._subagent_spawn_leaf.get(child_session_id),
             "taskId": child_session_id,
             "agentId": child_session_id,
         }
         cwd = _child_cwd(host)
-        lease = SessionLease.open_or_create(child_session_id, parent_session=parent_session, cwd=cwd)
+        lease = SessionLease.open_or_create(child_session_id, spawned_by=spawned_by, cwd=cwd)
         try:
             if not SessionManager.exists(child_session_id):
                 lease.manager.rewrite_file()
@@ -664,7 +679,8 @@ class SubAgentRunner:
                         f"Cannot resume with a different model.")
             eff_timeout = SubAgentManager.foreground_timeout(tool_timeout_ms, profile.timeout_ms, fleet_cfg)
             max_turns = host._subagents.bounded_max_turns(profile.max_turns)
-            host.emit(SubAgentStarted(agent_type=run.agent_type, description=description))
+            host.emit(SubAgentStarted(agent_type=run.agent_type, description=description,
+                                      run_id=resume_id, child_session_id=resume_id))
             sub_agent = None
             try:
                 self.record_subagent_spawn_leaf(host, resume_id)
@@ -690,7 +706,9 @@ class SubAgentRunner:
                         result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                         error="cancelled")
                     host._close_child_session(resume_id, sub_agent)
-                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description))
+                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description,
+                                        run_id=resume_id, child_session_id=resume_id,
+                                        status="cancelled"))
                 raise
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 if sub_agent is not None:
@@ -699,7 +717,9 @@ class SubAgentRunner:
                         result_text=host._subagent_captured_text(sub_agent) or f"Sub-agent error: {e}",
                         error=str(e))
                     host._close_child_session(resume_id, sub_agent)
-                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description))
+                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description,
+                                        run_id=resume_id, child_session_id=resume_id,
+                                        status="failed"))
                 return f"Sub-agent error: {e}"
             if kind != "ok":
                 host._spawn.finish_run_record(
@@ -708,7 +728,9 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or str(payload),
                     error=None if kind == "timeout" else str(payload))
                 host._close_child_session(resume_id, sub_agent)
-                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description))
+                host.emit(SubAgentEnded(agent_type=run.agent_type, description=description,
+                                        run_id=resume_id, child_session_id=resume_id,
+                                        status="timed_out" if kind == "timeout" else "failed"))
                 return host._finalize_foreground_terminal(
                     sub_agent, resume_id, kind, payload, eff_timeout)
             result = payload  # type: ignore[assignment]
@@ -718,7 +740,9 @@ class SubAgentRunner:
                 sub_agent=sub_agent, status="completed",
                 result_text=result["text"] or "", tokens=result["tokens"])
             host._close_child_session(resume_id, sub_agent)
-            host.emit(SubAgentEnded(agent_type=run.agent_type, description=description))
+            host.emit(SubAgentEnded(agent_type=run.agent_type, description=description,
+                                    run_id=resume_id, child_session_id=resume_id,
+                                    status="completed", tokens=result["tokens"]))
             return host._finalize_foreground_result(sub_agent, result, result_path, resume_id)
 
         # ── fresh path ──
@@ -750,7 +774,8 @@ class SubAgentRunner:
             cwd = host._effective_cwd() if hasattr(host, "_effective_cwd") else "."
             worktree = create_worktree(cwd, child_id)
             worktree_path = worktree.path
-        host.emit(SubAgentStarted(agent_type=agent_type, description=description))
+        host.emit(SubAgentStarted(agent_type=agent_type, description=description,
+                                  run_id=child_id, child_session_id=child_id))
         self.record_subagent_spawn_leaf(host, child_id)
         sub_agent = None
         try:
@@ -775,7 +800,9 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
                 host._close_child_session(child_id, sub_agent)
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description,
+                                    run_id=child_id, child_session_id=child_id,
+                                    status="cancelled"))
             raise
         except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
             if sub_agent is not None:
@@ -784,7 +811,9 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or f"Sub-agent error: {e}",
                     error=str(e))
                 host._close_child_session(child_id, sub_agent)
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description,
+                                    run_id=child_id, child_session_id=child_id,
+                                    status="failed"))
             return f"Sub-agent error: {e}"
         if kind != "ok":
             self.finish_run_record(
@@ -793,7 +822,9 @@ class SubAgentRunner:
                 result_text=host._subagent_captured_text(sub_agent) or str(payload),
                 error=None if kind == "timeout" else str(payload))
             host._close_child_session(child_id, sub_agent)
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description,
+                                    run_id=child_id, child_session_id=child_id,
+                                    status="timed_out" if kind == "timeout" else "failed"))
             return host._finalize_foreground_terminal(
                 sub_agent, child_id, kind, payload, eff_timeout)
         result = payload  # type: ignore[assignment]
@@ -806,7 +837,9 @@ class SubAgentRunner:
             run_record.append_event(child_id, "worktree_finalized",
                                     diffSummary=diff_summary(worktree_path))
         host._close_child_session(child_id, sub_agent)
-        host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+        host.emit(SubAgentEnded(agent_type=agent_type, description=description,
+                                run_id=child_id, child_session_id=child_id,
+                                status="completed", tokens=result["tokens"]))
         return host._finalize_foreground_result(sub_agent, result, result_path, child_id)
 
     # ─── chain / parallel fan-in（docs/16 #9：借 pi {previous} 与 fan-in 的编排点子）──
@@ -944,7 +977,8 @@ class SubAgentRunner:
             worktree = create_worktree(cwd, child_id)
             worktree_path = worktree.path
         self.record_subagent_spawn_leaf(host, child_id)
-        host.emit(SubAgentStarted(agent_type=agent_type, description=description))
+        host.emit(SubAgentStarted(agent_type=agent_type, description=description,
+                                  run_id=child_id, child_session_id=child_id, background=True))
         profile = build_profile(agent_type)
         try:
             sub_agent = host._build_sub_agent(system_prompt=profile.prompt,
@@ -958,8 +992,15 @@ class SubAgentRunner:
                 description=description, prompt=prompt, model=eff_model, background=True,
                 context_mode=context_mode, isolation=selected_isolation,
                 worktree_path=worktree_path, error=str(e))
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            host.emit(SubAgentEnded(agent_type=agent_type, description=description,
+                                    run_id=child_id, child_session_id=child_id,
+                                    status="failed"))
             return child_id
+        # D3：用户发起的后台子 agent —— 危险确认升级回父（取代 build 默认的 _auto_deny_confirm）。
+        # 仅此路径升级；reserved/curator/eval 不经此，保持 auto-deny（无人值守）。共享父去重集
+        # 使 _confirm_if_needed 的 storm/dedup 复用、审批记忆归同一个人。
+        sub_agent.set_confirm_fn(host.make_escalating_confirm(child_id))
+        sub_agent._confirmed_paths = host._confirmed_paths
         self.apply_child_worktree(host, sub_agent, worktree_path)
         run_id = self.begin_run_record(
             host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
@@ -990,6 +1031,10 @@ class SubAgentRunner:
                                       sub_agent=None, worktree_path: str | None = None,
                                       queued: bool = False) -> None:
         """detached 协程：构造 background 子 agent,跑 run_once,落终态 + 持久化。"""
+        def _ended(status: str, tokens: "dict | None" = None) -> None:
+            host.emit(SubAgentEnded(
+                agent_type=agent_type, description=description, run_id=agent_id,
+                child_session_id=agent_id, status=status, tokens=tokens))
         try:
             if queued:
                 await self.wait_for_background_slot(host, agent_id)
@@ -1008,7 +1053,7 @@ class SubAgentRunner:
             host.emit(NoticeRaised(
                 text=f"Background sub-agent run {agent_id} cancelled: {description}",
                 level="warn"))
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            _ended("cancelled")
             raise
         except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态,detached 任务不能悬挂 running
             if sub_agent is not None:
@@ -1020,7 +1065,7 @@ class SubAgentRunner:
             host.emit(NoticeRaised(
                 text=f"Background sub-agent run {agent_id} failed: {description}",
                 level="warn"))
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            _ended("failed")
             return
 
         if kind == "timeout":
@@ -1034,7 +1079,7 @@ class SubAgentRunner:
             host.emit(NoticeRaised(
                 text=f"Background sub-agent run {agent_id} timed out: {description}",
                 level="warn"))
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            _ended("timed_out")
             return
         if kind == "error":
             host._fold_subagent_tokens(sub_agent)
@@ -1047,7 +1092,7 @@ class SubAgentRunner:
             host.emit(NoticeRaised(
                 text=f"Background sub-agent run {agent_id} failed: {description}",
                 level="warn"))
-            host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+            _ended("failed")
             return
 
         result = payload  # kind == "ok"
@@ -1062,7 +1107,7 @@ class SubAgentRunner:
         host._close_child_session(agent_id, sub_agent)
         host.emit(NoticeRaised(
             text=f"Background sub-agent run {agent_id} completed: {description}"))
-        host.emit(SubAgentEnded(agent_type=agent_type, description=description))
+        _ended("completed", tokens=result["tokens"])
 
     # ─── memory curator spawns（搬迁自 engine,host-driven;curator 是 subagent,§13.8）──────────
     # ─── Memory consolidation (Auto-Dream) ────────────────────
@@ -1356,32 +1401,47 @@ class SubAgentRunner:
     # Optimization is owned by the memory-evolution system extension. There is
     # intentionally no SubAgentRunner optimize path and no vendored fallback.
 
-    async def run_reserved_agent(self, host, *, agent_type: str, prompt: str,
-                                 model: "str | None" = None,
-                                 timeout_ms: "int | None" = None) -> str:
-        """Reserved-agent spawn（如 memory retrieval diagnostician）。
+    async def spawn_subagent(self, host, *, profile: AgentProfile, prompt: str,
+                             description: "str | None" = None, model: "str | None" = None,
+                             timeout_ms: "int | None" = None, context_mode: str = "fresh",
+                             isolation: str = "shared", max_turns: "int | None" = None,
+                             emit_lifecycle: bool = True) -> SubagentOutcome:
+        """内核单发 spawn 原语（docs/26 阶段1 ①）。
 
-        走与普通 subagent 一致的 child-session run_record 体系（**无 host task**，
-        故不再触 TaskManager）。四态对称：completed 返回 text；cancelled/timeout/error
-        先写终态 run_record + 折 token + close child，再向上抛（调用方按 best-effort 处理）。
-        """
-        profile = build_profile(agent_type)
+        只收已解析的 `profile`（不收 raw tools/sandbox）——子工具经 child_tools/
+        effective_child_tools 内核派生（allow∩/deny∪/剔 agent），sandbox 继承父 profile，
+        故扩展/编排消费方**结构上无法提权**。走 child-session run_record（无 host task）。
+        四态对称：completed 返回 SubagentOutcome；cancelled/timeout/error 先写终态 record +
+        折 token + close child + emit lifecycle，再向上抛（与旧 run_reserved_agent 逐字等价）。"""
+        agent_type = profile.name
         eff_model = model or profile.model or host.model
-        description = agent_type
+        description = description or agent_type
+        eff_max_turns = (max_turns if max_turns is not None
+                         else host._subagents.bounded_max_turns(profile.max_turns or 1))
         child_id = self.new_child_session_id()
+
+        def _ended(status: str, tokens: "dict | None" = None) -> None:
+            if emit_lifecycle:
+                host.emit(SubAgentEnded(
+                    agent_type=agent_type, description=description, run_id=child_id,
+                    child_session_id=child_id, status=status, tokens=tokens))
+
+        if emit_lifecycle:
+            host.emit(SubAgentStarted(
+                agent_type=agent_type, description=description, run_id=child_id,
+                child_session_id=child_id, background=True))
         self.record_subagent_spawn_leaf(host, child_id)
         sub_agent = None
         try:
             sub_agent = host._build_sub_agent(
                 system_prompt=profile.prompt,
                 tools=child_tools(host, profile, background=True),
-                agent_type=agent_type, background=True,
-                max_turns=host._subagents.bounded_max_turns(profile.max_turns or 1),
+                agent_type=agent_type, background=True, max_turns=eff_max_turns,
                 model=model, artifact_id=child_id, agent_source=profile.source)
             self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
                 description=description, prompt=prompt, model=eff_model, background=True,
-                context_mode="fresh", isolation="shared", worktree_path=None)
+                context_mode=context_mode, isolation=isolation, worktree_path=None)
             if timeout_ms is not None:
                 result = await asyncio.wait_for(
                     sub_agent.run_once(prompt), timeout=timeout_ms / 1000.0)
@@ -1395,6 +1455,7 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
                 host._close_child_session(child_id, sub_agent)
+            _ended("cancelled")
             raise
         except asyncio.TimeoutError:
             if sub_agent is not None:
@@ -1404,6 +1465,7 @@ class SubAgentRunner:
                     result_text=host._subagent_captured_text(sub_agent)
                     or f"(timed out after {timeout_ms}ms)", error=None)
                 host._close_child_session(child_id, sub_agent)
+            _ended("timed_out")
             raise
         except Exception as e:
             if sub_agent is not None:
@@ -1417,12 +1479,31 @@ class SubAgentRunner:
                 self.create_failed_run_record(
                     host, child_session_id=child_id, agent_type=agent_type,
                     description=description, prompt=prompt, model=eff_model, background=True,
-                    context_mode="fresh", isolation="shared", worktree_path=None, error=str(e))
+                    context_mode=context_mode, isolation=isolation, worktree_path=None,
+                    error=str(e))
+            _ended("failed")
             raise
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
-        self.finish_run_record(
+        result_path = self.finish_run_record(
             sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"])
         host._close_child_session(child_id, sub_agent)
-        return text
+        _ended("completed", tokens=result["tokens"])
+        return SubagentOutcome(run_id=child_id, status="completed", text=text,
+                               tokens=result["tokens"], result_path=result_path)
+
+    async def run_reserved_agent(self, host, *, agent_type: str, prompt: str,
+                                 model: "str | None" = None,
+                                 timeout_ms: "int | None" = None) -> str:
+        """Reserved-agent spawn（如 memory retrieval diagnostician）的薄适配。
+
+        委托内核原语 `spawn_subagent`，保留原签名 + 裸 text 返回（facade/engine 委托与
+        consumer memory_evolution 依赖不变）。reserved 类型由 RESERVED_AGENT_TYPES 守门、
+        非模型可 spawn。四态语义（completed 返 text；其余写终态后抛）由 spawn_subagent 承载。
+        """
+        profile = build_profile(agent_type)
+        outcome = await self.spawn_subagent(
+            host, profile=profile, prompt=prompt, description=agent_type,
+            model=model, timeout_ms=timeout_ms)
+        return outcome.text

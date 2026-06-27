@@ -457,8 +457,11 @@ class FakeMgr:
     def get_branch(self):
         return self._branch
 
-    def parent_session(self):
+    def spawned_by(self):
         return self._parent
+
+    def forked_from(self):
+        return None
 
 
 class FakeStatsEngine:
@@ -504,7 +507,7 @@ def test_service_generation_get_branch_failure_is_error():
 
 def test_service_generation_parent_session_failure_is_error():
     class BrokenMgr(FakeMgr):
-        def parent_session(self):
+        def spawned_by(self):
             raise RuntimeError("parent blew up")
 
     svc = MemoryService(config=MemoryServiceConfig(backend="markdown"), cwd=".", agent_dir=".")

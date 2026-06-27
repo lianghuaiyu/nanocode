@@ -71,6 +71,34 @@ class TaskManagerView(_StaleGuard):
         return self._tm.update_task(task_id, **fields)
 
 
+class SpawnCap(_StaleGuard):
+    """受信 spawn 槽（docs/26 阶段1 ②）：扩展可 spawn 的 narrow 能力。
+
+    扩展只报 `agent_type`（限于本扩展贡献、且 manifest 声明了 `spawn:reserved` 的 reserved/
+    hidden agent）；子 agent 的工具集 / sandbox 由**内核**派生（child_tools→effective_child_tools
+    的 allow∩/deny∪/剔 agent + 父 sandbox 继承）。本视图**签名无 tools/sandbox 参数**——提权在
+    类型层就不可能：扩展永远拿不到「给子裸配工具」的权力（docs/26 §0.3 O5 命门）。
+
+    与 UNTRUSTED 工具封印一致性：UNTRUSTED 只封印模型可调的扩展**工具** ctx 槽；本槽在
+    context-view 侧（与 tasks/events/models 同类），由 host 仅向声明 capability 的扩展授予。"""
+
+    def __init__(self, host, thread, *, allowed_agent_types: "frozenset[str]") -> None:
+        self._host = host
+        self._thread = thread
+        self._allowed = frozenset(allowed_agent_types)
+
+    async def reserved(self, agent_type: str, prompt: str, *,
+                       model: "str | None" = None,
+                       timeout_ms: "int | None" = None) -> str:
+        self._ensure_active()
+        if agent_type not in self._allowed:
+            raise ExtensionRuntimeError(
+                f"extension may not spawn agent_type {agent_type!r} "
+                f"(granted reserved set: {sorted(self._allowed)})")
+        return await self._thread.run_reserved_subagent(
+            agent_type, prompt, model=model, timeout_ms=timeout_ms)
+
+
 class ExtensionModelRouter(_StaleGuard):
     """Resolve an extension model role to a concrete model id (docs/22 §5.4).
 
@@ -111,7 +139,8 @@ class ExtensionContext:
 
     def __init__(self, *, host, cwd: str, thread, session, memory,
                  tasks: "TaskManagerView", models: "ExtensionModelRouter",
-                 events: "EventSink", signal=None) -> None:
+                 events: "EventSink", spawn: "SpawnCap | None" = None,
+                 signal=None) -> None:
         self._host = host
         self.cwd = cwd
         self._thread = thread
@@ -120,6 +149,7 @@ class ExtensionContext:
         self.tasks = tasks
         self.models = models
         self.events = events
+        self.spawn = spawn
         self.signal = signal
 
     def _ensure_active(self) -> None:

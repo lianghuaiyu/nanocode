@@ -15,9 +15,10 @@ from nanocode.session.manager import SessionManager
 
 
 def new_session(sid: str, *, lock: bool = True, cwd: str | None = None,
-                parent_session: dict | None = None) -> SessionManager:
+                spawned_by: dict | None = None, forked_from: dict | None = None) -> SessionManager:
     """create 一个加锁的 canonical session（默认持写锁，供 append）。"""
-    return SessionManager.create(sid, cwd=cwd, parent_session=parent_session, lock=lock)
+    return SessionManager.create(sid, cwd=cwd, spawned_by=spawned_by,
+                                 forked_from=forked_from, lock=lock)
 
 
 def append_user(mgr: SessionManager, text: str):
@@ -97,14 +98,14 @@ def append_compaction(mgr: SessionManager, *, kind: str = "auto",
 
 
 def child_session(parent: SessionManager, child_sid: str, *, agent_id: str) -> SessionManager:
-    """create 一个 child session，header 回指 parent + agentId（多 agent fan-out）。
+    """create 一个 subagent child session，header 回指 parent + agentId（多 agent fan-out）。
 
-    children(parent_sid) 经 header.parentSession.sessionId 扫描发现；agent_id 经
-    parent_session().agentId 恢复。
+    children(parent_sid) 经 header.spawnedBy.sessionId 扫描发现；agent_id 经
+    spawned_by().agentId 恢复（docs/26 C2）。
     """
     return SessionManager.create(
         child_sid,
-        parent_session={"sessionId": parent.session_id, "entryId": parent.get_leaf(),
-                        "agentId": agent_id},
+        spawned_by={"sessionId": parent.session_id, "entryId": parent.get_leaf(),
+                    "agentId": agent_id},
         lock=True,
     )

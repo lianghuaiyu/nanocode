@@ -44,11 +44,11 @@ def test_new_lease_defers_file_until_assistant_message():
     from nanocode.session import tree as T
     from nanocode.session.lease import SessionLease
 
-    for sid, parent_session in (
+    for sid, spawned_by in (
         ("defer_top", None),
         ("defer_child", {"sessionId": "parent", "entryId": "spawn"}),
     ):
-        lease = SessionLease.open_or_create(sid, parent_session=parent_session)
+        lease = SessionLease.open_or_create(sid, spawned_by=spawned_by)
         mgr = lease.manager
         try:
             assert not SessionManager.exists(sid)

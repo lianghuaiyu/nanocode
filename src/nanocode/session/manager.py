@@ -98,25 +98,30 @@ class SessionManager:
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     @classmethod
     def create(cls, session_id: str | None = None, *, cwd: str | None = None,
-               parent_session: dict | None = None, lock: bool = True,
-               defer_persist: bool = False) -> "SessionManager":
+               spawned_by: dict | None = None, forked_from: dict | None = None,
+               lock: bool = True, defer_persist: bool = False) -> "SessionManager":
         # docs/14 SessionLease：create 默认 lock=True——「新建一个 session」即写者意图，理应持锁。
         # 例外是 bootstrap-then-handoff：clone() 复制 child 后交给 runtime lease 重新加锁打开，故
         # 那里显式传 lock=False（避免同进程 clone 持锁 → rebind 重开 LOCK_NB 自锁死）。read-only
         # 打开走 open(lock=False)。defer_persist 对齐 Pi：顶层新会话首个 assistant 前只在内存/锁中存在，
         # 不写 session.jsonl，避免 /resume 被 header-only 空会话污染。
+        # docs/26 C2：血缘正交两键——spawnedBy（subagent 控制血缘）⟂ forkedFrom（fork/clone 内容血缘）。
         sid = session_id or tree.new_id("sess")
         mgr = cls(sid, [], flushed=not defer_persist)
         if lock:
             mgr.acquire_lock()      # 建前先占锁——并发同 sid 创建时第二者 fail-closed
+        data = {"version": tree.V, "cwd": cwd or os.getcwd()}
+        if spawned_by:
+            data["spawnedBy"] = spawned_by
+        if forked_from:
+            data["forkedFrom"] = forked_from
         root = Entry(
             type=tree.SESSION_START,
             id=tree.new_id("ent"),
             parentId=None,
             sessionId=sid,
             timestamp=tree.now_iso(),
-            data={"version": tree.V, "cwd": cwd or os.getcwd(),
-                  **({"parentSession": parent_session} if parent_session else {})},
+            data=data,
         )
         mgr._persist_new(root)
         return mgr
@@ -288,13 +293,21 @@ class SessionManager:
     def name(self) -> str | None:
         return tree.session_name(self._entries)
 
-    def parent_session(self) -> dict | None:
-        """本 session 的 parentSession 回指（child 侧权威，docs/13 §7.2）。"""
+    def _header_data(self) -> dict:
         for e in self._entries:
             if e.type == tree.SESSION_START:
-                ps = e.data.get("parentSession")
-                return ps if isinstance(ps, dict) else None
-        return None
+                return e.data or {}
+        return {}
+
+    def spawned_by(self) -> dict | None:
+        """subagent 控制血缘回指（docs/26 C2）：仅当本 session 是被 spawn 的子 agent 时非 None。"""
+        sb = self._header_data().get("spawnedBy")
+        return sb if isinstance(sb, dict) else None
+
+    def forked_from(self) -> dict | None:
+        """fork/clone 内容血缘回指（docs/26 C2）：仅当本 session 由 fork/clone 派生时非 None。"""
+        ff = self._header_data().get("forkedFrom")
+        return ff if isinstance(ff, dict) else None
 
     # ── fork / clone（docs/13 §7：in-file vs 跨文件） ───────────────────────────
     def clone(self, from_entry_id: str | None = None, *, new_session_id: str | None = None,
@@ -316,8 +329,8 @@ class SessionManager:
         child = SessionManager.create(
             new_session_id,
             cwd=self._cwd(),
-            parent_session={"sessionId": self.session_id, "entryId": leaf,
-                            **(parent_session_extra or {})},
+            forked_from={"sessionId": self.session_id, "entryId": leaf,
+                         **(parent_session_extra or {})},
             lock=False,                 # bootstrap-then-handoff：child 由 runtime lease 重新加锁打开
         )
         for e in msgs:
@@ -345,10 +358,10 @@ class SessionManager:
         self._flushed = True
 
 
-# ─── 跨 session 导航（child 侧 session_start.parentSession 回指为权威，docs/13 §7.2/§11） ──
-def _scan_headers() -> list[tuple[str, dict | None]]:
-    """枚举所有 session 的 (session_id, parentSession)，只读 session.jsonl 首行（cheap listing）。"""
-    out: list[tuple[str, dict | None]] = []
+# ─── 跨 session 导航（child 侧 session_start 血缘回指为权威，docs/13 §7.2/§11；docs/26 C2 正交两键） ──
+def _scan_headers() -> list[tuple[str, dict | None, dict | None]]:
+    """枚举所有 session 的 (session_id, spawnedBy, forkedFrom)，只读 session.jsonl 首行（cheap listing）。"""
+    out: list[tuple[str, dict | None, dict | None]] = []
     root = sessions_dir()
     if not root.exists():
         return out
@@ -364,22 +377,27 @@ def _scan_headers() -> list[tuple[str, dict | None]]:
         except (OSError, json.JSONDecodeError):
             continue
         if d.get("type") == tree.SESSION_START:
-            ps = d.get("data", {}).get("parentSession")
-            out.append((d.get("sessionId", entry.name), ps if isinstance(ps, dict) else None))
+            data = d.get("data", {})
+            sb = data.get("spawnedBy")
+            ff = data.get("forkedFrom")
+            out.append((d.get("sessionId", entry.name),
+                        sb if isinstance(sb, dict) else None,
+                        ff if isinstance(ff, dict) else None))
     return out
 
 
 def children(parent_session_id: str) -> list[str]:
-    """parent 的所有 child session id（权威 = child header 回指扫描，branch-independent，
-    survives 父 abort/rewind/fork——评审命中）。"""
-    return sorted(sid for sid, ps in _scan_headers()
-                  if ps and ps.get("sessionId") == parent_session_id)
+    """parent 的所有 **subagent** child session id（权威 = child header spawnedBy 回指扫描，
+    branch-independent，survives 父 abort/rewind/fork）。仅 spawnedBy——fork/clone 不是控制子
+    （docs/26 C2：否则 run-ledger 会把 fork 误当 subagent 运行）。"""
+    return sorted(sid for sid, sb, _ff in _scan_headers()
+                  if sb and sb.get("sessionId") == parent_session_id)
 
 
 def parent_of(child_session_id: str) -> str | None:
-    for sid, ps in _scan_headers():
+    for sid, sb, _ff in _scan_headers():
         if sid == child_session_id:
-            return ps.get("sessionId") if ps else None
+            return sb.get("sessionId") if sb else None
     return None
 
 

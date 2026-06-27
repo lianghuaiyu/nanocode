@@ -20,7 +20,7 @@ def _child(parent, child_id="CHILD"):
     spawn = parent._session_mgr.append_message(T.user_message("spawn child")).id
     parent_session = {"sessionId": parent.session_id, "entryId": spawn,
                       "taskId": child_id, "agentId": child_id}
-    lease = SessionLease.open_or_create(child_id, parent_session=parent_session)
+    lease = SessionLease.open_or_create(child_id, spawned_by=parent_session)
     lease.manager.rewrite_file()
     child = _agent(parent.session_id)
     child.is_sub_agent = True

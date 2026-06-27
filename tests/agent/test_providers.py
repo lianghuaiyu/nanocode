@@ -205,16 +205,18 @@ def test_openai_adapter_no_tool_calls_finish_stop_default():
     assert res["choices"][0]["finish_reason"] == "stop"      # 缺省 stop
 
 
-# ─── adapter capture / stop-reason 归一（§5：capture 归 adapter）────────────────
-def test_adapter_capture_and_neutral_stop_reason():
+# ─── adapter provider 元数据（G2：capture/neutral_stop_reason 已归 ②b，不再在 adapter 上）──────
+def test_adapter_provider_metadata():
     a = AnthropicAdapter(None)
     assert a.name == "anthropic"
-    assert a.neutral_stop_reason("tool_use") == "toolUse"
-    assert a.neutral_stop_reason("end_turn") == "stop"
-    neutral = a.capture({"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
-                        model="claude-x", stop_reason="stop")
-    assert neutral[0]["role"] == "assistant" and neutral[0]["provider"] == "anthropic"
+    assert a.capture_api == "anthropic"
+    assert a.places_system_in_messages is False
+    # G2：adapter 不再持 capture/neutral_stop_reason（消息归一属 ②b harness，由 events.py 的
+    # record 路径调 session.capture；adapter 不 import session/tools）。
+    assert not hasattr(a, "capture")
+    assert not hasattr(a, "neutral_stop_reason")
 
     o = OpenAIAdapter(None)
-    assert o.neutral_stop_reason("tool_calls") == "toolUse"
-    assert o.capture({"role": "system", "content": "S"}, model="gpt-x") == []  # system 不入树
+    assert o.name == "openai"
+    assert o.capture_api == "openai-completions"
+    assert o.places_system_in_messages is True

@@ -125,6 +125,7 @@ class AgentSession:
         """绑定本 turn 的 AgentLoopConfig（docs/16 #3c）：scalars 快照 + 宿主能力闭包。
         execute_tool 必须是 allowlist fail-closed 咽喉点入口（_execute_tool_call→router.dispatch）。"""
         from ..agent.loop import AgentLoopConfig
+        from ..tools import get_active_tool_definitions
         a = self.agent
 
         def note_api_call() -> None:
@@ -159,7 +160,8 @@ class AgentSession:
             return drain_pending_steers(a, delivery="follow_up") > 0
 
         return AgentLoopConfig(
-            model=a.model, thinking_mode=a._thinking_mode, tools=a.tools,
+            model=a.model, thinking_mode=a._thinking_mode,
+            resolve_tools=lambda: get_active_tool_definitions(a.tools, registry=a._registry),
             is_sub_agent=a.is_sub_agent,
             rebuild_snapshot=self.project_request,
             to_completion=a._provider.complete,

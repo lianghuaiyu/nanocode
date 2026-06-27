@@ -17,6 +17,7 @@ def test_memory_classified_as_capability():
 class FakeHost:
     is_sub_agent = False
     session_id = "s"
+    registry = REGISTRY
 
     def __init__(self):
         self.received = None

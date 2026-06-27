@@ -23,7 +23,7 @@ import importlib
 from .api import ExtensionAPI
 from .context import (
     EventSink, ExtensionCommandContext, ExtensionContext, ExtensionModelRouter,
-    TaskManagerView,
+    SpawnCap, TaskManagerView,
 )
 from .errors import ExtensionLoadError, ExtensionRuntimeError
 from .manifest import ExtensionManifest
@@ -181,6 +181,20 @@ class ExtensionHost:
         return out
 
     # ── context factories (call-time) ─────────────────────────────────
+    def _spawn_allowed_agent_types(self) -> "frozenset[str]":
+        """docs/26 阶段1 ②：受信 spawn 槽可 spawn 的 agent_type 集。
+
+        = 声明了 `spawn:reserved` capability 的扩展所贡献的 hidden agents（双绑定：
+        opt-in capability × 该扩展自己注册、且内核已在 bind_runtime 校验过的 reserved/hidden
+        agent）。空集 → ctx 不挂 spawn 槽（`ctx.spawn is None`）。"""
+        from .manifest import SPAWN_RESERVED
+        granted = {m.id for m in self.manifests if SPAWN_RESERVED in m.capabilities}
+        if not granted:
+            return frozenset()
+        return frozenset(
+            name for name, (_profile, ext_id) in self.registry.hidden_agents.items()
+            if ext_id in granted)
+
     def _build_context_fields(self) -> dict:
         if not self._active:
             raise ExtensionRuntimeError(
@@ -191,6 +205,7 @@ class ExtensionHost:
         memory = getattr(services, "memory_service", None) if services is not None else None
         session = thread.readonly_session() if thread is not None else None
         host_model = getattr(thread, "model", "") or ""
+        allowed_spawn = self._spawn_allowed_agent_types()
         return dict(
             host=self,
             cwd=(services.cwd if services is not None else ""),
@@ -201,6 +216,8 @@ class ExtensionHost:
             models=ExtensionModelRouter(self, host_model=host_model,
                                         roles=dict(self.registry.model_roles)),
             events=EventSink(self, agent.emit) if agent is not None else None,
+            spawn=(SpawnCap(self, thread, allowed_agent_types=allowed_spawn)
+                   if thread is not None and allowed_spawn else None),
         )
 
     def create_context(self) -> ExtensionContext:

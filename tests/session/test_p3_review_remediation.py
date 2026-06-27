@@ -61,12 +61,13 @@ def test_fork_pre3a_first_message_yields_empty_new_session():
     assert new_t is not None
     assert a.session_id != "pre3a_fork"                      # 新 session
     assert a.agent_session.build_request_messages() == []    # 其前无内容 → 空上下文
-    from nanocode.session.manager import children
+    from nanocode.session.manager import SessionManager
     new_sid = a.session_id
-    assert new_sid not in children("pre3a_fork")             # 空 fork 首个 assistant 前不污染 children()
+    assert not SessionManager.exists(new_sid)                # 空 fork 首个 assistant 前不落盘
     a.agent_session.record_provider_messages({"role": "user", "content": "followup"})
     a.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
-    assert new_sid in children("pre3a_fork")                 # materialize 后 lineage 可发现
+    # docs/26 C2：fork 经 forkedFrom 记录 lineage（不入 children()——那是 subagent 控制血缘）。
+    assert SessionManager.open(new_sid).forked_from()["sessionId"] == "pre3a_fork"
 
 
 # docs/14 SessionLease：删除「空树回退 legacy」与「树仅 custom_message 回退 flat」两个用例——

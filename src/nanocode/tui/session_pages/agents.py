@@ -113,12 +113,21 @@ class ConversationModel(TextViewerModel):
         if desc:
             first += f"  {_DIM}{desc}{_RESET}"
         second = " · ".join(p for p in [status, stats, self.record["child_session_id"]] if p)
-        return [first, f"{_DIM}{second}{_RESET}", f"{_DIM}{self._hint()}{_RESET}"]
+        rows = [first, f"{_DIM}{second}{_RESET}"]
+        pa = self.record.get("pending_approval")
+        if isinstance(pa, dict):
+            rows.append(f"⏸ awaiting approval: {pa.get('command', '')}")
+        rows.append(f"{_DIM}{self._hint()}{_RESET}")
+        return rows
 
     def extra_keys(self) -> tuple[str, ...]:
+        if self.record.get("pending_approval"):
+            return ("x", "r", "a", "d")
         return ("x", "r")
 
     def on_key(self, key: str, item: str, index: int) -> KeyResult | None:
+        if key in ("a", "d") and self.record.get("pending_approval"):
+            return KeyResult("edit", edit_action="approve" if key == "a" else "deny")
         if key == "r":
             return KeyResult("edit", edit_action="resume")
         if key == "x" and self.record["status"] in {"running", "queued"}:
@@ -130,6 +139,8 @@ class ConversationModel(TextViewerModel):
 
     def _hint(self) -> str:
         base = "↑↓ scroll · r resume · Esc back"
+        if self.record.get("pending_approval"):
+            base = "a approve · d deny · " + base
         if self.record["status"] in {"running", "queued"}:
             return ("x again to STOP · " if self._stop_armed else "x stop · ") + base
         return base
@@ -187,6 +198,9 @@ async def view_agent_conversation(thread, child_session_id: str, *, host) -> dic
             return None
         if outcome.kind == "edit" and outcome.edit_action == "resume":
             return {"action": "resume", "session_id": child_session_id}
+        if outcome.kind == "edit" and outcome.edit_action in ("approve", "deny"):
+            await thread.run_approve(child_session_id, outcome.edit_action == "approve")
+            index = 0
         if outcome.kind == "edit" and outcome.edit_action == "cancel":
             await thread.subagent_cancel(child_session_id)
             index = 0

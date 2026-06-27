@@ -69,8 +69,8 @@ def test_thread_clone_creates_child_with_parent_session_and_switches():
     assert new_t is not None and host.current_thread is new_t
     child_sid = a.session_id
     assert child_sid != "CLONESRC"
-    ps = SessionManager.open(child_sid).parent_session()
-    assert ps and ps["sessionId"] == "CLONESRC"          # parentSession 血缘
+    ff = SessionManager.open(child_sid).forked_from()
+    assert ff and ff["sessionId"] == "CLONESRC"          # forkedFrom 血缘（docs/26 C2）
     assert "q1" in str(a.agent_session.build_request_messages())            # path-to-root 复制过来
 
 
@@ -107,12 +107,12 @@ def test_thread_fork_copies_prefix_into_new_session():
     assert "q1" in live and "a1" in live                     # 选中消息之前的内容复制过来
     assert "q2 SELECTED" not in live                         # 选中消息及其后不复制
     assert SessionManager.exists("FORKAT")                   # 原 session 保留
-    # 血缘（pi：fork 两条路径 header 形状一致）：sessionId + entryId(=复制前缀 tip) + forkedBeforeEntryId
+    # 血缘（docs/26 C2）：fork 经 forkedFrom 记录，不入 children()（那是 subagent 控制血缘）。
     from nanocode.session.manager import children
-    assert a.session_id in children("FORKAT")
-    ps = SessionManager.open(a.session_id).parent_session()
-    assert ps["sessionId"] == "FORKAT"
-    assert ps["forkedBeforeEntryId"] == u2.id
+    assert a.session_id not in children("FORKAT")
+    ff = SessionManager.open(a.session_id).forked_from()
+    assert ff["sessionId"] == "FORKAT"
+    assert ff["forkedBeforeEntryId"] == u2.id
 
 
 def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage():
@@ -122,16 +122,16 @@ def test_thread_fork_before_first_message_yields_empty_new_session_with_lineage(
     assert new_t is not None
     assert a.session_id != "FORKFIRST"                       # 之前无内容 → 全新空 session
     assert a.agent_session.build_request_messages() == []
-    # Pi 对齐：空 fork 首个 assistant 前不落盘、不污染 children()；materialize 后仍保留 lineage。
-    from nanocode.session.manager import children
+    # Pi 对齐：空 fork 首个 assistant 前不落盘；materialize 后 forkedFrom lineage 可发现
+    # （docs/26 C2：fork 经 forkedFrom，不入 children()）。
     new_sid = a.session_id
-    assert new_sid not in children("FORKFIRST")
+    assert not SessionManager.exists(new_sid)
     a.agent_session.record_provider_messages({"role": "user", "content": "followup"})
     a.agent_session.record_provider_messages({"role": "assistant", "content": "ok"})
-    assert new_sid in children("FORKFIRST")
-    ps = SessionManager.open(a.session_id).parent_session()
-    assert ps["sessionId"] == "FORKFIRST"
-    assert ps["forkedBeforeEntryId"] == u1.id
+    assert SessionManager.exists(new_sid)
+    ff = SessionManager.open(new_sid).forked_from()
+    assert ff["sessionId"] == "FORKFIRST"
+    assert ff["forkedBeforeEntryId"] == u1.id
 
 
 def test_thread_fork_rejects_non_user_entries_fail_closed():

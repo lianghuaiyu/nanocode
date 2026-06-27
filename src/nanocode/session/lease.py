@@ -36,15 +36,17 @@ class SessionLease:
         return self.manager.session_id
 
     @classmethod
-    def open_or_create(cls, session_id: str, *, parent_session: dict | None = None,
-                       cwd: str | None = None) -> "SessionLease":
+    def open_or_create(cls, session_id: str, *, spawned_by: dict | None = None,
+                       forked_from: dict | None = None, cwd: str | None = None) -> "SessionLease":
         """取得一个写者 lease：已存在树 → open(lock=True)；否则 create(lock=True) 写 root 并持锁。
 
+        spawned_by/forked_from：docs/26 C2 血缘正交两键（fresh create 时写 header；
+        subagent 传 spawned_by、fork 传 forked_from，各自至多其一）。
         目标被其它进程占用 → `SessionBusyError`；树损坏（非末行 torn）→ `SessionTreeError`。
         二者都由调用方处理（fail-closed：startup 退出 / `/resume` 提示 `--fork`）。"""
         mgr = (SessionManager.open(session_id, lock=True) if SessionManager.exists(session_id)
-               else SessionManager.create(session_id, cwd=cwd,
-                                          parent_session=parent_session, lock=True,
+               else SessionManager.create(session_id, cwd=cwd, spawned_by=spawned_by,
+                                          forked_from=forked_from, lock=True,
                                           defer_persist=True))
         return cls(mgr)
 

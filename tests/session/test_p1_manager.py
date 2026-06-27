@@ -97,9 +97,9 @@ def test_clone_copies_path_to_root_with_parent_link():
     a = src.append_message(tree.user_message("a"))
     b = src.append_message(tree.user_message("b"))
     child = src.clone(b.id, new_session_id="sG_clone")
-    # parentSession 回指
-    ps = child.parent_session()
-    assert ps == {"sessionId": "sG", "entryId": b.id}
+    # forkedFrom 回指（docs/26 C2）
+    ff = child.forked_from()
+    assert ff == {"sessionId": "sG", "entryId": b.id}
     # 复制了 path-to-root 的消息（a、b），但有自己的 session_start
     contents = [e.data["message"]["content"] for e in child.entries() if e.type == tree.MESSAGE]
     assert contents == ["a", "b"]
@@ -108,8 +108,8 @@ def test_clone_copies_path_to_root_with_parent_link():
 
 def test_cross_session_navigation_via_header_backref():
     parent = SessionManager.create("P")
-    SessionManager.create("C1", parent_session={"sessionId": "P", "entryId": "x"})
-    SessionManager.create("C2", parent_session={"sessionId": "P", "entryId": "y"})
+    SessionManager.create("C1", spawned_by={"sessionId": "P", "entryId": "x"})
+    SessionManager.create("C2", spawned_by={"sessionId": "P", "entryId": "y"})
     SessionManager.create("Other")  # 无 parent
     assert children("P") == ["C1", "C2"]
     assert parent_of("C1") == "P"
