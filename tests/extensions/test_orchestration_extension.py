@@ -49,6 +49,38 @@ class _FakeThread:
         self.calls.append(("cancel", group_id))
         return "cancelled"
 
+    def list_children(self, *, status=None):
+        self.calls.append(("list", status))
+        return [{"child_session_id": "sess_x", "status": status or "running"}]
+
+    def child_status(self, child_session_id):
+        self.calls.append(("status", child_session_id))
+        return {"child_session_id": child_session_id, "status": "running"}
+
+    def child_result(self, child_session_id):
+        self.calls.append(("result", child_session_id))
+        return {"childSessionId": child_session_id, "status": "completed"}
+
+    async def wait_child(self, child_session_id, **kw):
+        self.calls.append(("wait", child_session_id, kw))
+        return {"child_session_id": child_session_id, "status": "completed"}
+
+    async def cancel_child(self, child_session_id):
+        self.calls.append(("cancel_child", child_session_id))
+        return "child cancelled"
+
+    def steer_child(self, child_session_id, prompt, **kw):
+        self.calls.append(("steer", child_session_id, prompt, kw))
+        return {"state": "queued"}
+
+    def approval_inbox(self):
+        self.calls.append(("approval_inbox",))
+        return [{"childSessionId": "sess_x", "approval": {"approvalId": "ap1"}}]
+
+    def approve_child(self, child_session_id, approved):
+        self.calls.append(("approve", child_session_id, approved))
+        return "approved" if approved else "denied"
+
     def launch_orchestration_coordinator(self, coro, *, group_id):
         coro.close()   # 测试不真正跑 coordinator
         self.calls.append(("launch", group_id))
@@ -101,6 +133,18 @@ def test_orchestrate_methods_gated_when_not_granted():
         asyncio.run(cap.run_background("coder", "p"))
     with pytest.raises(ExtensionRuntimeError):
         asyncio.run(cap.cancel_group("g"))
+    with pytest.raises(ExtensionRuntimeError):
+        cap.list_children()
+    with pytest.raises(ExtensionRuntimeError):
+        cap.child_status("sess_x")
+    with pytest.raises(ExtensionRuntimeError):
+        cap.child_result("sess_x")
+    with pytest.raises(ExtensionRuntimeError):
+        asyncio.run(cap.wait_child("sess_x"))
+    with pytest.raises(ExtensionRuntimeError):
+        asyncio.run(cap.cancel_child("sess_x"))
+    with pytest.raises(ExtensionRuntimeError):
+        cap.steer_child("sess_x", "p")
 
 
 def test_orchestrate_methods_delegate_to_kernel_when_granted():
@@ -113,6 +157,44 @@ def test_orchestrate_methods_delegate_to_kernel_when_granted():
     assert asyncio.run(cap.cancel_group("g")) == "cancelled"
     kinds = [c[0] for c in thread.calls]
     assert kinds == ["fresh", "step", "bg", "cancel"]
+
+
+def test_orchestrate_child_control_methods_delegate_to_runtime_facade():
+    thread = _FakeThread()
+    cap = _cap(can_orchestrate=True, thread=thread)
+    assert cap.list_children(status="running") == [
+        {"child_session_id": "sess_x", "status": "running"}]
+    assert cap.child_status("sess_x")["status"] == "running"
+    assert cap.child_result("sess_x")["status"] == "completed"
+    assert asyncio.run(cap.wait_child("sess_x", timeout_ms=10))["status"] == "completed"
+    assert asyncio.run(cap.cancel_child("sess_x")) == "child cancelled"
+    assert cap.steer_child("sess_x", "adjust") == {"state": "queued"}
+    kinds = [c[0] for c in thread.calls]
+    assert kinds == ["list", "status", "result", "wait", "cancel_child", "steer"]
+
+
+def test_orchestrate_context_exposes_approval_and_workspace_views():
+    thread = _FakeThread()
+    h = ExtensionHost.load_system_extensions().activate_all()
+    h.bind_runtime(thread, None)
+    ctx = h.create_context()
+    assert ctx.approvals.pending()[0]["childSessionId"] == "sess_x"
+    assert ctx.approvals.decide("sess_x", True) == "approved"
+    assert ctx.workspace.supported_modes() == ["shared", "worktree"]
+    resolved = ctx.workspace.resolve(agent_type="coder", parallel=True)
+    assert resolved["provider"] == "nanocode.default"
+    assert resolved["mode"] in {"shared", "worktree"}
+    assert [c[0] for c in thread.calls[:2]] == ["approval_inbox", "approve"]
+
+
+def test_context_without_orchestrate_capability_has_no_approval_or_workspace_views():
+    h = ExtensionHost([])
+    h._activated = True
+    h.bind_runtime(_FakeThread(), None)
+    ctx = h.create_context()
+    assert ctx.spawn is None
+    assert ctx.approvals is None
+    assert ctx.workspace is None
 
 
 def test_orchestrate_rejects_reserved_agent_type():

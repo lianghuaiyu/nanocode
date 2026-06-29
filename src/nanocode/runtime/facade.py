@@ -1044,6 +1044,75 @@ class RuntimeThread:
         """级联取消整组（内核 run_cancel 的 group/单子不动点扫描，层③）。"""
         return await self._agent.run_cancel(group_id)
 
+    def list_children(self, *, status: str | None = None) -> list[dict]:
+        """Extension-facing child listing through the runtime snapshot boundary."""
+        return [r.to_dict() for r in self._agent._run_runtime.list(
+            self.session_id,
+            status=status,
+            live_run_ids=self._agent._live_run_ids(),
+        )]
+
+    def child_status(self, child_session_id: str) -> dict:
+        """Extension-facing child status snapshot."""
+        return self._agent._reconcile_run(child_session_id).to_dict()
+
+    def child_result(self, child_session_id: str) -> dict:
+        """Extension-facing child result snapshot."""
+        self._agent._reconcile_run(child_session_id)
+        return self._agent._run_runtime.output(child_session_id)
+
+    async def wait_child(self, child_session_id: str, *,
+                         timeout_ms: int | None = None,
+                         poll_interval_ms: int = 100) -> dict:
+        """Poll one child until terminal without exposing sidecar internals."""
+        from ..runs.models import TERMINAL_RUN_STATUSES
+
+        interval = max(10, int(poll_interval_ms or 100)) / 1000.0
+        deadline = None
+        if timeout_ms is not None and timeout_ms > 0:
+            deadline = asyncio.get_running_loop().time() + timeout_ms / 1000.0
+        while True:
+            snapshot = self.child_status(child_session_id)
+            if snapshot.get("status") in TERMINAL_RUN_STATUSES:
+                return snapshot
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return snapshot
+            await asyncio.sleep(interval)
+
+    async def cancel_child(self, child_session_id: str) -> str:
+        """Cancel one child run through the standard runtime command path."""
+        return await self._agent.run_cancel(child_session_id)
+
+    def steer_child(self, child_session_id: str, prompt: str, *,
+                    delivery: str = "steer") -> dict:
+        """Queue a steer/follow-up through the standard runtime command path."""
+        import json
+
+        return json.loads(self._agent.run_send(child_session_id, prompt, delivery=delivery))
+
+    def approval_inbox(self) -> list[dict]:
+        """Return bounded pending child approval requests for extensions."""
+        out: list[dict] = []
+        for rec in self._agent._run_runtime.list(
+            self.session_id,
+            live_run_ids=self._agent._live_run_ids(),
+        ):
+            if not rec.pending_approval:
+                continue
+            out.append({
+                "taskId": rec.task_id,
+                "runId": rec.run_id,
+                "childSessionId": rec.child_session_id,
+                "agentType": rec.agent_type,
+                "description": rec.description,
+                "approval": dict(rec.pending_approval),
+            })
+        return out
+
+    def approve_child(self, child_session_id: str, approved: bool) -> str:
+        """Resolve a child approval through the parent-owned approval path."""
+        return self._agent.run_approve(child_session_id, approved)
+
     async def run_extension_task(self, kind: str, payload: dict) -> str:
         import asyncio
         host = self._extension_host

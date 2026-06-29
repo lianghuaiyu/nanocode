@@ -1,15 +1,16 @@
-"""Replay child-owned subagent run records.
+"""Replay parent-visible subagent run projections.
 
 Discovery starts from canonical session headers via ``children(parent_id)`` and
-then reads each child's ``subagent-run/`` sidecar. The ledger never scans
-sidecars to invent child sessions.
+then reads each child's ``subagent-run/`` sidecar when present. If the sidecar is
+missing, bounded parent ``task_event`` envelopes can recover status/result
+metadata. The ledger never scans sidecars to invent child sessions.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from ..session import tree
+from ..session import tree, v2 as session_v2
 from ..session.manager import SessionManager, children
 from ..subagents import run_record
 from .models import AgentRunRecord, TERMINAL_RUN_STATUSES
@@ -21,8 +22,15 @@ class RunLedger:
     def replay(self, child_session_id: str) -> AgentRunRecord:
         if not SessionManager.exists(child_session_id):
             raise FileNotFoundError(f"child session does not exist: {child_session_id}")
-        status = run_record.read_status(child_session_id)
+        try:
+            status = run_record.read_status(child_session_id)
+        except FileNotFoundError:
+            status = session_v2.task_projection_for_child(child_session_id)
+            if status is None:
+                raise
         result = run_record.read_result(child_session_id)
+        if not result and status.get("resultSummary"):
+            result = status.get("resultSummary") or ""
         summary = _summary(result)
         return AgentRunRecord.from_status(status, summary=summary)
 
@@ -105,6 +113,7 @@ class RunLedger:
         out: dict[str, Any] = {
             "childSessionId": rec.child_session_id,
             "runId": rec.run_id,
+            "taskId": rec.task_id,
             "status": rec.status,
             "summary": rec.summary or "",
             "result": result,

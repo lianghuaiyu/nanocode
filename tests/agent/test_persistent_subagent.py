@@ -9,6 +9,7 @@
 
 import asyncio
 import json
+import shutil
 
 import pytest
 
@@ -75,6 +76,52 @@ def test_agent_tool_registers_run_record(monkeypatch):
     assert out["childSessionId"] == rec["child_session_id"]
     assert out["status"] == "completed"
     assert "sub done" in out["result"]
+
+
+def test_agent_tool_writes_replayable_parent_task_envelope(monkeypatch):
+    parent = _agent()
+    from nanocode.session import tree as T
+    from nanocode.session.manager import SessionManager
+    from nanocode.subagents import run_record
+
+    parent._session_mgr = SessionManager.create(parent.session_id)
+    spawn_leaf = parent._session_mgr.append_message(T.user_message("spawn a child")).id
+    real_build = parent._build_sub_agent
+
+    def _spy_build(**kw):
+        sub = real_build(**kw)
+        sub.run_once = _stub_run_once(sub, text="enveloped result")
+        return sub
+
+    monkeypatch.setattr(parent, "_build_sub_agent", _spy_build)
+    asyncio.run(parent._execute_agent_tool(
+        {"type": "coder", "description": "write envelope", "prompt": "p"}))
+
+    rec = json.loads(parent.run_list())[0]
+    child_id = rec["child_session_id"]
+    assert rec["run_id"] == child_id
+    assert rec["task_id"].startswith("task_")
+    assert rec["task_id"] != child_id
+
+    child = SessionManager.open(child_id)
+    spawned_by = child.spawned_by()
+    assert spawned_by["agentId"] == child_id
+    assert spawned_by["taskId"] == rec["task_id"]
+
+    task_events = [e for e in parent._session_mgr.entries() if e.type == T.TASK_EVENT]
+    assert [e.data["event"] for e in task_events] == ["task_started", "task_result"]
+    assert {e.data["childSessionId"] for e in task_events} == {child_id}
+    assert task_events[0].data["spawnEntryId"] == spawned_by["entryId"] == spawn_leaf
+    assert parent._session_mgr.get_leaf() == spawn_leaf
+
+    shutil.rmtree(run_record.run_dir(child_id))
+    status = json.loads(parent.run_status(child_id))
+    assert status["status"] == "completed"
+    assert status["task_id"] == rec["task_id"]
+    out = json.loads(parent.run_output(child_id))
+    assert out["status"] == "completed"
+    assert out["taskId"] == rec["task_id"]
+    assert "enveloped result" in out["summary"]
 
 
 def test_agent_tool_persists_messages_to_v2(monkeypatch):

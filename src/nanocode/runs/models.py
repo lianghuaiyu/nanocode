@@ -67,6 +67,7 @@ class AgentRunRecord:
     status: str
     agent_type: str
     description: str
+    task_id: str = ""
     model: dict[str, Any] | None = None
     background: bool = False
     context_mode: str = "fresh"
@@ -90,11 +91,16 @@ class AgentRunRecord:
     injected: bool = False
     summary: str | None = None
 
+    def __post_init__(self) -> None:
+        if not self.task_id:
+            self.task_id = self.child_session_id
+
     @classmethod
     def from_status(cls, status: dict[str, Any], *, summary: str | None = None) -> "AgentRunRecord":
         return cls(
             run_id=status["runId"],
             child_session_id=status["childSessionId"],
+            task_id=status.get("taskId") or status["childSessionId"],
             parent_session_id=status["parentSessionId"],
             status=status["status"],
             agent_type=status["agentType"],

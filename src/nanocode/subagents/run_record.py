@@ -298,6 +298,7 @@ def ensure_pending_file(child_session_id: str) -> None:
 def create_run_record(
     *,
     child_session_id: str,
+    task_id: str | None = None,
     parent_session_id: str,
     spawn_entry_id: str | None,
     tool_call_id: str | None,
@@ -318,6 +319,7 @@ def create_run_record(
     rd.mkdir(parents=True, exist_ok=True)
     prompt_doc = (
         f"# Subagent Prompt\n\n"
+        f"- taskId: {task_id or child_session_id}\n"
         f"- runId: {child_session_id}\n"
         f"- parentSessionId: {parent_session_id}\n"
         f"- agentType: {agent_type}\n"
@@ -331,6 +333,7 @@ def create_run_record(
     ensure_pending_file(child_session_id)
     snapshot = {
         "schemaVersion": 1,
+        "taskId": task_id or child_session_id,
         "runId": child_session_id,
         "childSessionId": child_session_id,
         "parentSessionId": parent_session_id,

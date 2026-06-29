@@ -48,6 +48,7 @@ LABEL = "label"
 SESSION_INFO = "session_info"
 PERMISSION_DECISION = "permission_decision"
 TASK_UPDATE = "task_update"
+TASK_EVENT = "task_event"
 SESSION_END = "session_end"
 # docs/14 Milestone B：把原本只进 wire 的派生遥测落进 canonical 树（trajectory 从树派生、不再读 wire）。
 # 这些都是**注解型** entry——不入 FOLD_TYPES（对 LLM 不可见）、不推进 leaf（见 leaf_id_after_entry）。
@@ -114,7 +115,8 @@ def leaf_id_after_entry(e: Entry) -> Any:
     if e.type == LEAF:
         return e.data.get("targetId")
     if e.type in (SESSION_START, LABEL, SESSION_INFO,
-                  PERMISSION_DECISION, TOOL_BLOCKED, BUDGET_EXCEEDED, TURN_END, SESSION_END, LLM_REQUEST):
+                  PERMISSION_DECISION, TOOL_BLOCKED, BUDGET_EXCEEDED, TURN_END,
+                  TASK_EVENT, SESSION_END, LLM_REQUEST):
         return _UNCHANGED
     return e.id
 

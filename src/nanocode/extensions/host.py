@@ -22,8 +22,8 @@ import importlib
 
 from .api import ExtensionAPI
 from .context import (
-    EventSink, ExtensionCommandContext, ExtensionContext, ExtensionModelRouter,
-    SpawnCap, TaskManagerView,
+    ApprovalInboxView, EventSink, ExtensionCommandContext, ExtensionContext,
+    ExtensionModelRouter, SpawnCap, TaskManagerView, WorkspaceProviderView,
 )
 from .errors import ExtensionLoadError, ExtensionRuntimeError
 from .manifest import ExtensionManifest
@@ -226,6 +226,9 @@ class ExtensionHost:
             spawn=(SpawnCap(self, thread, allowed_agent_types=allowed_spawn,
                             can_orchestrate=can_orchestrate)
                    if thread is not None and (allowed_spawn or can_orchestrate) else None),
+            approvals=(ApprovalInboxView(self, thread)
+                       if thread is not None and can_orchestrate else None),
+            workspace=(WorkspaceProviderView(self) if can_orchestrate else None),
         )
 
     def create_context(self) -> ExtensionContext:

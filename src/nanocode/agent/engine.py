@@ -762,7 +762,38 @@ class Agent(PlanModeMixin):
                 child_session_id,
                 reason="no live coroutine in current runtime",
             )
+            self._append_run_task_event("task_result", rec, action="marked_lost")
         return rec
+
+    def _append_run_task_event(self, event: str, rec, **overrides) -> None:
+        """Write a bounded parent-visible envelope for an existing child run."""
+        mgr = getattr(self, "_session_mgr", None)
+        if mgr is None or rec is None:
+            return
+        status = overrides.pop("status", rec.status)
+        fields = {
+            "task_id": getattr(rec, "task_id", None) or rec.child_session_id,
+            "child_session_id": rec.child_session_id,
+            "run_id": rec.run_id,
+            "agent_id": rec.child_session_id,
+            "spawn_entry_id": rec.spawn_entry_id,
+            "agent_type": rec.agent_type,
+            "description": rec.description,
+            "status": status,
+            "background": rec.background,
+            "context_mode": rec.context_mode,
+            "isolation": rec.isolation,
+            "group_id": rec.group_id,
+            "model": rec.model,
+            "worktree_path": rec.worktree_path,
+            "result_summary": rec.result_summary or rec.summary,
+            "result_path": rec.result_path,
+            "error": rec.error,
+            "pending_approval": rec.pending_approval,
+            "metrics": rec.metrics.to_status_dict(),
+        }
+        fields.update(overrides)
+        _session_v2.append_task_envelope(mgr, event, **fields)
 
     def run_list(self, status: str | None = None) -> str:
         import json
@@ -810,6 +841,14 @@ class Agent(PlanModeMixin):
                     or getattr(task, "_nanocode_group_id", None) == child_session_id):
                 task.cancel()
                 cancelled += 1
+        if cancelled:
+            for rec in self._run_runtime.list(
+                self.session_id,
+                live_run_ids=self._live_run_ids(),
+            ):
+                if rec.child_session_id == child_session_id or rec.group_id == child_session_id:
+                    self._append_run_task_event(
+                        "task_status", rec, status="running", action="cancel_requested")
         if cancelled == 1:
             return f"Requested cancel of run {child_session_id}."
         if cancelled > 1:
@@ -826,6 +865,11 @@ class Agent(PlanModeMixin):
             child_session_id,
             reason="cancel requested but no live coroutine found",
         )
+        try:
+            rec = self._run_runtime.status(child_session_id)
+            self._append_run_task_event("task_result", rec, action="marked_lost")
+        except Exception:
+            pass
         return f"Run {child_session_id}: no live coroutine found; marked lost."
 
     # ─── D3：后台子 agent 确认升级回父 ────────────────────────────────────────────
@@ -848,6 +892,14 @@ class Agent(PlanModeMixin):
                 _st = run_record.read_status(run_id)
             except Exception:
                 _st = {}
+            try:
+                rec = self._run_runtime.status(run_id)
+                self._append_run_task_event(
+                    "task_status", rec, status=rec.status,
+                    pending_approval={"approvalId": approval_id, "command": message},
+                    action="approval_requested")
+            except Exception:
+                pass
             self.emit(SubAgentBlockedPendingApproval(
                 agent_type=_st.get("agentType", "") or "", description=_st.get("description", "") or "",
                 run_id=run_id, child_session_id=run_id, approval_id=approval_id, command=message))
@@ -878,6 +930,13 @@ class Agent(PlanModeMixin):
         resolved = self._resolve_pending_approvals(child_session_id, decision)
         if resolved == 0:
             return f"Run {child_session_id}: no pending approval."
+        try:
+            rec = self._run_runtime.status(child_session_id)
+            self._append_run_task_event(
+                "task_status", rec, pending_approval=None,
+                action="approval_approved" if decision else "approval_denied")
+        except Exception:
+            pass
         verb = "Approved" if decision else "Denied"
         return f"{verb} {resolved} pending approval(s) for run {child_session_id}."
 
@@ -891,6 +950,8 @@ class Agent(PlanModeMixin):
             return f"Error: {e}"
         try:
             _st = self._run_runtime.status(child_session_id)
+            self._append_run_task_event(
+                "task_status", _st, delivery=delivery, action="steer_queued")
             self.emit(SubAgentSteered(
                 agent_type=getattr(_st, "agent_type", "") or "",
                 description=getattr(_st, "description", "") or "",
@@ -1137,7 +1198,7 @@ class Agent(PlanModeMixin):
 
     def _build_sub_agent(self, *, system_prompt, tools, agent_type, session_id=None,
                          background=False, max_turns=None, model=None,
-                         artifact_id=None, agent_source=None) -> "Agent":
+                         artifact_id=None, agent_source=None, task_id=None) -> "Agent":
         """构造子 agent：集中权限继承。
 
         与 Claude Code / Kimi Code 对齐：
@@ -1162,7 +1223,8 @@ class Agent(PlanModeMixin):
         return self._spawn.build_sub_agent(
             self, system_prompt=system_prompt, tools=tools, agent_type=agent_type,
             session_id=session_id, background=background, max_turns=max_turns,
-            model=model, artifact_id=artifact_id, agent_source=agent_source)
+            model=model, artifact_id=artifact_id, agent_source=agent_source,
+            task_id=task_id)
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -1217,6 +1279,7 @@ class Agent(PlanModeMixin):
             except asyncio.CancelledError:
                 if sub_agent is not None:
                     self._spawn.finish_run_record(
+                        self,
                         sub_agent=sub_agent, status="cancelled",
                         result_text=self._subagent_captured_text(sub_agent) or "(cancelled)",
                         error="cancelled")
@@ -1226,6 +1289,7 @@ class Agent(PlanModeMixin):
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 if sub_agent is not None:
                     self._spawn.finish_run_record(
+                        self,
                         sub_agent=sub_agent, status="failed",
                         result_text=self._subagent_captured_text(sub_agent) or f"Skill fork error: {e}",
                         error=str(e))
@@ -1242,6 +1306,7 @@ class Agent(PlanModeMixin):
             if kind == "timeout":
                 # 无超时设定 → 'timeout' 表示运行被取消/aborted：落 cancelled 并向上传播取消。
                 self._spawn.finish_run_record(
+                    self,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=self._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
@@ -1250,6 +1315,7 @@ class Agent(PlanModeMixin):
                 raise asyncio.CancelledError()
             if kind == "error":
                 self._spawn.finish_run_record(
+                    self,
                     sub_agent=sub_agent, status="failed",
                     result_text=self._subagent_captured_text(sub_agent) or f"Skill fork error: {payload}",
                     error=str(payload))
@@ -1261,6 +1327,7 @@ class Agent(PlanModeMixin):
             self.total_input_tokens += sub_result["tokens"]["input"]
             self.total_output_tokens += sub_result["tokens"]["output"]
             result_path = self._spawn.finish_run_record(
+                self,
                 sub_agent=sub_agent, status="completed",
                 result_text=sub_result["text"] or "", tokens=sub_result["tokens"])
             self._close_child_session(child_id, sub_agent)

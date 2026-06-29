@@ -71,6 +71,51 @@ class TaskManagerView(_StaleGuard):
         return self._tm.update_task(task_id, **fields)
 
 
+class ApprovalInboxView(_StaleGuard):
+    """Narrow extension view over parent-owned child approval requests."""
+
+    def __init__(self, host, thread) -> None:
+        self._host = host
+        self._thread = thread
+
+    def pending(self) -> list[dict]:
+        self._ensure_active()
+        return self._thread.approval_inbox()
+
+    def decide(self, child_session_id: str, approved: bool) -> str:
+        self._ensure_active()
+        return self._thread.approve_child(child_session_id, approved)
+
+
+class WorkspaceProviderView(_StaleGuard):
+    """Read-only workspace/isolation capability view for orchestration extensions.
+
+    The view does not create worktrees and exposes no filesystem handles. It only
+    lets an extension resolve whether a requested member should use shared or
+    worktree isolation; actual creation remains inside runtime spawn.
+    """
+
+    def __init__(self, host) -> None:
+        self._host = host
+
+    def supported_modes(self) -> list[str]:
+        self._ensure_active()
+        return ["shared", "worktree"]
+
+    def resolve(self, *, agent_type: str = "coder", parallel: bool = False,
+                requested: str | None = None) -> dict:
+        self._ensure_active()
+        from ..subagents.worktree import should_isolate
+        mode = should_isolate(agent_type=agent_type, parallel=parallel, requested=requested)
+        return {
+            "mode": mode,
+            "requested": requested,
+            "agentType": agent_type,
+            "parallel": bool(parallel),
+            "provider": "nanocode.default",
+        }
+
+
 class SpawnCap(_StaleGuard):
     """受信 spawn 槽（docs/26 阶段1 ②）：扩展可 spawn 的 narrow 能力。
 
@@ -179,6 +224,42 @@ class SpawnCap(_StaleGuard):
         self._ensure_orchestrate()
         return await self._thread.cancel_runs(group_id)
 
+    def list_children(self, *, status: str | None = None) -> list[dict]:
+        """List parent-visible child runs through the runtime facade."""
+        self._ensure_orchestrate()
+        return self._thread.list_children(status=status)
+
+    def child_status(self, child_session_id: str) -> dict:
+        """Return one child run status snapshot without exposing raw session managers."""
+        self._ensure_orchestrate()
+        return self._thread.child_status(child_session_id)
+
+    def child_result(self, child_session_id: str) -> dict:
+        """Return one bounded child result/output snapshot."""
+        self._ensure_orchestrate()
+        return self._thread.child_result(child_session_id)
+
+    async def wait_child(self, child_session_id: str, *,
+                         timeout_ms: int | None = None,
+                         poll_interval_ms: int = 100) -> dict:
+        """Poll a child through runtime status until it reaches a terminal state."""
+        self._ensure_orchestrate()
+        return await self._thread.wait_child(
+            child_session_id,
+            timeout_ms=timeout_ms,
+            poll_interval_ms=poll_interval_ms)
+
+    async def cancel_child(self, child_session_id: str) -> str:
+        """Cancel a single child run through the same control path as /agents."""
+        self._ensure_orchestrate()
+        return await self._thread.cancel_child(child_session_id)
+
+    def steer_child(self, child_session_id: str, prompt: str, *,
+                    delivery: str = "steer") -> dict:
+        """Queue a steer/follow-up message through the runtime mailbox."""
+        self._ensure_orchestrate()
+        return self._thread.steer_child(child_session_id, prompt, delivery=delivery)
+
 
 class ExtensionModelRouter(_StaleGuard):
     """Resolve an extension model role to a concrete model id (docs/22 §5.4).
@@ -221,6 +302,8 @@ class ExtensionContext:
     def __init__(self, *, host, cwd: str, thread, session, memory,
                  tasks: "TaskManagerView", models: "ExtensionModelRouter",
                  events: "EventSink", spawn: "SpawnCap | None" = None,
+                 approvals: "ApprovalInboxView | None" = None,
+                 workspace: "WorkspaceProviderView | None" = None,
                  signal=None) -> None:
         self._host = host
         self.cwd = cwd
@@ -231,6 +314,8 @@ class ExtensionContext:
         self.models = models
         self.events = events
         self.spawn = spawn
+        self.approvals = approvals
+        self.workspace = workspace
         self.signal = signal
 
     def _ensure_active(self) -> None:

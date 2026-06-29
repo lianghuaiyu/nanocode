@@ -222,10 +222,20 @@ class SubAgentRunner:
     def new_child_session_id(self) -> str:
         return _tree.new_id("sess")
 
+    def new_task_id(self) -> str:
+        return _session_v2.new_task_id()
+
+    def append_task_event(self, host, event: str, **fields):
+        """Append a bounded parent task envelope when a parent writer exists."""
+        mgr = getattr(host, "_session_mgr", None)
+        if mgr is None:
+            return None
+        return _session_v2.append_task_envelope(mgr, event, **fields)
+
     # ─── 子 agent 构造（集中权限继承）────────────────────────────────────────
     def build_sub_agent(self, host, *, system_prompt, tools, agent_type, session_id=None,
                         background=False, max_turns=None, model=None,
-                        artifact_id=None, agent_source=None):
+                        artifact_id=None, agent_source=None, task_id=None):
         """构造子 agent：集中权限继承（子继承父 permission_mode、共享 confirm_fn/_confirmed_paths/
         session_id/task_manager;is_sub_agent 工具表强制剔除 agent;前台传有界 max_turns;可选 per-agent
         model 覆盖）。background=True：confirm_fn=_auto_deny_confirm 恒拒 + 新空集 confirmed_paths。
@@ -273,7 +283,7 @@ class SubAgentRunner:
             sub._tree_session_id = host.child_session_id(artifact_id)
             sub._child_parent_session = {"sessionId": host.session_id,
                                          "entryId": host._subagent_spawn_leaf.get(artifact_id),
-                                         "taskId": artifact_id, "agentId": artifact_id}
+                                         "taskId": task_id or artifact_id, "agentId": artifact_id}
             cwd = _child_cwd(host)
             sub._session_lease = SessionLease.open_or_create(
                 sub._tree_session_id, spawned_by=sub._child_parent_session, cwd=cwd)
@@ -361,8 +371,12 @@ class SubAgentRunner:
                          group_id: str | None = None) -> str:
         self.materialize_child_session(sub_agent)
         child_session_id = sub_agent._tree_session_id
+        task_id = (
+            getattr(sub_agent, "_child_parent_session", {}) or {}
+        ).get("taskId") or child_session_id
         run_record.create_run_record(
             child_session_id=child_session_id,
+            task_id=task_id,
             parent_session_id=host.session_id,
             spawn_entry_id=host._subagent_spawn_leaf.get(agent_id),
             tool_call_id=None,
@@ -378,6 +392,23 @@ class SubAgentRunner:
             inject_summary=inject_summary,
             group_id=group_id,
         )
+        self.append_task_event(
+            host, "task_started",
+            task_id=task_id,
+            child_session_id=child_session_id,
+            run_id=child_session_id,
+            agent_id=agent_id,
+            spawn_entry_id=host._subagent_spawn_leaf.get(agent_id),
+            agent_type=agent_type,
+            description=description,
+            status=status,
+            background=background,
+            context_mode=context_mode,
+            isolation=isolation,
+            group_id=group_id,
+            model=_model_snapshot(host, model),
+            worktree_path=worktree_path,
+        )
         self.attach_run_record_projector(sub_agent, child_session_id)
         run_record.append_event(child_session_id, "session_ready")
         if status == "running":
@@ -389,12 +420,14 @@ class SubAgentRunner:
     def create_failed_run_record(self, host, *, child_session_id: str, agent_type: str,
                                  description: str, prompt: str, model: str, background: bool,
                                  context_mode: str, isolation: str,
-                                 worktree_path: str | None, error: str) -> str:
+                                 worktree_path: str | None, error: str,
+                                 task_id: str | None = None) -> str:
         from ..session.lease import SessionLease
+        task_id = task_id or self.new_task_id()
         spawned_by = {
             "sessionId": host.session_id,
             "entryId": host._subagent_spawn_leaf.get(child_session_id),
-            "taskId": child_session_id,
+            "taskId": task_id,
             "agentId": child_session_id,
         }
         cwd = _child_cwd(host)
@@ -406,6 +439,7 @@ class SubAgentRunner:
             lease.close()
         run_record.create_run_record(
             child_session_id=child_session_id,
+            task_id=task_id,
             parent_session_id=host.session_id,
             spawn_entry_id=host._subagent_spawn_leaf.get(child_session_id),
             tool_call_id=None,
@@ -419,6 +453,22 @@ class SubAgentRunner:
             prompt=prompt,
             status="running",
         )
+        self.append_task_event(
+            host, "task_started",
+            task_id=task_id,
+            child_session_id=child_session_id,
+            run_id=child_session_id,
+            agent_id=child_session_id,
+            spawn_entry_id=host._subagent_spawn_leaf.get(child_session_id),
+            agent_type=agent_type,
+            description=description,
+            status="running",
+            background=background,
+            context_mode=context_mode,
+            isolation=isolation,
+            model=_model_snapshot(host, model),
+            worktree_path=worktree_path,
+        )
         run_record.complete_run(
             child_session_id,
             status="failed",
@@ -427,9 +477,27 @@ class SubAgentRunner:
             result_entry_id=None,
             error=error,
         )
+        self.append_task_event(
+            host, "task_result",
+            task_id=task_id,
+            child_session_id=child_session_id,
+            run_id=child_session_id,
+            agent_id=child_session_id,
+            spawn_entry_id=host._subagent_spawn_leaf.get(child_session_id),
+            agent_type=agent_type,
+            description=description,
+            status="failed",
+            background=background,
+            context_mode=context_mode,
+            isolation=isolation,
+            model=_model_snapshot(host, model),
+            worktree_path=worktree_path,
+            result_summary=f"Sub-agent error: {error}",
+            error=error,
+        )
         return child_session_id
 
-    def finish_run_record(self, *, sub_agent, status: str, result_text: str,
+    def finish_run_record(self, host=None, *, sub_agent, status: str, result_text: str,
                           tokens: dict | None = None, error: str | None = None,
                           result_summary: str | None = None) -> str | None:
         child_session_id = getattr(sub_agent, "_tree_session_id", None)
@@ -450,6 +518,29 @@ class SubAgentRunner:
             error=error,
             result_summary=result_summary,
         )
+        if host is not None:
+            task_id = snapshot.get("taskId") or child_session_id
+            self.append_task_event(
+                host, "task_result",
+                task_id=task_id,
+                child_session_id=child_session_id,
+                run_id=child_session_id,
+                agent_id=child_session_id,
+                spawn_entry_id=snapshot.get("spawnEntryId"),
+                agent_type=snapshot.get("agentType"),
+                description=snapshot.get("description"),
+                status=status,
+                background=snapshot.get("background"),
+                context_mode=snapshot.get("contextMode"),
+                isolation=snapshot.get("isolation"),
+                group_id=snapshot.get("groupId"),
+                model=snapshot.get("model"),
+                worktree_path=snapshot.get("worktreePath"),
+                result_summary=result_summary or result_text,
+                result_path=snapshot.get("resultPath"),
+                error=error,
+                metrics=snapshot.get("metrics"),
+            )
         return snapshot.get("resultPath")
 
     # ─── token 折叠 ───────────────────────────────────────────────────────────
@@ -703,6 +794,28 @@ class SubAgentRunner:
                     resume_id, status="running", startedAt=_tree.now_iso(), endedAt=None,
                     error=None)
                 run_record.append_event(resume_id, "started", resume=True)
+                try:
+                    status = run_record.read_status(resume_id)
+                    self.append_task_event(
+                        host, "task_status",
+                        task_id=status.get("taskId") or resume_id,
+                        child_session_id=resume_id,
+                        run_id=resume_id,
+                        agent_id=resume_id,
+                        spawn_entry_id=status.get("spawnEntryId"),
+                        agent_type=status.get("agentType"),
+                        description=status.get("description"),
+                        status="running",
+                        background=status.get("background"),
+                        context_mode=status.get("contextMode"),
+                        isolation=status.get("isolation"),
+                        group_id=status.get("groupId"),
+                        model=status.get("model"),
+                        worktree_path=status.get("worktreePath"),
+                        action="resume_started",
+                    )
+                except FileNotFoundError:
+                    pass
                 from ..subagents.steer import drain_pending_steers
                 drain_pending_steers(sub_agent, delivery="steer")
                 kind, payload = await host._run_foreground_subagent(
@@ -710,6 +823,7 @@ class SubAgentRunner:
             except asyncio.CancelledError:
                 if sub_agent is not None:
                     host._spawn.finish_run_record(
+                        host,
                         sub_agent=sub_agent, status="cancelled",
                         result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                         error="cancelled")
@@ -721,6 +835,7 @@ class SubAgentRunner:
             except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
                 if sub_agent is not None:
                     host._spawn.finish_run_record(
+                        host,
                         sub_agent=sub_agent, status="failed",
                         result_text=host._subagent_captured_text(sub_agent) or f"Sub-agent error: {e}",
                         error=str(e))
@@ -731,6 +846,7 @@ class SubAgentRunner:
                 return f"Sub-agent error: {e}"
             if kind != "ok":
                 host._spawn.finish_run_record(
+                    host,
                     sub_agent=sub_agent,
                     status="timed_out" if kind == "timeout" else "failed",
                     result_text=host._subagent_captured_text(sub_agent) or str(payload),
@@ -745,6 +861,7 @@ class SubAgentRunner:
             host.total_input_tokens += result["tokens"]["input"]
             host.total_output_tokens += result["tokens"]["output"]
             result_path = host._spawn.finish_run_record(
+                host,
                 sub_agent=sub_agent, status="completed",
                 result_text=result["text"] or "", tokens=result["tokens"])
             host._close_child_session(resume_id, sub_agent)
@@ -775,6 +892,7 @@ class SubAgentRunner:
         max_turns = host._subagents.bounded_max_turns(profile.max_turns)
         eff_model = profile.model or host.model
         child_id = self.new_child_session_id()
+        task_id = self.new_task_id()
         selected_isolation = should_isolate(agent_type=agent_type, parallel=parallel,
                                             requested=isolation)
         worktree_path = None
@@ -790,7 +908,7 @@ class SubAgentRunner:
             sub_agent = host._build_sub_agent(
                 system_prompt=profile.prompt, tools=child_tools(host, profile),
                 agent_type=agent_type, max_turns=max_turns, model=eff_model,
-                artifact_id=child_id, agent_source=profile.source)
+                artifact_id=child_id, agent_source=profile.source, task_id=task_id)
             self.apply_child_worktree(host, sub_agent, worktree_path)
             run_id = self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
@@ -804,6 +922,7 @@ class SubAgentRunner:
         except asyncio.CancelledError:
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
@@ -815,6 +934,7 @@ class SubAgentRunner:
         except Exception as e:  # noqa: BLE001 — 构造期异常也须落终态
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="failed",
                     result_text=host._subagent_captured_text(sub_agent) or f"Sub-agent error: {e}",
                     error=str(e))
@@ -825,6 +945,7 @@ class SubAgentRunner:
             return f"Sub-agent error: {e}"
         if kind != "ok":
             self.finish_run_record(
+                host,
                 sub_agent=sub_agent,
                 status="timed_out" if kind == "timeout" else "failed",
                 result_text=host._subagent_captured_text(sub_agent) or str(payload),
@@ -839,6 +960,7 @@ class SubAgentRunner:
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         result_path = self.finish_run_record(
+            host,
             sub_agent=sub_agent, status="completed",
             result_text=result["text"] or "", tokens=result["tokens"])
         if worktree_path:
@@ -879,6 +1001,27 @@ class SubAgentRunner:
                     error=None,
                 )
                 run_record.append_event(run_id, "started")
+                try:
+                    status = run_record.read_status(run_id)
+                    self.append_task_event(
+                        host, "task_status",
+                        task_id=status.get("taskId") or run_id,
+                        child_session_id=run_id,
+                        run_id=run_id,
+                        agent_id=run_id,
+                        spawn_entry_id=status.get("spawnEntryId"),
+                        agent_type=status.get("agentType"),
+                        description=status.get("description"),
+                        status="running",
+                        background=status.get("background"),
+                        context_mode=status.get("contextMode"),
+                        isolation=status.get("isolation"),
+                        group_id=status.get("groupId"),
+                        model=status.get("model"),
+                        worktree_path=status.get("worktreePath"),
+                    )
+                except FileNotFoundError:
+                    pass
                 return
             await asyncio.sleep(0.05)
 
@@ -896,6 +1039,7 @@ class SubAgentRunner:
         上下文；``result_summary`` 是完成时写入的一行摘要（透传到 run_background_subagent）。"""
         eff_model = build_profile(agent_type).model or host.model
         child_id = self.new_child_session_id()
+        task_id = self.new_task_id()
         selected_isolation = should_isolate(agent_type=agent_type, parallel=False,
                                             requested=isolation)
         worktree_path = None
@@ -912,13 +1056,14 @@ class SubAgentRunner:
                 tools=child_tools(host, profile, background=True),
                 agent_type=agent_type, background=True,
                 max_turns=host._subagents.bounded_max_turns(profile.max_turns),
-                model=profile.model, artifact_id=child_id, agent_source=profile.source)
+                model=profile.model, artifact_id=child_id, agent_source=profile.source,
+                task_id=task_id)
         except Exception as e:
             self.create_failed_run_record(
                 host, child_session_id=child_id, agent_type=agent_type,
                 description=description, prompt=prompt, model=eff_model, background=True,
                 context_mode=context_mode, isolation=selected_isolation,
-                worktree_path=worktree_path, error=str(e))
+                worktree_path=worktree_path, error=str(e), task_id=task_id)
             host.emit(SubAgentEnded(agent_type=agent_type, description=description,
                                     run_id=child_id, child_session_id=child_id,
                                     status="failed"))
@@ -979,6 +1124,7 @@ class SubAgentRunner:
                 pass
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
@@ -991,6 +1137,7 @@ class SubAgentRunner:
         except Exception as e:  # noqa: BLE001 — 构造/启动期异常也须落终态,detached 任务不能悬挂 running
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="failed",
                     result_text=host._subagent_captured_text(sub_agent) or f"(sub-agent error: {e})",
                     error=str(e))
@@ -1005,6 +1152,7 @@ class SubAgentRunner:
             host._fold_subagent_tokens(sub_agent)
             text = host._subagent_captured_text(sub_agent) or f"(timed out after {timeout_ms}ms)"
             self.finish_run_record(
+                host,
                 sub_agent=sub_agent, status="timed_out",
                 result_text=text, error=None)
             if sub_agent is not None:
@@ -1018,6 +1166,7 @@ class SubAgentRunner:
             host._fold_subagent_tokens(sub_agent)
             text = host._subagent_captured_text(sub_agent) or f"(sub-agent error: {payload})"
             self.finish_run_record(
+                host,
                 sub_agent=sub_agent, status="failed",
                 result_text=text, error=str(payload))
             if sub_agent is not None:
@@ -1033,6 +1182,7 @@ class SubAgentRunner:
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
         self.finish_run_record(
+            host,
             sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"],
             result_summary=result_summary)
         if worktree_path:
@@ -1115,6 +1265,7 @@ class SubAgentRunner:
         except asyncio.CancelledError:
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled", result_summary="(cancelled by task_stop)")
@@ -1128,6 +1279,7 @@ class SubAgentRunner:
             )
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="timed_out",
                     result_text=text, error=None,
                     result_summary=f"(timed out after {timeout_ms}ms)")
@@ -1138,6 +1290,7 @@ class SubAgentRunner:
             text = host._subagent_captured_text(sub_agent) if sub_agent is not None else f"(curator error: {e})"
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="failed",
                     result_text=text, error=str(e),
                     result_summary=f"(curator error: {e})")
@@ -1161,6 +1314,7 @@ class SubAgentRunner:
             plan = parse_consolidation_plan(text)
         except Exception:
             self.finish_run_record(
+                host,
                 sub_agent=sub_agent, status="completed", result_text=text,
                 tokens=result["tokens"],
                 result_summary="Consolidation: no changes (unparseable plan)")
@@ -1170,6 +1324,7 @@ class SubAgentRunner:
 
         apply_result = apply_plan(plan)
         self.finish_run_record(
+            host,
             sub_agent=sub_agent, status="completed", result_text=text,
             tokens=result["tokens"], result_summary=apply_result.summary_line())
         host._close_child_session(agent_id, sub_agent)
@@ -1245,6 +1400,7 @@ class SubAgentRunner:
         except asyncio.CancelledError:
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled", result_summary="(cancelled by task_stop)")
@@ -1258,6 +1414,7 @@ class SubAgentRunner:
             )
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="timed_out",
                     result_text=text, error=None,
                     result_summary=f"(timed out after {timeout_ms}ms)")
@@ -1268,6 +1425,7 @@ class SubAgentRunner:
             text = host._subagent_captured_text(sub_agent) if sub_agent is not None else f"(eval curator error: {e})"
             if sub_agent is not None:
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="failed",
                     result_text=text, error=str(e),
                     result_summary=f"(eval curator error: {e})")
@@ -1295,6 +1453,7 @@ class SubAgentRunner:
             candidates = data.get("candidates", []) if isinstance(data, dict) else []
         except Exception:
             self.finish_run_record(
+                host,
                 sub_agent=sub_agent, status="completed", result_text=text,
                 tokens=result["tokens"],
                 result_summary="Generated 0 pending eval candidates (unparseable output)")
@@ -1326,6 +1485,7 @@ class SubAgentRunner:
         if skipped:
             summary += f" ({skipped} skipped)"
         self.finish_run_record(
+            host,
             sub_agent=sub_agent, status="completed", result_text=text,
             tokens=result["tokens"], result_summary=summary)
         host._close_child_session(agent_id, sub_agent)
@@ -1359,6 +1519,7 @@ class SubAgentRunner:
         eff_max_turns = (max_turns if max_turns is not None
                          else host._subagents.bounded_max_turns(profile.max_turns or 1))
         child_id = self.new_child_session_id()
+        task_id = self.new_task_id()
 
         def _ended(status: str, tokens: "dict | None" = None) -> None:
             if emit_lifecycle:
@@ -1377,7 +1538,8 @@ class SubAgentRunner:
                 system_prompt=profile.prompt,
                 tools=child_tools(host, profile, background=True),
                 agent_type=agent_type, background=True, max_turns=eff_max_turns,
-                model=model, artifact_id=child_id, agent_source=profile.source)
+                model=model, artifact_id=child_id, agent_source=profile.source,
+                task_id=task_id)
             self.begin_run_record(
                 host, sub_agent=sub_agent, agent_id=child_id, agent_type=agent_type,
                 description=description, prompt=prompt, model=eff_model, background=True,
@@ -1392,6 +1554,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._fold_subagent_tokens(sub_agent)
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="cancelled",
                     result_text=host._subagent_captured_text(sub_agent) or "(cancelled)",
                     error="cancelled")
@@ -1402,6 +1565,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._fold_subagent_tokens(sub_agent)
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="timed_out",
                     result_text=host._subagent_captured_text(sub_agent)
                     or f"(timed out after {timeout_ms}ms)", error=None)
@@ -1412,6 +1576,7 @@ class SubAgentRunner:
             if sub_agent is not None:
                 host._fold_subagent_tokens(sub_agent)
                 self.finish_run_record(
+                    host,
                     sub_agent=sub_agent, status="failed",
                     result_text=host._subagent_captured_text(sub_agent)
                     or f"(reserved-agent error: {e})", error=str(e))
@@ -1421,13 +1586,14 @@ class SubAgentRunner:
                     host, child_session_id=child_id, agent_type=agent_type,
                     description=description, prompt=prompt, model=eff_model, background=True,
                     context_mode=context_mode, isolation=isolation, worktree_path=None,
-                    error=str(e))
+                    error=str(e), task_id=task_id)
             _ended("failed")
             raise
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
         result_path = self.finish_run_record(
+            host,
             sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"],
             result_summary=result_summary)
         host._close_child_session(child_id, sub_agent)

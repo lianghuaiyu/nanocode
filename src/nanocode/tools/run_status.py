@@ -3,7 +3,7 @@
 SCHEMA = {
     "name": "run_status",
     "description": (
-        "Read one sub-agent run status snapshot from status.json when the user explicitly asks. "
+        "Read one sub-agent run status snapshot through the runtime ledger when the user explicitly asks. "
         "Do not repeatedly poll background runs; the host reports completion."
     ),
     "input_schema": {
