@@ -179,8 +179,11 @@ def _first_new_message_entry_id(agent, before_ids: set[str], role: str) -> str |
 
 
 def _active_owned_shell_tasks(host, owner_agent_id: str):
-    manager = getattr(host, "task_manager", None)
-    if manager is None:
+    # docs/26 S6-2：task_manager 现为 fail-closed 注入式服务（getattr-默认捕不住其 RuntimeError）。
+    # 本路径只在 live spawn 收尾被调，host 恒已注入；故 try 取用，未注入即视作无 owned tasks。
+    try:
+        manager = host.task_manager
+    except RuntimeError:
         return []
     return [
         t for t in manager.list_tasks()
@@ -304,9 +307,16 @@ class SubAgentRunner:
             # narrow_policy_for_context 再按 is_subagent/background/hook 上下文收紧）。
             sandbox_profile=getattr(host, "_sandbox_profile", "default"),
         )
-        # docs/23 Step 7-S4：sandbox manager per-runtime 共享（无状态）——子 agent 复用 host 的实例，
-        # 不再各自 new（Agent.__init__ 已建一个，作未装配场景的兜底；profile 仍经 ctor per-agent 继承）。
+        # docs/23 Step 7-S4：sandbox manager per-runtime 共享（无状态）——子 agent 复用 host 的实例。
+        # docs/26 S6-2：内核 Agent.__init__ 不再自建 ③ 服务——build_sub_agent（③ 层）显式注入：
+        # sandbox 复用 host 的（共享）；run_runtime / mcp_manager 给子 agent **各自 fresh** 实例
+        # （子不 spawn 孙、MCP 被 not is_sub_agent 闸挡在外，故二者保持 inert，与旧自建逐字等价）；
+        # task_manager 经上方 ctor 参（host.task_manager）共享。
+        from ..runs.runtime import AgentRunRuntime
+        from ..mcp import McpManager
         sub._sandbox = host._sandbox
+        sub._run_runtime = AgentRunRuntime()
+        sub._mcp_manager = McpManager()
         if artifact_id and artifact_id != "main":
             from ..session.lease import SessionLease
             sub._tree_session_id = host.child_session_id(artifact_id)

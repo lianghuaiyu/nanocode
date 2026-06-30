@@ -10,6 +10,7 @@ from nanocode.subagents.prompts import MEMORY_EVAL_CURATOR_TYPE
 from nanocode.memory import eval_store
 from nanocode.memory.service import MemoryService, MemoryServiceConfig
 from nanocode.session import v2 as _v2
+from .._helpers import inject_test_services
 
 
 SID = "evalsid"
@@ -22,7 +23,9 @@ def _agent(**kw):
         MemoryService(config=MemoryServiceConfig(backend="markdown"),
                       cwd=".", agent_dir="."),
     )
-    return Agent(api_key="test", session_id=SID, **kw)
+    _injected_agent = Agent(api_key="test", session_id=SID, **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _seed_session():

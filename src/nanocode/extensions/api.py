@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from .manifest import CommandContribution
 from .registry import (
-    CommandHandler, ContributionRegistry, HiddenAgentProfile, LifecycleHandler,
-    ModelRolePolicy, OrchestratorHandler, TaskHandler, ToolHandler,
+    CommandHandler, CompactionStrategyHandler, ContributionRegistry,
+    HiddenAgentProfile, LifecycleHandler, ModelRolePolicy, OrchestratorHandler,
+    TaskHandler, ToolHandler,
 )
 
 
@@ -46,6 +47,16 @@ class ExtensionAPI:
         through `ctx.spawn.*` (kernel derives child caps). Only one orchestrator may be
         registered host-wide; a second registration fails loud."""
         self._registry.add_orchestrator(handler, extension_id=self._extension_id)
+
+    def register_compaction_strategy(self, handler: CompactionStrategyHandler) -> None:
+        """Register the single before_compact strategy (docs/26 G4).
+
+        `handler(ctx, request: CompactionRequest) -> CompactionOutcome` owns only the
+        "produce a summary" step; the kernel still owns cut/fold/record_event/restore.
+        Returning an outcome with `cancel=True` cancels compaction; `summary=None`
+        (without cancel) abstains and the kernel falls back to its built-in summarizer.
+        Only one strategy may be registered host-wide; a second registration fails loud."""
+        self._registry.add_compaction_strategy(handler, extension_id=self._extension_id)
 
     def register_hidden_agent(self, profile: HiddenAgentProfile) -> None:
         self._registry.add_hidden_agent(profile, extension_id=self._extension_id)

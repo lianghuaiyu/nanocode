@@ -14,11 +14,14 @@ from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import SubagentOutcome, live_agent_profile
 from nanocode.subagents import run_record
 from nanocode.tools import REGISTRY
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="spawn_parent", **kw)
+    _injected_agent = Agent(api_key="test", session_id="spawn_parent", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _spy_build(parent, *, text, capture):

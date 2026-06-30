@@ -8,13 +8,16 @@ import asyncio
 from nanocode.agent.engine import Agent
 from nanocode.tools import REGISTRY
 from nanocode.agents import registry as config
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "default")
-    return Agent(api_key="test", session_id="apsid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="apsid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_subagent_confirm_message_contains_identity():
@@ -118,6 +121,7 @@ def test_confirm_dedupe_key_is_identity_scoped_for_subagents():
     sub-agent skip its own identity-bearing confirmation (shared _confirmed_paths)."""
     parent = Agent(api_key="test", permission_mode="bypassPermissions",
                    session_id="dedupe")
+    inject_test_services(parent)
     a = parent._build_sub_agent(system_prompt="s", tools=parent.tools,
                                 agent_type="coder", artifact_id="agent-001")
     b = parent._build_sub_agent(system_prompt="s", tools=parent.tools,
@@ -141,6 +145,7 @@ def test_confirm_if_needed_dedupes_within_agent_but_not_across_siblings():
     shared = set()
     parent = Agent(api_key="test", permission_mode="default",
                    session_id="apdedupe", confirmed_paths=shared)
+    inject_test_services(parent)
     prompts = []
 
     def make(artifact_id):

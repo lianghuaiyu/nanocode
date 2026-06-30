@@ -1,9 +1,12 @@
 import asyncio
 from nanocode.agent.engine import Agent
+from .._helpers import inject_test_services
 
 
 def _agent():
-    return Agent(api_key="test", permission_mode="bypassPermissions")
+    _injected_agent = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_agent_has_task_manager():
@@ -15,6 +18,7 @@ def test_subagent_shares_parent_task_manager():
     parent = _agent()
     child = Agent(api_key="test", is_sub_agent=True,
                   task_manager=parent.task_manager)
+    inject_test_services(child)
     assert child.task_manager is parent.task_manager
 
 
@@ -35,6 +39,7 @@ def test_spawn_background_shell_returns_task_id_and_completes(tmp_path):
 
 def test_spawn_background_shell_tags_main_session_owner():
     a = Agent(api_key="test", permission_mode="bypassPermissions", session_id="main-session")
+    inject_test_services(a)
 
     async def scenario():
         tid = await a._spawn_background_shell("echo owner", timeout_ms=None)
@@ -57,6 +62,7 @@ def test_spawn_background_shell_tags_subagent_tree_session_owner():
         session_id=parent.session_id,
         permission_mode="bypassPermissions",
     )
+    inject_test_services(child)
     child._tree_session_id = "sess_child"
 
     async def scenario():
@@ -107,6 +113,7 @@ def test_execute_tool_call_task_output_unknown():
 def test_stop_task_persists_cancelled_state():
     from nanocode.session import v2
     a = Agent(api_key="test", permission_mode="bypassPermissions", session_id="stop_persist")
+    inject_test_services(a)
     t = a.task_manager.create_task("shell", "orphan")
     a.task_manager.update_task(t.id, status="running")
 

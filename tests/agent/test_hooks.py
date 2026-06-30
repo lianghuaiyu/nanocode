@@ -2,10 +2,13 @@ import asyncio
 from nanocode.agent.engine import Agent
 
 from .._helpers import attach_runtime_agent
+from .._helpers import inject_test_services
 
 
 def _agent():
-    return Agent(api_key="test")
+    _injected_agent = Agent(api_key="test")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_skill_invocation_registers_hooks(tmp_path, monkeypatch):

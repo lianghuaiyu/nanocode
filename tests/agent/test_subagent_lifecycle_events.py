@@ -12,6 +12,7 @@ from nanocode.agent.events import SubAgentEnded, SubAgentStarted
 from nanocode.agents.registry import build_profile
 from nanocode.extensions import ExtensionHost
 from nanocode.runtime import AgentRuntime
+from .._helpers import inject_test_services
 
 
 # ─── ③.1 充实事件：spawn 路径发出的事件带 run_id/status ─────────────────────────
@@ -19,7 +20,9 @@ from nanocode.runtime import AgentRuntime
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
     kw.setdefault("session_id", "life_parent")
-    return Agent(api_key="test", **kw)
+    _injected_agent = Agent(api_key="test", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _stub(parent, *, text):

@@ -14,10 +14,13 @@ from nanocode.entrypoints.host import RuntimeHost
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 from nanocode.tui.selector import Outcome
+from .._helpers import inject_test_services
 
 
 def _agent(sid):
-    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    _injected_agent = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _host(sid):

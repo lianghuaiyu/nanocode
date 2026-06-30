@@ -17,13 +17,16 @@ from nanocode.agent.engine import Agent
 from nanocode.tools.permissions import ALWAYS_ALLOWED_META as _ALWAYS_ALLOWED_META
 from nanocode.tools import REGISTRY
 from nanocode.agents import registry as config
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="cgsid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="cgsid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _read_only_sub(parent):

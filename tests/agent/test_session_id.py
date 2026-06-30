@@ -8,10 +8,13 @@ import asyncio
 import os
 
 from nanocode.agent.engine import Agent
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
-    return Agent(api_key="test", **kw)
+    _injected_agent = Agent(api_key="test", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_agent_adopts_session_id():

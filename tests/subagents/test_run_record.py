@@ -9,10 +9,13 @@ from nanocode.session.lease import SessionLease
 from nanocode.session.manager import SessionManager, session_root
 from nanocode.subagents import run_record
 from nanocode.subagents.steer import drain_pending_steers, queue_steer
+from .._helpers import inject_test_services
 
 
 def _agent(sid="P"):
-    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    _injected_agent = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _child(parent, child_id="CHILD"):

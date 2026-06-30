@@ -1,6 +1,9 @@
-"""Task 2: agent 工具 schema 扩展 —— coder enum + resume + run_in_background。"""
+"""Task 2: agent 工具 schema 扩展 —— coder enum + resume + run_in_background。
 
-from nanocode.tools.agent import SCHEMA
+docs/26 G7：模块级 `SCHEMA` 现在是 slim 的 `BASE_SCHEMA`（单 spawn 面，无编排词汇）；
+steps/tasks/accept/plan_fanout 移到 `ORCHESTRATION_SCHEMA`，仅编排扩展激活时由 facade overlay。"""
+
+from nanocode.tools.agent import BASE_SCHEMA, ORCHESTRATION_SCHEMA, SCHEMA
 
 
 def test_schema_name():
@@ -39,8 +42,31 @@ def test_no_global_required_fields():
 
 
 def test_steps_and_tasks_orchestration_arrays():
-    props = SCHEMA["input_schema"]["properties"]
+    # G7：编排词汇只在 ORCHESTRATION_SCHEMA 出现，不在常驻 slim SCHEMA 里。
+    props = ORCHESTRATION_SCHEMA["input_schema"]["properties"]
     for key in ("steps", "tasks"):
         assert props[key]["type"] == "array"
         assert props[key]["items"]["required"] == ["prompt"]
-    assert "{previous}" in SCHEMA["description"]
+    assert "{previous}" in ORCHESTRATION_SCHEMA["description"]
+
+
+def test_base_schema_has_no_orchestration_vocab():
+    # 常驻 builtin（=SCHEMA=BASE_SCHEMA）不含编排键，description 不提 {previous}/steps。
+    assert SCHEMA is BASE_SCHEMA
+    props = SCHEMA["input_schema"]["properties"]
+    for key in ("steps", "tasks", "accept", "plan_fanout"):
+        assert key not in props
+    assert "{previous}" not in SCHEMA["description"]
+    # 单 spawn 面字段仍在。
+    for key in ("description", "prompt", "type", "resume", "run_in_background", "timeout_ms"):
+        assert key in props
+
+
+def test_orchestration_schema_is_base_superset():
+    # ORCHESTRATION_SCHEMA = BASE 的全部 spawn 字段 + 4 个编排键（同名 'agent'）。
+    base_props = set(BASE_SCHEMA["input_schema"]["properties"])
+    orch_props = set(ORCHESTRATION_SCHEMA["input_schema"]["properties"])
+    assert base_props <= orch_props
+    assert orch_props - base_props == {"steps", "tasks", "accept", "plan_fanout"}
+    assert ORCHESTRATION_SCHEMA["name"] == BASE_SCHEMA["name"] == "agent"
+

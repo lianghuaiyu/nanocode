@@ -5,12 +5,15 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 from nanocode.session.render import ModelCtx, render
+from .._helpers import inject_test_services
 
 ANTH = ModelCtx("anthropic", "anthropic", "claude-x")
 
 
 def _agent(sid):
-    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    _injected_agent = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_tree_custom_message_folds_and_merges_into_user():

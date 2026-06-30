@@ -22,9 +22,21 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from ..session.agent import AgentSession
+
+if TYPE_CHECKING:
+    # docs/26 S6-3：RuntimeServices 字段的具体类型缝（concrete，非 Protocol——port 级抽象 YAGNI，
+    # 待要可换实现再加）。仅类型期 import（PEP 563 下注解是字符串，运行时不触发这些 ③ 层 import，
+    # 保 facade 构造期不静态拖入它们；具体实例仍由 RuntimeServices.create 在函数内 lazy import 构造）。
+    from ..capabilities.sandbox import SandboxManager
+    from ..context import ContextSources
+    from ..extensions import ExtensionHost
+    from ..mcp import McpManager
+    from ..memory.service import MemoryService
+    from ..runs.runtime import AgentRunRuntime
+    from ..tasks.manager import TaskManager
 
 
 # ─── 结果对象 ────────────────────────────────────────────────
@@ -176,18 +188,22 @@ class RuntimeServices:
 
     cwd: str
     workspace_trusted: bool
-    memory_service: object | None
-    context_sources: object
-    extension_host: object | None = None
+    memory_service: "MemoryService | None"
+    context_sources: "ContextSources"
+    extension_host: "ExtensionHost | None" = None
     diagnostics: tuple[str, ...] = ()
     # docs/23 Step 7-S4：sandbox manager 归 runtime 所有（per-runtime 共享，无状态）。
     # profile 仍 per-agent（AgentConfig.sandbox_profile）；per-call HostContext 现场收窄。
-    sandbox: object | None = None
+    sandbox: "SandboxManager | None" = None
     # docs/23 Step 7-S5：MCP 连接管理器 + run-ledger runtime 也归 runtime 所有（③）。二者
     # per-runtime 生命周期、跨会话切换保活（rebind 复用同一 Agent，今天就不重建它们）——
     # 故主 agent 只在首次装配采用，rebind 不换（见 _apply_runtime_services 的 first_attach）。
-    mcp_manager: object | None = None
-    run_runtime: object | None = None
+    mcp_manager: "McpManager | None" = None
+    run_runtime: "AgentRunRuntime | None" = None
+    # docs/26 S6-1：TaskManager 也归 runtime 所有（per-session 有状态）——主 agent 首次装配采用
+    # bundle 实例（rebind 由 runtime/rebind.py 重建并 reload v2 task state，故同 first_attach，
+    # _apply 不在 rebind 覆盖）。子 agent 经 build_sub_agent 走 ctor 参共享父 task_manager。
+    task_manager: "TaskManager | None" = None
 
     @classmethod
     def create(cls, config: AgentConfig, *, cwd: str | None = None) -> "RuntimeServices":
@@ -236,6 +252,7 @@ class RuntimeServices:
         from ..capabilities.sandbox import SandboxManager
         from ..mcp import McpManager
         from ..runs.runtime import AgentRunRuntime
+        from ..tasks.manager import TaskManager
 
         # docs/26 G6: feed untrusted/declarative extensions' MCP servers into the
         # manager BEFORE the lazy first-turn connect. Fail-soft — a bad spec must not
@@ -261,6 +278,7 @@ class RuntimeServices:
             sandbox=SandboxManager(),
             mcp_manager=mcp_manager,
             run_runtime=AgentRunRuntime(),
+            task_manager=TaskManager(),
         )
 
 
@@ -273,13 +291,19 @@ def _apply_runtime_services(agent, services: RuntimeServices) -> None:
     agent._memory_service = services.memory_service
     agent.workspace_trusted = services.workspace_trusted
     # docs/23 Step 7-S4：sandbox manager 无状态、per-runtime 共享，可随 bundle 重建（含 rebind）。
-    if getattr(services, "sandbox", None) is not None:
+    # docs/26 S6-3：services 恒为 typed RuntimeServices——字段直读（替代旧 getattr 鸭子注入）。
+    if services.sandbox is not None:
         agent._sandbox = services.sandbox
     if first_attach:
-        if getattr(services, "mcp_manager", None) is not None:
+        if services.mcp_manager is not None:
             agent._mcp_manager = services.mcp_manager
-        if getattr(services, "run_runtime", None) is not None:
+        if services.run_runtime is not None:
             agent._run_runtime = services.run_runtime
+        # docs/26 S6-1：TaskManager 仅首次装配采用 bundle 实例。rebind 不走此路——runtime/rebind.py
+        # 已重建 fresh TaskManager 并 reload 该 session 的 v2 task state，若此处 every-time 覆盖会丢掉
+        # reload 的状态（rebind 在 _apply 之前完成）。故与 mcp/run 同 first_attach。
+        if services.task_manager is not None:
+            agent.task_manager = services.task_manager
     with _push_cwd(services.cwd):
         from ..prompt import build_system_prompt
         agent._base_system_prompt = build_system_prompt()
@@ -289,21 +313,38 @@ def _apply_runtime_services(agent, services: RuntimeServices) -> None:
     # 咽喉点授权 + UNTRUSTED 策略铸 ctx（全 None 把手）。rebind 复用同一 _registry 且扩展 host 每
     # services 新建——按已存在名跳过，保 idempotent（不重复注册炸）。扩展是主 agent runtime 关注点；
     # 子 agent 的 tools 是固定子集，不在此被刷新（避免提权回全量）。
-    host = getattr(services, "extension_host", None)
+    host = services.extension_host
     registry = getattr(agent, "_registry", None)
     if (host is not None and getattr(host, "_activated", False)
             and registry is not None and not getattr(agent, "is_sub_agent", False)):
+        changed = False
         try:
             ext_tools = host.tool_contributions()
         except Exception:
             ext_tools = []
-        added = False
         for t in ext_tools:
             if registry.get(t.name) is None:
                 registry.register(t)
-                added = True
-        if added:
+                changed = True
+        # docs/26 G7：编排 schema 仅当编排扩展激活时对主 agent 出现（实现可卸 ⟹ 模型可见的
+        # steps/tasks/accept/plan_fanout 词汇随之可卸）。子 agent 不走此路（编排是主 agent 面，
+        # 且 orchestrate cap 仅授编排扩展）；无编排扩展 → 保持常驻 slim BASE_SCHEMA。idempotent：
+        # rebind 复用同一 _registry，set_schema 用同一 ORCHESTRATION_SCHEMA 重写无副作用。
+        if getattr(host.registry, "orchestrator", None) is not None and registry.get("agent") is not None:
+            from ..tools.agent import ORCHESTRATION_SCHEMA
+            registry.set_schema("agent", ORCHESTRATION_SCHEMA)
+            changed = True
+        if changed:
             agent.tools = registry.schemas()
+    # docs/26 G4：before_compact 可拔插策略注入（与 memory/context_sources 同套路）。host 注册了
+    # compaction_strategy → 装上 callable(request)->CompactionOutcome；否则显式复位 None（rebind 从
+    # 有策略 host 切到无策略 host 时不留陈旧 lambda）。内核 compact() 仍独占 cut/fold/record_event/
+    # restore——策略只替换"产摘要"这一步（agent/session 永不 import extensions/，只调注入的 callable）。
+    cs_registry = getattr(host, "registry", None) if host is not None else None
+    if cs_registry is not None and getattr(cs_registry, "compaction_strategy", None) is not None:
+        agent._compaction_strategy = lambda request: host.run_compaction_strategy(request)
+    else:
+        agent._compaction_strategy = None
 
 
 # ─── 审批归口 ────────────────────────────────────────────────

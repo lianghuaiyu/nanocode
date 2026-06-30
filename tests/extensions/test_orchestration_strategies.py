@@ -9,10 +9,12 @@ import json
 from nanocode.agent.engine import Agent
 
 from .._helpers import attach_orchestration
+from .._helpers import inject_test_services
 
 
 def _agent():
     a = Agent(api_key="test", session_id="orchstrat", permission_mode="bypassPermissions")
+    inject_test_services(a)
     a._mcp_initialized = True
     attach_orchestration(a)
     return a

@@ -332,7 +332,13 @@ class AgentSession:
             cut_idx = (next((i for i, e in enumerate(branch) if e.id == first_kept), len(branch))
                        if first_kept is not None else len(branch))
             prefix_branch = branch[:cut_idx]
-            raw_summary, retry_count = await self._summarize_prefix_with_retry(prefix_branch, instructions)
+            raw_summary, retry_count, cancelled = await self._produce_compaction_summary(
+                prefix_branch, instructions, trigger, tokens_before, branch)
+            if cancelled:
+                # docs/26 G4：策略主动取消本次压缩 → 内核早退，绝不写 COMPACTION entry、对话不收缩
+                # （finally 仍复位 _compacting/_summarizer_partial）。auto 路径视为正常返回（非失败）。
+                a.emit(_events.NoticeRaised(text="Compaction cancelled by strategy."))
+                return
             from ..agent.summary_prompts import format_compact_summary
             summary = format_compact_summary(raw_summary) if raw_summary else (raw_summary or "")
             # review MED：summarizer 真的产出了内容、但 format 后为空（模型只吐 <analysis>/空 <summary>）=
@@ -381,6 +387,51 @@ class AgentSession:
         finally:
             a._compacting = False
             a._summarizer_partial = False   # review：retry 标记不跨 compaction 残留（防陈旧 partial prompt）
+
+    async def _produce_compaction_summary(self, prefix_branch, instructions, trigger,
+                                          tokens_before, branch):
+        """产出 compaction summary（docs/26 G4）。返回 (raw_summary, retry_count, cancelled)。
+
+        无 before_compact 策略（`a._compaction_strategy is None`）→ 原样内置 summarizer
+        （`_summarize_prefix_with_retry`，cancelled=False）。有策略：喂一份 **curated**
+        `CompactionRequest`（中性投影 + 标量，绝不递 mgr/agent/tree Entry），按 outcome 分三路：
+
+        - `outcome.cancel` → `(None, 0, True)`：compact() 早退，不写 COMPACTION entry。
+        - `outcome.summary` 非空 → `(summary, 0, False)`：用策略产摘要（**不**调内置 summarizer）。
+        - `outcome.summary is None`（弃权）或 handler 抛错 → 捕获 + notice，**回退**内置 summarizer。
+
+        熔断不双计：策略抛错只回退、不抛；内置 summarizer 自身失败照旧上抛（auto 由
+        check_and_compact 计入、手动 /compact 由命令层显示）。本方法只替换"产摘要"这一步——
+        format / record_event(CompactionRequested) / cut / fold / restore 仍内核独占（compact() 内）。"""
+        a = self.agent
+        strategy = getattr(a, "_compaction_strategy", None)
+        if strategy is None:
+            raw_summary, retry_count = await self._summarize_prefix_with_retry(prefix_branch, instructions)
+            return raw_summary, retry_count, False
+        from ..agent.compaction import CompactionRequest
+        read_files, modified_files = self._compaction_file_tracking(branch)
+        request = CompactionRequest(
+            messages=self._project_branch_prefix(prefix_branch) or [],
+            tokens_before=tokens_before,
+            trigger=trigger,
+            instructions=instructions,
+            file_ops={"read": read_files, "modified": modified_files},
+            previous_summary=None,
+        )
+        try:
+            outcome = await strategy(request)
+            if getattr(outcome, "cancel", False):
+                return None, 0, True
+            summary = getattr(outcome, "summary", None)
+            if summary:
+                return summary, 0, False
+            # summary is None → 策略弃权，回退内置 summarizer（落到下方）。
+        except Exception as e:  # noqa: BLE001 — 策略故障绝不炸 compaction：回退内置（不双计熔断）
+            a.emit(_events.NoticeRaised(
+                text=f"[compaction] before_compact strategy failed; using built-in summarizer: {e}",
+                level="warn"))
+        raw_summary, retry_count = await self._summarize_prefix_with_retry(prefix_branch, instructions)
+        return raw_summary, retry_count, False
 
     async def _restore_context_after_compaction(self) -> None:
         """compaction 后立即恢复 session-level 上下文（docs/18 Phase 5）。

@@ -8,10 +8,13 @@ from nanocode.agent.engine import Agent
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
 from nanocode.session import v2 as _session_v2
+from .._helpers import inject_test_services
 
 
 def _agent(sid):
-    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    _injected_agent = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions")
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 # 受 rebind 复位的 session 维度字段（drift guard 比对 fresh-vs-rebound）
@@ -108,6 +111,7 @@ def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
     # 启动即 --plan 的 agent（baseline=plan）：rebind 后新 session 仍 plan，但 plan 文件/提示重指新 sid，
     # 旧 sid 路径不泄漏（修复 P2 review 的 HIGH：plan prompt/path 跨会话泄漏）。
     a = Agent(api_key="test", session_id="POLD", permission_mode="plan")
+    inject_test_services(a)
     a._session_mgr = SessionManager.create("POLD")
     old_plan_path = a._plan_file_path
     assert old_plan_path and "POLD" in old_plan_path and "POLD" in a._system_prompt
@@ -121,6 +125,7 @@ def test_rebind_resets_plan_mode_to_new_session(monkeypatch):
 def test_rebind_from_toggled_plan_reverts_to_base_mode():
     # 运行中 toggle 进 plan（baseline=default）：rebind 后回到 default、_system_prompt 复位为 base。
     a = Agent(api_key="test", session_id="TOG", permission_mode="default")
+    inject_test_services(a)
     a._session_mgr = SessionManager.create("TOG")
     a.toggle_plan_mode()
     assert a.permission_mode == "plan"

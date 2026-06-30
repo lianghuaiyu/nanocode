@@ -11,10 +11,13 @@ from nanocode.agent.engine import Agent
 from nanocode.session import capture
 from nanocode.session import tree as T
 from nanocode.session.manager import SessionManager
+from .._helpers import inject_test_services
 
 
 def _agent(sid, **kw):
-    return Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions", **kw)
+    _injected_agent = Agent(api_key="test", session_id=sid, permission_mode="bypassPermissions", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_subagent_compaction_writes_to_its_child_tree(monkeypatch):

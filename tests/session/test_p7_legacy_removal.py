@@ -6,6 +6,7 @@ import time
 
 from nanocode.session.manager import SessionManager
 from nanocode.session.store import get_latest_session_id
+from .._helpers import inject_test_services
 
 
 def test_get_latest_resolves_canonical_session_without_legacy_json():
@@ -32,6 +33,7 @@ def test_auto_save_no_longer_writes_legacy_flat_snapshot():
     from nanocode.session import tree as T
     from nanocode.paths import sessions_dir
     a = Agent(api_key="test", session_id="NOFLAT", permission_mode="bypassPermissions")
+    inject_test_services(a)
     a._session_mgr = SessionManager.create("NOFLAT")
     a._session_mgr.append_message(T.user_message("hi"))
     a.agent_session.auto_save()

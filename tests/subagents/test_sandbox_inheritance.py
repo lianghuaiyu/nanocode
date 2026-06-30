@@ -7,11 +7,14 @@ from nanocode.agent.engine import Agent
 from nanocode.capabilities.sandbox import (
     ApprovalDecision, HostContext, SandboxBackend, SandboxDeny, SandboxEngine, SandboxManager,
     ShellRequest, narrow_policy_for_context, policy_for_profile)
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="par", **kw)
+    _injected_agent = Agent(api_key="test", session_id="par", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _host(tmp_path, **kw):

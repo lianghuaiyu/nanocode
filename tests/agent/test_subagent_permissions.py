@@ -11,12 +11,15 @@ import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.tools import REGISTRY, check_permission
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
-    return Agent(api_key="test", **kw)
+    _injected_agent = Agent(api_key="test", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 # ─── 权限模式继承（不再 bypass） ─────────────────────────────

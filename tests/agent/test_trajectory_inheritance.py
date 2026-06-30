@@ -7,11 +7,14 @@ docs/14 Milestone B：Tracer/wire 已退役——`trajectory_enabled`/`trajector
 from __future__ import annotations
 
 from nanocode.agent.engine import Agent
+from .._helpers import inject_test_services
 
 
 def _agent(session_id, **kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id=session_id, **kw)
+    _injected_agent = Agent(api_key="test", session_id=session_id, **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def test_main_agent_carries_trajectory_flags():

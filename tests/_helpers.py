@@ -32,14 +32,45 @@ def leased_manager(session_id: str, **kw) -> SessionManager:
     return SessionManager.create(session_id, lock=True, **kw)
 
 
+def inject_test_services(agent, services=None):
+    """给一个**已构造**的 Agent 填上 runtime 注入式 ③ 宿主服务（docs/26 S6）。
+
+    S6-2 后内核 `Agent.__init__` 不再自建 SandboxManager/AgentRunRuntime/McpManager/TaskManager，
+    这些 slot 默认 None 且 deref 时 fail-closed。生产由 runtime（thread_start/_apply_runtime_services
+    / build_sub_agent）注入；测试经此载体注入默认实例（或从传入的 RuntimeServices 覆盖）。
+    task_manager 仅在 agent 尚未持有时填（尊重 ctor 参 / 既有注入）。"""
+    from nanocode.capabilities.sandbox import SandboxManager
+    from nanocode.mcp import McpManager
+    from nanocode.runs.runtime import AgentRunRuntime
+    from nanocode.tasks.manager import TaskManager
+    agent._sandbox = getattr(services, "sandbox", None) or SandboxManager()
+    agent._run_runtime = getattr(services, "run_runtime", None) or AgentRunRuntime()
+    agent._mcp_manager = getattr(services, "mcp_manager", None) or McpManager()
+    if getattr(agent, "_svc_task_manager", None) is None:
+        agent.task_manager = getattr(services, "task_manager", None) or TaskManager()
+    return agent
+
+
+def build_test_agent(session_id: str | None = None, *, services=None, **kw):
+    """构造一个测试用 Agent 并注入 ③ 宿主服务（docs/26 S6-0：机械迁移的唯一载体）。
+
+    等价于旧 `_agent()` 工厂里 `Agent(api_key="test", permission_mode="bypassPermissions", ...)`
+    再加 S6-2 后必需的服务注入。默认 bypassPermissions + test key，便于纯逻辑用例；**不**注入
+    会话写者租约（需 leased mgr 的用例用 `make_leased_agent` / `attach_runtime_agent`）。"""
+    from nanocode.agent.engine import Agent
+    kw.setdefault("api_key", "test")
+    kw.setdefault("permission_mode", "bypassPermissions")
+    a = Agent(session_id=session_id, **kw)
+    inject_test_services(a, services)
+    return a
+
+
 def make_leased_agent(session_id: str, **agent_kw):
     """构造一个主 Agent 并注入一把 locked SessionManager（模拟 runtime 的 lease 注入）。
 
-    返回 (agent, mgr)。默认 bypassPermissions + trace 关，便于纯逻辑用例。"""
-    from nanocode.agent.engine import Agent
-    agent_kw.setdefault("api_key", "test")
-    agent_kw.setdefault("permission_mode", "bypassPermissions")
-    a = Agent(session_id=session_id, **agent_kw)
+    返回 (agent, mgr)。默认 bypassPermissions + trace 关，便于纯逻辑用例；经 build_test_agent
+    一并注入 S6 ③ 宿主服务（sandbox/run/mcp/task），故 deref 不再 fail-closed。"""
+    a = build_test_agent(session_id, **agent_kw)
     mgr = leased_manager(session_id)
     a._session_mgr = mgr
     return a, mgr
@@ -52,8 +83,12 @@ def attach_runtime_agent(agent):
 
     复用 agent 自身的 `_tree_session_id` / `_child_parent_session`（与旧自取语义逐字一致），
     故主 agent 与白盒子 agent 都适用（主 agent 的 `_child_parent_session` 为 None）。
-    返回该 agent，便于链式调用。"""
+    返回该 agent，便于链式调用。
+
+    docs/26 S6：顺带注入 ③ 宿主服务（sandbox/run/mcp/task），使经此装配的白盒 agent deref
+    这些服务不再 fail-closed（与旧「内核自建兜底」逐字等价的行为面）。"""
     from nanocode.session.lease import SessionLease
+    inject_test_services(agent)
     lease = SessionLease.open_or_create(
         agent._tree_session_id, spawned_by=agent._child_parent_session)
     agent._session_lease = lease

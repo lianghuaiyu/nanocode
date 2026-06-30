@@ -14,11 +14,14 @@ from nanocode.session.manager import SessionManager
 from nanocode.subagents import run_record
 from nanocode.tools import permissions
 from nanocode.paths import data_dir
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="capsid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="capsid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _set_agents_settings(monkeypatch, tmp_path, obj):

@@ -74,11 +74,43 @@ def _embedder_overlay(embedder_tools: "list | None") -> list:
 # （ALWAYS_ALLOWED_META / AGENT_META_TOOL / allowlist_blocks），由 PermissionEngine 统一持有。
 
 
+class _InjectedService:
+    """fail-closed 描述符：runtime 注入式 ③ 宿主服务的取用闸（docs/26 S6-2/G5）。
+
+    内核 `Agent.__init__` 不再自建 sandbox/run_runtime/mcp_manager/task_manager——slot 默认 None，
+    由 runtime（thread_start/_apply_runtime_services / build_sub_agent）或测试载体 build_test_agent
+    注入。未注入即 deref → fail-loud（无声自建兜底彻底消失，G5「服务可换」收口）。setter 写 backing
+    slot，使既有 `agent._sandbox = x` / `agent.task_manager = x` 注入点零改动。"""
+
+    def __init__(self, slot: str, label: str) -> None:
+        self._slot = slot
+        self._label = label
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        value = obj.__dict__.get(self._slot)
+        if value is None:
+            raise RuntimeError(
+                f"{self._label} service not injected; construct the Agent via runtime "
+                f"(thread_start / build_sub_agent) or tests._helpers.build_test_agent")
+        return value
+
+    def __set__(self, obj, value) -> None:
+        obj.__dict__[self._slot] = value
+
+
 class Agent(PlanModeMixin):
     # 记忆巩固 curator 的内置保留类型（与 subagents.prompts.MEMORY_CURATOR_TYPE 对齐）。
     _MEMORY_CURATOR_TYPE = "memory-curator"
     # 记忆 EVAL-mode curator 的内置保留类型（与 subagents.prompts.MEMORY_EVAL_CURATOR_TYPE 对齐）。
     _MEMORY_EVAL_CURATOR_TYPE = "memory-eval-curator"
+
+    # docs/26 S6-2：runtime 注入式 ③ 宿主服务的 fail-closed 取用闸（backing slot 在 __init__ 置 None）。
+    _sandbox = _InjectedService("_svc_sandbox", "sandbox")
+    _run_runtime = _InjectedService("_svc_run_runtime", "run_runtime")
+    _mcp_manager = _InjectedService("_svc_mcp_manager", "mcp_manager")
+    task_manager = _InjectedService("_svc_task_manager", "task_manager")
 
     def __init__(
         self,
@@ -157,11 +189,10 @@ class Agent(PlanModeMixin):
         # docs/19：sandbox profile（default/read-only/strict/vm/danger-full-access）。
         # profile 是 public runtime config（AgentConfig.sandbox_profile）；模型无法影响。
         self._sandbox_profile = sandbox_profile
-        # docs/23 Step 7-S4：SandboxManager 归 runtime 所有（RuntimeServices.sandbox，per-runtime
-        # 共享、无状态）——主 agent 经 _apply_runtime_services、子 agent 经 build_sub_agent 采用该实例。
-        # 此处自建一个作兜底（未经 runtime 装配的白盒/测试 agent）；彻底移除待 S6（__init__ 接 bundle）。
-        from ..capabilities.sandbox import SandboxManager
-        self._sandbox = SandboxManager()
+        # docs/26 S6-2：SandboxManager 是 runtime 注入式 ③ 服务（per-runtime 共享、无状态）——
+        # 主 agent 经 _apply_runtime_services、子 agent 经 build_sub_agent 注入；内核不再自建。
+        # slot 默认 None，经 _sandbox 描述符 fail-closed（未注入即 deref 报错）。
+        self._svc_sandbox = None
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = session_id or uuid.uuid4().hex[:8]
         # artifact_id：主 agent 默认 "main"；子 agent 传入 child session id。
@@ -199,6 +230,10 @@ class Agent(PlanModeMixin):
         # 本 session 后续 auto compact（手动 /compact 不受限）。会话维度状态 → rebind 时复位。
         self._compacting = False
         self._consecutive_compaction_failures = 0
+        # docs/26 G4：before_compact 可拔插策略（注入式 host 服务）。None = 用内核内置 summarizer；
+        # 编排/记忆同套路由 runtime._apply_runtime_services 在 host 注册了 compaction_strategy 时注入
+        # 一个 callable(request)->CompactionOutcome。内核仍独占 cut/fold/record_event/restore。
+        self._compaction_strategy = None
         # docs/18 Phase 6：per-message 聚合 tool-result 预算的替换决策（按 toolCallId 冻结，跨 turn
         # 稳定，保护 prompt-cache 前缀）。请求局部投影，绝不改写树；会话维度 → rebind 复位。
         from .tool_result_budget import ContentReplacementState
@@ -220,24 +255,22 @@ class Agent(PlanModeMixin):
         self._turn_context_plan = None
         self._context_ledger = None
 
-        # Background tasks (shell) — TaskManager shared with sub-agents via ctor param
-        if task_manager is not None:
-            self.task_manager = task_manager
-        else:
-            from ..tasks.manager import TaskManager
-            self.task_manager = TaskManager()
+        # Background tasks (shell) — TaskManager 是 runtime 注入式 ③ 服务（per-session 有状态）。
+        # docs/26 S6-2：内核不再自建。子 agent 经 ctor 参共享父 task_manager（build_sub_agent）；主
+        # agent 经 _apply_runtime_services 首次装配注入；rebind 由 runtime/rebind.py 重建。slot 默认
+        # None（ctor 参给出即预置），经 task_manager 描述符 fail-closed。
+        self._svc_task_manager = task_manager
         self._background_tasks: set[asyncio.Task] = set()
         self._background_run_queue: list[str] = []
         # CAP-P1：子 agent 并发/深度/超时/turn 上限策略归口（Agent 持有并委托）。
         self._subagents = SubAgentManager(self)
-        # docs/23 Step 7-S5：run-ledger runtime 归 runtime 所有（RuntimeServices.run_runtime）——
-        # 主 agent 首次装配采用 bundle 实例；此处自建作兜底（子 agent / 未装配的白盒/测试 agent）。
-        from ..runs.runtime import AgentRunRuntime
-        self._run_runtime = AgentRunRuntime()
+        # docs/26 S6-2：AgentRunRuntime（run-ledger）是 runtime 注入式 ③ 服务（per-runtime 有状态）——
+        # 主 agent 经 _apply_runtime_services first_attach、子 agent 经 build_sub_agent 注入；内核不再
+        # 自建。slot 默认 None，经 _run_runtime 描述符 fail-closed。
+        self._svc_run_runtime = None
         # docs/15 Phase 6：子 agent 构造 + 产物落盘机器（host-driven）。无状态,可共享。
-        # docs/23 §4.1/§4.2：runtime/spawn 是 L4 host 服务（③）；core(②a/②b) 不在模块顶层
-        # 静态依赖 ③ 实现——lazy import 保 `import nanocode.agent.engine` 不拖入 nanocode.runtime
-        # （与同构造器内 AgentRunRuntime 的 lazy import 同风格；行为不变，构造点与时机一致）。
+        # SubAgentRunner / CapabilityRouter 是 ②内核自有的**无状态** dispatch 原语（非 ③ 服务），
+        # 故内核仍自建（不进 RuntimeServices bundle，docs/26 S6 清单后两项）。
         from ..runtime.spawn import SubAgentRunner
         self._spawn = SubAgentRunner()
         self._agent_session_obj = None     # lazy AgentSession（docs/16 #1：record_event 唯一 message 树写者）
@@ -278,11 +311,11 @@ class Agent(PlanModeMixin):
         self._files_modified: set[str] = set()
 
         # MCP integration
-        # docs/23 Step 7-S5：McpManager 归 runtime 所有（RuntimeServices.mcp_manager，per-runtime
-        # 生命周期、跨会话保活）——主 agent 首次装配采用 bundle 实例并在首 turn 连接。此处自建作兜底；
-        # 子 agent 保留各自这个 inert 实例（子被 session/agent.py 的 not is_sub_agent 闸挡在 MCP 外）。
-        from ..mcp import McpManager
-        self._mcp_manager = McpManager()
+        # docs/26 S6-2：McpManager 是 runtime 注入式 ③ 服务（per-runtime 生命周期、跨会话保活）——
+        # 主 agent 经 _apply_runtime_services first_attach 注入并在首 turn 连接；子 agent 经
+        # build_sub_agent 注入一个 inert 实例（子被 session/agent.py 的 not is_sub_agent 闸挡在 MCP
+        # 外，从不连接）。内核不再自建；slot 默认 None，经 _mcp_manager 描述符 fail-closed。
+        self._svc_mcp_manager = None
         self._mcp_initialized = False
 
         # Memory recall state — no-LLM fast prefetch per user turn.

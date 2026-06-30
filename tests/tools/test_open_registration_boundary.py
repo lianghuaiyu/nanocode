@@ -18,6 +18,7 @@ from nanocode.tools import REGISTRY
 from nanocode.tools.registry import ToolRegistry
 from nanocode.tools.spec import Tool
 from nanocode.tools.types import Capability, ToolSource, Trust
+from .._helpers import inject_test_services
 
 
 _CAP_SLOTS = ("fs_read", "fs_write", "fs_list", "exec", "tasks", "runs",
@@ -52,7 +53,9 @@ def test_overlay_does_not_mutate_global_registry():
 
 def test_two_agents_do_not_share_external_tools():
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     b = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(b)
     a._registry.register(_ext_tool("mcp__srv__do", source=ToolSource.MCP))
     assert a._registry.get("mcp__srv__do") is not None
     assert b._registry.get("mcp__srv__do") is None        # 跨 agent 不串
@@ -71,6 +74,7 @@ def test_per_registry_activation_is_independent():
 
 def test_untrusted_external_tool_gets_all_none_ctx():
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     seen = {}
 
     def _run(ctx, inp):
@@ -97,6 +101,7 @@ def test_untrusted_external_tool_gets_all_none_ctx():
 
 def test_external_cannot_shadow_builtin_name():
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     # read_file 是内置保留名：外部缺前缀先被 forced-namespace 拦（同样 fail-loud）。
     with pytest.raises(RuntimeError, match="namespace prefix"):
         a._registry.register(_ext_tool("read_file", source=ToolSource.MCP))
@@ -104,6 +109,7 @@ def test_external_cannot_shadow_builtin_name():
 
 def test_external_missing_prefix_fails_loud():
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     for source in (ToolSource.MCP, ToolSource.EXT, ToolSource.EMBEDDER):
         with pytest.raises(RuntimeError, match="namespace prefix"):
             a._registry.register(_ext_tool("bare", source=source))
@@ -136,6 +142,7 @@ def test_same_source_trusted_override_allowed():
 
 def test_mcp_routed_by_source_not_prefix():
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     a._registry.register(_ext_tool("mcp__srv__do", source=ToolSource.MCP))
     called = {}
 
@@ -173,6 +180,7 @@ def test_extension_register_tool_end_to_end():
     assert tools[0].source is ToolSource.EXT and tools[0].trust is Trust.UNTRUSTED
 
     a = Agent(api_key="test", permission_mode="bypassPermissions")
+    inject_test_services(a)
     for t in tools:
         a._registry.register(t)
     a.tools = a._registry.schemas()
@@ -196,6 +204,7 @@ def test_extension_tool_still_passes_through_allowlist_chokepoint():
 
     a = Agent(api_key="test", permission_mode="bypassPermissions",
               is_sub_agent=True, allowed_tool_names={"read_file"})
+    inject_test_services(a)
     for t in host.tool_contributions():
         a._registry.register(t)
     out = asyncio.run(a._execute_tool_call("ext__memev__frob", {}))
@@ -218,6 +227,7 @@ def test_embedder_tools_registered_with_namespace_and_untrusted_ctx():
         run=_run, trust=Trust.UNTRUSTED,
         needs=frozenset({Capability.FS_WRITE, Capability.EXEC}))
     a = Agent(api_key="test", permission_mode="bypassPermissions", embedder_tools=[t])
+    inject_test_services(a)
     assert "embedder__do_x" in a._registry.names()
     assert REGISTRY.get("embedder__do_x") is None           # 全局未污染
     out = asyncio.run(a._execute_tool_call("embedder__do_x", {"x": "hi"}))

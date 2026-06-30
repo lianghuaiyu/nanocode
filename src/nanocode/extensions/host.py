@@ -364,6 +364,26 @@ class ExtensionHost:
         ctx = self.create_context(ext_id)
         return await handler(ctx, payload)
 
+    # ── compaction strategy dispatch (docs/26 G4) ─────────────────────
+    async def run_compaction_strategy(self, request):
+        """Invoke the registered before_compact strategy with a fresh context.
+
+        No strategy registered ⟹ **abstain** (`CompactionOutcome(summary=None,
+        cancel=False)`) — the kernel falls back to its built-in summarizer. A handler
+        that returns a non-`CompactionOutcome` (or raises) is normalized to abstain so a
+        misbehaving extension can never silently drop the conversation; the kernel still
+        owns cut/fold/record_event/restore. Unlike orchestration there is NO fail-loud
+        here: compaction must always make progress, so a missing strategy is a no-op."""
+        from ..agent.compaction import CompactionOutcome
+        if self.registry.compaction_strategy is None:
+            return CompactionOutcome(summary=None, cancel=False)
+        handler, ext_id = self.registry.compaction_strategy
+        ctx = self.create_context(ext_id)
+        outcome = await handler(ctx, request)
+        if isinstance(outcome, CompactionOutcome):
+            return outcome
+        return CompactionOutcome(summary=None, cancel=False)
+
     # ── lifecycle dispatch ────────────────────────────────────────────
     async def emit(self, event: str, payload: dict | None = None) -> None:
         """Run lifecycle handlers for an event with a per-extension-scoped context

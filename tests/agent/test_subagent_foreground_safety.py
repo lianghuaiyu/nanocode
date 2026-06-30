@@ -8,13 +8,16 @@ from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import REGISTRY
 from nanocode.tools.agent import SCHEMA
 from nanocode.agents import registry as config
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="fgsid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="fgsid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _spy_build(parent, *, run_once=None, text="fg done",

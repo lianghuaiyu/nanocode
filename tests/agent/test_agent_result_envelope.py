@@ -13,11 +13,14 @@ import json
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.agent_result import build_agent_result, render_agent_result_envelope
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="p3sid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="p3sid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 # ─── host-derived file tracking ─────────────────────────────

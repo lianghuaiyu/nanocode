@@ -12,10 +12,13 @@ import pytest
 from nanocode.agent.engine import Agent
 from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.tools import permissions
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
-    return Agent(api_key="test", **kw)
+    _injected_agent = Agent(api_key="test", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _hook(cmd):

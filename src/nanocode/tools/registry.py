@@ -98,6 +98,25 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def set_schema(self, name: str, schema: dict) -> None:
+        """替换**本 registry** 里某既有工具的模型可见 schema（docs/26 G7）。
+
+        仅供 per-agent overlay 用（绝不在全局 REGISTRY 上调）——`overlay()` 已把每个 Tool 拷进
+        本表自己的 `_tools` dict，`dataclasses.replace` 造**新** frozen Tool 并重指本表 slot，
+        全局 REGISTRY 的 dict 仍指向旧 Tool，不受影响。schema 经 `_closed` 收口（与 builtins 一致：
+        additionalProperties=false），其余字段（run/concurrency_safe/needs/source/trust）保持。
+        未注册的 name → fail-loud（编排 overlay 只在主 agent registry 上调，`agent` 必存在）。
+
+        用例：编排扩展激活时把常驻 builtin 的 slim `agent` schema 换成含 steps/tasks/accept/
+        plan_fanout 的 ORCHESTRATION_SCHEMA——「编排实现可卸 ⟹ 模型可见编排词汇随之可卸」。"""
+        import dataclasses
+
+        from .spec import _closed
+        tool = self._tools.get(name)
+        if tool is None:
+            raise RuntimeError(f"cannot set schema for unregistered tool: {name}")
+        self._tools[name] = dataclasses.replace(tool, schema=_closed(schema))
+
     def names(self) -> list[str]:
         return list(self._tools)
 

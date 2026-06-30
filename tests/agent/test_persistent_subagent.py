@@ -14,11 +14,14 @@ import shutil
 import pytest
 
 from nanocode.agent.engine import Agent
+from .._helpers import inject_test_services
 
 
 def _agent(**kw):
-    return Agent(api_key="test",
+    _injected_agent = Agent(api_key="test",
                  permission_mode="bypassPermissions", session_id="psid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _stub_run_once(agent, text="sub done", history=None):
@@ -322,6 +325,7 @@ def test_provider_runtime_config_openai():
     parent = Agent(api_key="test",
                    permission_mode="bypassPermissions",
                    api_base="https://example.com/v1", session_id="osid")
+    inject_test_services(parent)
     assert parent.provider_runtime_config.name == "openai"
 
 

@@ -17,13 +17,16 @@ from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.subagents import run_record
 from nanocode.tools import REGISTRY
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
 
 def _agent(**kw):
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(api_key="test", session_id="bgsid", **kw)
+    _injected_agent = Agent(api_key="test", session_id="bgsid", **kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _spy_build_with_stub(parent, *, text="bg done", tokens=None, run_once=None):

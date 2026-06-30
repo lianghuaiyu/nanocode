@@ -19,6 +19,7 @@ from nanocode.agent.engine import Agent
 from nanocode.agent.subagent_manager import SUBAGENT_MAX_TURNS_FALLBACK
 from nanocode.tools import REGISTRY
 from nanocode.agents import registry as config
+from .._helpers import inject_test_services
 
 tool_definitions = REGISTRY.schemas()
 
@@ -27,7 +28,9 @@ def _agent(**kw):
     kw.setdefault("api_key", "test")
     kw.setdefault("session_id", "secsid")
     kw.setdefault("permission_mode", "bypassPermissions")
-    return Agent(**kw)
+    _injected_agent = Agent(**kw)
+    inject_test_services(_injected_agent)
+    return _injected_agent
 
 
 def _write(d, name, body):
@@ -41,6 +44,7 @@ def _write(d, name, body):
 def test_empty_custom_tools_does_not_widen_to_all():
     # Agent.__init__: custom_tools=[] must stay [] (None means "main agent default").
     a = Agent(api_key="test", is_sub_agent=True, custom_tools=[])
+    inject_test_services(a)
     assert a.tools == []
     names = {t["name"] for t in a.tools}
     assert "agent" not in names
@@ -49,6 +53,7 @@ def test_empty_custom_tools_does_not_widen_to_all():
 
 def test_main_agent_none_tools_still_gets_full_table():
     a = Agent(api_key="test")
+    inject_test_services(a)
     assert a.tools == tool_definitions
 
 

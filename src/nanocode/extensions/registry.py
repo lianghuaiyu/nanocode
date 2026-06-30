@@ -26,6 +26,9 @@ LifecycleHandler = Callable[..., Awaitable[None]]
 # docs/26 §0.6 阶段1：编排 handler `orchestrate(ctx, payload) -> str`。单一注册（编排策略上提
 # 层④的唯一入口）；前台返聚合 envelope，后台经 detached task 跑（dispatch 在 engine/host）。
 OrchestratorHandler = Callable[..., Awaitable[str]]
+# docs/26 G4：before_compact 策略 handler `strategy(ctx, request) -> CompactionOutcome`。单一注册
+# （可拔插压缩算法的唯一入口）；只替换"产摘要"这一步，内核独占 cut/fold/record_event/restore。
+CompactionStrategyHandler = Callable[..., Awaitable[object]]
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class ContributionRegistry:
     model_roles: dict[str, tuple[ModelRolePolicy, str]] = field(default_factory=dict)
     tools: dict[str, RegisteredTool] = field(default_factory=dict)
     orchestrator: "tuple[OrchestratorHandler, str] | None" = None
+    compaction_strategy: "tuple[CompactionStrategyHandler, str] | None" = None
 
     # ── command ───────────────────────────────────────────────────────
     # Note: builtin-vs-extension command collisions are enforced by the
@@ -143,6 +147,17 @@ class ContributionRegistry:
                 f"extension {extension_id!r}: orchestrator already registered "
                 f"by extension {self.orchestrator[1]!r}")
         self.orchestrator = (handler, extension_id)
+
+    # ── compaction strategy (docs/26 G4) ──────────────────────────────
+    def add_compaction_strategy(self, handler: "CompactionStrategyHandler", *,
+                                extension_id: str) -> None:
+        """登记唯一 before_compact 策略 handler（dup fail-loud）。可拔插压缩算法的单一入口；
+        内核 compact() 经注入的 callable 委托到 host.run_compaction_strategy（仿 add_orchestrator）。"""
+        if self.compaction_strategy is not None:
+            raise ExtensionLoadError(
+                f"extension {extension_id!r}: compaction strategy already registered "
+                f"by extension {self.compaction_strategy[1]!r}")
+        self.compaction_strategy = (handler, extension_id)
 
     # ── tool (docs/24 Phase 4b) ───────────────────────────────────────
     def add_tool(self, name: str, schema: dict, handler: ToolHandler, *,
