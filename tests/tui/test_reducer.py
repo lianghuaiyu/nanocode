@@ -12,6 +12,7 @@ from nanocode.tui.state import (
     AssistantItem,
     ErrorItem,
     NoticeItem,
+    SelectorState,
     SubAgentItem,
     ThinkingItem,
     ToolItem,
@@ -45,6 +46,27 @@ def test_llm_request_sets_running_and_model():
     st = drive(E.LlmRequestPrepared(model="claude-opus-4-8", message_count=3, messages_chars=120))
     assert st.mode == "running"
     assert st.status.model == "claude-opus-4-8"
+
+
+def test_background_activity_does_not_steal_selector_mode():
+    st = TuiState()
+    st.mode = "selector"
+    st.selector = SelectorState(model=object(), index=0)
+
+    reducer.reduce(st, env(E.LlmRequestPrepared(model="child-model", message_count=1, messages_chars=10)))
+    assert st.mode == "selector"
+    assert st.selector is not None
+    assert st.status.model == "child-model"
+
+    reducer.reduce(st, env(E.TurnCompleted(input_tokens=10, output_tokens=2, turns=1, cost_usd=0.01)))
+    assert st.mode == "selector"
+    assert st.selector is not None
+    assert st.status.cost_usd == 0.01
+
+    reducer.reduce(st, env(E.ErrorRaised(message="background issue")))
+    assert st.mode == "selector"
+    assert st.selector is not None
+    assert any(isinstance(i, ErrorItem) and i.text == "background issue" for i in st.timeline)
 
 
 def test_assistant_text_deltas_merge_into_one_item():
@@ -220,3 +242,15 @@ def test_hydrate_status_from_snapshot():
     assert st.status.input_tokens == 42000
     assert st.status.context_window == 200000
     assert st.mode == "running"  # is_processing=True
+
+
+def test_hydrate_status_preserves_selector_mode():
+    st = TuiState()
+    st.mode = "selector"
+    st.selector = SelectorState(model=object(), index=0)
+
+    reducer.hydrate_status(st, {"session_id": "abc123", "is_processing": True})
+
+    assert st.mode == "selector"
+    assert st.selector is not None
+    assert st.status.session_id == "abc123"

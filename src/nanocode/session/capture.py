@@ -13,7 +13,6 @@ P2 双写脚手架用：把 engine 现有的 provider-shaped 列表（_anthropic
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from . import tree
 

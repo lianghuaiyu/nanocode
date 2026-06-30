@@ -17,8 +17,6 @@ ENABLED = "enabled"
 DISABLED = "disabled"
 POLLUTED = "polluted"
 
-_MODES = (ENABLED, DISABLED, POLLUTED)
-
 # External-context sources that pollute a thread for the purpose of *generation*
 # (read/use is unaffected). Mirrors Codex `disable_on_external_context`.
 EXTERNAL_CONTEXT_SOURCES = frozenset({

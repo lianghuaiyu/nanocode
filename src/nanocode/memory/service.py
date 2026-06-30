@@ -31,8 +31,6 @@ VALID_BACKENDS = ("off", "markdown", "simplemem")
 DEFAULT_BACKEND = "markdown"
 
 # Tool actions exposed in the first-version schema (docs/20 §8).
-_READ_ACTIONS = frozenset({"search", "read", "list", "stats"})
-_WRITE_ACTIONS = frozenset({"add_note"})
 _HOST_ACTIONS = frozenset({"consolidate"})
 
 
@@ -334,10 +332,6 @@ class MemoryService:
         """Mark the thread polluted when external context is consumed.
         Returns True if the policy mode transitioned."""
         return self.policy.mark_external_context(source)
-
-    def reset_policy_for_session(self) -> None:
-        """Reset per-thread pollution at a session boundary (new/resume)."""
-        self.policy.reset_thread_mode()
 
     # ── generation pipeline (docs/20 §5.1 / §7 Phase 6) ──────────────
     async def maybe_start_generation_pipeline(self, *, thread_id: str, session_mgr,

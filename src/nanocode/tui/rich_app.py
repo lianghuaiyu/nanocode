@@ -1,8 +1,8 @@
 """tui/rich_app.py —— Rich Live 交互客户端（docs/18：Codex inline-viewport 模型）。
 
 取代 prompt_toolkit `TuiApp`。一个 `Live(console=tui.console, screen=False)` 持有底部 viewport
-（输入行 + footer + 正在流式变化的 active cell；modal；session 选择器面板），**自动刷新**→
-thinking 动画 + 流式丝滑。近期对话保留在 Live viewport 中以便像 Pi 一样重渲染可展开工具块；
+（输入行 + footer + 正在流式变化的 active cell；modal；session 选择器面板），按事件显式刷新，
+仅前台 turn 运行时低频 tick 驱动 thinking 动画。近期对话保留在 Live viewport 中以便像 Pi 一样重渲染可展开工具块；
 显式 session/branch 导航才把持久 transcript replay 到 Live 上方的终端 scrollback。
 
 嵌入式边界：本模块只 import `.{state,reducer,footer,selector,line_editor,primitives,theme,tooltext}`
@@ -340,6 +340,8 @@ class _InputProxy:
 class RichApp:
     """挂在 RuntimeThread 上的 Rich Live 客户端（与 TuiApp 同一 client 协议）。"""
 
+    _FOREGROUND_REFRESH_HZ = 4.0
+
     def __init__(self, *, input=None, output=None, registry=None, completer=None) -> None:
         self.state = TuiState()
         self.thread = None
@@ -362,6 +364,7 @@ class RichApp:
         self._plan_future: asyncio.Future | None = None
         self._selector_future: asyncio.Future | None = None
         self._ask_future: asyncio.Future | None = None
+        self._selector_mouse_defer_disable = False
         self._transcript_scroll = 0
         self._parser = KeyParser()
         self._esc_timer = None
@@ -371,6 +374,7 @@ class RichApp:
         self._tools_expanded = False
         self._turn_started: float | None = None
         self._live = None
+        self._refresh_task: asyncio.Task | None = None
         self._subagent_widget_cache_at = 0.0
         self._subagent_widget_snapshot: list[dict] = []
         self._subagent_widget_frame = 0
@@ -426,6 +430,12 @@ class RichApp:
             loop.call_soon_threadsafe(self._apply, env)
 
     def _apply(self, env: dict) -> None:
+        if self._is_one_shot_notice(env):
+            event = env.get("event")
+            text = self._event_value(event, "text", "") or ""
+            self._above_console().print(Text(text, style="accent"))
+            self._refresh()
+            return
         reduce(self.state, env)
         self._commit_finalized_event(env)
         self._refresh()
@@ -436,6 +446,23 @@ class RichApp:
                 self._live.refresh()
             except Exception:
                 pass
+
+    def _needs_periodic_refresh(self) -> bool:
+        if (
+            self.state.selector is not None
+            or self.state.modal is not None
+            or self.state.plan_modal is not None
+            or self.state.text_prompt is not None
+        ):
+            return False
+        return self._turn_task is not None and not self._turn_task.done()
+
+    async def _refresh_loop(self) -> None:
+        interval = 1.0 / max(1.0, float(self._FOREGROUND_REFRESH_HZ))
+        while self._exit is not None and not self._exit.done():
+            if self._needs_periodic_refresh():
+                self._refresh()
+            await asyncio.sleep(interval)
 
     def _above_console(self):
         live = self._live
@@ -544,6 +571,7 @@ class RichApp:
         idx = 0 if not items else max(0, min(initial_index, len(items) - 1))
         self.state.selector = SelectorState(model=model, index=idx)
         self.state.mode = "selector"
+        self._selector_mouse_defer_disable = False
         self._mouse_tracking(True)
         self._refresh()
         fut = loop.create_future()
@@ -553,9 +581,15 @@ class RichApp:
         finally:
             self._selector_future = None
             self.state.selector = None
-            self._mouse_tracking(False)
-            self.state.mode = "running" if self._is_running() else "idle"
-            self._refresh()
+            owner_turn = asyncio.current_task() is self._turn_task
+            if owner_turn:
+                self._selector_mouse_defer_disable = True
+            else:
+                self._mouse_tracking(False)
+            still_in_owner_turn = owner_turn or self._is_running()
+            self.state.mode = "running" if still_in_owner_turn else "idle"
+            if not still_in_owner_turn:
+                self._refresh()
 
     async def ask_text(self, prompt: str):
         loop = self._loop
@@ -598,12 +632,20 @@ class RichApp:
                 await self.thread.run(text)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.state.timeline.append(ErrorItem(text=msg))
+            try:
+                self.print_above(f"Error: {msg}", error=True)
+            except Exception:
+                pass
         finally:
             self._turn_started = None
             if self.state.mode == "running":
                 self.state.mode = "idle"
+            if self._selector_mouse_defer_disable:
+                self._mouse_tracking(False)
+                self._selector_mouse_defer_disable = False
             self._refresh()
 
     # ── 输入分发（替代 prompt_toolkit key bindings）──────────────────
@@ -1217,6 +1259,12 @@ class RichApp:
             return event.get(name, default)
         return getattr(event, name, default)
 
+    def _is_one_shot_notice(self, env: dict) -> bool:
+        if env.get("type") != "notice_raised":
+            return False
+        text = self._event_value(env.get("event"), "text", "") or ""
+        return text.startswith("Session → ") or text.startswith("Background sub-agent run ")
+
     def _remove_notice_text(self, text: str) -> None:
         self.state.timeline = [
             item
@@ -1569,9 +1617,12 @@ class RichApp:
             except (NotImplementedError, OSError):
                 fd = None
         try:
-            with Live(self, console=self._console, screen=False, refresh_per_second=20,
-                      auto_refresh=True, transient=False) as live:
+            with Live(self, console=self._console, screen=False,
+                      refresh_per_second=self._FOREGROUND_REFRESH_HZ,
+                      auto_refresh=False, transient=False) as live:
                 self._live = live
+                self._refresh()
+                self._refresh_task = asyncio.create_task(self._refresh_loop())
                 try:
                     await self._exit
                 except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1596,6 +1647,15 @@ class RichApp:
                     pass
                 except Exception:
                     pass
+            if self._refresh_task is not None and not self._refresh_task.done():
+                self._refresh_task.cancel()
+                try:
+                    await self._refresh_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            self._refresh_task = None
             self._live = None
             if fd is not None:
                 try:

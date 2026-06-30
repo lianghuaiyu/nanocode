@@ -97,7 +97,8 @@ def test_orchestrator_registered_uniquely_in_system_host():
     h = ExtensionHost.load_system_extensions().activate_all()
     assert h.registry.orchestrator is not None
     assert h.registry.orchestrator[1] == "nanocode.orchestration"
-    assert h._orchestrate_granted() is True
+    assert h._orchestrate_granted("nanocode.orchestration") is True
+    assert h._orchestrate_granted("nanocode.memory_evolution") is False
 
 
 def test_duplicate_orchestrator_fails_loud():
@@ -177,7 +178,7 @@ def test_orchestrate_context_exposes_approval_and_workspace_views():
     thread = _FakeThread()
     h = ExtensionHost.load_system_extensions().activate_all()
     h.bind_runtime(thread, None)
-    ctx = h.create_context()
+    ctx = h.create_context("nanocode.orchestration")
     assert ctx.approvals.pending()[0]["childSessionId"] == "sess_x"
     assert ctx.approvals.decide("sess_x", True) == "approved"
     assert ctx.workspace.supported_modes() == ["shared", "worktree"]
@@ -191,7 +192,7 @@ def test_context_without_orchestrate_capability_has_no_approval_or_workspace_vie
     h = ExtensionHost([])
     h._activated = True
     h.bind_runtime(_FakeThread(), None)
-    ctx = h.create_context()
+    ctx = h.create_context("nonexistent.extension")
     assert ctx.spawn is None
     assert ctx.approvals is None
     assert ctx.workspace is None

@@ -79,7 +79,7 @@ async def _chain_foreground(ctx, payload: dict, steps, n: int) -> str:
     previous = "(no previous step)"
     sections: list[str] = []
     for i, step in enumerate(steps, 1):
-        if ctx.thread.is_turn_aborted():
+        if ctx.spawn.is_aborted():
             sections.append(f"## Step {i}/{n} — skipped (turn aborted)")
             break
         agent_type = _normalize_agent_type(step.get("type", "general"))

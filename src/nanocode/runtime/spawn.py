@@ -39,6 +39,7 @@ from ..session import tree as _tree
 from ..session.manager import SessionManager
 from ..subagents import run_record
 from ..subagents.worktree import create_worktree, diff_summary, should_isolate
+from ..tasks.models import TERMINAL_TASK_STATUSES
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,34 @@ def _first_new_message_entry_id(agent, before_ids: set[str], role: str) -> str |
         if e.type == _tree.MESSAGE and (e.data.get("message") or {}).get("role") == role:
             return e.id
     return None
+
+
+def _active_owned_shell_tasks(host, owner_agent_id: str):
+    manager = getattr(host, "task_manager", None)
+    if manager is None:
+        return []
+    return [
+        t for t in manager.list_tasks()
+        if t.kind == "shell"
+        and t.owner_agent_id == owner_agent_id
+        and t.status not in TERMINAL_TASK_STATUSES
+    ]
+
+
+def _adopt_owned_background_tasks(host, sub_agent, task_ids: set[str]) -> None:
+    if sub_agent is None or not task_ids:
+        return
+    host_tasks = getattr(host, "_background_tasks", None)
+    if host_tasks is None:
+        return
+    for task in list(getattr(sub_agent, "_background_tasks", set())):
+        if task.done():
+            continue
+        if getattr(task, "_nanocode_task_id", None) not in task_ids:
+            continue
+        if task not in host_tasks:
+            host_tasks.add(task)
+            task.add_done_callback(host_tasks.discard)
 
 
 def live_agent_profile(host) -> AgentProfile:
@@ -574,16 +603,6 @@ class SubAgentRunner:
                 host._session_mgr.get_leaf() if host._session_mgr is not None else None)
         except Exception:
             host._subagent_spawn_leaf[child_session_id] = None
-
-    def write_host_task_result(self, host, task_id: str, text: str) -> "str | None":
-        """Internal host job output -> tasks/<task_id>/result.md."""
-        try:
-            d = _session_v2.task_dir(host.session_id, task_id)
-            p = d / "result.md"
-            p.write_text(text or "", encoding="utf-8")
-            return str(p)
-        except Exception:
-            return None
 
     # ─── 前台 run 原语 + 终态信封（搬迁自 engine,host-driven）──────────────────
     async def await_subagent_run(self, sub_agent, prompt: str,
@@ -1181,6 +1200,25 @@ class SubAgentRunner:
         host.total_input_tokens += result["tokens"]["input"]
         host.total_output_tokens += result["tokens"]["output"]
         text = result["text"] or ""
+        active_shell_tasks = _active_owned_shell_tasks(host, agent_id)
+        if active_shell_tasks:
+            task_ids = ", ".join(t.id for t in active_shell_tasks)
+            _adopt_owned_background_tasks(host, sub_agent, {t.id for t in active_shell_tasks})
+            msg = (
+                "Sub-agent left background shell task(s) still running: "
+                f"{task_ids}. Use task_output/task_stop or /tasks to inspect or stop them."
+            )
+            result_text = f"{text}\n\n{msg}" if text else msg
+            self.finish_run_record(
+                host,
+                sub_agent=sub_agent, status="failed", result_text=result_text,
+                tokens=result["tokens"], error=msg)
+            host._close_child_session(agent_id, sub_agent)
+            host.emit(NoticeRaised(
+                text=f"Background sub-agent run {agent_id} failed: {description}",
+                level="warn"))
+            _ended("failed", tokens=result["tokens"])
+            return
         self.finish_run_record(
             host,
             sub_agent=sub_agent, status="completed", result_text=text, tokens=result["tokens"],

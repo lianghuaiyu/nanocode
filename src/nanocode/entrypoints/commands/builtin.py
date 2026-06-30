@@ -208,8 +208,8 @@ async def _agents(ctx: CommandContext, args: str) -> "Control | Local":
         return Local(output=ctx.thread.agents_overview())
     elif sub == "available":
         if ctx.interactive and ctx.selector_host is not None:
-            from ...tui.session_pages.agents import view_agent_text
-            await view_agent_text(ctx.selector_host, "Agent types", ctx.thread.agent_definitions())
+            from ...tui.session_pages.agents import view_agent_definitions
+            await view_agent_definitions(ctx.thread, host=ctx.selector_host)
             return Local()
         return Local(output=ctx.thread.agent_definitions())
     elif sub == "running":

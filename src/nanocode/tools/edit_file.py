@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .shared import _normalize_quotes, _find_actual_string, _generate_diff
+from .shared import _find_actual_string, _generate_diff
 
 SCHEMA = {
     "name": "edit_file",

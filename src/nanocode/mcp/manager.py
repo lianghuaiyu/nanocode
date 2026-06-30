@@ -21,6 +21,18 @@ class McpManager:
         self._connections: dict[str, McpConnection] = {}
         self._tools: list[dict] = []
         self._connected = False
+        self._extension_servers: dict[str, dict] = {}
+
+    def add_extension_servers(self, specs: "dict[str, dict]") -> None:
+        """Merge extension-declared MCP server specs before first connect (docs/26 G6).
+
+        Untrusted declarative extensions reach execution only through an out-of-process
+        MCP server; the host feeds their specs here at RuntimeServices bootstrap, before
+        the lazy first-turn `load_and_connect`. Calling this after connect is a wiring
+        bug → fail loud (the one-shot connect already happened)."""
+        if self._connected:
+            raise RuntimeError("add_extension_servers must run before load_and_connect")
+        self._extension_servers.update(specs)
 
     async def load_and_connect(self, notify=None) -> None:
         """Read settings, connect to all configured MCP servers, discover tools.
@@ -70,10 +82,6 @@ class McpManager:
             for t in self._tools
         ]
 
-    def is_mcp_tool(self, name: str) -> bool:
-        """Check if a tool name is an MCP-prefixed tool."""
-        return name.startswith("mcp__")
-
     async def call_tool(self, prefixed_name: str, args: dict) -> str:
         """Route a prefixed tool call to the correct server."""
         parts = prefixed_name.split("__")
@@ -85,11 +93,6 @@ class McpManager:
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
         return await conn.call_tool(tool_name, args)
-
-    async def disconnect_all(self) -> None:
-        """Disconnect all servers."""
-        for conn in self._connections.values():
-            conn.close()
         self._connections.clear()
         self._tools.clear()
         self._connected = False
@@ -97,7 +100,10 @@ class McpManager:
     # ─── Config loading ──────────────────────────────────────
 
     def _load_configs(self) -> dict[str, dict]:
-        merged: dict[str, dict] = {}
+        # Extension-declared servers (docs/26 G6) are the lowest-priority base layer;
+        # user config files merge on top, so a user-config server wins on key collision
+        # (extension keys are id-namespaced, so collisions are unlikely anyway).
+        merged: dict[str, dict] = dict(self._extension_servers)
 
         # 1. Global: data_dir()/settings.json (= ~/.nanocode/settings.json)
         global_path = data_dir() / "settings.json"

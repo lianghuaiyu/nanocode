@@ -163,7 +163,6 @@ class AgentSession:
         return AgentLoopConfig(
             model=a.model, thinking_mode=a._thinking_mode,
             resolve_tools=lambda: get_active_tool_definitions(a.tools, registry=a._registry),
-            is_sub_agent=a.is_sub_agent,
             rebuild_snapshot=self.project_request,
             to_completion=a._provider.complete,
             record_provider_messages=self.record_provider_messages,
@@ -174,7 +173,6 @@ class AgentSession:
             persist_large_result=a._persist_large_result,
             check_budget=a._check_budget,
             bump_turn=bump_turn, note_api_call=note_api_call, add_usage=add_usage,
-            token_totals=lambda: (a.total_input_tokens, a.total_output_tokens),
             is_aborted=lambda: a._aborted,
             compact=self._compact_on_overflow,
             consume_context_break=consume_context_break,
@@ -1032,12 +1030,6 @@ class AgentSession:
         abandoned = self._abandoned_branch_entries(mgr.get_leaf(), target_id)
         return any(e.type in (_tree.MESSAGE, _tree.CUSTOM_MESSAGE, _tree.COMPACTION, _tree.BRANCH_SUMMARY)
                    for e in abandoned)
-
-    def _summary_text_for_entries(self, entries: list) -> str:
-        """Plain transcript for a branch-summary LLM request（兼容入口；Phase 7 收敛到
-        branch_summary.serialize_branch_conversation——带 tool-result 限长）。"""
-        from . import branch_summary as _bs
-        return _bs.serialize_branch_conversation(entries)
 
     async def move_to_with_branch_summary(self, target_id: "str | None",
                                           *, focus: "str | None" = None) -> list:

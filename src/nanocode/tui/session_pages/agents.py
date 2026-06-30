@@ -19,6 +19,12 @@ class RunItem:
     record: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class AgentTypeItem:
+    name: str
+    description: str = ""
+
+
 class AgentRunsModel(SelectorModel):
     def __init__(self, records: list[dict[str, Any]]) -> None:
         self._records = [RunItem(r) for r in records]
@@ -68,6 +74,36 @@ class AgentRunsModel(SelectorModel):
         return None
 
 
+class AgentTypesModel(SelectorModel):
+    def __init__(self, definitions_text: str) -> None:
+        self._items = _parse_agent_definitions(definitions_text)
+
+    def items(self) -> list[AgentTypeItem]:
+        return self._items
+
+    def border_accent(self) -> bool:
+        return True
+
+    def header_lines(self, width: int) -> list[str]:
+        return [
+            f"{_BOLD}Agent types{_RESET}",
+            f"{_DIM}Enter view · Esc back{_RESET}",
+        ]
+
+    def list_text(self, item: AgentTypeItem, selected: bool, width: int) -> str:
+        cursor = "› " if selected else "  "
+        body = cursor + item.name
+        if item.description:
+            body += f"  {item.description}"
+        return "  " + truncate_cells(body, max(1, width - 4))
+
+    def empty_text(self, width: int) -> str:
+        return "  No agent types found."
+
+    def max_visible(self, height: int) -> int:
+        return min(10, max(4, height - 8))
+
+
 class TextViewerModel(SelectorModel):
     def __init__(self, title: str, lines: list[str], *, hint: str = "Esc back") -> None:
         self._title = title
@@ -96,15 +132,34 @@ class TextViewerModel(SelectorModel):
 
 
 class ConversationModel(TextViewerModel):
-    def __init__(self, snapshot: dict[str, Any]) -> None:
+    def __init__(self, snapshot: dict[str, Any], *, snapshot_loader=None) -> None:
+        self._snapshot_loader = snapshot_loader
         self.record = snapshot["record"]
         self._stop_armed = False
-        lines = _conversation_lines(snapshot.get("messages") or [])
+        lines = _conversation_lines(snapshot)
         if not lines:
             lines = ["(waiting for first message...)"]
-        super().__init__(_conversation_title(self.record), lines, hint=self._hint())
+        super().__init__(_conversation_title(self.record), lines, hint=self._hint_text())
+
+    def _refresh_snapshot(self) -> None:
+        if self._snapshot_loader is None:
+            return
+        try:
+            snapshot = self._snapshot_loader()
+        except Exception:
+            return
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("record"), dict):
+            return
+        self.record = snapshot["record"]
+        lines = _conversation_lines(snapshot)
+        self._lines = lines or ["(waiting for first message...)"]
+
+    def items(self) -> list[str]:
+        self._refresh_snapshot()
+        return self._lines
 
     def header_lines(self, width: int) -> list[str]:
+        self._refresh_snapshot()
         status = str(self.record["status"])
         metrics = self.record.get("metrics") if isinstance(self.record.get("metrics"), dict) else {}
         stats = _stats(metrics)
@@ -120,7 +175,7 @@ class ConversationModel(TextViewerModel):
         pa = self.record.get("pending_approval")
         if isinstance(pa, dict):
             rows.append(f"⏸ awaiting approval: {pa.get('command', '')}")
-        rows.append(f"{_DIM}{self._hint()}{_RESET}")
+        rows.append(f"{_DIM}{self._hint_text()}{_RESET}")
         return rows
 
     def extra_keys(self) -> tuple[str, ...]:
@@ -140,7 +195,7 @@ class ConversationModel(TextViewerModel):
             return KeyResult("refresh")
         return None
 
-    def _hint(self) -> str:
+    def _hint_text(self) -> str:
         base = "↑↓ scroll · r resume · Esc back"
         if self.record.get("pending_approval"):
             base = "a approve · d deny · " + base
@@ -167,7 +222,7 @@ async def run_agents_page(thread, *, host) -> dict | None:
         if outcome.kind == "cancel":
             return None
         if outcome.item.value == "types":
-            await view_agent_text(host, "Agent types", thread.agent_definitions())
+            await view_agent_definitions(thread, host=host)
             continue
         result = await run_agent_runs(thread, host=host)
         if result is not None:
@@ -195,7 +250,13 @@ async def view_agent_conversation(thread, child_session_id: str, *, host) -> dic
     index: int | None = None
     while True:
         snapshot = thread.subagent_conversation_snapshot(child_session_id)
-        outcome: Outcome = await host.run_selector(ConversationModel(snapshot), initial_index=index)
+        outcome: Outcome = await host.run_selector(
+            ConversationModel(
+                snapshot,
+                snapshot_loader=lambda: thread.subagent_conversation_snapshot(child_session_id),
+            ),
+            initial_index=index,
+        )
         index = outcome.index
         if outcome.kind in {"cancel", "done"}:
             return None
@@ -213,12 +274,46 @@ async def view_agent_text(host, title: str, text: str) -> None:
     await host.run_selector(TextViewerModel(title, text.splitlines()))
 
 
+async def view_agent_definitions(thread, *, host) -> None:
+    index: int | None = None
+    while True:
+        definitions_text = thread.agent_definitions()
+        model = AgentTypesModel(definitions_text)
+        if not model.items():
+            await view_agent_text(host, "Agent types", definitions_text)
+            return
+        outcome: Outcome = await host.run_selector(model, initial_index=index)
+        index = outcome.index
+        if outcome.kind == "cancel":
+            return
+        if outcome.kind == "done" and outcome.item is not None:
+            detail = thread.agent_detail(outcome.item.name)
+            await view_agent_text(host, outcome.item.name, detail)
+
+
 def _ordered_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     active = [r for r in records if r["status"] in {"running", "queued"}]
     finished = [r for r in records if r["status"] not in {"running", "queued"}]
     active.sort(key=lambda r: r.get("started_at") or r.get("created_at") or "")
     finished.sort(key=lambda r: r.get("ended_at") or r.get("started_at") or "", reverse=True)
     return active + finished
+
+
+def _parse_agent_definitions(text: str) -> list[AgentTypeItem]:
+    items: list[AgentTypeItem] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.endswith(":"):
+            continue
+        left, sep, right = line.partition("—")
+        if not sep:
+            continue
+        name = left.strip()
+        if not name:
+            continue
+        desc = right.strip()
+        items.append(AgentTypeItem(name=name, description=desc))
+    return items
 
 
 def _record_id(rec: dict[str, Any]) -> str:
@@ -256,7 +351,9 @@ def _conversation_title(record: dict[str, Any]) -> str:
     return f"Sub-agent · {record['child_session_id']}"
 
 
-def _conversation_lines(messages: list[dict[str, Any]]) -> list[str]:
+def _conversation_lines(snapshot: dict[str, Any]) -> list[str]:
+    record = snapshot.get("record") if isinstance(snapshot.get("record"), dict) else {}
+    messages = snapshot.get("messages") or []
     lines: list[str] = []
     for msg in messages:
         role = msg.get("role")
@@ -271,6 +368,9 @@ def _conversation_lines(messages: list[dict[str, Any]]) -> list[str]:
                 lines.append(f"  [Tool: {tool}]")
         elif role == "toolResult" and text.strip():
             _append_section(lines, "[Result]", _truncate_block(text, 500))
+    error = str(record.get("error") or "").strip()
+    if error:
+        _append_section(lines, "[Error]", _truncate_block(error, 500))
     return lines
 
 

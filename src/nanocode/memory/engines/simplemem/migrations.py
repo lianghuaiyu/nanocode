@@ -86,11 +86,6 @@ def read_schema_state(root: Path):
         return _CORRUPT
 
 
-def read_schema_version(root: Path) -> "int | None":
-    state = read_schema_state(root)
-    return state[1] if isinstance(state, tuple) else None
-
-
 def write_schema_version(root: Path) -> None:
     import json
     root.mkdir(parents=True, exist_ok=True)

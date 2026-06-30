@@ -12,7 +12,7 @@ self-validated write (docs/22 §4.3 / §5.3).
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from .engines.simplemem.retrieval_config import FUSION_MODES, RetrievalConfig
 from .retrieval_eval import RetrievalEvalCase, RetrievalEvalResult, score_case

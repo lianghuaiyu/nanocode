@@ -6,8 +6,6 @@ prints. LLM/embedding are injected by the host.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from .config import SimpleMemConfig
 from .embeddings import Embedder
 from .llm import LlmClient

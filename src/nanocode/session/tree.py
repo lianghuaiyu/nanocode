@@ -47,7 +47,6 @@ LEAF = "leaf"
 LABEL = "label"
 SESSION_INFO = "session_info"
 PERMISSION_DECISION = "permission_decision"
-TASK_UPDATE = "task_update"
 TASK_EVENT = "task_event"
 SESSION_END = "session_end"
 # docs/14 Milestone B：把原本只进 wire 的派生遥测落进 canonical 树（trajectory 从树派生、不再读 wire）。

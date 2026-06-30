@@ -10,18 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# 可投影为 step 的关键动作类型（docs/10 step_type 的稳定子集）。
-STEP_TYPES = frozenset({
-    "llm_decision",
-    "tool_action",
-    "approval",
-    "compaction",
-    "final",
-})
-
-# 风险分级（docs/10 risk_level）。
-RISK_LEVELS = frozenset({"low", "medium", "high"})
-
 
 def step_id(agent_id: str, seq: int) -> str:
     """确定性 step id：``step_{agent_id}_{seq}``（与 event_id 同构，便于关联 wire seq）。"""

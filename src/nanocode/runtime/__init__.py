@@ -6,7 +6,6 @@ does not also import the in-process facade and agent session machinery.
 
 _FACADE_EXPORTS = {
     "AgentConfig",
-    "AgentResult",
     "AgentRuntime",
     "ApprovalManager",
     "ApprovalRequest",

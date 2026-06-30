@@ -60,6 +60,19 @@ def _find_tool(state: TuiState, tool_use_id: str) -> ToolItem | None:
     return None
 
 
+def _owner_ui_active(state: TuiState) -> bool:
+    return (
+        state.selector is not None
+        or state.text_prompt is not None
+        or state.plan_modal is not None
+    )
+
+
+def _set_activity_mode(state: TuiState, mode: str) -> None:
+    if not _owner_ui_active(state):
+        state.mode = mode
+
+
 def reduce(state: TuiState, env: dict) -> TuiState:
     kind = env.get("type")
     event = env.get("event")
@@ -69,7 +82,7 @@ def reduce(state: TuiState, env: dict) -> TuiState:
         state.timeline.append(UserItem(text=_g(event, "text", "")))
 
     elif kind == "llm_request_prepared":
-        state.mode = "running"
+        _set_activity_mode(state, "running")
         model = _g(event, "model")
         if model:
             state.status.model = model
@@ -186,8 +199,9 @@ def reduce(state: TuiState, env: dict) -> TuiState:
         )
 
     elif kind == "turn_completed":
-        state.mode = "idle"
-        state.modal = None
+        if not _owner_ui_active(state):
+            state.mode = "idle"
+            state.modal = None
         state.status.input_tokens = _g(event, "input_tokens", state.status.input_tokens) or 0
         state.status.output_tokens = _g(event, "output_tokens", state.status.output_tokens) or 0
         cost = _g(event, "cost_usd")
@@ -196,8 +210,9 @@ def reduce(state: TuiState, env: dict) -> TuiState:
         state.active_tools.clear()
 
     elif kind == "turn_aborted":
-        state.mode = "idle"
-        state.modal = None
+        if not _owner_ui_active(state):
+            state.mode = "idle"
+            state.modal = None
         # 中断时仍在跑的工具标记 denied,使其成终态(可被提交进 scrollback,不卡 live)。
         for item in state.timeline:
             if isinstance(item, ToolItem) and item.status == "running":
@@ -206,7 +221,7 @@ def reduce(state: TuiState, env: dict) -> TuiState:
         state.active_tools.clear()
 
     elif kind == "error_raised":
-        state.mode = "error"
+        _set_activity_mode(state, "error")
         state.timeline.append(ErrorItem(text=_g(event, "message", "")))
 
     return state
@@ -217,5 +232,6 @@ def hydrate_status(state: TuiState, snapshot: dict) -> TuiState:
 
     timeline-from-messages 的完整 re-hydrate 属后续步骤（接 `state().messages`）；此处只收口 footer。"""
     state.status = StatusSnapshot.from_status(snapshot)
-    state.mode = "running" if state.status.is_processing else ("idle" if state.mode != "error" else "error")
+    if not _owner_ui_active(state):
+        state.mode = "running" if state.status.is_processing else ("idle" if state.mode != "error" else "error")
     return state

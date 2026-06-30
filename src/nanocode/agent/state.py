@@ -37,19 +37,6 @@ class ProviderProjection:
     messages: list[dict]
     system: str | None = None
 
-    @property
-    def is_openai(self) -> bool:
-        return self.provider == "openai"
-
-
-@dataclass
-class TurnState:
-    """一个 turn 内的瞬时状态（pending tool calls/results、context-break）。turn 结束即丢弃，不持久。"""
-
-    pending_tool_calls: list[dict] = field(default_factory=list)
-    pending_tool_results: list[dict] = field(default_factory=list)
-    context_break: bool = False
-
 
 @dataclass
 class AgentState:
@@ -79,8 +66,6 @@ class AgentState:
     # flags
     aborted: bool = False
     streaming: bool = False
-    # turn-local 瞬时态
-    turn: TurnState = field(default_factory=TurnState)
 
     # ── hydrate（tree → state，§3.2/§6）────────────────────────────────────────
     @classmethod

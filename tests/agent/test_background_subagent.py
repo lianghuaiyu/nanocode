@@ -3,11 +3,16 @@
 import asyncio
 import json
 import re
+import shlex
+import subprocess
+import sys
+import uuid
 
 import pytest
 
 from nanocode.agent.engine import Agent
 from nanocode.agent.events import ToolCallRequested, ToolResultObserved
+from nanocode.capabilities.sandbox import SandboxManager
 from nanocode.runs.models import TERMINAL_RUN_STATUSES
 from nanocode.runtime.spawn import _auto_deny_confirm
 from nanocode.subagents import run_record
@@ -62,6 +67,23 @@ def _run_id_from_started(text: str) -> str:
     m = re.search(r"run (sess_[A-Za-z0-9_]+)", text)
     assert m, text
     return m.group(1)
+
+
+def _process_table() -> str:
+    return subprocess.run(
+        ["ps", "-axo", "command"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+
+
+class _PassthroughNative:
+    def run_structured_plan(self, plan):
+        raise AssertionError("foreground native shell should use async argv execution")
+
+    def build_argv_from_plan(self, plan):
+        return ["/bin/sh", "-c", plan.command]
 
 
 # ─── Task 1：_build_sub_agent(background=...) ────────────────
@@ -152,6 +174,87 @@ def test_background_completes_and_fills_run_record_result():
     run_id, status = asyncio.run(scenario())
     assert status["status"] == "completed"
     assert "the bg output body" in run_record.read_result(run_id)
+
+
+def test_background_fails_when_subagent_leaves_shell_task_running():
+    parent = _agent()
+
+    def _run_once(sub):
+        async def _ro(prompt: str) -> dict:
+            if sub._session_mgr is not None:
+                sub.agent_session.record_provider_messages({"role": "user", "content": prompt})
+                sub.agent_session.record_provider_messages({"role": "assistant", "content": "child done"})
+            sub.task_manager.create_task(
+                "shell",
+                "sleep 90",
+                owner_agent_id=sub._tree_session_id,
+            )
+            return {"text": "child done", "tokens": {"input": 2, "output": 1}}
+        return _ro
+
+    _spy_build_with_stub(parent, run_once=_run_once)
+
+    async def scenario():
+        res = await parent._execute_agent_tool(
+            {"type": "coder", "description": "d",
+             "prompt": "p", "run_in_background": True})
+        run_id = _run_id_from_started(res)
+        return run_id, await _wait_run_terminal(run_id)
+
+    run_id, status = asyncio.run(scenario())
+    assert status["status"] == "failed"
+    assert "background shell task" in (status["error"] or "")
+    assert "task-001" in (status["error"] or "")
+    assert "child done" in run_record.read_result(run_id)
+    assert parent.task_manager.get_task("task-001").status == "running"
+
+
+def test_background_adopts_leftover_subagent_shell_task_for_parent_stop():
+    parent = _agent()
+    marker = f"nanocode_task_stop_marker_{uuid.uuid4().hex}"
+    command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)' {marker}"
+
+    def _run_once(sub):
+        async def _ro(prompt: str) -> dict:
+            await sub._spawn_background_shell(command, None)
+            for _ in range(100):
+                if marker in _process_table():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker in _process_table()
+            return {"text": "child done", "tokens": {"input": 2, "output": 1}}
+        return _ro
+
+    _spy_build_with_stub(parent, run_once=_run_once)
+
+    async def scenario():
+        try:
+            res = await parent._execute_agent_tool(
+                {"type": "coder", "description": "d",
+                 "prompt": "p", "run_in_background": True})
+            run_id = _run_id_from_started(res)
+            status = await _wait_run_terminal(run_id)
+            stop_result = await parent._execute_tool_call("task_stop", {"task_id": "task-001"})
+            for _ in range(100):
+                if marker not in _process_table():
+                    break
+                await asyncio.sleep(0.02)
+            return (
+                status,
+                stop_result,
+                parent.task_manager.get_task("task-001").status,
+                marker in _process_table(),
+            )
+        finally:
+            if marker in _process_table():
+                subprocess.run(["pkill", "-f", marker], check=False)
+
+    status, stop_result, task_status, marker_alive = asyncio.run(scenario())
+    assert status["status"] == "failed"
+    assert "background shell task" in (status["error"] or "")
+    assert "requested stop" in stop_result.lower()
+    assert task_status == "cancelled"
+    assert marker_alive is False
 
 
 def test_background_projects_child_tool_activity_to_run_record():
@@ -332,6 +435,54 @@ def test_background_cancelled_via_task_stop():
 
     run_id, status = asyncio.run(scenario())
     assert status["status"] == "cancelled"
+
+
+def test_background_cancel_stops_foreground_native_shell_process():
+    parent = _agent()
+    parent._sandbox = SandboxManager(
+        native_backend=_PassthroughNative(),
+        native_probe=lambda: True,
+        vm_probe=lambda: False,
+    )
+    marker = f"NANOCODE_BG_NATIVE_CANCEL_{uuid.uuid4().hex}"
+    command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)' {marker}"
+
+    def _run_once(sub):
+        async def _ro(prompt):
+            await sub._execute_tool_call("run_shell", {
+                "command": command,
+                "timeout": 60000,
+            })
+            return {"text": "never", "tokens": {"input": 0, "output": 0}}
+        return _ro
+
+    _spy_build_with_stub(parent, run_once=_run_once)
+
+    async def scenario():
+        try:
+            res = await parent._execute_agent_tool(
+                {"type": "coder", "description": "d",
+                 "prompt": "p", "run_in_background": True})
+            run_id = _run_id_from_started(res)
+            for _ in range(100):
+                if marker in _process_table():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker in _process_table()
+            await parent.run_cancel(run_id)
+            status = await _wait_run_terminal(run_id)
+            for _ in range(100):
+                if marker not in _process_table():
+                    break
+                await asyncio.sleep(0.02)
+            return status, marker in _process_table()
+        finally:
+            if marker in _process_table():
+                subprocess.run(["pkill", "-f", marker], check=False)
+
+    status, marker_alive = asyncio.run(scenario())
+    assert status["status"] == "cancelled"
+    assert marker_alive is False
 
 
 def test_background_timeout_marks_run_timed_out():

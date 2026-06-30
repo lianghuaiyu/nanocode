@@ -26,8 +26,7 @@ class SubAgentManager:
         """当前并发运行的后台子 agent 数（单账本 = child-owned run record，docs/25 A2）。
 
         所有后台子 agent（含 memory curator/eval）以 live coroutine 的 ``_nanocode_run_id`` +
-        child run record 为准。host task（后台 shell / 扩展任务）``owner_agent_id`` 恒为 None，
-        不计入子 agent 并发上限。
+        child run record 为准。host task（后台 shell / 扩展任务）不计入子 agent 并发上限。
         """
         n = 0
         for t in self.agent._background_tasks:

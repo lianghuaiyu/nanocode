@@ -28,7 +28,6 @@ class AgentLoopConfig:
     # 循环不再读 provider，故不在 config 上保留该死字段。
     model: str
     thinking_mode: str
-    is_sub_agent: bool
     # active-tool 解析器（G2）：每请求调用,读 agent registry 当前激活集（tool_search 可在 turn 内
     # 激活工具,故不是 turn-start 快照）。过滤逻辑 get_active_tool_definitions 由 ②b 在 _loop_config
     # 绑定（① adapter 不再 import ③ tools），① 收到的即最终请求工具表,直接发往 provider。
@@ -48,7 +47,6 @@ class AgentLoopConfig:
     bump_turn: Callable[[], None]
     note_api_call: Callable[[], None]
     add_usage: Callable[[int, int], None]
-    token_totals: Callable[[], tuple]
     # ── 控制流信号 ──
     is_aborted: Callable[[], bool]
     compact: Callable[[], Awaitable[None]]            # overflow 恢复（docs/16 #10）：压缩后重试一次

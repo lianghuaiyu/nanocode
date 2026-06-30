@@ -15,13 +15,13 @@ from .registry import Registry
 from .types import Command, CommandContext, CommandSpec, Local
 
 
-def _make_handler(ext_handler):
+def _make_handler(ext_handler, extension_id: str):
     async def _run(ctx: CommandContext, args: str) -> Local:
         thread = ctx.thread
         host = getattr(thread, "extension_host", None)
         if host is None or not host.is_active:
             return Local(output="memory evolution extension is not available for this session.")
-        ext_ctx = host.create_command_context()
+        ext_ctx = host.create_command_context(extension_id)
         out = await ext_handler(ext_ctx, args)
         return Local(output=out if isinstance(out, str) else (out or ""))
     return _run
@@ -37,7 +37,7 @@ def merge_system_extension_commands(registry: Registry) -> "object":
 
     host = ExtensionHost.load_system_extensions().activate_all()
     builtin_names = {s.name for s in registry.specs()}
-    for contribution, ext_handler in host.command_contributions():
+    for contribution, ext_handler, extension_id in host.command_contributions():
         if contribution.name in builtin_names:
             raise ExtensionLoadError(
                 f"extension command {contribution.name!r} collides with a "
@@ -46,5 +46,5 @@ def merge_system_extension_commands(registry: Registry) -> "object":
             name=contribution.name, kind="local",
             description=contribution.description, arg_hint=contribution.arg_hint,
             match=contribution.match, source="extension")
-        registry.register(Command(spec, _make_handler(ext_handler)))
+        registry.register(Command(spec, _make_handler(ext_handler, extension_id)))
     return host

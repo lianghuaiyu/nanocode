@@ -34,16 +34,22 @@ def test_activate_does_not_touch_memory_service(monkeypatch):
     monkeypatch.setattr(svc.MemoryService, "__init__", _boom)
     h = ExtensionHost.load_system_extensions().activate_all()
     assert h.is_active is False
-    assert "/memory optimize" in {c.name for c, _ in h.command_contributions()}
+    assert "/memory optimize" in {c.name for c, _h, _eid in h.command_contributions()}
 
 
 def test_activate_registers_expected_contributions():
     h = ExtensionHost.load_system_extensions().activate_all()
-    assert {c.name for c, _ in h.command_contributions()} == {
+    assert {c.name for c, _h, _eid in h.command_contributions()} == {
         "/memory optimize", "/memory eval generate"}
     assert "memory_optimize" in h.registry.task_kinds
     assert "memory_diagnosis" in h.registry.model_roles
     assert "memory-retrieval-diagnostician" in h.registry.hidden_agents
+
+
+def test_command_contributions_carry_extension_id():
+    h = ExtensionHost.load_system_extensions().activate_all()
+    for _c, _handler, ext_id in h.command_contributions():
+        assert ext_id == "nanocode.memory_evolution"
 
 
 def test_run_task_before_bind_fails_loud():
@@ -126,3 +132,44 @@ def test_model_role_resolves_host_and_env(monkeypatch):
     assert router.resolve("r") == "claude-opus"
     monkeypatch.setenv("X_MODEL", "small-model")
     assert router.resolve("r") == "small-model"
+
+
+# ── docs/26 G6: untrusted extensions are declarative-only / out-of-process ──
+
+def test_activate_all_skips_untrusted():
+    from nanocode.extensions.host import ExtensionHost as _H
+    from nanocode.extensions.manifest import (
+        ExtensionContributes, ExtensionManifest, McpServerSpec,
+    )
+    untrusted = ExtensionManifest(
+        id="acme.tools", kind="untrusted",
+        contributes=ExtensionContributes(mcp_servers=(McpServerSpec("files", "echo"),)))
+    h = _H([untrusted] + _H.load_system_extensions().manifests).activate_all()
+    # untrusted contributes NOTHING in-process (no entrypoint resolved, no activate)
+    contributing_ids = (
+        {rc.extension_id for rc in h.registry.commands.values()}
+        | {e for _hd, e in h.registry.task_kinds.values()}
+        | {e for _p, e in h.registry.hidden_agents.values()})
+    assert "acme.tools" not in contributing_ids
+
+
+def test_mcp_contributions_namespaced_no_double_underscore():
+    from nanocode.extensions.host import ExtensionHost as _H
+    from nanocode.extensions.manifest import (
+        ExtensionContributes, ExtensionManifest, McpServerSpec,
+    )
+    untrusted = ExtensionManifest(
+        id="acme.tools", kind="untrusted",
+        contributes=ExtensionContributes(mcp_servers=(
+            McpServerSpec("files", "echo", args=("x",), env=(("A", "1"),)),)))
+    h = _H([untrusted]).activate_all()
+    contribs = h.mcp_contributions()
+    assert len(contribs) == 1
+    key = next(iter(contribs))
+    assert "__" not in key  # MCP tool-name split on __ would mis-route otherwise
+    assert contribs[key] == {"command": "echo", "args": ["x"], "env": {"A": "1"}}
+
+
+def test_system_extensions_contribute_no_mcp_servers():
+    h = ExtensionHost.load_system_extensions().activate_all()
+    assert h.mcp_contributions() == {}

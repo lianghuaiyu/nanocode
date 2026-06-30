@@ -15,6 +15,9 @@ from nanocode.extensions.context import SpawnCap
 from nanocode.extensions.errors import ExtensionRuntimeError
 from nanocode.extensions.memory_evolution.manifest import MEMORY_DIAGNOSTICIAN_TYPE
 
+_MEMORY_EVOLUTION = "nanocode.memory_evolution"
+_ORCHESTRATION = "nanocode.orchestration"
+
 
 class _FakeThread:
     def __init__(self):
@@ -37,19 +40,25 @@ def _bound_system_host():
     return host, thread
 
 
-def test_spawn_cap_granted_to_capability_extension():
+def test_spawn_cap_scoped_per_extension():
+    """docs/26 G6 Tier 2: each extension's ctx carries ONLY its own caps.
+
+    memory_evolution → reserved diagnostician, NOT orchestrate.
+    orchestration    → orchestrate primitives, NO reserved agents."""
     host, _thread = _bound_system_host()
-    ctx = host.create_context()
-    assert isinstance(ctx.spawn, SpawnCap)
-    # memory_evolution 声明 spawn:reserved 且贡献 diagnostician → 仅它在授予集。
-    assert ctx.spawn._allowed == frozenset({MEMORY_DIAGNOSTICIAN_TYPE})
-    # orchestration 扩展声明 spawn:orchestrate → 同一槽也解锁编排原语（docs/26 §0.6 阶段1）。
-    assert ctx.spawn._can_orchestrate is True
+    mem = host.create_context(_MEMORY_EVOLUTION)
+    assert isinstance(mem.spawn, SpawnCap)
+    assert mem.spawn._allowed == frozenset({MEMORY_DIAGNOSTICIAN_TYPE})
+    assert mem.spawn._can_orchestrate is False
+    orc = host.create_context(_ORCHESTRATION)
+    assert isinstance(orc.spawn, SpawnCap)
+    assert orc.spawn._allowed == frozenset()
+    assert orc.spawn._can_orchestrate is True
 
 
 def test_spawn_cap_reserved_delegates_to_kernel():
     host, thread = _bound_system_host()
-    ctx = host.create_context()
+    ctx = host.create_context(_MEMORY_EVOLUTION)
     out = asyncio.run(ctx.spawn.reserved(MEMORY_DIAGNOSTICIAN_TYPE, "diagnose", model="m", timeout_ms=50))
     assert out == f"reserved:{MEMORY_DIAGNOSTICIAN_TYPE}"
     assert thread.calls == [(MEMORY_DIAGNOSTICIAN_TYPE, "diagnose", "m", 50)]
@@ -57,7 +66,7 @@ def test_spawn_cap_reserved_delegates_to_kernel():
 
 def test_spawn_cap_rejects_non_granted_type():
     host, _thread = _bound_system_host()
-    ctx = host.create_context()
+    ctx = host.create_context(_MEMORY_EVOLUTION)
     with pytest.raises(ExtensionRuntimeError):
         asyncio.run(ctx.spawn.reserved("coder", "escalate pls"))
 
@@ -69,16 +78,16 @@ def test_spawn_cap_signature_has_no_tools_or_sandbox():
 
 
 def test_no_spawn_cap_without_capability():
-    # 无任何声明 spawn:reserved 的扩展 → ctx.spawn is None。
+    # 无任何声明 spawn:reserved/orchestrate 的扩展 → ctx.spawn is None。
     host = ExtensionHost([]).activate_all()
     host.bind_runtime(_FakeThread(), None)
-    ctx = host.create_context()
+    ctx = host.create_context("nonexistent.extension")
     assert ctx.spawn is None
 
 
 def test_stale_spawn_cap_fails_loud():
     host, _thread = _bound_system_host()
-    ctx = host.create_context()
+    ctx = host.create_context(_MEMORY_EVOLUTION)
     host.invalidate("dispose")
     with pytest.raises(ExtensionRuntimeError):
         asyncio.run(ctx.spawn.reserved(MEMORY_DIAGNOSTICIAN_TYPE, "p"))

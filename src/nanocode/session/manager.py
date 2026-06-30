@@ -14,7 +14,6 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from ..paths import sessions_dir
 from . import context, tree

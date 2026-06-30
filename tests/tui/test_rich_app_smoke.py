@@ -21,7 +21,14 @@ def _env(event):
 
 
 class FakeThread:
-    def __init__(self, *, block: bool = False, emit_delta: bool = True, final_text: str = "hi"):
+    def __init__(
+        self,
+        *,
+        block: bool = False,
+        emit_delta: bool = True,
+        final_text: str = "hi",
+        subagent_records: list[dict] | None = None,
+    ):
         self._listeners = []
         self.is_processing = False
         self.session_id = "fake123"
@@ -32,6 +39,7 @@ class FakeThread:
         self.transcript_messages = []
         self.emit_delta = emit_delta
         self.final_text = final_text
+        self.subagent_records = list(subagent_records or [])
 
     def status(self):
         return {"session_id": "fake123", "cwd": "/repo", "session_name": "Fake", "input_tokens": 0,
@@ -45,7 +53,7 @@ class FakeThread:
         return s
 
     def subagent_widget_snapshot(self):
-        return []
+        return list(self.subagent_records)
 
     def subscribe(self, l):
         self._listeners.append(l)
@@ -92,6 +100,25 @@ def _render(app: RichApp, con: Console) -> str:
     return con.file.getvalue()
 
 
+def _running_subagent_record() -> dict:
+    return {
+        "status": "running",
+        "description": "background sleep",
+        "agent_type": "coder",
+        "started_at": "2026-06-29T15:00:00Z",
+        "metrics": {
+            "toolUses": 1,
+            "currentTool": "run_shell",
+            "activeTools": [
+                {
+                    "tool": "run_shell",
+                    "inputSummary": "{\"command\": \"sleep 600\"}",
+                }
+            ],
+        },
+    }
+
+
 def test_submit_runs_turn_and_reduces():
     async def scenario():
         r, w = os.pipe()
@@ -132,6 +159,29 @@ def test_bind_thread_clears_live_timeline_residue():
     assert any(isinstance(i, SessionBoundaryItem) for i in app.state.timeline)
 
 
+def test_run_turn_surfaces_submit_exceptions():
+    from nanocode.tui.state import ErrorItem
+
+    async def scenario():
+        con = _console()
+        app = RichApp(output=con)
+        app.bind_thread(FakeThread())
+
+        async def submit(_text):
+            raise RuntimeError("selector exploded")
+
+        app.set_submit_handler(submit)
+        app.state.mode = "running"
+        await app._run_turn("boom")
+        return app, con
+
+    app, con = asyncio.run(scenario())
+
+    assert app.state.mode == "idle"
+    assert any(isinstance(i, ErrorItem) and i.text == "selector exploded" for i in app.state.timeline)
+    assert "Error: selector exploded" in con.file.getvalue()
+
+
 def test_session_switch_notice_commits_above_without_live_residue():
     from nanocode.tui.state import NoticeItem
 
@@ -141,8 +191,45 @@ def test_session_switch_notice_commits_above_without_live_residue():
     app.on_event(_env(E.NoticeRaised(text="Session → abc12345 (34 messages).")))
 
     out = con.file.getvalue()
-    assert "Session → abc12345 (34 messages)." in out
+    assert out.count("Session → abc12345 (34 messages).") == 1
     assert not any(isinstance(i, NoticeItem) and i.text.startswith("Session → ") for i in app.state.timeline)
+
+
+def test_session_switch_notice_from_runtime_dict_does_not_enter_live_timeline():
+    from nanocode.tui.state import NoticeItem
+
+    con = _console()
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    app.on_event({
+        "thread_id": "t",
+        "session_id": "abc12345",
+        "seq": 1,
+        "type": "notice_raised",
+        "event": {
+            "text": "Session → abc12345 (34 messages).",
+            "level": "info",
+            "kind": "notice_raised",
+        },
+    })
+
+    out = con.file.getvalue()
+    assert out.count("Session → abc12345 (34 messages).") == 1
+    assert not any(isinstance(i, NoticeItem) and i.text.startswith("Session → ") for i in app.state.timeline)
+
+
+def test_background_subagent_terminal_notice_prints_once_without_live_residue():
+    from nanocode.tui.state import NoticeItem
+
+    con = _console()
+    app = RichApp(output=con)
+    app.bind_thread(FakeThread())
+    text = "Background sub-agent run sess_abc completed: UI smoke"
+    app.on_event(_env(E.NoticeRaised(text=text)))
+
+    out = con.file.getvalue()
+    assert out.count(text) == 1
+    assert not any(isinstance(i, NoticeItem) and i.text == text for i in app.state.timeline)
 
 
 def test_regular_notice_stays_in_live_timeline():
@@ -184,6 +271,159 @@ def test_ctrl_c_aborts_running_turn_without_exit():
     assert aborted == 1
     assert alive is True
     assert app.state.mode == "idle"
+
+
+def test_background_widget_alone_does_not_need_periodic_refresh():
+    async def scenario():
+        app = RichApp(output=_console())
+        app.bind_thread(FakeThread(subagent_records=[_running_subagent_record()]))
+
+        background_only = app._needs_periodic_refresh()
+        app._turn_task = asyncio.create_task(asyncio.sleep(10))
+        try:
+            foreground_turn = app._needs_periodic_refresh()
+        finally:
+            app._turn_task.cancel()
+            try:
+                await app._turn_task
+            except asyncio.CancelledError:
+                pass
+            app._turn_task = None
+        return background_only, foreground_turn
+
+    background_only, foreground_turn = asyncio.run(scenario())
+    assert background_only is False
+    assert foreground_turn is True
+
+
+def test_selector_suppresses_foreground_periodic_refresh():
+    from nanocode.tui.selector import ChoiceItem, ChoiceModel
+    from nanocode.tui.state import SelectorState
+
+    async def scenario():
+        app = RichApp(output=_console())
+        app.bind_thread(FakeThread())
+        app._turn_task = asyncio.create_task(asyncio.sleep(10))
+        try:
+            model = ChoiceModel(
+                "Actions",
+                [ChoiceItem(label="Open", value="open")],
+            )
+            app.state.selector = SelectorState(model=model, index=0)
+            selector_active = app._needs_periodic_refresh()
+
+            app.state.selector = None
+            foreground_turn = app._needs_periodic_refresh()
+        finally:
+            app._turn_task.cancel()
+            try:
+                await app._turn_task
+            except asyncio.CancelledError:
+                pass
+            app._turn_task = None
+        return selector_active, foreground_turn
+
+    selector_active, foreground_turn = asyncio.run(scenario())
+    assert selector_active is False
+    assert foreground_turn is True
+
+
+def test_selector_close_during_foreground_turn_skips_intermediate_running_refresh():
+    from nanocode.tui.selector import ChoiceItem, ChoiceModel
+
+    class RecordingApp(RichApp):
+        def __init__(self):
+            super().__init__(output=_console())
+            self.refreshes: list[tuple[str, bool]] = []
+
+        def _refresh(self) -> None:
+            self.refreshes.append((self.state.mode, self.state.selector is not None))
+
+    async def scenario():
+        app = RecordingApp()
+        app._loop = asyncio.get_running_loop()
+        app._turn_task = asyncio.create_task(asyncio.sleep(10))
+        try:
+            model = ChoiceModel("Actions", [ChoiceItem("Open", "open")])
+            selector_task = asyncio.create_task(app.run_selector(model))
+            await asyncio.sleep(0)
+            app._dispatch_selector("escape")
+            outcome = await asyncio.wait_for(selector_task, timeout=3)
+            return outcome, app.refreshes
+        finally:
+            app._turn_task.cancel()
+            try:
+                await app._turn_task
+            except asyncio.CancelledError:
+                pass
+
+    outcome, refreshes = asyncio.run(scenario())
+
+    assert outcome.kind == "cancel"
+    assert ("selector", True) in refreshes
+    assert ("running", False) not in refreshes
+
+
+def test_selector_close_inside_owner_turn_defers_mouse_tracking_until_turn_end():
+    from nanocode.tui.selector import ChoiceItem, ChoiceModel
+
+    class RecordingApp(RichApp):
+        def __init__(self):
+            super().__init__(output=_console())
+            self.mouse_tracking_calls: list[bool] = []
+
+        def _mouse_tracking(self, enabled: bool) -> None:
+            self.mouse_tracking_calls.append(enabled)
+
+    async def scenario():
+        app = RecordingApp()
+        app._loop = asyncio.get_running_loop()
+        app.bind_thread(FakeThread())
+
+        async def submit(_text: str):
+            model = ChoiceModel("Actions", [ChoiceItem("Open", "open")])
+            app._loop.call_soon(app._dispatch_selector, "escape")
+            await app.run_selector(model)
+            assert app._selector_mouse_defer_disable is True
+            assert app.mouse_tracking_calls == [True]
+
+        app.set_submit_handler(submit)
+        app._submit("open selector")
+        await asyncio.wait_for(app._turn_task, timeout=3)
+        return app.mouse_tracking_calls, app._selector_mouse_defer_disable
+
+    mouse_calls, deferred = asyncio.run(scenario())
+
+    assert mouse_calls == [True, False]
+    assert deferred is False
+
+
+def test_idle_background_widget_still_accepts_input_submission():
+    async def scenario():
+        r, w = os.pipe()
+        app = RichApp(input=r, output=_console())
+        thread = FakeThread(subagent_records=[_running_subagent_record()])
+        app.bind_thread(thread)
+        calls = []
+
+        async def submit(text: str):
+            calls.append(text)
+
+        app.set_submit_handler(submit)
+        task = asyncio.create_task(app.run())
+        await asyncio.sleep(0.05)
+        os.write(w, b"/agents running\r")
+        await asyncio.sleep(0.15)
+        os.write(w, b"\x04")
+        await asyncio.wait_for(task, timeout=3)
+        os.close(w)
+        try:
+            os.close(r)
+        except OSError:
+            pass
+        return calls
+
+    assert asyncio.run(scenario()) == ["/agents running"]
 
 
 def test_chinese_input_then_submit():

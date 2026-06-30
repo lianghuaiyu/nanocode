@@ -3,12 +3,6 @@ import sys
 from nanocode.mcp import McpManager, McpConnection
 
 
-def test_is_mcp_tool():
-    m = McpManager()
-    assert m.is_mcp_tool("mcp__srv__do") is True
-    assert m.is_mcp_tool("read_file") is False
-
-
 def test_tool_definitions_prefix():
     m = McpManager()
     m._tools = [{"name": "echo", "description": "d",
@@ -32,3 +26,20 @@ def test_echo_server_integration():
     names, out = asyncio.run(go())
     assert "echo" in names
     assert out == "hi"
+
+
+# ── docs/26 G6: extension-declared MCP servers (out-of-process tier) ─────────
+
+def test_add_extension_servers_merges_before_connect():
+    m = McpManager()
+    m.add_extension_servers({"acme-tools-files": {"command": "echo", "args": ["x"]}})
+    cfgs = m._load_configs()
+    assert cfgs.get("acme-tools-files") == {"command": "echo", "args": ["x"]}
+
+
+def test_add_extension_servers_after_connect_raises():
+    import pytest
+    m = McpManager()
+    m._connected = True  # simulate post-first-turn connect
+    with pytest.raises(RuntimeError):
+        m.add_extension_servers({"x": {"command": "echo"}})

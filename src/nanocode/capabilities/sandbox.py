@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -636,10 +637,10 @@ class SandboxManager:
         if isinstance(plan, SandboxDeny):
             return f"[sandbox] {plan.reason}"
         if plan.backend is SandboxBackend.HOST:
-            return self._host_text(plan)
+            return await self._host_text_async(plan)
         if plan.backend is SandboxBackend.NATIVE:
-            return self._native_text(plan)
-        return self._vm_text(plan)
+            return await self._native_text_async(plan)
+        return await asyncio.to_thread(self._vm_text, plan)
 
     async def execute_structured(
         self,
@@ -656,14 +657,10 @@ class SandboxManager:
             return {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False,
                     "error": None, "blocked": plan.reason}
         if plan.backend is SandboxBackend.NATIVE:
-            backend = self._native()
-            if backend is None:
-                return {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False,
-                        "error": None, "blocked": "native OS sandbox unavailable"}
-            return backend.run_structured_plan(plan)
+            return await self._native_structured_async(plan)
         if plan.backend is SandboxBackend.MICROVM:
-            return self._vm().run_plan(plan)
-        return _host_structured(plan)
+            return await asyncio.to_thread(self._vm().run_plan, plan)
+        return await _host_structured_async(plan)
 
     async def execute_background(
         self,
@@ -702,10 +699,12 @@ class SandboxManager:
                     env = dict(os.environ)
                     env["TMPDIR"] = os.environ.get("TMPDIR") or "/tmp"
                     proc = await asyncio.create_subprocess_exec(
-                        *argv, stdout=fo, stderr=fe, cwd=str(plan.cwd), env=env)
+                        *argv, stdout=fo, stderr=fe, cwd=str(plan.cwd), env=env,
+                        start_new_session=True)
                 else:  # HOST
                     proc = await asyncio.create_subprocess_shell(
-                        plan.command, stdout=fo, stderr=fe, cwd=str(plan.cwd))
+                        plan.command, stdout=fo, stderr=fe, cwd=str(plan.cwd),
+                        start_new_session=True)
                 timeout_s = (plan.timeout_ms / 1000) if plan.timeout_ms else None
                 try:
                     if timeout_s is not None:
@@ -727,17 +726,31 @@ class SandboxManager:
 
     # ── backend 文本编排（机制失败 vs 命令失败 区分，但都不自动扩权）──
 
-    def _native_text(self, plan: SandboxPlan) -> str:
-        backend = self._native()
-        if backend is None:
+    async def _native_text_async(self, plan: SandboxPlan) -> str:
+        r = await self._native_structured_async(plan)
+        if r.get("blocked"):
             return "[sandbox] native OS sandbox unavailable on this host. " + _NO_BACKEND_HINT
-        r = backend.run_structured_plan(plan)
         if r["error"] is not None:
             return ("[sandbox] native OS sandbox failed to run this command "
                     f"({r['error']}). " + _NO_BACKEND_HINT)
         if r["timed_out"] or r["exit_code"] != 0:
             return f"{_NATIVE_FAIL_HINT}\n\n{_format_structured(r, plan.timeout_ms)}"
         return r["stdout"] or "(no output)"
+
+    async def _native_structured_async(self, plan: SandboxPlan) -> dict:
+        """Run native sandbox commands through an async process so cancellation kills children."""
+        backend = self._native()
+        if backend is None:
+            return {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False,
+                    "error": None, "blocked": "native OS sandbox unavailable"}
+        try:
+            argv = backend.build_argv_from_plan(plan)
+        except Exception as e:
+            return {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False,
+                    "error": str(e)}
+        env = dict(os.environ)
+        env["TMPDIR"] = os.environ.get("TMPDIR") or "/tmp"
+        return await _exec_argv_structured_async(argv, plan, env=env)
 
     def _vm_text(self, plan: SandboxPlan) -> str:
         adapter = self._vm()
@@ -749,8 +762,8 @@ class SandboxManager:
             return f"{_VM_FAIL_HINT}\n\n{_format_structured(r, plan.timeout_ms)}"
         return r["stdout"] or "(no output)"
 
-    def _host_text(self, plan: SandboxPlan) -> str:
-        r = _host_structured(plan)
+    async def _host_text_async(self, plan: SandboxPlan) -> str:
+        r = await _host_structured_async(plan)
         if r["error"] is not None:
             return f"Error: {r['error']}"
         return _format_structured(r, plan.timeout_ms)
@@ -767,10 +780,77 @@ def _format_structured(r: dict, timeout_ms: int) -> str:
     return r["stdout"] or "(no output)"
 
 
-def _host_structured(plan: SandboxPlan) -> dict:
-    """宿主裸跑 plan.command（仅 escalate/danger 经审批后抵达）。"""
-    return exec_host_command(plan.command, cwd=str(plan.cwd),
-                             timeout_ms=plan.timeout_ms, stdin=plan.stdin)
+async def _host_structured_async(plan: SandboxPlan) -> dict:
+    """宿主裸跑 plan.command（async 版本，避免前台 shell 阻塞 TUI 事件循环）。"""
+    out = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False, "error": None}
+    proc = None
+    try:
+        stdin_pipe = asyncio.subprocess.PIPE if plan.stdin is not None else None
+        proc = await asyncio.create_subprocess_shell(
+            plan.command,
+            stdin=stdin_pipe,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(plan.cwd),
+            start_new_session=True,
+        )
+        input_bytes = plan.stdin.encode() if plan.stdin is not None else None
+        timeout_s = (plan.timeout_ms / 1000) if plan.timeout_ms else None
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input_bytes), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            out["timed_out"] = True
+            await _terminate_then_kill(proc)
+            return out
+        out["exit_code"] = proc.returncode
+        out["stdout"] = stdout_b.decode(errors="replace") if stdout_b else ""
+        out["stderr"] = stderr_b.decode(errors="replace") if stderr_b else ""
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _terminate_then_kill(proc)
+        raise
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+async def _exec_argv_structured_async(
+    argv: list[str],
+    plan: SandboxPlan,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict:
+    out = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": False, "error": None}
+    proc = None
+    try:
+        stdin_pipe = asyncio.subprocess.PIPE if plan.stdin is not None else None
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=stdin_pipe,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(plan.cwd),
+            env=env,
+            start_new_session=True,
+        )
+        input_bytes = plan.stdin.encode() if plan.stdin is not None else None
+        timeout_s = (plan.timeout_ms / 1000) if plan.timeout_ms else None
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input_bytes), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            out["timed_out"] = True
+            await _terminate_then_kill(proc)
+            return out
+        out["exit_code"] = proc.returncode
+        out["stdout"] = stdout_b.decode(errors="replace") if stdout_b else ""
+        out["stderr"] = stderr_b.decode(errors="replace") if stderr_b else ""
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _terminate_then_kill(proc)
+        raise
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def exec_host_command(command: str, *, cwd: str, timeout_ms: int,
@@ -794,15 +874,28 @@ def exec_host_command(command: str, *, cwd: str, timeout_ms: int,
 
 
 async def _terminate_then_kill(proc, grace_s: float = 3.0) -> None:
+    pgid = None
+    if hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return
+
+    def _signal(sig: int) -> None:
+        if pgid is not None:
+            os.killpg(pgid, sig)
+        else:
+            proc.send_signal(sig)
+
     try:
-        proc.terminate()
+        _signal(signal.SIGTERM)
     except ProcessLookupError:
         return
     try:
         await asyncio.wait_for(proc.wait(), timeout=grace_s)
     except asyncio.TimeoutError:
         try:
-            proc.kill()
+            _signal(signal.SIGKILL)
         except ProcessLookupError:
             pass
         await proc.wait()

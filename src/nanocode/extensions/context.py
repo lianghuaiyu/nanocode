@@ -7,8 +7,11 @@ Mirrors Pi's `ExtensionContext` / `ExtensionCommandContext` split:
 - a context bound to a host that has since been invalidated (session
   replacement / teardown) is **stale**: mutating capabilities fail loud
   (`ExtensionRuntimeError`) instead of writing the wrong session (docs/22 §9.1.6).
-- the session view is read-only; the context never exposes the raw `Agent`,
-  `_session_mgr`, or `_background_tasks`.
+- the session view is read-only; the context never exposes the raw `RuntimeThread`
+  / `Agent` / `_session_mgr` / `_background_tasks`. Every capability is a narrow,
+  individually-bound view (spawn / approvals / workspace / memory_evolution /
+  tasks / events / models) — there is no `.thread` escape hatch through which a
+  handler could reach exec/spawn/set_sandbox (docs/26 G6).
 
 The command context additionally exposes `wait_for_idle` (stronger session
 control surface, kept separate from plain event/task contexts).
@@ -170,6 +173,14 @@ class SpawnCap(_StaleGuard):
             raise ExtensionRuntimeError(
                 f"orchestration may not spawn reserved agent_type {agent_type!r}")
 
+    def is_aborted(self) -> bool:
+        """前台编排在步/任务边界查 turn abort（docs/26 G6：取代经 ctx.thread 直读 facade）。
+
+        只读查询，与编排原语同槽（spawn:orchestrate）。扩展永远拿不到 raw thread——
+        它能问的只有「这一回合是否已被打断」。"""
+        self._ensure_orchestrate()
+        return bool(self._thread.is_turn_aborted())
+
     def new_group(self) -> str:
         self._ensure_orchestrate()
         return self._thread.new_orchestration_group()
@@ -261,6 +272,32 @@ class SpawnCap(_StaleGuard):
         return self._thread.steer_child(child_session_id, prompt, delivery=delivery)
 
 
+class MemoryEvolutionCap(_StaleGuard):
+    """受信 memory-evolution 槽（docs/26 G6 收口，capability `memory:evaluate`）。
+
+    memory_evolution 扩展命令所需的两个宿主操作的 narrow 视图——取代经 `ctx.thread`
+    直达整个 RuntimeThread facade 的能力泄漏。扩展能做的只有「跑自己的优化任务」与
+    「跑 EVAL 生成」；它永远拿不到 raw thread，也就够不到 exec/spawn/set_sandbox。
+
+    仅由 host 向声明 `memory:evaluate` capability 的扩展授予；未授予时 `ctx.memory_evolution`
+    为 None（与 spawn/approvals/workspace 同一受信授予模型）。"""
+
+    def __init__(self, host, thread) -> None:
+        self._host = host
+        self._thread = thread
+
+    async def run_optimization(self, *, diagnose: bool = False) -> str:
+        """`/memory optimize [--diagnose]` — 创建宿主 memory_optimize 后台任务（task kind 内核固定，
+        扩展不可传任意 kind）。"""
+        self._ensure_active()
+        return await self._thread.run_extension_task("memory_optimize", {"diagnose": diagnose})
+
+    async def eval_generate(self) -> str:
+        """`/memory eval generate` — 跑 EVAL 模式 curator（受信 reserved spawn，经宿主打包）。"""
+        self._ensure_active()
+        return await self._thread.spawn_memory_eval()
+
+
 class ExtensionModelRouter(_StaleGuard):
     """Resolve an extension model role to a concrete model id (docs/22 §5.4).
 
@@ -291,23 +328,24 @@ class ExtensionModelRouter(_StaleGuard):
 class ExtensionContext:
     """Call-time context handed to event/task handlers.
 
-    Built fresh by `ExtensionHost.create_context()` per invocation. `thread`,
-    `session`, and `memory` are exposed as stale-guarded properties: once the
-    owning host is invalidated (session replacement / teardown), accessing them —
-    like the `tasks`/`models`/`events` views — fails loud, so a cached context can
-    never reach the raw RuntimeThread / MemoryService to write the wrong session
-    (docs/22 §9.1.6). `session` is read-only; the raw Agent / `_session_mgr` /
-    `_background_tasks` are never exposed."""
+    Built fresh by `ExtensionHost.create_context()` per invocation. `session` and
+    `memory` are exposed as stale-guarded properties: once the owning host is
+    invalidated (session replacement / teardown), accessing them — like the
+    `tasks`/`models`/`events` views — fails loud, so a cached context can never
+    reach the live `MemoryService` to write the wrong session (docs/22 §9.1.6).
+    `session` is read-only. The raw `RuntimeThread` / `Agent` / `_session_mgr` /
+    `_background_tasks` are **never** exposed: a handler reaches the runtime only
+    through the narrow, individually-bound capability views (docs/26 G6 — no
+    `.thread` escape hatch)."""
 
-    def __init__(self, *, host, cwd: str, thread, session, memory,
+    def __init__(self, *, host, cwd: str, session, memory,
                  tasks: "TaskManagerView", models: "ExtensionModelRouter",
                  events: "EventSink", spawn: "SpawnCap | None" = None,
                  approvals: "ApprovalInboxView | None" = None,
                  workspace: "WorkspaceProviderView | None" = None,
-                 signal=None) -> None:
+                 memory_evolution: "MemoryEvolutionCap | None" = None) -> None:
         self._host = host
         self.cwd = cwd
-        self._thread = thread
         self._session = session
         self._memory = memory
         self.tasks = tasks
@@ -316,18 +354,13 @@ class ExtensionContext:
         self.spawn = spawn
         self.approvals = approvals
         self.workspace = workspace
-        self.signal = signal
+        self.memory_evolution = memory_evolution
 
     def _ensure_active(self) -> None:
         if self._host is None or not getattr(self._host, "is_active", False):
             raise ExtensionRuntimeError(
                 "extension context is stale (session was replaced or torn down); "
                 "obtain a fresh context from the current ExtensionHost")
-
-    @property
-    def thread(self):
-        self._ensure_active()
-        return self._thread
 
     @property
     def session(self):

@@ -41,24 +41,6 @@ class TurnResult:
     error: str | None = None
 
 
-@dataclass
-class AgentResult:
-    """子 agent / 分支线程的结构化结果（形式化现有 _build_agent_result dict）。
-
-    host-derived 不变量：files_read/files_modified 由宿主观测，绝不信任模型自述。
-    """
-    agent_id: str
-    branch_id: str
-    status: str
-    summary: str
-    files_read: list[str] = field(default_factory=list)
-    files_modified: list[str] = field(default_factory=list)
-    result_path: str | None = None
-    messages_path: str | None = None
-    events_path: str | None = None
-    tokens: dict = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class SkillInvocation:
     """Result of a user-invoked skill crossing the runtime boundary."""
@@ -193,7 +175,6 @@ class RuntimeServices:
     """Cwd-bound services owned by the runtime host."""
 
     cwd: str
-    agent_dir: str
     workspace_trusted: bool
     memory_service: object | None
     context_sources: object
@@ -250,16 +231,24 @@ class RuntimeServices:
 
         from ..extensions import ExtensionHost
         with _push_cwd(resolved):
-            extension_host = ExtensionHost.load_system_extensions().activate_all()
+            extension_host = ExtensionHost.load_all_extensions(cwd=resolved).activate_all()
 
         from ..capabilities.sandbox import SandboxManager
         from ..mcp import McpManager
         from ..runs.runtime import AgentRunRuntime
 
+        # docs/26 G6: feed untrusted/declarative extensions' MCP servers into the
+        # manager BEFORE the lazy first-turn connect. Fail-soft — a bad spec must not
+        # block session bootstrap (a dead server fails per-server inside connect).
+        mcp_manager = McpManager()
+        try:
+            mcp_manager.add_extension_servers(extension_host.mcp_contributions())
+        except Exception:  # noqa: BLE001
+            pass
+
         trusted = config.workspace_trusted if str(Path(config.cwd or resolved).resolve()) == resolved else is_trusted(Path(resolved))
         return cls(
             cwd=resolved,
-            agent_dir=str(data_dir()),
             workspace_trusted=trusted,
             memory_service=service,
             context_sources=ContextSources(
@@ -270,7 +259,7 @@ class RuntimeServices:
             extension_host=extension_host,
             diagnostics=tuple(diagnostics),
             sandbox=SandboxManager(),
-            mcp_manager=McpManager(),
+            mcp_manager=mcp_manager,
             run_runtime=AgentRunRuntime(),
         )
 
@@ -850,8 +839,7 @@ class RuntimeThread:
         return task_output_text(self._agent.task_manager, task_id, tail_bytes)
 
     async def task_stop(self, task_id: str) -> str:
-        from ..tools.tasks_tool import task_stop
-        return await task_stop(self._agent.task_manager, self._agent._background_tasks, task_id)
+        return await self._agent.stop_task(task_id)
 
     def agents_overview(self) -> str:
         from ..tools.tasks_tool import agents_overview_text

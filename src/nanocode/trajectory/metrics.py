@@ -102,10 +102,6 @@ def _avg(total: "int | float", n: int) -> "float | None":
     return (total / n) if n else None
 
 
-def _mean_int(values: "list[int]") -> "int | None":
-    return int(sum(values) / len(values)) if values else None
-
-
 def _pytest_outcome(result_text: str) -> dict:
     """从一次 pytest/test run 的结果文本 best-effort 解析 passed/failed 计数。
 

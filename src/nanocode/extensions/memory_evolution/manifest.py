@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from ..manifest import (
-    CommandContribution, ExtensionContributes, ExtensionManifest, SPAWN_RESERVED,
+    CommandContribution, ExtensionContributes, ExtensionManifest, MEMORY_EVALUATE,
+    SPAWN_RESERVED,
 )
 
 # Reserved hidden agent type registered by this extension (docs/22 §6).
@@ -32,7 +33,7 @@ MANIFEST = ExtensionManifest(
     ),
     capabilities=frozenset({
         "memory:read",
-        "memory:evaluate",
+        MEMORY_EVALUATE,  # docs/26 G6：授予 ctx.memory_evolution 槽（run_optimization / eval_generate）
         "memory:write_retrieval_config",
         "task:create",
         "model:diagnose",

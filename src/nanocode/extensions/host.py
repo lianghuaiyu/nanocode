@@ -23,7 +23,8 @@ import importlib
 from .api import ExtensionAPI
 from .context import (
     ApprovalInboxView, EventSink, ExtensionCommandContext, ExtensionContext,
-    ExtensionModelRouter, SpawnCap, TaskManagerView, WorkspaceProviderView,
+    ExtensionModelRouter, MemoryEvolutionCap, SpawnCap, TaskManagerView,
+    WorkspaceProviderView,
 )
 from .errors import ExtensionLoadError, ExtensionRuntimeError
 from .manifest import ExtensionManifest
@@ -77,6 +78,7 @@ def _make_ext_adapter(handler, tool_name: str):
 class ExtensionHost:
     def __init__(self, manifests: list[ExtensionManifest]) -> None:
         self.manifests = list(manifests)
+        self._manifest_by_id = {m.id: m for m in self.manifests}
         self.registry = ContributionRegistry()
         self._activated = False
         self._active = False          # True only between bind_runtime and invalidate
@@ -86,17 +88,73 @@ class ExtensionHost:
     # ── load / activate ───────────────────────────────────────────────
     @classmethod
     def load_system_extensions(cls) -> "ExtensionHost":
+        """First-party system extensions only (no project/user discovery).
+
+        Used at module load by the command bridge (no cwd, side-effect-free import
+        contract). Per-session bootstrap uses `load_all_extensions(cwd=...)` instead,
+        which additionally discovers untrusted project extensions (docs/26 G6)."""
         return cls(_system_manifests())
+
+    @classmethod
+    def load_all_extensions(cls, *, cwd: "str | None" = None) -> "ExtensionHost":
+        """System extensions + discovered untrusted project extensions (docs/26 G6).
+
+        Untrusted extensions are declarative-only (no Python entrypoint); their only
+        execution path is an out-of-process MCP server the host spawns. Discovery is
+        fail-soft per extension — one malformed manifest never breaks the session."""
+        return cls(_system_manifests() + cls._discover_untrusted_manifests(cwd))
+
+    @staticmethod
+    def _discover_untrusted_manifests(cwd: "str | None" = None) -> list[ExtensionManifest]:
+        """Scan `<cwd>/.nanocode/extensions/*/manifest.json` for untrusted extensions.
+
+        Strict + fail-soft: each manifest must parse to a valid `kind="untrusted"`
+        manifest (only `mcp_servers`; `ExtensionManifest.__post_init__` enforces the
+        rest) or it is skipped. Missing dir → []. Project-level only (no user-level /
+        versioning / enable-disable / hot-reload — docs/26 G6 defers those)."""
+        import json
+        from pathlib import Path
+        from ..paths import project_config_dir
+        from .manifest import ExtensionContributes, McpServerSpec
+
+        root = project_config_dir(Path(cwd) if cwd else None) / "extensions"
+        if not root.exists():
+            return []
+        out: list[ExtensionManifest] = []
+        for d in sorted(root.iterdir()):
+            mf = d / "manifest.json"
+            if not mf.is_file():
+                continue
+            try:
+                raw = json.loads(mf.read_text(encoding="utf-8"))
+                servers = tuple(
+                    McpServerSpec(
+                        name=str(s["name"]), command=str(s["command"]),
+                        args=tuple(str(a) for a in s.get("args", ())),
+                        env=tuple((str(k), str(v)) for k, v in (s.get("env") or {}).items()))
+                    for s in raw.get("mcp_servers", []))
+                out.append(ExtensionManifest(
+                    id=str(raw["id"]), kind="untrusted", entrypoint="",
+                    contributes=ExtensionContributes(mcp_servers=servers)))
+            except Exception:  # noqa: BLE001 — fail-soft per extension; never break the session
+                continue
+        return out
 
     def activate_all(self) -> "ExtensionHost":
         """Run each extension's activate(api). Registration-only — no host access,
         no env/project reads (the hidden-agent-vs-custom-agent conflict check is
         deferred to bind_runtime, a host/trust phase). Conflict rules in the
         ContributionRegistry that are pure (dup command/task/hidden-agent) fire
-        here (fail loud)."""
+        here (fail loud).
+
+        Untrusted extensions (docs/26 G6) are declarative-only — skipped here: they
+        have no entrypoint and contribute no in-process code, only MCP server specs
+        surfaced by `mcp_contributions()`."""
         if self._activated:
             return self
         for manifest in self.manifests:
+            if manifest.kind == "untrusted":
+                continue
             activate = _resolve_entrypoint(manifest.entrypoint)
             api = ExtensionAPI(self.registry, extension_id=manifest.id)
             try:
@@ -146,12 +204,39 @@ class ExtensionHost:
 
     # ── command surface (static) ──────────────────────────────────────
     def command_contributions(self) -> list:
-        """[(CommandContribution, ext_handler)] for the entrypoints bridge.
+        """[(CommandContribution, ext_handler, extension_id)] for the entrypoints bridge.
 
         Handlers are static; they resolve the *live* bound host from the command
         context at call time, so this list can be built once at module load from
-        an activated-but-unbound host."""
-        return [(rc.contribution, rc.handler) for rc in self.registry.commands.values()]
+        an activated-but-unbound host. `extension_id` is carried so the bridge can
+        build a per-extension-scoped command context (docs/26 G6)."""
+        return [(rc.contribution, rc.handler, rc.extension_id)
+                for rc in self.registry.commands.values()]
+
+    # ── MCP surface (declarative, docs/26 G6) ─────────────────────────
+    def mcp_contributions(self) -> "dict[str, dict]":
+        """Aggregate declared MCP servers across manifests, namespaced by extension.
+
+        Returns the dict shape `McpManager` consumes: `{server_key: {command, args?,
+        env?}}`. `server_key` is sanitized to contain NO `__` (MCP tool names are
+        `mcp__<server>__<tool>` and `call_tool` splits on `__`, so a `__` inside the
+        server segment would mis-route) — extension id + spec name joined with `-`.
+
+        Independent of `activate_all()`: reads manifest data, so untrusted
+        (never-activated) extensions contribute here too."""
+        def _key(ext_id: str, name: str) -> str:
+            return f"{ext_id}.{name}".replace("__", "-").replace(".", "-")
+
+        out: "dict[str, dict]" = {}
+        for m in self.manifests:
+            for spec in m.contributes.mcp_servers:
+                cfg: dict = {"command": spec.command}
+                if spec.args:
+                    cfg["args"] = list(spec.args)
+                if spec.env:
+                    cfg["env"] = dict(spec.env)
+                out[_key(m.id, spec.name)] = cfg
+        return out
 
     # ── tool surface (docs/24 Phase 4b) ───────────────────────────────
     def tool_contributions(self) -> list:
@@ -181,27 +266,34 @@ class ExtensionHost:
             ))
         return out
 
-    # ── context factories (call-time) ─────────────────────────────────
-    def _spawn_allowed_agent_types(self) -> "frozenset[str]":
-        """docs/26 阶段1 ②：受信 spawn 槽可 spawn 的 agent_type 集。
+    # ── context factories (call-time, docs/26 G6 per-extension scoped) ─
+    def _spawn_allowed_agent_types(self, extension_id: str) -> "frozenset[str]":
+        """docs/26 阶段1 ②：受信 spawn 槽可 spawn 的 agent_type 集（**按扩展作用域**）。
 
-        = 声明了 `spawn:reserved` capability 的扩展所贡献的 hidden agents（双绑定：
-        opt-in capability × 该扩展自己注册、且内核已在 bind_runtime 校验过的 reserved/hidden
-        agent）。空集 → ctx 不挂 spawn 槽（`ctx.spawn is None`）。"""
+        = 该扩展若声明了 `spawn:reserved`，则为它**自己贡献**的 hidden agents；否则空集。
+        空集 → ctx 不挂 spawn 槽（`ctx.spawn is None`）。每个 handler 只拿到它自己声明、
+        自己贡献的 reserved agent（codex contributor 模式，docs/26 G6 Tier 2）。"""
         from .manifest import SPAWN_RESERVED
-        granted = {m.id for m in self.manifests if SPAWN_RESERVED in m.capabilities}
-        if not granted:
+        m = self._manifest_by_id.get(extension_id)
+        if m is None or SPAWN_RESERVED not in m.capabilities:
             return frozenset()
         return frozenset(
             name for name, (_profile, ext_id) in self.registry.hidden_agents.items()
-            if ext_id in granted)
+            if ext_id == extension_id)
 
-    def _orchestrate_granted(self) -> bool:
-        """docs/26 §0.6 阶段1：是否有 active 扩展声明了 `spawn:orchestrate`（解锁编排原语）。"""
+    def _orchestrate_granted(self, extension_id: str) -> bool:
+        """docs/26 §0.6 阶段1：该扩展是否声明了 `spawn:orchestrate`（解锁编排原语）。"""
         from .manifest import SPAWN_ORCHESTRATE
-        return any(SPAWN_ORCHESTRATE in m.capabilities for m in self.manifests)
+        m = self._manifest_by_id.get(extension_id)
+        return m is not None and SPAWN_ORCHESTRATE in m.capabilities
 
-    def _build_context_fields(self) -> dict:
+    def _memory_evolution_granted(self, extension_id: str) -> bool:
+        """docs/26 G6：该扩展是否声明了 `memory:evaluate`（解锁 ctx.memory_evolution 槽）。"""
+        from .manifest import MEMORY_EVALUATE
+        m = self._manifest_by_id.get(extension_id)
+        return m is not None and MEMORY_EVALUATE in m.capabilities
+
+    def _build_context_fields(self, extension_id: str) -> dict:
         if not self._active:
             raise ExtensionRuntimeError(
                 "extension host is not bound to a live runtime (or was invalidated)")
@@ -211,12 +303,11 @@ class ExtensionHost:
         memory = getattr(services, "memory_service", None) if services is not None else None
         session = thread.readonly_session() if thread is not None else None
         host_model = getattr(thread, "model", "") or ""
-        allowed_spawn = self._spawn_allowed_agent_types()
-        can_orchestrate = self._orchestrate_granted()
+        allowed_spawn = self._spawn_allowed_agent_types(extension_id)
+        can_orchestrate = self._orchestrate_granted(extension_id)
         return dict(
             host=self,
             cwd=(services.cwd if services is not None else ""),
-            thread=thread,
             session=session,
             memory=memory,
             tasks=TaskManagerView(self, agent.task_manager) if agent is not None else None,
@@ -229,14 +320,16 @@ class ExtensionHost:
             approvals=(ApprovalInboxView(self, thread)
                        if thread is not None and can_orchestrate else None),
             workspace=(WorkspaceProviderView(self) if can_orchestrate else None),
+            memory_evolution=(MemoryEvolutionCap(self, thread)
+                              if thread is not None and self._memory_evolution_granted(extension_id)
+                              else None),
         )
 
-    def create_context(self) -> ExtensionContext:
-        return ExtensionContext(**self._build_context_fields())
+    def create_context(self, extension_id: str) -> ExtensionContext:
+        return ExtensionContext(**self._build_context_fields(extension_id))
 
-    def create_command_context(self) -> ExtensionCommandContext:
-        fields = self._build_context_fields()
-        thread = self._thread
+    def create_command_context(self, extension_id: str) -> ExtensionCommandContext:
+        fields = self._build_context_fields(extension_id)
 
         async def _wait_for_idle() -> None:
             return None  # REPL is strictly serial; idle by the time a command runs
@@ -252,8 +345,8 @@ class ExtensionHost:
         entry = self.registry.task_kinds.get(kind)
         if entry is None:
             raise ExtensionRuntimeError(f"no extension task handler for kind {kind!r}")
-        handler, _ext = entry
-        ctx = self.create_context()
+        handler, ext_id = entry
+        ctx = self.create_context(ext_id)
         await handler(ctx, payload, task_id=task_id)
 
     # ── orchestration dispatch (docs/26 §0.6 阶段1) ───────────────────
@@ -267,22 +360,33 @@ class ExtensionHost:
         chain/parallel fallback (the policy lives only in the extension)."""
         if self.registry.orchestrator is None:
             raise ExtensionRuntimeError("no orchestration extension is registered")
-        handler, _ext = self.registry.orchestrator
-        ctx = self.create_context()
+        handler, ext_id = self.registry.orchestrator
+        ctx = self.create_context(ext_id)
         return await handler(ctx, payload)
 
     # ── lifecycle dispatch ────────────────────────────────────────────
     async def emit(self, event: str, payload: dict | None = None) -> None:
-        """Run lifecycle handlers for an event. Handler errors are isolated
-        (surfaced as notices) — one bad handler never blocks the others."""
+        """Run lifecycle handlers for an event with a per-extension-scoped context
+        (docs/26 G6). Handler errors are isolated (surfaced as notices) — one bad
+        handler never blocks the others."""
         handlers = self.registry.lifecycle_handlers.get(event, [])
         if not handlers:
             return
-        ctx = self.create_context()
         for handler, ext_id in handlers:
             try:
+                ctx = self.create_context(ext_id)
                 await handler(ctx, payload or {})
             except Exception as e:  # noqa: BLE001
-                if ctx.events is not None:
-                    ctx.events.notice(f"[extension {ext_id}] {event} handler failed: {e}",
-                                      level="warn")
+                # Diagnostics use an independent events sink so a per-handler ctx
+                # build failure still surfaces (the scoped ctx may not exist here).
+                self._notice_handler_failure(event, ext_id, e)
+
+    def _notice_handler_failure(self, event: str, ext_id: str, exc: Exception) -> None:
+        agent = getattr(self._thread, "_agent", None)
+        if agent is None:
+            return
+        try:
+            EventSink(self, agent.emit).notice(
+                f"[extension {ext_id}] {event} handler failed: {exc}", level="warn")
+        except Exception:  # noqa: BLE001 — a dead sink never breaks dispatch
+            pass

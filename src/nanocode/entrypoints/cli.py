@@ -464,7 +464,7 @@ async def run_repl(thread: RuntimeThread, *, input=None, output=None) -> None:
         """用户提交一行：命令分发 / skill / !shell / 跑一轮 chat（注入给 TuiApp）。
 
         替代旧 while-loop body。TuiApp 把本协程跑成 task、维护运行态、Ctrl-C→abort，故这里不再
-        处理 SIGINT / 行读 / 取消计数。异常由 TuiApp._run_turn 吞（error_raised 事件已入 timeline）。"""
+        处理 SIGINT / 行读 / 取消计数。异常由 TuiApp._run_turn 显示为简短错误。"""
         inp = text.strip()
         # 中文输入法的全角斜杠／归一为半角，否则 "／memory" 不匹配命令、被当普通文本发给 AI。
         if inp[:1] == "／":

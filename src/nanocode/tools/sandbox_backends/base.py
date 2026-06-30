@@ -8,8 +8,6 @@ READ_ONLY = "read-only"
 WORKSPACE_WRITE = "workspace-write"
 DANGER_FULL_ACCESS = "danger-full-access"
 
-POSTURES = (READ_ONLY, WORKSPACE_WRITE, DANGER_FULL_ACCESS)
-
 # 可写工作区内仍受保护、禁止写入的项目元数据目录
 DEFAULT_PROTECTED_ROOTS = (".git", ".nanocode", ".claude", ".codex", ".agents")
 

@@ -254,17 +254,6 @@ class RepoMapProvider:
         }
         return (root, tracked) if tracked else None
 
-    @staticmethod
-    def _personal_abs_files(repo_root: Path, request: ContextRequest) -> set[Path]:
-        out: set[Path] = set()
-        for name in request.files_read + request.files_modified:
-            try:
-                p = Path(name)
-                out.add((p if p.is_absolute() else repo_root / p).resolve())
-            except Exception:
-                continue
-        return out
-
 
 def _default_git_source(request: ContextRequest) -> str:
     from ..prompt import get_git_context

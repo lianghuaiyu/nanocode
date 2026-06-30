@@ -109,14 +109,6 @@ def load_context_config() -> dict:
     return cfg
 
 
-def _coerce_nonnegative_int(value, default):
-    try:
-        out = int(value)
-    except (ValueError, TypeError):
-        return default
-    return out if out >= 0 else default
-
-
 def _coerce_optional_int(value):
     if value is None:
         return None

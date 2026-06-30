@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Callable, Awaitable
 
 from ..tools import (
     REGISTRY,
@@ -352,32 +352,6 @@ class Agent(PlanModeMixin):
     def is_processing(self) -> bool:
         return self._current_task is not None and not self._current_task.done()
 
-    def _build_side_query(self):
-        """Build a sideQuery callable for memory recall, works with both backends."""
-        client = self._provider.client
-        if self._provider.name == "anthropic" and client is not None:
-            model = self.model
-            async def _sq(system: str, user_message: str) -> str:
-                resp = await client.messages.create(
-                    model=model, max_tokens=256, system=system,
-                    messages=[{"role": "user", "content": user_message}],
-                )
-                return "".join(b.text for b in resp.content if b.type == "text")
-            return _sq
-        if self._provider.name == "openai" and client is not None:
-            model = self.model
-            async def _sq_oai(system: str, user_message: str) -> str:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_message},
-                    ],
-                )
-                return resp.choices[0].message.content or "" if resp.choices else ""
-            return _sq_oai
-        return None
-
     async def _recall_memory_semantic(self, query: str, limit: int = 5) -> str:
         if self._memory_service is None:
             return "Memory is not available for this agent."
@@ -670,7 +644,8 @@ class Agent(PlanModeMixin):
     # ─── Execute tool (handles agent/skill/plan mode internally) ─────
 
     async def _spawn_background_shell(self, command: str, timeout_ms: int | None) -> str:
-        rec = self.task_manager.create_task("shell", command, owner_agent_id=None)
+        owner_agent_id = getattr(self, "_tree_session_id", self.session_id)
+        rec = self.task_manager.create_task("shell", command, owner_agent_id=owner_agent_id)
         d = _session_v2.task_dir(self.session_id, rec.id)
         stdout_path = str(d / "stdout.log"); stderr_path = str(d / "stderr.log")
         self.task_manager.update_task(rec.id, stdout_path=stdout_path, stderr_path=stderr_path)
@@ -740,9 +715,11 @@ class Agent(PlanModeMixin):
 
     async def stop_task(self, task_id: str) -> str:
         from ..tools.tasks_tool import task_stop
-        return await task_stop(
+        result = await task_stop(
             self.task_manager, self._background_tasks, task_id,
             allow_orphan_cancel=not self.is_sub_agent)
+        self._persist_state()
+        return result
 
     def _live_run_ids(self) -> set[str]:
         return {

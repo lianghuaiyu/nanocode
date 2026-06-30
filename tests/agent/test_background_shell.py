@@ -33,6 +33,44 @@ def test_spawn_background_shell_returns_task_id_and_completes(tmp_path):
     assert rec.status == "completed" and rec.exit_code == 0
 
 
+def test_spawn_background_shell_tags_main_session_owner():
+    a = Agent(api_key="test", permission_mode="bypassPermissions", session_id="main-session")
+
+    async def scenario():
+        tid = await a._spawn_background_shell("echo owner", timeout_ms=None)
+        for _ in range(100):
+            if a.task_manager.get_task(tid).status != "running":
+                break
+            await asyncio.sleep(0.02)
+        return a.task_manager.get_task(tid)
+
+    rec = asyncio.run(scenario())
+    assert rec.owner_agent_id == "main-session"
+
+
+def test_spawn_background_shell_tags_subagent_tree_session_owner():
+    parent = _agent()
+    child = Agent(
+        api_key="test",
+        is_sub_agent=True,
+        task_manager=parent.task_manager,
+        session_id=parent.session_id,
+        permission_mode="bypassPermissions",
+    )
+    child._tree_session_id = "sess_child"
+
+    async def scenario():
+        tid = await child._spawn_background_shell("echo child", timeout_ms=None)
+        for _ in range(100):
+            if parent.task_manager.get_task(tid).status != "running":
+                break
+            await asyncio.sleep(0.02)
+        return parent.task_manager.get_task(tid)
+
+    rec = asyncio.run(scenario())
+    assert rec.owner_agent_id == "sess_child"
+
+
 def test_execute_tool_call_routes_background(tmp_path):
     a = _agent()
     res = asyncio.run(a._execute_tool_call("run_shell", {"command": "echo bg", "run_in_background": True}))
@@ -64,6 +102,20 @@ def test_execute_tool_call_task_output_unknown():
     a = _agent()
     res = asyncio.run(a._execute_tool_call("task_output", {"task_id": "task-404"}))
     assert "unknown" in res.lower()
+
+
+def test_stop_task_persists_cancelled_state():
+    from nanocode.session import v2
+    a = Agent(api_key="test", permission_mode="bypassPermissions", session_id="stop_persist")
+    t = a.task_manager.create_task("shell", "orphan")
+    a.task_manager.update_task(t.id, status="running")
+
+    res = asyncio.run(a.stop_task(t.id))
+
+    state = v2.read_state("stop_persist")
+    assert "marked cancelled" in res.lower()
+    assert state["tasks"][0]["id"] == t.id
+    assert state["tasks"][0]["status"] == "cancelled"
 
 
 def test_task_tools_default_mode_allow():
@@ -110,4 +162,3 @@ def test_inject_finished_tasks_tree_write_failure_retries(monkeypatch):
     monkeypatch.setattr(a.agent_session, "_tree_custom_message", lambda *args, **kw: False)
     a.agent_session.inject_finished_tasks()
     assert a.task_manager.get_task(t.id).injected is False      # 未推进 dedup → 重试
-

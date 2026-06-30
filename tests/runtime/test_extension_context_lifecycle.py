@@ -47,9 +47,12 @@ def _bound_host():
     return host, thread
 
 
+_MEMORY_EVOLUTION = "nanocode.memory_evolution"
+
+
 def test_context_is_live_while_bound():
     host, thread = _bound_host()
-    ctx = host.create_context()
+    ctx = host.create_context(_MEMORY_EVOLUTION)
     assert ctx.memory is None              # services=None
     assert ctx.session is None
     ctx.tasks.update_task("t1", status="completed")
@@ -60,15 +63,14 @@ def test_context_is_live_while_bound():
 
 def test_stale_context_fails_loud_after_invalidate():
     host, thread = _bound_host()
-    ctx = host.create_context()
+    ctx = host.create_context(_MEMORY_EVOLUTION)
     host.invalidate("dispose")
     with pytest.raises(ExtensionRuntimeError):
         ctx.tasks.update_task("t1", status="completed")
     with pytest.raises(ExtensionRuntimeError):
         ctx.models.resolve("memory_diagnosis")
-    # raw thread / memory / session must not be reachable through a stale ctx
-    with pytest.raises(ExtensionRuntimeError):
-        _ = ctx.thread
+    # raw memory / session must not be reachable through a stale ctx (the raw
+    # RuntimeThread is never reachable at all — there is no `.thread`, docs/26 G6)
     with pytest.raises(ExtensionRuntimeError):
         _ = ctx.memory
     with pytest.raises(ExtensionRuntimeError):
@@ -79,10 +81,10 @@ def test_create_context_after_invalidate_fails_loud():
     host, _thread = _bound_host()
     host.invalidate("dispose")
     with pytest.raises(ExtensionRuntimeError):
-        host.create_context()
+        host.create_context(_MEMORY_EVOLUTION)
 
 
 def test_command_context_has_wait_for_idle():
     host, _thread = _bound_host()
-    cctx = host.create_command_context()
+    cctx = host.create_command_context(_MEMORY_EVOLUTION)
     assert cctx.wait_for_idle is not None

@@ -73,7 +73,7 @@ def attach_orchestration(agent, *, cwd="."):
     thread = rt.register(RuntimeThread(rt, agent, AgentSession(agent)))
     host = ExtensionHost.load_system_extensions().activate_all()
     services = RuntimeServices(
-        cwd=cwd, agent_dir=cwd, workspace_trusted=True,
+        cwd=cwd, workspace_trusted=True,
         memory_service=None, context_sources=None, extension_host=host)
     thread._extension_host = host
     host.bind_runtime(thread, services)

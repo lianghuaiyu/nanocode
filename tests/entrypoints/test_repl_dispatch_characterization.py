@@ -86,6 +86,7 @@ class _FakeAgent:
 
     async def _spawn_memory_consolidate(self): self.calls.append(("_spawn_memory_consolidate",)); return ""
     async def _spawn_memory_eval(self): self.calls.append(("_spawn_memory_eval",)); return ""
+    async def stop_task(self, task_id: str): self.calls.append(("task_stop", task_id)); return "stopped"
     def _register_skill_hooks(self, skill): self.calls.append(("_register_skill_hooks", skill.name))
     def _live_run_ids(self): return set()
 

@@ -8,7 +8,7 @@ extensions, does not activate anything, and does not start background workers
 from .errors import ExtensionError, ExtensionLoadError, ExtensionRuntimeError
 from .host import ExtensionHost
 from .manifest import (
-    CommandContribution, ExtensionContributes, ExtensionManifest,
+    CommandContribution, ExtensionContributes, ExtensionManifest, McpServerSpec,
 )
 
 __all__ = [
@@ -16,6 +16,7 @@ __all__ = [
     "ExtensionManifest",
     "ExtensionContributes",
     "CommandContribution",
+    "McpServerSpec",
     "ExtensionError",
     "ExtensionLoadError",
     "ExtensionRuntimeError",
