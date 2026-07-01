@@ -1,5 +1,11 @@
 """agent/state.py — AgentState：SessionManager.build_context() 的可丢弃运行态投影（docs/15 §6）。
 
+分层归属（docs/26 G1）：本模块是 **②b harness 投影**，**不属于 ②a 裸循环**——`AgentState` 只被
+`session/agent.py`(②b) 的 `hydrate_state()`/`project_request()` 消费，裸循环（`core.py`/`loop.py`，
+②a）**从不 import 它**（见 `tests/agent/test_bare_loop_purity.py` 的 import 闭包证明）。故它 import
+`session.{context,manager,render}`(②b) 是**同层**引用，非 ②a→②b 的 G1 越界。它恰好与裸循环同住
+`agent/` 目录（分层按角色不按目录，与 Codex 单 crate / Pi 单 package 同理）。
+
 §0 硬不变量：AgentState 绝不是 durable truth。它由 `build_context()`（中立 Message[] + ScalarState）
 + AgentProfile / runtime config 重建，并能 render 成任一 provider 的请求 payload，**无需任何
 provider-specific durable messages**——旧的 `_anthropic_messages` / `_openai_messages` 降为
